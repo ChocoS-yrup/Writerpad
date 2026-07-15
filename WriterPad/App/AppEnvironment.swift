@@ -1,4 +1,5 @@
 import Combine
+import Foundation
 import SwiftData
 
 @MainActor
@@ -7,6 +8,7 @@ final class AppEnvironment: ObservableObject {
     let projectRepository: any ProjectRepository
     let documentRepository: any DocumentRepository
     let workspaceStateRepository: any WorkspaceStateRepository
+    let projectManager: any ProjectManaging
     let clock: any AppClock
     let futureChangeNotifier: any FutureChangeNotifying
 
@@ -17,6 +19,7 @@ final class AppEnvironment: ObservableObject {
         projectRepository: any ProjectRepository,
         documentRepository: any DocumentRepository,
         workspaceStateRepository: any WorkspaceStateRepository,
+        projectManager: any ProjectManaging,
         clock: any AppClock,
         futureChangeNotifier: any FutureChangeNotifying
     ) {
@@ -24,6 +27,7 @@ final class AppEnvironment: ObservableObject {
         self.projectRepository = projectRepository
         self.documentRepository = documentRepository
         self.workspaceStateRepository = workspaceStateRepository
+        self.projectManager = projectManager
         self.clock = clock
         self.futureChangeNotifier = futureChangeNotifier
     }
@@ -41,13 +45,30 @@ final class AppEnvironment: ObservableObject {
             isStoredInMemoryOnly: isStoredInMemoryOnly
         )
         let repository = SwiftDataMetadataRepository(modelContainer: container)
+        let pathResolver: ProjectPathResolver
+        if isStoredInMemoryOnly {
+            let root = FileManager.default.temporaryDirectory
+                .appendingPathComponent("WriterPad-Preview-\(UUID().uuidString)")
+                .appendingPathComponent("Projects", isDirectory: true)
+            pathResolver = ProjectPathResolver(projectsRootURL: root)
+        } else {
+            pathResolver = try ProjectPathResolver.live()
+        }
+        let clock = SystemClock()
+        let projectManager = LocalProjectManager(
+            projectRepository: repository,
+            workspaceStateRepository: repository,
+            pathResolver: pathResolver,
+            clock: clock
+        )
 
         return AppEnvironment(
             modelContainer: container,
             projectRepository: repository,
             documentRepository: repository,
             workspaceStateRepository: repository,
-            clock: SystemClock(),
+            projectManager: projectManager,
+            clock: clock,
             futureChangeNotifier: NoOpFutureChangeNotifier()
         )
     }

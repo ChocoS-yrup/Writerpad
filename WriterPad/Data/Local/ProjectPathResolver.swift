@@ -101,6 +101,19 @@ struct ProjectPathResolver: @unchecked Sendable {
         try policy.validateName(projectName)
         let projectContainer = projectsRootURL
             .appendingPathComponent(projectName, isDirectory: true)
+        return try standardPaths(
+            atProjectContainer: projectContainer,
+            projectName: projectName
+        )
+    }
+
+    /// 거래용 임시 폴더처럼 최종 작품명과 다른 컨테이너에도 표준 구조를 계산한다.
+    func standardPaths(
+        atProjectContainer projectContainer: URL,
+        projectName: String
+    ) throws -> StandardProjectPaths {
+        try policy.validateName(projectName)
+        _ = try containedCanonicalURL(projectContainer, root: projectsRootURL)
         let workspace = projectContainer
             .appendingPathComponent("집필모드", isDirectory: true)
         let main = workspace.appendingPathComponent("메인", isDirectory: true)
@@ -141,6 +154,42 @@ struct ProjectPathResolver: @unchecked Sendable {
         try validateProjectNameForCreation(projectName, existingProjects: existingProjects)
 
         let paths = try standardPaths(forProjectNamed: projectName)
+        try createDirectoriesAndSettings(paths: paths, projectName: projectName)
+        return paths
+    }
+
+    /// 새 작품 거래가 사용하는 숨김 임시 컨테이너 안에 전체 구조를 만든다.
+    func createStandardStructure(
+        atProjectContainer projectContainer: URL,
+        projectName: String
+    ) throws -> StandardProjectPaths {
+        try fileManager.createDirectory(
+            at: projectsRootURL,
+            withIntermediateDirectories: true
+        )
+        let paths = try standardPaths(
+            atProjectContainer: projectContainer,
+            projectName: projectName
+        )
+        try createDirectoriesAndSettings(paths: paths, projectName: projectName)
+        return paths
+    }
+
+    /// 이름 변경 거래에서 설정 파일의 작품명도 원자적으로 맞춘다.
+    func updateStoredProjectName(forProjectNamed projectName: String) throws {
+        let settingsURL = try standardPaths(forProjectNamed: projectName).settingsFileURL
+        try writeSettingsFile(at: settingsURL, projectName: projectName)
+    }
+
+    func storedProjectName(forProjectNamed projectName: String) throws -> String? {
+        let paths = try standardPaths(forProjectNamed: projectName)
+        return storedProjectName(from: paths.settingsFileURL)
+    }
+
+    private func createDirectoriesAndSettings(
+        paths: StandardProjectPaths,
+        projectName: String
+    ) throws {
         _ = try containedCanonicalURL(paths.projectContainerURL, root: projectsRootURL)
 
         for directory in paths.requiredDirectories {
@@ -156,7 +205,6 @@ struct ProjectPathResolver: @unchecked Sendable {
 
         _ = try containedCanonicalURL(paths.settingsFileURL, root: paths.workspaceRootURL)
         try ensureSettingsFile(at: paths.settingsFileURL, projectName: projectName)
-        return paths
     }
 
     /// 검증된 상대 경로를 작품의 집필모드 루트 안 URL로 바꾼다.
@@ -272,6 +320,34 @@ struct ProjectPathResolver: @unchecked Sendable {
             contents: data
         )
         guard created else {
+            throw ProjectPathResolverError.settingsFileCreationFailed(url.path)
+        }
+    }
+
+    private func writeSettingsFile(at url: URL, projectName: String) throws {
+        var isDirectory: ObjCBool = false
+        guard fileManager.fileExists(atPath: url.path, isDirectory: &isDirectory),
+              !isDirectory.boolValue
+        else {
+            throw ProjectPathResolverError.settingsPathIsNotFile(url.path)
+        }
+        var settings: [String: Any] = [:]
+        if let data = try? Data(contentsOf: url),
+           let decoded = try? JSONSerialization.jsonObject(with: data),
+           let object = decoded as? [String: Any] {
+            settings = object
+        }
+        settings["project_name"] = projectName
+        guard var data = try? JSONSerialization.data(
+            withJSONObject: settings,
+            options: [.sortedKeys]
+        ) else {
+            throw ProjectPathResolverError.settingsFileCreationFailed(url.path)
+        }
+        data.append(0x0A)
+        do {
+            try data.write(to: url, options: .atomic)
+        } catch {
             throw ProjectPathResolverError.settingsFileCreationFailed(url.path)
         }
     }

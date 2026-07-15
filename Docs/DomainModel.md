@@ -17,6 +17,7 @@ erDiagram
 | 모델 | 저장하는 정보 | 저장하지 않는 정보 |
 |---|---|---|
 | `Project` | 작품 UUID, 이름, 생성·수정 시각 | 서버 revision, 원고 본문 |
+| `ManagedProject` | Project, 사용자 순서, 활성·삭제 대기 상태 | 원고 본문, 실제 휴지통 처리 |
 | `DocumentNode` | 문서 UUID, 작품 UUID, 종류, 부모, 상대 경로, 순서, 수정 시각, SHA-256, 삭제·커서·펼침 상태 | TXT 본문 |
 | `BackupSnapshot` | 백업 UUID, 연결된 작품·문서 UUID, 백업 위치, 시각, 해시, 생성 이유, 보관 여부 | 백업 본문 자체 |
 | `EditorWorkspaceState` | 좌우 문서, 각 커서, 활성 편집기 | UIKit 객체·NSRange |
@@ -27,6 +28,7 @@ erDiagram
 ## 저장 경계
 
 - `ProjectRepository`: 작품 메타데이터
+- `ProjectManaging`: 작품 폴더·메타데이터를 함께 다루는 생성·이름 변경·순서·삭제 확인 거래
 - `DocumentRepository`: 문서 메타데이터
 - `LocalDocumentStoring`: UTF-8 TXT 읽기와 원자 저장
 - `BackupStoring`: 백업 생성·조회·복원

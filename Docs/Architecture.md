@@ -33,6 +33,12 @@ flowchart TD
 
 SwiftData 갱신에 실패하더라도 TXT 원고를 되돌려 잃게 만들지 않는다. 원고 교체 전에 저장한 재조정 표식과 실제 TXT SHA-256가 일치할 때만 다음 실행에서 메타데이터를 반영한다.
 
+## 작품 관리 흐름
+
+`ProjectListModel`은 `ProjectManaging`만 호출하고 파일 시스템과 SwiftData를 직접 수정하지 않는다. `LocalProjectManager` actor가 작품 생성·이름 변경을 직렬화하며, 숨김 임시 폴더와 단계별 저널로 파일 이동과 SwiftData 갱신 사이의 중단을 복구한다. SwiftData V1은 작품 정체성과 이름을, 원자적 로컬 카탈로그는 사용자 순서와 삭제 대기 상태를 담당한다.
+
+삭제 확인은 파일 제거가 아니라 `deletionRequested` 상태 전이다. 실제 `메인/휴지통` 이동이나 영구 삭제는 6단계 정책이 이 상태를 소비할 때 수행한다.
+
 ## 문서 정체성과 경로
 
 - `project_id`와 `document_id`는 생성 후 바뀌지 않는다.

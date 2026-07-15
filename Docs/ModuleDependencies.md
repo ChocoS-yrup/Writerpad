@@ -30,6 +30,7 @@
 `AppEnvironment`가 다음 protocol 구현을 조립한다.
 
 - ProjectRepository
+- ProjectManaging
 - DocumentRepository
 - LocalDocumentStoring
 - BackupStoring
