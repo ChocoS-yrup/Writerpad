@@ -10,6 +10,7 @@ final class AppEnvironment: ObservableObject {
     let workspaceStateRepository: any WorkspaceStateRepository
     let projectManager: any ProjectManaging
     let projectImporter: any ProjectImporting
+    let binderRepository: any BinderRepository
     let clock: any AppClock
     let futureChangeNotifier: any FutureChangeNotifying
 
@@ -22,6 +23,7 @@ final class AppEnvironment: ObservableObject {
         workspaceStateRepository: any WorkspaceStateRepository,
         projectManager: any ProjectManaging,
         projectImporter: any ProjectImporting,
+        binderRepository: any BinderRepository,
         clock: any AppClock,
         futureChangeNotifier: any FutureChangeNotifying
     ) {
@@ -31,6 +33,7 @@ final class AppEnvironment: ObservableObject {
         self.workspaceStateRepository = workspaceStateRepository
         self.projectManager = projectManager
         self.projectImporter = projectImporter
+        self.binderRepository = binderRepository
         self.clock = clock
         self.futureChangeNotifier = futureChangeNotifier
     }
@@ -73,6 +76,19 @@ final class AppEnvironment: ObservableObject {
             pathResolver: pathResolver,
             clock: clock
         )
+        let workspaceLocator = RepositoryProjectWorkspaceLocator(
+            projectRepository: repository,
+            pathResolver: pathResolver
+        )
+        let binderScanner = LocalBinderDirectoryScanner(pathResolver: pathResolver)
+        let binderRepository = LocalBinderRepository(
+            metadataStore: repository,
+            workspaceStateRepository: repository,
+            workspaceLocator: workspaceLocator,
+            scanner: binderScanner,
+            pathPolicy: pathResolver.policy,
+            clock: clock
+        )
 
         return AppEnvironment(
             modelContainer: container,
@@ -81,6 +97,7 @@ final class AppEnvironment: ObservableObject {
             workspaceStateRepository: repository,
             projectManager: projectManager,
             projectImporter: projectImporter,
+            binderRepository: binderRepository,
             clock: clock,
             futureChangeNotifier: NoOpFutureChangeNotifier()
         )

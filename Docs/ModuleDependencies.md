@@ -34,6 +34,7 @@
 - ProjectImporting
 - ProjectImportMetadataRegistering
 - DocumentRepository
+- BinderRepository
 - LocalDocumentStoring
 - BackupStoring
 - TrashManaging

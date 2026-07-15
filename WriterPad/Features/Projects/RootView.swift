@@ -7,7 +7,8 @@ struct RootView: View {
     var body: some View {
         ProjectWorkspaceView(
             projectManager: environment.projectManager,
-            projectImporter: environment.projectImporter
+            projectImporter: environment.projectImporter,
+            binderRepository: environment.binderRepository
         )
             .task {
                 await environment.futureChangeNotifier.record(.appLaunched)
@@ -23,11 +24,14 @@ private struct ProjectWorkspaceView: View {
     @State private var renameText = ""
     @State private var deleteTarget: ManagedProject?
     @State private var isSelectingImportFolder = false
+    private let binderRepository: any BinderRepository
 
     init(
         projectManager: any ProjectManaging,
-        projectImporter: any ProjectImporting
+        projectImporter: any ProjectImporting,
+        binderRepository: any BinderRepository
     ) {
+        self.binderRepository = binderRepository
         _model = StateObject(
             wrappedValue: ProjectListModel(
                 projectManager: projectManager,
@@ -76,21 +80,32 @@ private struct ProjectWorkspaceView: View {
             }
         } detail: {
             if let project = model.selectedProject {
-                VStack(spacing: 14) {
-                    Image(systemName: "book.closed")
-                        .font(.system(size: 44))
-                        .foregroundStyle(.secondary)
-                    Text(project.name)
-                        .font(.title2.weight(.semibold))
-                    Text("작품 폴더와 메타데이터가 준비되었습니다.\n원고 목록과 편집기는 다음 단계에서 연결됩니다.")
-                        .multilineTextAlignment(.center)
-                        .foregroundStyle(.secondary)
-                    if project.isDeletionRequested {
-                        Label("삭제 대기 중", systemImage: "trash")
-                            .foregroundStyle(.orange)
+                HStack(spacing: 0) {
+                    BinderPanel(
+                        projectID: project.id,
+                        repository: binderRepository
+                    )
+                    .frame(minWidth: 250, idealWidth: 310, maxWidth: 380)
+
+                    Divider()
+
+                    VStack(spacing: 14) {
+                        Image(systemName: "book.closed")
+                            .font(.system(size: 44))
+                            .foregroundStyle(.secondary)
+                        Text(project.name)
+                            .font(.title2.weight(.semibold))
+                        Text("바인더 항목을 펼쳐 작품 구조를 확인할 수 있습니다.\n원고 편집기는 후속 단계에서 연결됩니다.")
+                            .multilineTextAlignment(.center)
+                            .foregroundStyle(.secondary)
+                        if project.isDeletionRequested {
+                            Label("삭제 대기 중", systemImage: "trash")
+                                .foregroundStyle(.orange)
+                        }
                     }
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+                    .padding()
                 }
-                .padding()
             } else {
                 ContentUnavailableView(
                     "작품을 선택하세요",

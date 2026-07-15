@@ -1,0 +1,246 @@
+import Foundation
+import SwiftData
+import XCTest
+@testable import WriterPad
+
+final class LocalBinderRepositoryTests: XCTestCase {
+    private var roots: [URL] = []
+
+    override func tearDownWithError() throws {
+        for root in roots {
+            try? FileManager.default.removeItem(at: root)
+        }
+        roots = []
+    }
+
+    func testThousandChapterProjectInitiallyScansOnlyMainAndShowsEightFixedRoots() async throws {
+        let harness = try await makeHarness(projectName: "천화 작품")
+        let manuscript = harness.workspace.appendingPathComponent("메인/원고/1권")
+        try FileManager.default.createDirectory(at: manuscript, withIntermediateDirectories: true)
+        for chapter in 1...1_000 {
+            try Data("본문 \(chapter)".utf8).write(
+                to: manuscript.appendingPathComponent(String(format: "%04d화.txt", chapter))
+            )
+        }
+        try FileManager.default.createDirectory(
+            at: harness.workspace.appendingPathComponent("메인/플롯"),
+            withIntermediateDirectories: true
+        )
+        await harness.scanner.resetMetrics()
+
+        let roots = try await harness.binder.rootNodes(in: harness.project.id)
+        let metrics = await harness.scanner.metrics()
+        let metadata = try await harness.repository.documents(in: harness.project.id)
+
+        XCTAssertEqual(
+            Array(roots.prefix(8).compactMap(\.fixedCategory)),
+            BinderFixedCategory.allCases
+        )
+        XCTAssertEqual(roots.first?.fixedCategory, .manuscript)
+        XCTAssertEqual(roots.last?.displayName, "플롯")
+        XCTAssertNil(roots.last?.fixedCategory)
+        XCTAssertEqual(metrics.relativeDirectories, ["메인"])
+        XCTAssertFalse(metrics.performedMainThreadIO)
+        XCTAssertFalse(metadata.contains { $0.relativePath.rawValue.contains("1권") })
+    }
+
+    func testFoldersAndTextUseNaturalOrderHideExtensionAndExposeContentState() async throws {
+        let harness = try await makeHarness(projectName: "정렬 작품")
+        for volume in ["10권", "2권", "1권"] {
+            try FileManager.default.createDirectory(
+                at: harness.workspace.appendingPathComponent("메인/원고/\(volume)"),
+                withIntermediateDirectories: true
+            )
+        }
+        try writeText("열 번째", workspace: harness.workspace, path: "메인/원고/1권/010화.txt")
+        try writeText("", workspace: harness.workspace, path: "메인/원고/1권/002화.txt")
+        try writeText("첫 번째", workspace: harness.workspace, path: "메인/원고/1권/001화.txt")
+
+        let roots = try await harness.binder.rootNodes(in: harness.project.id)
+        let manuscript = try XCTUnwrap(roots.first { $0.fixedCategory == .manuscript })
+        let volumes = try await harness.binder.children(
+            of: manuscript.id,
+            in: harness.project.id
+        )
+        let firstVolume = try XCTUnwrap(volumes.first)
+        let chapters = try await harness.binder.children(
+            of: firstVolume.id,
+            in: harness.project.id
+        )
+
+        XCTAssertEqual(volumes.map(\.displayName), ["1권", "2권", "10권"])
+        XCTAssertEqual(chapters.map(\.displayName), ["001화", "002화", "010화"])
+        XCTAssertFalse(chapters.contains { $0.displayName.lowercased().hasSuffix(".txt") })
+        XCTAssertTrue(chapters.allSatisfy {
+            $0.relativePath.rawValue.lowercased().hasSuffix(".txt")
+        })
+        XCTAssertEqual(chapters[0].contentState, .written)
+        XCTAssertEqual(chapters[1].contentState, .empty)
+        XCTAssertEqual(chapters[2].contentState, .written)
+    }
+
+    func testStoredUserOrderOverridesNaturalOrder() async throws {
+        let harness = try await makeHarness(projectName: "사용자 정렬")
+        try writeText("첫째", workspace: harness.workspace, path: "메인/메모장/1.txt")
+        try writeText("둘째", workspace: harness.workspace, path: "메인/메모장/2.txt")
+        let roots = try await harness.binder.rootNodes(in: harness.project.id)
+        let notes = try XCTUnwrap(roots.first { $0.fixedCategory == .notes })
+        let natural = try await harness.binder.children(of: notes.id, in: harness.project.id)
+        let storedFirst = try await harness.repository.document(id: natural[0].id)
+        let storedSecond = try await harness.repository.document(id: natural[1].id)
+        let first = try XCTUnwrap(storedFirst)
+        let second = try XCTUnwrap(storedSecond)
+        try await harness.repository.save(
+            first.relocated(
+                to: first.relativePath,
+                parentID: first.parentID,
+                userOrder: 20,
+                at: first.modifiedAt
+            )
+        )
+        try await harness.repository.save(
+            second.relocated(
+                to: second.relativePath,
+                parentID: second.parentID,
+                userOrder: 10,
+                at: second.modifiedAt
+            )
+        )
+
+        let reordered = try await harness.binder.children(of: notes.id, in: harness.project.id)
+
+        XCTAssertEqual(reordered.map(\.displayName), ["2", "1"])
+        XCTAssertEqual(reordered.map(\.id), [second.id, first.id])
+    }
+
+    @MainActor
+    func testExpandedBranchesRestoreThroughViewModelWithoutLoadingCollapsedSiblings() async throws {
+        let harness = try await makeHarness(projectName: "펼침 복원")
+        try writeText("본문", workspace: harness.workspace, path: "메인/원고/1권/001화.txt")
+        let roots = try await harness.binder.rootNodes(in: harness.project.id)
+        let manuscript = try XCTUnwrap(roots.first { $0.fixedCategory == .manuscript })
+        let volumes = try await harness.binder.children(of: manuscript.id, in: harness.project.id)
+        let volume = try XCTUnwrap(volumes.first)
+        try await harness.binder.setExpanded(true, for: manuscript.id)
+        try await harness.binder.setExpanded(true, for: volume.id)
+        await harness.scanner.resetMetrics()
+
+        let model = BinderViewModel(repository: harness.binder)
+        await model.load(projectID: harness.project.id)
+        let metrics = await harness.scanner.metrics()
+
+        XCTAssertTrue(model.roots.first { $0.id == manuscript.id }?.isExpanded == true)
+        XCTAssertEqual(
+            model.visibleRows.first { $0.node.id == volume.id }?.depth,
+            1
+        )
+        XCTAssertEqual(
+            model.visibleRows.first { $0.node.displayName == "001화" }?.depth,
+            2
+        )
+        XCTAssertEqual(metrics.relativeDirectories, ["메인", "메인/원고", "메인/원고/1권"])
+    }
+
+    func testExternalTextRenameKeepsUUIDWhenHashMatchIsUnique() async throws {
+        let harness = try await makeHarness(projectName: "외부 변경")
+        try writeText("동일한 본문", workspace: harness.workspace, path: "메인/메모장/초안.txt")
+        let roots = try await harness.binder.rootNodes(in: harness.project.id)
+        let notes = try XCTUnwrap(roots.first { $0.fixedCategory == .notes })
+        let before = try await harness.binder.children(of: notes.id, in: harness.project.id)
+        let source = harness.workspace.appendingPathComponent("메인/메모장/초안.txt")
+        let destination = harness.workspace.appendingPathComponent("메인/메모장/완성.txt")
+        try FileManager.default.moveItem(at: source, to: destination)
+
+        let after = try await harness.binder.children(of: notes.id, in: harness.project.id)
+        let stored = try await harness.repository.document(id: before[0].id)
+
+        XCTAssertEqual(after.map(\.id), before.map(\.id))
+        XCTAssertEqual(after.first?.displayName, "완성")
+        XCTAssertEqual(stored?.relativePath.rawValue, "메인/메모장/완성.txt")
+    }
+
+    func testExternalAdditionKeepsExistingUUIDAndCreatesOnlyOneNewIdentity() async throws {
+        let harness = try await makeHarness(projectName: "외부 추가")
+        try writeText("기존", workspace: harness.workspace, path: "메인/설정집/기존.txt")
+        let roots = try await harness.binder.rootNodes(in: harness.project.id)
+        let settings = try XCTUnwrap(roots.first { $0.fixedCategory == .settings })
+        let before = try await harness.binder.children(of: settings.id, in: harness.project.id)
+        try writeText("새 문서", workspace: harness.workspace, path: "메인/설정집/추가.txt")
+
+        let after = try await harness.binder.children(of: settings.id, in: harness.project.id)
+
+        XCTAssertEqual(after.count, 2)
+        XCTAssertTrue(after.contains { $0.id == before[0].id })
+        XCTAssertEqual(Set(after.map(\.id)).count, 2)
+    }
+
+    private struct Harness {
+        let root: URL
+        let container: ModelContainer
+        let repository: SwiftDataMetadataRepository
+        let resolver: ProjectPathResolver
+        let scanner: LocalBinderDirectoryScanner
+        let binder: LocalBinderRepository
+        let project: ManagedProject
+        let workspace: URL
+    }
+
+    private struct FixedClock: AppClock {
+        let date: Date
+        func now() -> Date { date }
+    }
+
+    private func makeHarness(projectName: String) async throws -> Harness {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("WriterPad-BinderTests-\(UUID().uuidString)")
+        roots.append(root)
+        let container = try WriterPadMetadataStore.makeContainer(isStoredInMemoryOnly: true)
+        let repository = SwiftDataMetadataRepository(modelContainer: container)
+        let resolver = ProjectPathResolver(
+            projectsRootURL: root.appendingPathComponent("Projects")
+        )
+        let clock = FixedClock(date: Date(timeIntervalSince1970: 4_000))
+        let manager = LocalProjectManager(
+            projectRepository: repository,
+            workspaceStateRepository: repository,
+            pathResolver: resolver,
+            clock: clock
+        )
+        let project = try await manager.createProject(named: projectName)
+        let locator = RepositoryProjectWorkspaceLocator(
+            projectRepository: repository,
+            pathResolver: resolver
+        )
+        let scanner = LocalBinderDirectoryScanner(pathResolver: resolver)
+        let binder = LocalBinderRepository(
+            metadataStore: repository,
+            workspaceStateRepository: repository,
+            workspaceLocator: locator,
+            scanner: scanner,
+            pathPolicy: resolver.policy,
+            clock: clock
+        )
+        let workspace = try resolver.standardPaths(
+            forProjectNamed: projectName
+        ).workspaceRootURL
+        return Harness(
+            root: root,
+            container: container,
+            repository: repository,
+            resolver: resolver,
+            scanner: scanner,
+            binder: binder,
+            project: project,
+            workspace: workspace
+        )
+    }
+
+    private func writeText(_ text: String, workspace: URL, path: String) throws {
+        let url = workspace.appendingPathComponent(path)
+        try FileManager.default.createDirectory(
+            at: url.deletingLastPathComponent(),
+            withIntermediateDirectories: true
+        )
+        try Data(text.utf8).write(to: url, options: .atomic)
+    }
+}
