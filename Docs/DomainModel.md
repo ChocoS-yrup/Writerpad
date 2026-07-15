@@ -40,6 +40,6 @@ erDiagram
 
 `FutureSyncMode`는 `unconfigured`, `localOnly`, `futureConnection`만 표현한다. 로컬 사건에는 안정적인 작품·문서 ID와 content hash 확장점이 있지만 서버 revision, metadata revision, operation payload는 정의하지 않았다.
 
-## 다음 단계
+## SwiftData 연결
 
-1-4에서 이 순수 모델을 SwiftData 메타데이터 레코드로 변환한다. 이때도 TXT 본문은 스키마에 추가하지 않는다.
+1-4에서 이 순수 모델을 SwiftData V1 메타데이터 레코드로 연결했다. 변환과 무결성 검사는 `SwiftDataMetadataRepository` actor 안에서 수행하며 TXT 본문은 스키마에 포함하지 않는다.

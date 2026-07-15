@@ -2,14 +2,15 @@
 
 ## 현재 상태
 
-- 현재 단계: 1-3 핵심 도메인 모델과 로컬 저장 경계 구성 완료
-- 다음 단계: 1-4 SwiftData 메타데이터 계층 구현
+- 현재 단계: 1-4 SwiftData 메타데이터 계층 완료 — 1단계 완료
+- 다음 단계: 2-1 로컬 경로 정책과 파일명 검증
 - 제품 코드: SwiftUI 앱·SwiftData 메타데이터 저장소·테스트 타깃 기반 생성 완료
 - Git: 로컬 저장소 초기화 완료
 - Xcode: 26.6 설치·라이선스·최초 구성 완료
 - Apple SDK: iOS/iPadOS 26.5 SDK 사용 가능
 - Simulator: iOS 26.5 런타임과 iPad Pro·Air·mini·기본 iPad 기기 사용 가능
-- 검증 기기: iPad Pro 13-inch (M5), iOS 26.5 시뮬레이터
+- 검증 기기: iPad Pro 11-inch (M5), iOS 26.5 시뮬레이터
+- 사용자 실기기: iPad Pro 11-inch (M4), 실기기 서명·검증은 후속 진행
 - Bundle ID: `com.chocos.writerpad`
 - Deployment Target: iPadOS 17.0
 - Mac Catalyst: 설정 및 호환 빌드 확인 완료
@@ -45,16 +46,20 @@
 - `WindowsReferenceFindings.md`: Windows 소스·테스트 작품 대조 결과
 - `BuildSetup.md`: Xcode 열기·빌드·테스트·서명 설정
 - `DomainModel.md`: 프로젝트·문서·백업·편집·저장 상태 모델 관계
+- `SwiftDataMetadata.md`: V1 스키마·무결성·복원·복구 정책
 - `ADR/README.md`: 확정된 설계 결정 색인
 
-## 1-3 검증 결과
+## 1-4 검증 결과
 
 - 앱과 테스트 타깃을 Xcode가 정상 인식한다.
 - iPad 시뮬레이터 빌드가 성공한다.
-- SwiftData 기반 확인 테스트와 순수 도메인 자동 테스트 9개가 통과한다.
+- SwiftData 재실행 복원과 순수 도메인 자동 테스트 15개가 통과한다.
 - 작품·문서·백업 ID와 상대 경로가 별도 타입으로 분리됐다.
 - 이동·휴지통 이동 후에도 문서 ID와 작품 ID가 유지된다.
 - Codable 메타데이터에 원고 본문 필드가 없음을 검사한다.
 - 저장 상태는 이전 generation의 늦은 결과를 무시한다.
+- 작품·문서·마지막 작품·좌우 문서·커서·바인더 너비·펼침 상태가 저장된다.
+- 잘못된 부모와 작품을 넘는 부모 관계가 저장 단계에서 거부된다.
+- 손상 메타데이터는 오류로 보고하며 원고 TXT에는 접근하지 않는다.
 - Mac Catalyst 호환 빌드가 성공한다.
 - 실제 iPad 설치용 Apple 개발 팀과 서명은 아직 설정하지 않았다.

@@ -27,6 +27,17 @@
 - 서버 상태는 미설정·로컬 전용·향후 연결의 최소 경계만 정의
 - Codable 왕복·UUID 유지·본문 미중복·저장 상태 전이 포함 전체 테스트 9개 통과
 
+현재 1-4 검증 결과:
+
+- `WriterPadSchemaV1` 1.0.0과 빈 명시적 migration plan 구성
+- 작품·문서·앱 상태·작품별 화면 상태 SwiftData 레코드 분리
+- `SwiftDataMetadataRepository` actor가 Project·Document·Workspace protocol 구현
+- 마지막 작품, 좌우 문서, 활성 편집기, 바인더 너비, 펼친 폴더, 문서별 커서 복원
+- 누락 부모·자기 부모·다른 작품 부모·비폴더 부모 저장 거부
+- 손상 kind·hash·휴지통 복원 정보·화면 상태를 숨기지 않고 오류로 보고
+- 실제 파일 저장소 재오픈을 포함한 전체 테스트 15개 통과
+- iPad Pro 11-inch 시뮬레이터와 Mac Catalyst 빌드 통과
+
 ## 2단계 — 로컬 문서 저장과 작품 관리
 
 - 기본 작품 폴더에 플롯·메인 스토리 틀 고정 폴더가 없다.

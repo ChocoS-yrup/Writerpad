@@ -4,6 +4,9 @@ import SwiftData
 @MainActor
 final class AppEnvironment: ObservableObject {
     let modelContainer: ModelContainer
+    let projectRepository: any ProjectRepository
+    let documentRepository: any DocumentRepository
+    let workspaceStateRepository: any WorkspaceStateRepository
     let clock: any AppClock
     let futureChangeNotifier: any FutureChangeNotifying
 
@@ -11,10 +14,16 @@ final class AppEnvironment: ObservableObject {
 
     init(
         modelContainer: ModelContainer,
+        projectRepository: any ProjectRepository,
+        documentRepository: any DocumentRepository,
+        workspaceStateRepository: any WorkspaceStateRepository,
         clock: any AppClock,
         futureChangeNotifier: any FutureChangeNotifying
     ) {
         self.modelContainer = modelContainer
+        self.projectRepository = projectRepository
+        self.documentRepository = documentRepository
+        self.workspaceStateRepository = workspaceStateRepository
         self.clock = clock
         self.futureChangeNotifier = futureChangeNotifier
     }
@@ -28,19 +37,16 @@ final class AppEnvironment: ObservableObject {
     }
 
     private static func make(isStoredInMemoryOnly: Bool) throws -> AppEnvironment {
-        let schema = Schema([BootstrapRecord.self])
-        let configuration = ModelConfiguration(
-            "WriterPadMetadata",
-            schema: schema,
+        let container = try WriterPadMetadataStore.makeContainer(
             isStoredInMemoryOnly: isStoredInMemoryOnly
         )
-        let container = try ModelContainer(
-            for: schema,
-            configurations: [configuration]
-        )
+        let repository = SwiftDataMetadataRepository(modelContainer: container)
 
         return AppEnvironment(
             modelContainer: container,
+            projectRepository: repository,
+            documentRepository: repository,
+            workspaceStateRepository: repository,
             clock: SystemClock(),
             futureChangeNotifier: NoOpFutureChangeNotifier()
         )
