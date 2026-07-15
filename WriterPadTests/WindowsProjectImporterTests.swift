@@ -98,6 +98,38 @@ final class WindowsProjectImporterTests: XCTestCase {
         XCTAssertTrue(report.fatalIssues.contains { $0.kind == .invalidVolumeName })
     }
 
+    func testImportNameRulesAllowThousandAndTitleButRejectUnicodeDigits() async throws {
+        let harness = try makeHarness()
+        let valid = try makeFixture(in: harness.root, name: "천화 작품")
+        try writeText(
+            "결말",
+            to: valid.workspace,
+            path: "메인/원고/40권/1000화 마지막 이야기.txt"
+        )
+
+        let validReport = try await harness.importer.inspect(valid.container)
+
+        XCTAssertTrue(validReport.canImport)
+
+        let invalid = try makeFixture(in: harness.root, name: "유사 숫자 작품")
+        try writeText(
+            "전각 권",
+            to: invalid.workspace,
+            path: "메인/원고/１권/001화.txt"
+        )
+        try writeText(
+            "전각 화",
+            to: invalid.workspace,
+            path: "메인/원고/1권/００１화.txt"
+        )
+
+        let invalidReport = try await harness.importer.inspect(invalid.container)
+
+        XCTAssertFalse(invalidReport.canImport)
+        XCTAssertTrue(invalidReport.fatalIssues.contains { $0.kind == .invalidVolumeName })
+        XCTAssertTrue(invalidReport.fatalIssues.contains { $0.kind == .invalidChapterName })
+    }
+
     func testUnreadableItemIsReportedAsFatal() async throws {
         let harness = try makeHarness(
             faultPlan: ImportFaultPlan(

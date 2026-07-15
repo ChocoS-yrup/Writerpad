@@ -94,6 +94,7 @@ actor WindowsProjectImporter: ProjectImporting {
     private let clock: any AppClock
     private let uuidGenerator: any UUIDGenerating
     private let hasher: any ContentHashing
+    private let binderRuleService: BinderRuleService
     private let fileManager: FileManager
     private let faultPlan: ImportFaultPlan?
 
@@ -119,6 +120,7 @@ actor WindowsProjectImporter: ProjectImporting {
         self.clock = clock
         self.uuidGenerator = uuidGenerator
         self.hasher = hasher
+        self.binderRuleService = BinderRuleService(pathPolicy: pathResolver.policy)
         self.fileManager = fileManager
         self.faultPlan = faultPlan
     }
@@ -952,20 +954,11 @@ actor WindowsProjectImporter: ProjectImporting {
     }
 
     private func parseVolumeNumber(_ name: String) -> Int? {
-        guard name.hasSuffix("권") else { return nil }
-        let digits = String(name.dropLast())
-        guard !digits.isEmpty, digits.first != "0",
-              digits.allSatisfy(\.isNumber), let value = Int(digits), value > 0
-        else { return nil }
-        return value
+        binderRuleService.volumeNumber(fromStoredName: name)
     }
 
     private func parseChapterNumber(_ name: String) -> Int? {
-        guard name.count == 8, name.hasSuffix("화.txt") else { return nil }
-        let digits = String(name.dropLast(5))
-        guard digits.allSatisfy(\.isNumber), let value = Int(digits), value > 0
-        else { return nil }
-        return value
+        binderRuleService.titledChapterIdentity(fromStoredName: name)?.number
     }
 
     private func unreadableIssue(_ relativePath: String) -> ImportIssue {

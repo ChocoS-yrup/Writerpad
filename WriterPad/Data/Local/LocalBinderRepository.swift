@@ -6,6 +6,7 @@ actor LocalBinderRepository: BinderRepository {
     private let workspaceLocator: any ProjectWorkspaceLocating
     private let scanner: any BinderDirectoryScanning
     private let pathPolicy: PathPolicy
+    private let ruleService: BinderRuleService
     private let clock: any AppClock
     private let uuidGenerator: any UUIDGenerating
 
@@ -23,6 +24,7 @@ actor LocalBinderRepository: BinderRepository {
         self.workspaceLocator = workspaceLocator
         self.scanner = scanner
         self.pathPolicy = pathPolicy
+        self.ruleService = BinderRuleService(pathPolicy: pathPolicy)
         self.clock = clock
         self.uuidGenerator = uuidGenerator
     }
@@ -68,11 +70,12 @@ actor LocalBinderRepository: BinderRepository {
             in: workspaceRoot,
             parentPath: parent.relativePath
         )
-        return try await reconcile(
+        let nodes = try await reconcile(
             entries: entries,
             parent: parent,
             projectID: projectID
-        ).sorted(by: childOrdering)
+        )
+        return orderedChildren(nodes, parentPath: parent.relativePath)
     }
 
     func setExpanded(_ isExpanded: Bool, for folderID: DocumentID) async throws {
@@ -225,5 +228,20 @@ actor LocalBinderRepository: BinderRepository {
     private func childOrdering(_ lhs: BinderNode, _ rhs: BinderNode) -> Bool {
         if lhs.userOrder != rhs.userOrder { return lhs.userOrder < rhs.userOrder }
         return lhs.displayName.localizedStandardCompare(rhs.displayName) == .orderedAscending
+    }
+
+    private func orderedChildren(
+        _ nodes: [BinderNode],
+        parentPath: RelativeDocumentPath
+    ) -> [BinderNode] {
+        guard ruleService.usesManuscriptNaturalOrder(in: parentPath) else {
+            return nodes.sorted(by: childOrdering)
+        }
+        return nodes.sorted {
+            ruleService.manuscriptItemPrecedes(
+                $0.relativePath.rawValue.split(separator: "/").last.map(String.init) ?? "",
+                $1.relativePath.rawValue.split(separator: "/").last.map(String.init) ?? ""
+            )
+        }
     }
 }

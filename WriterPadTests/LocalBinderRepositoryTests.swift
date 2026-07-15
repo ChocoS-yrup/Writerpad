@@ -77,6 +77,32 @@ final class LocalBinderRepositoryTests: XCTestCase {
         XCTAssertEqual(chapters[0].contentState, .written)
         XCTAssertEqual(chapters[1].contentState, .empty)
         XCTAssertEqual(chapters[2].contentState, .written)
+
+        let firstStored = try await harness.repository.document(id: volumes[0].id)
+        let tenthStored = try await harness.repository.document(id: volumes[2].id)
+        let first = try XCTUnwrap(firstStored)
+        let tenth = try XCTUnwrap(tenthStored)
+        try await harness.repository.save(
+            first.relocated(
+                to: first.relativePath,
+                parentID: first.parentID,
+                userOrder: 100,
+                at: first.modifiedAt
+            )
+        )
+        try await harness.repository.save(
+            tenth.relocated(
+                to: tenth.relativePath,
+                parentID: tenth.parentID,
+                userOrder: 0,
+                at: tenth.modifiedAt
+            )
+        )
+        let manuscriptOrder = try await harness.binder.children(
+            of: manuscript.id,
+            in: harness.project.id
+        )
+        XCTAssertEqual(manuscriptOrder.map(\.displayName), ["1권", "2권", "10권"])
     }
 
     func testStoredUserOrderOverridesNaturalOrder() async throws {
