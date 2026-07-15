@@ -90,3 +90,19 @@ extension SwiftDataMetadataRepository: DocumentRepository {
         }
     }
 }
+
+extension SwiftDataMetadataRepository: DocumentFileMetadataUpdating {
+    func updateAfterFileSave(_ receipt: DocumentSaveReceipt) async throws {
+        let record = try requireDocumentRecord(id: receipt.documentID)
+        guard record.projectID == receipt.projectID.rawValue else {
+            throw MetadataRepositoryError.documentProjectCannotChange(receipt.documentID)
+        }
+        guard record.kindRawValue == DocumentKind.text.rawValue else {
+            throw MetadataRepositoryError.documentIsNotText(receipt.documentID)
+        }
+        record.relativePath = receipt.relativePath.rawValue
+        record.contentHash = receipt.contentHash.rawValue
+        record.modifiedAt = receipt.modifiedAt
+        try modelContext.save()
+    }
+}

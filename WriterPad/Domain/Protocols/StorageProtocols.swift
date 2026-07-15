@@ -1,3 +1,5 @@
+import Foundation
+
 /// 작품 메타데이터 저장 구현이 따라야 하는 경계다.
 protocol ProjectRepository: Sendable {
     func projects() async throws -> [Project]
@@ -32,6 +34,16 @@ protocol WorkspaceStateRepository: Sendable {
 protocol LocalDocumentStoring: Sendable {
     func loadText(for document: DocumentNode) async throws -> String
     func save(_ request: DocumentSaveRequest) async throws -> DocumentSaveReceipt
+}
+
+/// 작품 ID를 실제 집필모드 루트로 바꾸는 경계다.
+protocol ProjectWorkspaceLocating: Sendable {
+    func workspaceRoot(for projectID: ProjectID) async throws -> URL
+}
+
+/// TXT 교체 후 문서 해시와 수정 시각만 반영하는 경계다.
+protocol DocumentFileMetadataUpdating: Sendable {
+    func updateAfterFileSave(_ receipt: DocumentSaveReceipt) async throws
 }
 
 /// 백업 생성·조회·복원을 담당할 경계다.

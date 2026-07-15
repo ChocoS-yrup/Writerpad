@@ -126,6 +126,55 @@ final class SwiftDataMetadataRepositoryTests: XCTestCase {
     }
 
     @MainActor
+    func testFileSaveReceiptUpdatesHashPathAndModificationDate() async throws {
+        let repository = try makeInMemoryRepository()
+        try await repository.save(makeProject())
+        try await repository.save(makeFolder())
+        try await repository.save(
+            makeDocument(
+                id: firstDocumentID,
+                projectID: projectID,
+                parentID: folderID,
+                order: 7,
+                path: "메인/원고/1권/001화.txt"
+            )
+        )
+        let newDate = date.addingTimeInterval(60)
+        let hash = ContentHash(rawValue: String(repeating: "a", count: 64))!
+
+        await assertMetadataError(.documentIsNotText(folderID)) {
+            try await repository.updateAfterFileSave(
+                DocumentSaveReceipt(
+                    projectID: projectID,
+                    documentID: folderID,
+                    relativePath: RelativeDocumentPath(rawValue: "메인/원고/1권"),
+                    contentHash: hash,
+                    modifiedAt: newDate,
+                    generation: 3
+                )
+            )
+        }
+
+        try await repository.updateAfterFileSave(
+            DocumentSaveReceipt(
+                projectID: projectID,
+                documentID: firstDocumentID,
+                relativePath: RelativeDocumentPath(rawValue: "메인/원고/1권/002화.txt"),
+                contentHash: hash,
+                modifiedAt: newDate,
+                generation: 3
+            )
+        )
+
+        let updated = try await repository.document(id: firstDocumentID)
+        XCTAssertEqual(updated?.relativePath.rawValue, "메인/원고/1권/002화.txt")
+        XCTAssertEqual(updated?.contentHash, hash)
+        XCTAssertEqual(updated?.modifiedAt, newDate)
+        XCTAssertEqual(updated?.parentID, folderID)
+        XCTAssertEqual(updated?.userOrder, 7)
+    }
+
+    @MainActor
     func testCorruptedRecordIsReportedWithoutTouchingManuscript() async throws {
         let container = try WriterPadMetadataStore.makeContainer(isStoredInMemoryOnly: true)
         container.mainContext.insert(

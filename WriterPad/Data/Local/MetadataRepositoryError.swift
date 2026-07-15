@@ -9,6 +9,7 @@ enum MetadataRepositoryError: Error, Equatable, LocalizedError, Sendable {
     case parentBelongsToAnotherProject(DocumentID)
     case parentIsNotFolder(DocumentID)
     case documentProjectCannotChange(DocumentID)
+    case documentIsNotText(DocumentID)
     case invalidCursor(DocumentID)
     case invalidBinderWidth(Double)
     case invalidEditorState(ProjectID)
@@ -30,6 +31,8 @@ enum MetadataRepositoryError: Error, Equatable, LocalizedError, Sendable {
             "부모 문서가 폴더가 아닙니다: \(id.rawValue)"
         case let .documentProjectCannotChange(id):
             "기존 문서의 작품 ID를 변경할 수 없습니다: \(id.rawValue)"
+        case let .documentIsNotText(id):
+            "TXT가 아닌 문서에 파일 저장 결과를 반영할 수 없습니다: \(id.rawValue)"
         case let .invalidCursor(id):
             "커서 위치를 저장할 수 없습니다: \(id.rawValue)"
         case let .invalidBinderWidth(width):

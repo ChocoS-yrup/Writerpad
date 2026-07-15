@@ -9,7 +9,8 @@ struct DocumentSaveRequest: Equatable, Sendable {
     let generation: UInt64
 }
 
-struct DocumentSaveReceipt: Equatable, Sendable {
+struct DocumentSaveReceipt: Codable, Equatable, Sendable {
+    let projectID: ProjectID
     let documentID: DocumentID
     let relativePath: RelativeDocumentPath
     let contentHash: ContentHash

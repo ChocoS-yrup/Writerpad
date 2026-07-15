@@ -31,7 +31,7 @@
 - `WriterPad/Platform`: UIKit/TextKit 연결부
 - `WriterPad/Sync`: 향후 서버 기능의 protocol 구현부; 현재는 no-op만 사용
 
-SwiftData에는 현재 앱 구동 확인용 메타데이터만 있다. 원고 본문은 저장하지 않으며, 2단계부터 UTF-8 TXT 파일을 단일 원본으로 다룬다.
+SwiftData에는 앱 구동·바인더·문서 식별에 필요한 메타데이터만 있다. 원고 본문은 저장하지 않으며 UTF-8 TXT 파일을 단일 원본으로 다룬다.
 
 ## 로컬 설정과 비밀값
 
@@ -40,7 +40,7 @@ SwiftData에는 현재 앱 구동 확인용 메타데이터만 있다. 원고 �
 ## 검증 결과
 
 - iPad 시뮬레이터 Debug 빌드: 통과
-- 전체 자동 테스트: 28개 통과
+- 전체 자동 테스트: 39개 통과
 - Mac Catalyst Debug 호환 빌드: 통과
 
 실제 iPad에 설치하려면 Xcode의 WriterPad 대상에서 Signing & Capabilities를 열고 사용자의 Apple 개발 Team을 선택해야 한다. 이 설정은 개인 계정에 종속되므로 저장소에 임의 값을 고정하지 않는다.

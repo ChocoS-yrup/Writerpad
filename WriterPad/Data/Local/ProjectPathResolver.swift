@@ -57,7 +57,7 @@ struct StandardProjectPaths: Equatable {
 }
 
 /// 작품 경로 생성을 한곳에 모으고 표준화 후 루트 포함 여부를 재검사한다.
-struct ProjectPathResolver {
+struct ProjectPathResolver: @unchecked Sendable {
     static let legacyPlotPath = RelativeDocumentPath(rawValue: "메인/플롯")
     static let legacyPreMigrationBackupPath = RelativeDocumentPath(rawValue: "백업/전환직전")
 
