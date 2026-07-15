@@ -1,10 +1,14 @@
 import SwiftUI
+import UniformTypeIdentifiers
 
 struct RootView: View {
     @EnvironmentObject private var environment: AppEnvironment
 
     var body: some View {
-        ProjectWorkspaceView(projectManager: environment.projectManager)
+        ProjectWorkspaceView(
+            projectManager: environment.projectManager,
+            projectImporter: environment.projectImporter
+        )
             .task {
                 await environment.futureChangeNotifier.record(.appLaunched)
             }
@@ -18,10 +22,17 @@ private struct ProjectWorkspaceView: View {
     @State private var renameTarget: ManagedProject?
     @State private var renameText = ""
     @State private var deleteTarget: ManagedProject?
+    @State private var isSelectingImportFolder = false
 
-    init(projectManager: any ProjectManaging) {
+    init(
+        projectManager: any ProjectManaging,
+        projectImporter: any ProjectImporting
+    ) {
         _model = StateObject(
-            wrappedValue: ProjectListModel(projectManager: projectManager)
+            wrappedValue: ProjectListModel(
+                projectManager: projectManager,
+                projectImporter: projectImporter
+            )
         )
     }
 
@@ -52,6 +63,10 @@ private struct ProjectWorkspaceView: View {
             .toolbar {
                 ToolbarItemGroup(placement: .topBarTrailing) {
                     EditButton()
+                    Button("Windows 작품 가져오기", systemImage: "square.and.arrow.down") {
+                        isSelectingImportFolder = true
+                    }
+                    .disabled(model.isWorking)
                     Button("새 작품", systemImage: "plus") {
                         newProjectName = ""
                         isCreating = true
@@ -87,6 +102,30 @@ private struct ProjectWorkspaceView: View {
         }
         .navigationSplitViewStyle(.balanced)
         .task { await model.load() }
+        .fileImporter(
+            isPresented: $isSelectingImportFolder,
+            allowedContentTypes: [.folder],
+            allowsMultipleSelection: false
+        ) { result in
+            switch result {
+            case let .success(urls):
+                guard let sourceURL = urls.first else { return }
+                Task { await model.inspectImport(at: sourceURL) }
+            case let .failure(error):
+                model.present(error: error)
+            }
+        }
+        .sheet(
+            item: $model.importReport,
+            onDismiss: { model.dismissImportReport() }
+        ) { report in
+            ImportReportView(
+                report: report,
+                isWorking: model.isWorking,
+                onCancel: { model.dismissImportReport() },
+                onImport: { Task { await model.confirmImport() } }
+            )
+        }
         .onChange(of: model.selectedProjectID) { _, id in
             Task { await model.select(id) }
         }
@@ -142,6 +181,17 @@ private struct ProjectWorkspaceView: View {
         } message: {
             Text(model.errorMessage ?? "알 수 없는 오류")
         }
+        .alert(
+            "가져오기 완료",
+            isPresented: Binding(
+                get: { model.importSuccessMessage != nil },
+                set: { if !$0 { model.clearImportSuccess() } }
+            )
+        ) {
+            Button("확인") { model.clearImportSuccess() }
+        } message: {
+            Text(model.importSuccessMessage ?? "작품을 가져왔습니다.")
+        }
     }
 
     @ViewBuilder
@@ -170,6 +220,93 @@ private struct ProjectWorkspaceView: View {
         } else {
             Button("삭제…", systemImage: "trash", role: .destructive) {
                 deleteTarget = project
+            }
+        }
+    }
+}
+
+private struct ImportReportView: View {
+    let report: ImportReport
+    let isWorking: Bool
+    let onCancel: () -> Void
+    let onImport: () -> Void
+
+    var body: some View {
+        NavigationStack {
+            List {
+                Section("검사 결과") {
+                    LabeledContent("작품 이름", value: report.proposedProjectName)
+                    LabeledContent("폴더", value: "\(report.directoryCount)개")
+                    LabeledContent("파일", value: "\(report.fileCount)개")
+                    LabeledContent("TXT 파일", value: "\(report.textFileCount)개")
+                }
+
+                if report.issues.isEmpty {
+                    Section {
+                        Label("가져올 수 있습니다", systemImage: "checkmark.circle.fill")
+                            .foregroundStyle(.green)
+                    }
+                } else {
+                    issueSection(
+                        title: "치명 오류 \(report.fatalIssues.count)개",
+                        issues: report.fatalIssues,
+                        color: .red
+                    )
+                    issueSection(
+                        title: "확인할 경고 \(report.warnings.count)개",
+                        issues: report.warnings,
+                        color: .orange
+                    )
+                }
+
+                Section {
+                    Text("원본 폴더는 수정하지 않습니다. 플롯·메인 스토리 틀·레거시 백업은 일반 사용자 폴더로 그대로 보존됩니다.")
+                        .font(.footnote)
+                        .foregroundStyle(.secondary)
+                }
+            }
+            .navigationTitle("Windows 작품 검사")
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) {
+                    Button("닫기", action: onCancel)
+                        .disabled(isWorking)
+                }
+                ToolbarItem(placement: .confirmationAction) {
+                    Button(report.warnings.isEmpty ? "가져오기" : "경고 확인 후 가져오기") {
+                        onImport()
+                    }
+                    .disabled(!report.canImport || isWorking)
+                }
+            }
+            .overlay {
+                if isWorking {
+                    ProgressView("가져오는 중…")
+                        .padding()
+                        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 12))
+                }
+            }
+        }
+    }
+
+    @ViewBuilder
+    private func issueSection(
+        title: String,
+        issues: [ImportIssue],
+        color: Color
+    ) -> some View {
+        if !issues.isEmpty {
+            Section(title) {
+                ForEach(issues) { issue in
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text(issue.message)
+                        if !issue.relativePath.isEmpty {
+                            Text(issue.relativePath)
+                                .font(.caption.monospaced())
+                                .foregroundStyle(.secondary)
+                        }
+                    }
+                    .foregroundStyle(color)
+                }
             }
         }
     }

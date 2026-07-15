@@ -9,6 +9,7 @@ final class AppEnvironment: ObservableObject {
     let documentRepository: any DocumentRepository
     let workspaceStateRepository: any WorkspaceStateRepository
     let projectManager: any ProjectManaging
+    let projectImporter: any ProjectImporting
     let clock: any AppClock
     let futureChangeNotifier: any FutureChangeNotifying
 
@@ -20,6 +21,7 @@ final class AppEnvironment: ObservableObject {
         documentRepository: any DocumentRepository,
         workspaceStateRepository: any WorkspaceStateRepository,
         projectManager: any ProjectManaging,
+        projectImporter: any ProjectImporting,
         clock: any AppClock,
         futureChangeNotifier: any FutureChangeNotifying
     ) {
@@ -28,6 +30,7 @@ final class AppEnvironment: ObservableObject {
         self.documentRepository = documentRepository
         self.workspaceStateRepository = workspaceStateRepository
         self.projectManager = projectManager
+        self.projectImporter = projectImporter
         self.clock = clock
         self.futureChangeNotifier = futureChangeNotifier
     }
@@ -61,6 +64,15 @@ final class AppEnvironment: ObservableObject {
             pathResolver: pathResolver,
             clock: clock
         )
+        let projectImporter = WindowsProjectImporter(
+            projectRepository: repository,
+            documentRepository: repository,
+            metadataRegistrar: repository,
+            workspaceStateRepository: repository,
+            projectManager: projectManager,
+            pathResolver: pathResolver,
+            clock: clock
+        )
 
         return AppEnvironment(
             modelContainer: container,
@@ -68,6 +80,7 @@ final class AppEnvironment: ObservableObject {
             documentRepository: repository,
             workspaceStateRepository: repository,
             projectManager: projectManager,
+            projectImporter: projectImporter,
             clock: clock,
             futureChangeNotifier: NoOpFutureChangeNotifier()
         )

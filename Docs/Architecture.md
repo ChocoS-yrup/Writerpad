@@ -39,6 +39,12 @@ SwiftData 갱신에 실패하더라도 TXT 원고를 되돌려 잃게 만들지 
 
 삭제 확인은 파일 제거가 아니라 `deletionRequested` 상태 전이다. 실제 `메인/휴지통` 이동이나 영구 삭제는 6단계 정책이 이 상태를 소비할 때 수행한다.
 
+## Windows 작품 가져오기 흐름
+
+`ProjectListModel`은 폴더 선택 URL을 `ProjectImporting`에 전달할 뿐 파일을 직접 읽지 않는다. `WindowsProjectImporter` actor가 security-scoped resource 접근을 작업 범위에 맞춰 열고 닫으며, 읽기 전용 전체 검사와 쓰기 거래를 분리한다.
+
+검사 보고서는 UTF-8, 구조, 중복 화, 이름 규칙, 접근 오류와 레거시 자료를 분류한다. 사용자가 경고를 확인하면 앱 내부 숨김 임시 프로젝트로 전체 트리를 복사하고, `SwiftDataMetadataRepository`가 작품과 문서 UUID·해시를 한 번에 등록한다. 이후에만 정식 작품 경로로 승격한다. 단계 표식은 앱 중단 후 완료 여부를 판정하며 불완전한 복사본과 메타데이터는 함께 롤백한다. 원본 폴더에는 어떤 쓰기 작업도 하지 않는다.
+
 ## 문서 정체성과 경로
 
 - `project_id`와 `document_id`는 생성 후 바뀌지 않는다.

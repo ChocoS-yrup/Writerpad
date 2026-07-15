@@ -181,6 +181,17 @@ struct ProjectPathResolver: @unchecked Sendable {
         try writeSettingsFile(at: settingsURL, projectName: projectName)
     }
 
+    func updateStoredProjectName(
+        atProjectContainer projectContainer: URL,
+        projectName: String
+    ) throws {
+        let settingsURL = try standardPaths(
+            atProjectContainer: projectContainer,
+            projectName: projectName
+        ).settingsFileURL
+        try writeSettingsFile(at: settingsURL, projectName: projectName)
+    }
+
     func storedProjectName(forProjectNamed projectName: String) throws -> String? {
         let paths = try standardPaths(forProjectNamed: projectName)
         return storedProjectName(from: paths.settingsFileURL)

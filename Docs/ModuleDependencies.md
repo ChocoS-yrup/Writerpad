@@ -31,6 +31,8 @@
 
 - ProjectRepository
 - ProjectManaging
+- ProjectImporting
+- ProjectImportMetadataRegistering
 - DocumentRepository
 - LocalDocumentStoring
 - BackupStoring

@@ -6,12 +6,19 @@ final class ProjectListModel: ObservableObject {
     @Published private(set) var projects: [ManagedProject] = []
     @Published var selectedProjectID: ProjectID?
     @Published private(set) var errorMessage: String?
+    @Published var importReport: ImportReport?
+    @Published private(set) var importSuccessMessage: String?
     @Published private(set) var isWorking = false
 
     private let projectManager: any ProjectManaging
+    private let projectImporter: any ProjectImporting
 
-    init(projectManager: any ProjectManaging) {
+    init(
+        projectManager: any ProjectManaging,
+        projectImporter: any ProjectImporting
+    ) {
         self.projectManager = projectManager
+        self.projectImporter = projectImporter
     }
 
     var selectedProject: ManagedProject? {
@@ -20,9 +27,35 @@ final class ProjectListModel: ObservableObject {
 
     func load() async {
         await perform {
+            try await projectImporter.recoverPendingImports()
             projects = try await projectManager.projects()
             selectedProjectID = try await projectManager.restoreLastProject()?.id
         }
+    }
+
+    func inspectImport(at sourceURL: URL) async {
+        importReport = nil
+        await perform {
+            importReport = try await projectImporter.inspect(sourceURL)
+        }
+    }
+
+    func confirmImport() async {
+        guard let report = importReport else { return }
+        await perform {
+            let result = try await projectImporter.importProject(
+                from: report,
+                confirmsWarnings: true
+            )
+            projects = try await projectManager.projects()
+            selectedProjectID = result.project.id
+            importReport = nil
+            importSuccessMessage = "‘\(result.project.name)’ 작품과 문서 \(result.documentCount)개를 가져왔습니다."
+        }
+    }
+
+    func dismissImportReport() {
+        importReport = nil
     }
 
     func create(named name: String) async {
@@ -74,6 +107,14 @@ final class ProjectListModel: ObservableObject {
 
     func clearError() {
         errorMessage = nil
+    }
+
+    func present(error: Error) {
+        errorMessage = error.localizedDescription
+    }
+
+    func clearImportSuccess() {
+        importSuccessMessage = nil
     }
 
     private func perform(_ operation: () async throws -> Void) async {
