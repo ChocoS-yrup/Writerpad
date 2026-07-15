@@ -17,6 +17,17 @@
 		A10000000000000000000008 /* UIKitTextViewBridge.swift in Sources */ = {isa = PBXBuildFile; fileRef = B10000000000000000000008 /* UIKitTextViewBridge.swift */; };
 		A10000000000000000000009 /* Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = B10000000000000000000009 /* Assets.xcassets */; };
 		A1000000000000000000000A /* AppEnvironmentTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = B1000000000000000000000A /* AppEnvironmentTests.swift */; };
+		A1000000000000000000000B /* Identifiers.swift in Sources */ = {isa = PBXBuildFile; fileRef = B1000000000000000000000F /* Identifiers.swift */; };
+		A1000000000000000000000C /* Project.swift in Sources */ = {isa = PBXBuildFile; fileRef = B10000000000000000000010 /* Project.swift */; };
+		A1000000000000000000000D /* DocumentNode.swift in Sources */ = {isa = PBXBuildFile; fileRef = B10000000000000000000011 /* DocumentNode.swift */; };
+		A1000000000000000000000E /* BackupSnapshot.swift in Sources */ = {isa = PBXBuildFile; fileRef = B10000000000000000000012 /* BackupSnapshot.swift */; };
+		A1000000000000000000000F /* EditorAndSaveState.swift in Sources */ = {isa = PBXBuildFile; fileRef = B10000000000000000000013 /* EditorAndSaveState.swift */; };
+		A10000000000000000000010 /* StorageOperations.swift in Sources */ = {isa = PBXBuildFile; fileRef = B10000000000000000000014 /* StorageOperations.swift */; };
+		A10000000000000000000011 /* StorageProtocols.swift in Sources */ = {isa = PBXBuildFile; fileRef = B10000000000000000000015 /* StorageProtocols.swift */; };
+		A10000000000000000000012 /* UtilityProtocols.swift in Sources */ = {isa = PBXBuildFile; fileRef = B10000000000000000000016 /* UtilityProtocols.swift */; };
+		A10000000000000000000013 /* SaveStateMachine.swift in Sources */ = {isa = PBXBuildFile; fileRef = B10000000000000000000017 /* SaveStateMachine.swift */; };
+		A10000000000000000000014 /* DomainModelTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = B10000000000000000000018 /* DomainModelTests.swift */; };
+		A10000000000000000000015 /* SaveStateMachineTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = B10000000000000000000019 /* SaveStateMachineTests.swift */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXContainerItemProxy section */
@@ -44,6 +55,17 @@
 		B1000000000000000000000C /* WriterPadTests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = WriterPadTests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
 		B1000000000000000000000D /* Local.xcconfig.example */ = {isa = PBXFileReference; lastKnownFileType = text.xcconfig; path = Local.xcconfig.example; sourceTree = "<group>"; };
 		B1000000000000000000000E /* README.md */ = {isa = PBXFileReference; lastKnownFileType = net.daringfireball.markdown; path = README.md; sourceTree = "<group>"; };
+		B1000000000000000000000F /* Identifiers.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Identifiers.swift; sourceTree = "<group>"; };
+		B10000000000000000000010 /* Project.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Project.swift; sourceTree = "<group>"; };
+		B10000000000000000000011 /* DocumentNode.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DocumentNode.swift; sourceTree = "<group>"; };
+		B10000000000000000000012 /* BackupSnapshot.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BackupSnapshot.swift; sourceTree = "<group>"; };
+		B10000000000000000000013 /* EditorAndSaveState.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = EditorAndSaveState.swift; sourceTree = "<group>"; };
+		B10000000000000000000014 /* StorageOperations.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = StorageOperations.swift; sourceTree = "<group>"; };
+		B10000000000000000000015 /* StorageProtocols.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = StorageProtocols.swift; sourceTree = "<group>"; };
+		B10000000000000000000016 /* UtilityProtocols.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = UtilityProtocols.swift; sourceTree = "<group>"; };
+		B10000000000000000000017 /* SaveStateMachine.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SaveStateMachine.swift; sourceTree = "<group>"; };
+		B10000000000000000000018 /* DomainModelTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DomainModelTests.swift; sourceTree = "<group>"; };
+		B10000000000000000000019 /* SaveStateMachineTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SaveStateMachineTests.swift; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -60,18 +82,18 @@
 		G10000000000000000000002 /* WriterPad */ = {isa = PBXGroup; children = (G10000000000000000000003 /* App */, G10000000000000000000004 /* Domain */, G10000000000000000000007 /* Data */, G10000000000000000000008 /* Sync */, G10000000000000000000009 /* Features */, G1000000000000000000000F /* Platform */, G10000000000000000000010 /* Resources */); path = WriterPad; sourceTree = "<group>"; };
 		G10000000000000000000003 /* App */ = {isa = PBXGroup; children = (B10000000000000000000001 /* WriterPadApp.swift */, B10000000000000000000002 /* AppEnvironment.swift */); path = App; sourceTree = "<group>"; };
 		G10000000000000000000004 /* Domain */ = {isa = PBXGroup; children = (G10000000000000000000005 /* Models */, G10000000000000000000006 /* Rules */, G10000000000000000000014 /* Protocols */); path = Domain; sourceTree = "<group>"; };
-		G10000000000000000000005 /* Models */ = {isa = PBXGroup; children = (B10000000000000000000003 /* BootstrapRecord.swift */); path = Models; sourceTree = "<group>"; };
-		G10000000000000000000006 /* Rules */ = {isa = PBXGroup; children = (); path = Rules; sourceTree = "<group>"; };
+		G10000000000000000000005 /* Models */ = {isa = PBXGroup; children = (B1000000000000000000000F /* Identifiers.swift */, B10000000000000000000010 /* Project.swift */, B10000000000000000000011 /* DocumentNode.swift */, B10000000000000000000012 /* BackupSnapshot.swift */, B10000000000000000000013 /* EditorAndSaveState.swift */, B10000000000000000000014 /* StorageOperations.swift */); path = Models; sourceTree = "<group>"; };
+		G10000000000000000000006 /* Rules */ = {isa = PBXGroup; children = (B10000000000000000000017 /* SaveStateMachine.swift */); path = Rules; sourceTree = "<group>"; };
 		G10000000000000000000007 /* Data */ = {isa = PBXGroup; children = (G10000000000000000000015 /* Local */, G10000000000000000000016 /* Backup */, G10000000000000000000017 /* Trash */, G10000000000000000000018 /* Migration */); path = Data; sourceTree = "<group>"; };
 		G10000000000000000000008 /* Sync */ = {isa = PBXGroup; children = (B10000000000000000000006 /* NoOpFutureChangeNotifier.swift */); path = Sync; sourceTree = "<group>"; };
 		G10000000000000000000009 /* Features */ = {isa = PBXGroup; children = (G10000000000000000000019 /* Projects */, G1000000000000000000001A /* Binder */, G1000000000000000000001B /* Editor */, G1000000000000000000001C /* Backup */, G1000000000000000000001D /* Search */, G1000000000000000000001E /* Export */, G1000000000000000000001F /* Settings */); path = Features; sourceTree = "<group>"; };
 		G1000000000000000000000F /* Platform */ = {isa = PBXGroup; children = (B10000000000000000000008 /* UIKitTextViewBridge.swift */); path = Platform; sourceTree = "<group>"; };
 		G10000000000000000000010 /* Resources */ = {isa = PBXGroup; children = (B10000000000000000000009 /* Assets.xcassets */); path = Resources; sourceTree = "<group>"; };
-		G10000000000000000000011 /* WriterPadTests */ = {isa = PBXGroup; children = (B1000000000000000000000A /* AppEnvironmentTests.swift */); path = WriterPadTests; sourceTree = "<group>"; };
+		G10000000000000000000011 /* WriterPadTests */ = {isa = PBXGroup; children = (B1000000000000000000000A /* AppEnvironmentTests.swift */, B10000000000000000000018 /* DomainModelTests.swift */, B10000000000000000000019 /* SaveStateMachineTests.swift */); path = WriterPadTests; sourceTree = "<group>"; };
 		G10000000000000000000012 /* Configuration */ = {isa = PBXGroup; children = (B1000000000000000000000D /* Local.xcconfig.example */, B1000000000000000000000E /* README.md */); path = Configuration; sourceTree = "<group>"; };
 		G10000000000000000000013 /* Products */ = {isa = PBXGroup; children = (B1000000000000000000000B /* WriterPad.app */, B1000000000000000000000C /* WriterPadTests.xctest */); name = Products; sourceTree = "<group>"; };
-		G10000000000000000000014 /* Protocols */ = {isa = PBXGroup; children = (B10000000000000000000004 /* AppClock.swift */, B10000000000000000000005 /* FutureChangeNotifying.swift */); path = Protocols; sourceTree = "<group>"; };
-		G10000000000000000000015 /* Local */ = {isa = PBXGroup; children = (); path = Local; sourceTree = "<group>"; };
+		G10000000000000000000014 /* Protocols */ = {isa = PBXGroup; children = (B10000000000000000000004 /* AppClock.swift */, B10000000000000000000005 /* FutureChangeNotifying.swift */, B10000000000000000000015 /* StorageProtocols.swift */, B10000000000000000000016 /* UtilityProtocols.swift */); path = Protocols; sourceTree = "<group>"; };
+		G10000000000000000000015 /* Local */ = {isa = PBXGroup; children = (B10000000000000000000003 /* BootstrapRecord.swift */); path = Local; sourceTree = "<group>"; };
 		G10000000000000000000016 /* Backup */ = {isa = PBXGroup; children = (); path = Backup; sourceTree = "<group>"; };
 		G10000000000000000000017 /* Trash */ = {isa = PBXGroup; children = (); path = Trash; sourceTree = "<group>"; };
 		G10000000000000000000018 /* Migration */ = {isa = PBXGroup; children = (); path = Migration; sourceTree = "<group>"; };
@@ -112,8 +134,8 @@
 /* End PBXResourcesBuildPhase section */
 
 /* Begin PBXSourcesBuildPhase section */
-		I10000000000000000000001 /* Sources */ = {isa = PBXSourcesBuildPhase; buildActionMask = 2147483647; files = (A10000000000000000000001 /* WriterPadApp.swift in Sources */, A10000000000000000000002 /* AppEnvironment.swift in Sources */, A10000000000000000000003 /* BootstrapRecord.swift in Sources */, A10000000000000000000004 /* AppClock.swift in Sources */, A10000000000000000000005 /* FutureChangeNotifying.swift in Sources */, A10000000000000000000006 /* NoOpFutureChangeNotifier.swift in Sources */, A10000000000000000000007 /* RootView.swift in Sources */, A10000000000000000000008 /* UIKitTextViewBridge.swift in Sources */); runOnlyForDeploymentPostprocessing = 0; };
-		I10000000000000000000002 /* Sources */ = {isa = PBXSourcesBuildPhase; buildActionMask = 2147483647; files = (A1000000000000000000000A /* AppEnvironmentTests.swift in Sources */); runOnlyForDeploymentPostprocessing = 0; };
+		I10000000000000000000001 /* Sources */ = {isa = PBXSourcesBuildPhase; buildActionMask = 2147483647; files = (A10000000000000000000001 /* WriterPadApp.swift in Sources */, A10000000000000000000002 /* AppEnvironment.swift in Sources */, A10000000000000000000003 /* BootstrapRecord.swift in Sources */, A10000000000000000000004 /* AppClock.swift in Sources */, A10000000000000000000005 /* FutureChangeNotifying.swift in Sources */, A10000000000000000000006 /* NoOpFutureChangeNotifier.swift in Sources */, A10000000000000000000007 /* RootView.swift in Sources */, A10000000000000000000008 /* UIKitTextViewBridge.swift in Sources */, A1000000000000000000000B /* Identifiers.swift in Sources */, A1000000000000000000000C /* Project.swift in Sources */, A1000000000000000000000D /* DocumentNode.swift in Sources */, A1000000000000000000000E /* BackupSnapshot.swift in Sources */, A1000000000000000000000F /* EditorAndSaveState.swift in Sources */, A10000000000000000000010 /* StorageOperations.swift in Sources */, A10000000000000000000011 /* StorageProtocols.swift in Sources */, A10000000000000000000012 /* UtilityProtocols.swift in Sources */, A10000000000000000000013 /* SaveStateMachine.swift in Sources */); runOnlyForDeploymentPostprocessing = 0; };
+		I10000000000000000000002 /* Sources */ = {isa = PBXSourcesBuildPhase; buildActionMask = 2147483647; files = (A1000000000000000000000A /* AppEnvironmentTests.swift in Sources */, A10000000000000000000014 /* DomainModelTests.swift in Sources */, A10000000000000000000015 /* SaveStateMachineTests.swift in Sources */); runOnlyForDeploymentPostprocessing = 0; };
 /* End PBXSourcesBuildPhase section */
 
 /* Begin PBXTargetDependency section */

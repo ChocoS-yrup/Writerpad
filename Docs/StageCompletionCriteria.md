@@ -18,6 +18,15 @@
 - Mac Catalyst 호환 빌드 성공
 - 실제 iPad 서명·한글 입력 검증은 후속 완료 조건으로 유지
 
+현재 1-3 검증 결과:
+
+- Domain에서 SwiftUI·UIKit·SwiftData import가 없음을 정적 검사
+- `Project`, `DocumentNode`, `BackupSnapshot`, `SaveState`와 편집기 상태 값 구현
+- 작품·문서·백업 UUID와 상대 경로를 별도 타입으로 분리
+- 저장소·파일 저장·백업·검색·추출·시계·UUID·해시 protocol 정의
+- 서버 상태는 미설정·로컬 전용·향후 연결의 최소 경계만 정의
+- Codable 왕복·UUID 유지·본문 미중복·저장 상태 전이 포함 전체 테스트 9개 통과
+
 ## 2단계 — 로컬 문서 저장과 작품 관리
 
 - 기본 작품 폴더에 플롯·메인 스토리 틀 고정 폴더가 없다.

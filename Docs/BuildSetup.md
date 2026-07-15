@@ -39,7 +39,7 @@ SwiftData에는 현재 앱 구동 확인용 메타데이터만 있다. 원고 �
 ## 검증 결과
 
 - iPad 시뮬레이터 Debug 빌드: 통과
-- `AppEnvironmentTests`: 2개 통과
+- 전체 자동 테스트: 9개 통과
 - Mac Catalyst Debug 호환 빌드: 통과
 
 실제 iPad에 설치하려면 Xcode의 WriterPad 대상에서 Signing & Capabilities를 열고 사용자의 Apple 개발 Team을 선택해야 한다. 이 설정은 개인 계정에 종속되므로 저장소에 임의 값을 고정하지 않는다.
