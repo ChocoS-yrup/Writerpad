@@ -5,7 +5,9 @@
 - 현재 단계: 1-1 저장소 조사와 개발 문서 준비
 - 제품 코드: 아직 없음
 - Git: 로컬 저장소 초기화 완료
-- Xcode: 전체 Xcode가 활성화되지 않았고 Command Line Tools만 선택됨
+- Xcode: 26.6 설치·라이선스·최초 구성 완료
+- Apple SDK: iOS/iPadOS 26.5 SDK 사용 가능
+- Simulator: iOS 26.5 런타임과 iPad Pro·Air·mini·기본 iPad 기기 사용 가능
 - Windows 소스: `공유/`에 읽기 전용 참조 소스 제공됨
 - Windows 테스트 작품: `집필모드/`에 1권·2권, 총 50화 제공됨
 - Supabase: 1~7단계 범위에서 제외
@@ -40,7 +42,7 @@
 
 ## 1-2 진입 전 확인
 
-- 전체 Xcode 설치 또는 활성 developer directory 확인
-- iPadOS 17 이상 SDK 사용 가능 여부 확인
+- Xcode 26.6과 iOS/iPadOS 26.5 SDK 확인 완료
+- iPadOS 17 이상 deployment target 설정 준비
 - Bundle ID 초안 결정 위치 마련
 - Windows 참조 소스의 실제 경로 규칙을 1~7단계 프롬프트에 반영했는지 확인
