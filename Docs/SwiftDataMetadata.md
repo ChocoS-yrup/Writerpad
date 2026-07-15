@@ -13,6 +13,8 @@
 
 `BootstrapRecord`는 초기 Xcode 기반에서 만들어진 기존 빈 저장소와의 연속성을 위한 구동 표식이다. 원고나 사용자 기능 데이터는 담지 않는다.
 
+휴지통 여부의 Swift 필드는 SwiftData 자체 삭제 상태와 충돌하지 않는 `isTrashed`다. 기존 V1 저장 필드명 `isDeleted`는 `@Attribute(originalName:)`으로 유지해 호환성을 보존한다.
+
 ## 저장소 격리
 
 `SwiftDataMetadataRepository`는 `@ModelActor`로 격리하며 다음 protocol을 한 저장 문맥에서 구현한다.

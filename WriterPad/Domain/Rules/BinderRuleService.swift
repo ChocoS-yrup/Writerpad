@@ -202,6 +202,26 @@ struct BinderRuleService: Sendable {
         evaluateRelocation(request)
     }
 
+    /// 휴지통 이동은 일반 위치 이동과 다른 삭제 명령이다.
+    /// 원고 권·화도 원래 경로를 보존하는 조건으로 휴지통에 놓을 수 있다.
+    func evaluateTrash(
+        sourcePath: RelativeDocumentPath,
+        kind: DocumentKind,
+        existingTrashNames: [String]
+    ) -> BinderRuleDecision {
+        switch manuscriptLocation(of: sourcePath) {
+        case .root:
+            return .denied(.manuscriptRootLocked)
+        case .invalid:
+            return .denied(.invalidManuscriptDestination)
+        case .outside, .volume, .chapter:
+            return nameDenial(
+                storedName(of: sourcePath),
+                existingNames: existingTrashNames
+            ) ?? .allowed
+        }
+    }
+
     func evaluateReorder(
         itemPath: RelativeDocumentPath,
         proposedIndex: Int

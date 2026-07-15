@@ -13,14 +13,18 @@ final class BinderViewModel: ObservableObject {
     @Published private(set) var roots: [BinderNode] = []
     @Published private(set) var childrenByParent: [DocumentID: [BinderNode]] = [:]
     @Published private(set) var loadingFolderIDs: Set<DocumentID> = []
+    @Published private(set) var workingDocumentIDs: Set<DocumentID> = []
+    @Published private(set) var commandDescriptorsByDocument: [DocumentID: [BinderCommandDescriptor]] = [:]
     @Published private(set) var errorMessage: String?
     @Published var selectedNodeID: DocumentID?
 
     private let repository: any BinderRepository
+    private let commands: any BinderCommanding
     private var loadedProjectID: ProjectID?
 
-    init(repository: any BinderRepository) {
+    init(repository: any BinderRepository, commands: any BinderCommanding) {
         self.repository = repository
+        self.commands = commands
     }
 
     var visibleRows: [BinderVisibleRow] {
@@ -34,12 +38,16 @@ final class BinderViewModel: ObservableObject {
         roots = []
         childrenByParent = [:]
         loadingFolderIDs = []
+        workingDocumentIDs = []
+        commandDescriptorsByDocument = [:]
         errorMessage = nil
         selectedNodeID = nil
         do {
+            try await commands.recoverPendingTransactions(in: projectID)
             let loadedRoots = try await repository.rootNodes(in: projectID)
             guard loadedProjectID == projectID else { return }
             roots = loadedRoots
+            try await refreshCommandDescriptors(for: loadedRoots, projectID: projectID)
             for root in loadedRoots where root.isExpanded {
                 try await restoreExpandedBranch(from: root, projectID: projectID)
             }
@@ -72,6 +80,62 @@ final class BinderViewModel: ObservableObject {
         errorMessage = nil
     }
 
+    func descriptor(
+        _ kind: BinderCommandKind,
+        for node: BinderNode
+    ) -> BinderCommandDescriptor {
+        commandDescriptorsByDocument[node.id]?.first { $0.kind == kind }
+            ?? BinderCommandDescriptor(
+                kind: kind,
+                isEnabled: false,
+                denialReason: "명령 상태를 확인하는 중입니다."
+            )
+    }
+
+    func create(kind: DocumentKind, named name: String, in parent: BinderNode) async {
+        await perform(on: parent.id) { projectID in
+            let result = try await commands.create(
+                kind: kind,
+                named: name,
+                in: parent.id,
+                projectID: projectID
+            )
+            return result.affectedDocumentID
+        }
+    }
+
+    func rename(_ node: BinderNode, to name: String) async {
+        await perform(on: node.id) { projectID in
+            let result = try await commands.rename(
+                documentID: node.id,
+                to: name,
+                projectID: projectID
+            )
+            return result.affectedDocumentID
+        }
+    }
+
+    func move(_ nodeID: DocumentID, to destination: BinderNode) async {
+        await perform(on: nodeID) { projectID in
+            let result = try await commands.move(
+                documentID: nodeID,
+                to: .folder(destination.id),
+                projectID: projectID
+            )
+            return result.affectedDocumentID
+        }
+    }
+
+    func moveToTrash(_ node: BinderNode) async {
+        await perform(on: node.id) { projectID in
+            _ = try await commands.moveToTrash(
+                documentID: node.id,
+                projectID: projectID
+            )
+            return nil
+        }
+    }
+
     private func restoreExpandedBranch(
         from node: BinderNode,
         projectID: ProjectID
@@ -92,6 +156,35 @@ final class BinderViewModel: ObservableObject {
         let children = try await repository.children(of: node.id, in: projectID)
         guard loadedProjectID == projectID else { return }
         childrenByParent[node.id] = children
+        try await refreshCommandDescriptors(for: children, projectID: projectID)
+    }
+
+    private func refreshCommandDescriptors(
+        for nodes: [BinderNode],
+        projectID: ProjectID
+    ) async throws {
+        for node in nodes {
+            commandDescriptorsByDocument[node.id] = try await commands.commandDescriptors(
+                for: node.id,
+                in: projectID
+            )
+        }
+    }
+
+    private func perform(
+        on documentID: DocumentID,
+        operation: (ProjectID) async throws -> DocumentID?
+    ) async {
+        guard let projectID = loadedProjectID else { return }
+        workingDocumentIDs.insert(documentID)
+        defer { workingDocumentIDs.remove(documentID) }
+        do {
+            let selection = try await operation(projectID)
+            await load(projectID: projectID)
+            selectedNodeID = selection
+        } catch {
+            errorMessage = error.localizedDescription
+        }
     }
 
     private func updateExpansion(id: DocumentID, isExpanded: Bool) {

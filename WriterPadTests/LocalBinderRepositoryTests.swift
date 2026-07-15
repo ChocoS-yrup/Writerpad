@@ -151,7 +151,10 @@ final class LocalBinderRepositoryTests: XCTestCase {
         try await harness.binder.setExpanded(true, for: volume.id)
         await harness.scanner.resetMetrics()
 
-        let model = BinderViewModel(repository: harness.binder)
+        let model = BinderViewModel(
+            repository: harness.binder,
+            commands: harness.commands
+        )
         await model.load(projectID: harness.project.id)
         let metrics = await harness.scanner.metrics()
 
@@ -207,6 +210,7 @@ final class LocalBinderRepositoryTests: XCTestCase {
         let resolver: ProjectPathResolver
         let scanner: LocalBinderDirectoryScanner
         let binder: LocalBinderRepository
+        let commands: LocalBinderCommandService
         let project: ManagedProject
         let workspace: URL
     }
@@ -246,6 +250,13 @@ final class LocalBinderRepositoryTests: XCTestCase {
             pathPolicy: resolver.policy,
             clock: clock
         )
+        let commands = LocalBinderCommandService(
+            metadataStore: repository,
+            workspaceStateRepository: repository,
+            workspaceLocator: locator,
+            pathPolicy: resolver.policy,
+            clock: clock
+        )
         let workspace = try resolver.standardPaths(
             forProjectNamed: projectName
         ).workspaceRootURL
@@ -256,6 +267,7 @@ final class LocalBinderRepositoryTests: XCTestCase {
             resolver: resolver,
             scanner: scanner,
             binder: binder,
+            commands: commands,
             project: project,
             workspace: workspace
         )

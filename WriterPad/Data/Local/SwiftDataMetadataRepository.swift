@@ -121,7 +121,7 @@ extension SwiftDataMetadataRepository {
         }
 
         let deletionStatus: DocumentDeletionStatus
-        if record.isDeleted {
+        if record.isTrashed {
             guard let originalPath = record.originalPath, let deletedAt = record.deletedAt else {
                 throw MetadataRepositoryError.corruptedRecord(
                     entity: "DocumentRecord",
@@ -175,11 +175,11 @@ extension SwiftDataMetadataRepository {
 
         switch document.deletionStatus {
         case .active:
-            record.isDeleted = false
+            record.isTrashed = false
             record.originalPath = nil
             record.deletedAt = nil
         case let .trashed(originalPath, deletedAt):
-            record.isDeleted = true
+            record.isTrashed = true
             record.originalPath = originalPath.rawValue
             record.deletedAt = deletedAt
         }

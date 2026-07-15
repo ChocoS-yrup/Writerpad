@@ -11,6 +11,7 @@ final class AppEnvironment: ObservableObject {
     let projectManager: any ProjectManaging
     let projectImporter: any ProjectImporting
     let binderRepository: any BinderRepository
+    let binderCommands: any BinderCommanding
     let clock: any AppClock
     let futureChangeNotifier: any FutureChangeNotifying
 
@@ -24,6 +25,7 @@ final class AppEnvironment: ObservableObject {
         projectManager: any ProjectManaging,
         projectImporter: any ProjectImporting,
         binderRepository: any BinderRepository,
+        binderCommands: any BinderCommanding,
         clock: any AppClock,
         futureChangeNotifier: any FutureChangeNotifying
     ) {
@@ -34,6 +36,7 @@ final class AppEnvironment: ObservableObject {
         self.projectManager = projectManager
         self.projectImporter = projectImporter
         self.binderRepository = binderRepository
+        self.binderCommands = binderCommands
         self.clock = clock
         self.futureChangeNotifier = futureChangeNotifier
     }
@@ -89,6 +92,13 @@ final class AppEnvironment: ObservableObject {
             pathPolicy: pathResolver.policy,
             clock: clock
         )
+        let binderCommands = LocalBinderCommandService(
+            metadataStore: repository,
+            workspaceStateRepository: repository,
+            workspaceLocator: workspaceLocator,
+            pathPolicy: pathResolver.policy,
+            clock: clock
+        )
 
         return AppEnvironment(
             modelContainer: container,
@@ -98,6 +108,7 @@ final class AppEnvironment: ObservableObject {
             projectManager: projectManager,
             projectImporter: projectImporter,
             binderRepository: binderRepository,
+            binderCommands: binderCommands,
             clock: clock,
             futureChangeNotifier: NoOpFutureChangeNotifier()
         )

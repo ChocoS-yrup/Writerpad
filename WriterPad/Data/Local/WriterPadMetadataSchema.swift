@@ -52,7 +52,7 @@ final class DocumentRecord {
     var userOrder: Int
     var modifiedAt: Date
     var contentHash: String?
-    var isDeleted: Bool
+    @Attribute(originalName: "isDeleted") var isTrashed: Bool
     var originalPath: String?
     var deletedAt: Date?
     var cursorLocation: Int
@@ -83,7 +83,7 @@ final class DocumentRecord {
         self.userOrder = userOrder
         self.modifiedAt = modifiedAt
         self.contentHash = contentHash
-        self.isDeleted = isDeleted
+        self.isTrashed = isDeleted
         self.originalPath = originalPath
         self.deletedAt = deletedAt
         self.cursorLocation = cursorLocation

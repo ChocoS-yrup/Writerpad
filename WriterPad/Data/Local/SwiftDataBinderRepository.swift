@@ -2,6 +2,11 @@ import Foundation
 import SwiftData
 
 extension SwiftDataMetadataRepository: BinderMetadataStoring {
+    func binderDocuments(in projectID: ProjectID) async throws -> [DocumentNode] {
+        _ = try requireProjectRecord(id: projectID)
+        return try documentRecords(in: projectID).map(domainDocument)
+    }
+
     func binderDocument(id: DocumentID) async throws -> DocumentNode? {
         try uniqueDocumentRecord(id: id).map(domainDocument)
     }

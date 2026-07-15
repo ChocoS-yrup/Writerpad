@@ -8,7 +8,8 @@ struct RootView: View {
         ProjectWorkspaceView(
             projectManager: environment.projectManager,
             projectImporter: environment.projectImporter,
-            binderRepository: environment.binderRepository
+            binderRepository: environment.binderRepository,
+            binderCommands: environment.binderCommands
         )
             .task {
                 await environment.futureChangeNotifier.record(.appLaunched)
@@ -25,13 +26,16 @@ private struct ProjectWorkspaceView: View {
     @State private var deleteTarget: ManagedProject?
     @State private var isSelectingImportFolder = false
     private let binderRepository: any BinderRepository
+    private let binderCommands: any BinderCommanding
 
     init(
         projectManager: any ProjectManaging,
         projectImporter: any ProjectImporting,
-        binderRepository: any BinderRepository
+        binderRepository: any BinderRepository,
+        binderCommands: any BinderCommanding
     ) {
         self.binderRepository = binderRepository
+        self.binderCommands = binderCommands
         _model = StateObject(
             wrappedValue: ProjectListModel(
                 projectManager: projectManager,
@@ -83,7 +87,8 @@ private struct ProjectWorkspaceView: View {
                 HStack(spacing: 0) {
                     BinderPanel(
                         projectID: project.id,
-                        repository: binderRepository
+                        repository: binderRepository,
+                        commands: binderCommands
                     )
                     .frame(minWidth: 250, idealWidth: 310, maxWidth: 380)
 
