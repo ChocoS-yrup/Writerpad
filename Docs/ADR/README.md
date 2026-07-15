@@ -9,5 +9,6 @@
 | [ADR-005](ADR-005-cross-platform-filenames.md) | Windows·iPad 공통 안전 파일명 정책 | 승인 |
 | [ADR-006](ADR-006-fixed-binder-categories.md) | 고정 바인더 8개와 사용자 폴더 정책 | 승인 |
 | [ADR-007](ADR-007-windows-local-path-compatibility.md) | Windows 실제 로컬 경로와 레거시 폴더 보존 | 승인 |
+| [ADR-008](ADR-008-apple-project-identity.md) | Apple 프로젝트 식별자와 지원 플랫폼 기준 | 승인 |
 
 새 결정은 기존 문서를 덮어쓰지 말고 다음 번호 ADR로 추가한다. 결정이 바뀌면 이전 ADR 상태를 `대체됨`으로 바꾸고 새 ADR에서 대체 이유를 기록한다.

@@ -1,0 +1,139 @@
+// !$*UTF8*$!
+{
+	archiveVersion = 1;
+	classes = {
+	};
+	objectVersion = 56;
+	objects = {
+
+/* Begin PBXBuildFile section */
+		A10000000000000000000001 /* WriterPadApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = B10000000000000000000001 /* WriterPadApp.swift */; };
+		A10000000000000000000002 /* AppEnvironment.swift in Sources */ = {isa = PBXBuildFile; fileRef = B10000000000000000000002 /* AppEnvironment.swift */; };
+		A10000000000000000000003 /* BootstrapRecord.swift in Sources */ = {isa = PBXBuildFile; fileRef = B10000000000000000000003 /* BootstrapRecord.swift */; };
+		A10000000000000000000004 /* AppClock.swift in Sources */ = {isa = PBXBuildFile; fileRef = B10000000000000000000004 /* AppClock.swift */; };
+		A10000000000000000000005 /* FutureChangeNotifying.swift in Sources */ = {isa = PBXBuildFile; fileRef = B10000000000000000000005 /* FutureChangeNotifying.swift */; };
+		A10000000000000000000006 /* NoOpFutureChangeNotifier.swift in Sources */ = {isa = PBXBuildFile; fileRef = B10000000000000000000006 /* NoOpFutureChangeNotifier.swift */; };
+		A10000000000000000000007 /* RootView.swift in Sources */ = {isa = PBXBuildFile; fileRef = B10000000000000000000007 /* RootView.swift */; };
+		A10000000000000000000008 /* UIKitTextViewBridge.swift in Sources */ = {isa = PBXBuildFile; fileRef = B10000000000000000000008 /* UIKitTextViewBridge.swift */; };
+		A10000000000000000000009 /* Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = B10000000000000000000009 /* Assets.xcassets */; };
+		A1000000000000000000000A /* AppEnvironmentTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = B1000000000000000000000A /* AppEnvironmentTests.swift */; };
+/* End PBXBuildFile section */
+
+/* Begin PBXContainerItemProxy section */
+		C10000000000000000000001 /* PBXContainerItemProxy */ = {
+			isa = PBXContainerItemProxy;
+			containerPortal = D10000000000000000000001 /* Project object */;
+			proxyType = 1;
+			remoteGlobalIDString = E10000000000000000000001;
+			remoteInfo = WriterPad;
+		};
+/* End PBXContainerItemProxy section */
+
+/* Begin PBXFileReference section */
+		B10000000000000000000001 /* WriterPadApp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WriterPadApp.swift; sourceTree = "<group>"; };
+		B10000000000000000000002 /* AppEnvironment.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppEnvironment.swift; sourceTree = "<group>"; };
+		B10000000000000000000003 /* BootstrapRecord.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BootstrapRecord.swift; sourceTree = "<group>"; };
+		B10000000000000000000004 /* AppClock.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppClock.swift; sourceTree = "<group>"; };
+		B10000000000000000000005 /* FutureChangeNotifying.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FutureChangeNotifying.swift; sourceTree = "<group>"; };
+		B10000000000000000000006 /* NoOpFutureChangeNotifier.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NoOpFutureChangeNotifier.swift; sourceTree = "<group>"; };
+		B10000000000000000000007 /* RootView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RootView.swift; sourceTree = "<group>"; };
+		B10000000000000000000008 /* UIKitTextViewBridge.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = UIKitTextViewBridge.swift; sourceTree = "<group>"; };
+		B10000000000000000000009 /* Assets.xcassets */ = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = Assets.xcassets; sourceTree = "<group>"; };
+		B1000000000000000000000A /* AppEnvironmentTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppEnvironmentTests.swift; sourceTree = "<group>"; };
+		B1000000000000000000000B /* WriterPad.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = WriterPad.app; sourceTree = BUILT_PRODUCTS_DIR; };
+		B1000000000000000000000C /* WriterPadTests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = WriterPadTests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
+		B1000000000000000000000D /* Local.xcconfig.example */ = {isa = PBXFileReference; lastKnownFileType = text.xcconfig; path = Local.xcconfig.example; sourceTree = "<group>"; };
+		B1000000000000000000000E /* README.md */ = {isa = PBXFileReference; lastKnownFileType = net.daringfireball.markdown; path = README.md; sourceTree = "<group>"; };
+/* End PBXFileReference section */
+
+/* Begin PBXFrameworksBuildPhase section */
+		F10000000000000000000001 /* Frameworks */ = {isa = PBXFrameworksBuildPhase; buildActionMask = 2147483647; files = (); runOnlyForDeploymentPostprocessing = 0; };
+		F10000000000000000000002 /* Frameworks */ = {isa = PBXFrameworksBuildPhase; buildActionMask = 2147483647; files = (); runOnlyForDeploymentPostprocessing = 0; };
+/* End PBXFrameworksBuildPhase section */
+
+/* Begin PBXGroup section */
+		G10000000000000000000001 = {
+			isa = PBXGroup;
+			children = (G10000000000000000000002 /* WriterPad */, G10000000000000000000011 /* WriterPadTests */, G10000000000000000000012 /* Configuration */, G10000000000000000000013 /* Products */);
+			sourceTree = "<group>";
+		};
+		G10000000000000000000002 /* WriterPad */ = {isa = PBXGroup; children = (G10000000000000000000003 /* App */, G10000000000000000000004 /* Domain */, G10000000000000000000007 /* Data */, G10000000000000000000008 /* Sync */, G10000000000000000000009 /* Features */, G1000000000000000000000F /* Platform */, G10000000000000000000010 /* Resources */); path = WriterPad; sourceTree = "<group>"; };
+		G10000000000000000000003 /* App */ = {isa = PBXGroup; children = (B10000000000000000000001 /* WriterPadApp.swift */, B10000000000000000000002 /* AppEnvironment.swift */); path = App; sourceTree = "<group>"; };
+		G10000000000000000000004 /* Domain */ = {isa = PBXGroup; children = (G10000000000000000000005 /* Models */, G10000000000000000000006 /* Rules */, G10000000000000000000014 /* Protocols */); path = Domain; sourceTree = "<group>"; };
+		G10000000000000000000005 /* Models */ = {isa = PBXGroup; children = (B10000000000000000000003 /* BootstrapRecord.swift */); path = Models; sourceTree = "<group>"; };
+		G10000000000000000000006 /* Rules */ = {isa = PBXGroup; children = (); path = Rules; sourceTree = "<group>"; };
+		G10000000000000000000007 /* Data */ = {isa = PBXGroup; children = (G10000000000000000000015 /* Local */, G10000000000000000000016 /* Backup */, G10000000000000000000017 /* Trash */, G10000000000000000000018 /* Migration */); path = Data; sourceTree = "<group>"; };
+		G10000000000000000000008 /* Sync */ = {isa = PBXGroup; children = (B10000000000000000000006 /* NoOpFutureChangeNotifier.swift */); path = Sync; sourceTree = "<group>"; };
+		G10000000000000000000009 /* Features */ = {isa = PBXGroup; children = (G10000000000000000000019 /* Projects */, G1000000000000000000001A /* Binder */, G1000000000000000000001B /* Editor */, G1000000000000000000001C /* Backup */, G1000000000000000000001D /* Search */, G1000000000000000000001E /* Export */, G1000000000000000000001F /* Settings */); path = Features; sourceTree = "<group>"; };
+		G1000000000000000000000F /* Platform */ = {isa = PBXGroup; children = (B10000000000000000000008 /* UIKitTextViewBridge.swift */); path = Platform; sourceTree = "<group>"; };
+		G10000000000000000000010 /* Resources */ = {isa = PBXGroup; children = (B10000000000000000000009 /* Assets.xcassets */); path = Resources; sourceTree = "<group>"; };
+		G10000000000000000000011 /* WriterPadTests */ = {isa = PBXGroup; children = (B1000000000000000000000A /* AppEnvironmentTests.swift */); path = WriterPadTests; sourceTree = "<group>"; };
+		G10000000000000000000012 /* Configuration */ = {isa = PBXGroup; children = (B1000000000000000000000D /* Local.xcconfig.example */, B1000000000000000000000E /* README.md */); path = Configuration; sourceTree = "<group>"; };
+		G10000000000000000000013 /* Products */ = {isa = PBXGroup; children = (B1000000000000000000000B /* WriterPad.app */, B1000000000000000000000C /* WriterPadTests.xctest */); name = Products; sourceTree = "<group>"; };
+		G10000000000000000000014 /* Protocols */ = {isa = PBXGroup; children = (B10000000000000000000004 /* AppClock.swift */, B10000000000000000000005 /* FutureChangeNotifying.swift */); path = Protocols; sourceTree = "<group>"; };
+		G10000000000000000000015 /* Local */ = {isa = PBXGroup; children = (); path = Local; sourceTree = "<group>"; };
+		G10000000000000000000016 /* Backup */ = {isa = PBXGroup; children = (); path = Backup; sourceTree = "<group>"; };
+		G10000000000000000000017 /* Trash */ = {isa = PBXGroup; children = (); path = Trash; sourceTree = "<group>"; };
+		G10000000000000000000018 /* Migration */ = {isa = PBXGroup; children = (); path = Migration; sourceTree = "<group>"; };
+		G10000000000000000000019 /* Projects */ = {isa = PBXGroup; children = (B10000000000000000000007 /* RootView.swift */); path = Projects; sourceTree = "<group>"; };
+		G1000000000000000000001A /* Binder */ = {isa = PBXGroup; children = (); path = Binder; sourceTree = "<group>"; };
+		G1000000000000000000001B /* Editor */ = {isa = PBXGroup; children = (); path = Editor; sourceTree = "<group>"; };
+		G1000000000000000000001C /* Backup */ = {isa = PBXGroup; children = (); path = Backup; sourceTree = "<group>"; };
+		G1000000000000000000001D /* Search */ = {isa = PBXGroup; children = (); path = Search; sourceTree = "<group>"; };
+		G1000000000000000000001E /* Export */ = {isa = PBXGroup; children = (); path = Export; sourceTree = "<group>"; };
+		G1000000000000000000001F /* Settings */ = {isa = PBXGroup; children = (); path = Settings; sourceTree = "<group>"; };
+/* End PBXGroup section */
+
+/* Begin PBXNativeTarget section */
+		E10000000000000000000001 /* WriterPad */ = {isa = PBXNativeTarget; buildConfigurationList = H10000000000000000000002 /* Build configuration list for PBXNativeTarget "WriterPad" */; buildPhases = (I10000000000000000000001 /* Sources */, F10000000000000000000001 /* Frameworks */, J10000000000000000000001 /* Resources */); buildRules = (); dependencies = (); name = WriterPad; productName = WriterPad; productReference = B1000000000000000000000B /* WriterPad.app */; productType = "com.apple.product-type.application"; };
+		E10000000000000000000002 /* WriterPadTests */ = {isa = PBXNativeTarget; buildConfigurationList = H10000000000000000000003 /* Build configuration list for PBXNativeTarget "WriterPadTests" */; buildPhases = (I10000000000000000000002 /* Sources */, F10000000000000000000002 /* Frameworks */, J10000000000000000000002 /* Resources */); buildRules = (); dependencies = (K10000000000000000000001 /* PBXTargetDependency */); name = WriterPadTests; productName = WriterPadTests; productReference = B1000000000000000000000C /* WriterPadTests.xctest */; productType = "com.apple.product-type.bundle.unit-test"; };
+/* End PBXNativeTarget section */
+
+/* Begin PBXProject section */
+		D10000000000000000000001 /* Project object */ = {
+			isa = PBXProject;
+			attributes = {BuildIndependentTargetsInParallel = 1; LastSwiftUpdateCheck = 2660; LastUpgradeCheck = 2660; TargetAttributes = {E10000000000000000000001 = {CreatedOnToolsVersion = 26.6; }; E10000000000000000000002 = {CreatedOnToolsVersion = 26.6; TestTargetID = E10000000000000000000001; }; }; };
+			buildConfigurationList = H10000000000000000000001 /* Build configuration list for PBXProject "WriterPad" */;
+			compatibilityVersion = "Xcode 14.0";
+			developmentRegion = en;
+			hasScannedForEncodings = 0;
+			knownRegions = (en, Base, ko);
+			mainGroup = G10000000000000000000001;
+			productRefGroup = G10000000000000000000013 /* Products */;
+			projectDirPath = "";
+			projectRoot = "";
+			targets = (E10000000000000000000001 /* WriterPad */, E10000000000000000000002 /* WriterPadTests */);
+		};
+/* End PBXProject section */
+
+/* Begin PBXResourcesBuildPhase section */
+		J10000000000000000000001 /* Resources */ = {isa = PBXResourcesBuildPhase; buildActionMask = 2147483647; files = (A10000000000000000000009 /* Assets.xcassets in Resources */); runOnlyForDeploymentPostprocessing = 0; };
+		J10000000000000000000002 /* Resources */ = {isa = PBXResourcesBuildPhase; buildActionMask = 2147483647; files = (); runOnlyForDeploymentPostprocessing = 0; };
+/* End PBXResourcesBuildPhase section */
+
+/* Begin PBXSourcesBuildPhase section */
+		I10000000000000000000001 /* Sources */ = {isa = PBXSourcesBuildPhase; buildActionMask = 2147483647; files = (A10000000000000000000001 /* WriterPadApp.swift in Sources */, A10000000000000000000002 /* AppEnvironment.swift in Sources */, A10000000000000000000003 /* BootstrapRecord.swift in Sources */, A10000000000000000000004 /* AppClock.swift in Sources */, A10000000000000000000005 /* FutureChangeNotifying.swift in Sources */, A10000000000000000000006 /* NoOpFutureChangeNotifier.swift in Sources */, A10000000000000000000007 /* RootView.swift in Sources */, A10000000000000000000008 /* UIKitTextViewBridge.swift in Sources */); runOnlyForDeploymentPostprocessing = 0; };
+		I10000000000000000000002 /* Sources */ = {isa = PBXSourcesBuildPhase; buildActionMask = 2147483647; files = (A1000000000000000000000A /* AppEnvironmentTests.swift in Sources */); runOnlyForDeploymentPostprocessing = 0; };
+/* End PBXSourcesBuildPhase section */
+
+/* Begin PBXTargetDependency section */
+		K10000000000000000000001 /* PBXTargetDependency */ = {isa = PBXTargetDependency; target = E10000000000000000000001 /* WriterPad */; targetProxy = C10000000000000000000001 /* PBXContainerItemProxy */; };
+/* End PBXTargetDependency section */
+
+/* Begin XCBuildConfiguration section */
+		L10000000000000000000001 /* Debug */ = {isa = XCBuildConfiguration; buildSettings = {ALWAYS_SEARCH_USER_PATHS = NO; CLANG_ANALYZER_NONNULL = YES; CLANG_ENABLE_MODULES = YES; CLANG_ENABLE_OBJC_ARC = YES; COPY_PHASE_STRIP = NO; DEBUG_INFORMATION_FORMAT = dwarf; ENABLE_TESTABILITY = YES; GCC_C_LANGUAGE_STANDARD = gnu17; GCC_OPTIMIZATION_LEVEL = 0; MTL_ENABLE_DEBUG_INFO = INCLUDE_SOURCE; ONLY_ACTIVE_ARCH = YES; SDKROOT = iphoneos; SWIFT_ACTIVE_COMPILATION_CONDITIONS = "DEBUG $(inherited)"; SWIFT_OPTIMIZATION_LEVEL = "-Onone"; }; name = Debug; };
+		L10000000000000000000002 /* Release */ = {isa = XCBuildConfiguration; buildSettings = {ALWAYS_SEARCH_USER_PATHS = NO; CLANG_ANALYZER_NONNULL = YES; CLANG_ENABLE_MODULES = YES; CLANG_ENABLE_OBJC_ARC = YES; COPY_PHASE_STRIP = NO; DEBUG_INFORMATION_FORMAT = "dwarf-with-dsym"; ENABLE_NS_ASSERTIONS = NO; GCC_C_LANGUAGE_STANDARD = gnu17; MTL_ENABLE_DEBUG_INFO = NO; SDKROOT = iphoneos; SWIFT_COMPILATION_MODE = wholemodule; VALIDATE_PRODUCT = YES; }; name = Release; };
+		L10000000000000000000003 /* Debug */ = {isa = XCBuildConfiguration; buildSettings = {CODE_SIGN_STYLE = Automatic; CURRENT_PROJECT_VERSION = 1; DERIVE_MACCATALYST_PRODUCT_BUNDLE_IDENTIFIER = NO; DEVELOPMENT_TEAM = ""; ENABLE_PREVIEWS = YES; GENERATE_INFOPLIST_FILE = YES; INFOPLIST_KEY_CFBundleDisplayName = WriterPad; INFOPLIST_KEY_LSApplicationCategoryType = "public.app-category.productivity"; INFOPLIST_KEY_UIApplicationSupportsIndirectInputEvents = YES; INFOPLIST_KEY_UILaunchScreen_Generation = YES; INFOPLIST_KEY_UISupportedInterfaceOrientations_iPad = "UIInterfaceOrientationPortrait UIInterfaceOrientationPortraitUpsideDown UIInterfaceOrientationLandscapeLeft UIInterfaceOrientationLandscapeRight"; IPHONEOS_DEPLOYMENT_TARGET = 17.0; MARKETING_VERSION = 0.1.0; PRODUCT_BUNDLE_IDENTIFIER = com.chocos.writerpad; PRODUCT_NAME = "$(TARGET_NAME)"; SUPPORTED_PLATFORMS = "iphoneos iphonesimulator"; SUPPORTS_MACCATALYST = YES; SUPPORTS_MAC_DESIGNED_FOR_IPHONE_IPAD = NO; SWIFT_EMIT_LOC_STRINGS = YES; SWIFT_STRICT_CONCURRENCY = complete; SWIFT_VERSION = 5.0; TARGETED_DEVICE_FAMILY = 2; }; name = Debug; };
+		L10000000000000000000004 /* Release */ = {isa = XCBuildConfiguration; buildSettings = {CODE_SIGN_STYLE = Automatic; CURRENT_PROJECT_VERSION = 1; DERIVE_MACCATALYST_PRODUCT_BUNDLE_IDENTIFIER = NO; DEVELOPMENT_TEAM = ""; ENABLE_PREVIEWS = YES; GENERATE_INFOPLIST_FILE = YES; INFOPLIST_KEY_CFBundleDisplayName = WriterPad; INFOPLIST_KEY_LSApplicationCategoryType = "public.app-category.productivity"; INFOPLIST_KEY_UIApplicationSupportsIndirectInputEvents = YES; INFOPLIST_KEY_UILaunchScreen_Generation = YES; INFOPLIST_KEY_UISupportedInterfaceOrientations_iPad = "UIInterfaceOrientationPortrait UIInterfaceOrientationPortraitUpsideDown UIInterfaceOrientationLandscapeLeft UIInterfaceOrientationLandscapeRight"; IPHONEOS_DEPLOYMENT_TARGET = 17.0; MARKETING_VERSION = 0.1.0; PRODUCT_BUNDLE_IDENTIFIER = com.chocos.writerpad; PRODUCT_NAME = "$(TARGET_NAME)"; SUPPORTED_PLATFORMS = "iphoneos iphonesimulator"; SUPPORTS_MACCATALYST = YES; SUPPORTS_MAC_DESIGNED_FOR_IPHONE_IPAD = NO; SWIFT_EMIT_LOC_STRINGS = YES; SWIFT_STRICT_CONCURRENCY = complete; SWIFT_VERSION = 5.0; TARGETED_DEVICE_FAMILY = 2; }; name = Release; };
+		L10000000000000000000005 /* Debug */ = {isa = XCBuildConfiguration; buildSettings = {BUNDLE_LOADER = "$(TEST_HOST)"; CODE_SIGN_STYLE = Automatic; DEVELOPMENT_TEAM = ""; GENERATE_INFOPLIST_FILE = YES; IPHONEOS_DEPLOYMENT_TARGET = 17.0; PRODUCT_BUNDLE_IDENTIFIER = com.chocos.writerpad.tests; PRODUCT_NAME = "$(TARGET_NAME)"; SWIFT_STRICT_CONCURRENCY = complete; SWIFT_VERSION = 5.0; TARGETED_DEVICE_FAMILY = 2; TEST_HOST = "$(BUILT_PRODUCTS_DIR)/WriterPad.app/$(BUNDLE_EXECUTABLE_FOLDER_PATH)/WriterPad"; }; name = Debug; };
+		L10000000000000000000006 /* Release */ = {isa = XCBuildConfiguration; buildSettings = {BUNDLE_LOADER = "$(TEST_HOST)"; CODE_SIGN_STYLE = Automatic; DEVELOPMENT_TEAM = ""; GENERATE_INFOPLIST_FILE = YES; IPHONEOS_DEPLOYMENT_TARGET = 17.0; PRODUCT_BUNDLE_IDENTIFIER = com.chocos.writerpad.tests; PRODUCT_NAME = "$(TARGET_NAME)"; SWIFT_STRICT_CONCURRENCY = complete; SWIFT_VERSION = 5.0; TARGETED_DEVICE_FAMILY = 2; TEST_HOST = "$(BUILT_PRODUCTS_DIR)/WriterPad.app/$(BUNDLE_EXECUTABLE_FOLDER_PATH)/WriterPad"; }; name = Release; };
+/* End XCBuildConfiguration section */
+
+/* Begin XCConfigurationList section */
+		H10000000000000000000001 /* Build configuration list for PBXProject "WriterPad" */ = {isa = XCConfigurationList; buildConfigurations = (L10000000000000000000001 /* Debug */, L10000000000000000000002 /* Release */); defaultConfigurationIsVisible = 0; defaultConfigurationName = Release; };
+		H10000000000000000000002 /* Build configuration list for PBXNativeTarget "WriterPad" */ = {isa = XCConfigurationList; buildConfigurations = (L10000000000000000000003 /* Debug */, L10000000000000000000004 /* Release */); defaultConfigurationIsVisible = 0; defaultConfigurationName = Release; };
+		H10000000000000000000003 /* Build configuration list for PBXNativeTarget "WriterPadTests" */ = {isa = XCConfigurationList; buildConfigurations = (L10000000000000000000005 /* Debug */, L10000000000000000000006 /* Release */); defaultConfigurationIsVisible = 0; defaultConfigurationName = Release; };
+/* End XCConfigurationList section */
+	};
+	rootObject = D10000000000000000000001 /* Project object */;
+}

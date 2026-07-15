@@ -1,0 +1,5 @@
+// 복사본 이름을 Local.xcconfig로 바꾸고 개인 서명 값만 로컬에서 설정한다.
+// Local.xcconfig는 Git에 포함하지 않는다.
+
+DEVELOPMENT_TEAM =
+PRODUCT_BUNDLE_IDENTIFIER = com.chocos.writerpad

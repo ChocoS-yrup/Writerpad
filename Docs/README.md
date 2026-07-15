@@ -2,12 +2,17 @@
 
 ## 현재 상태
 
-- 현재 단계: 1-1 저장소 조사와 개발 문서 준비
-- 제품 코드: 아직 없음
+- 현재 단계: 1-2 Xcode 프로젝트와 로컬 앱 기반 구성 완료
+- 다음 단계: 1-3 핵심 도메인 모델과 로컬 저장 경계 구체화
+- 제품 코드: SwiftUI 앱·SwiftData 메타데이터 저장소·테스트 타깃 기반 생성 완료
 - Git: 로컬 저장소 초기화 완료
 - Xcode: 26.6 설치·라이선스·최초 구성 완료
 - Apple SDK: iOS/iPadOS 26.5 SDK 사용 가능
 - Simulator: iOS 26.5 런타임과 iPad Pro·Air·mini·기본 iPad 기기 사용 가능
+- 검증 기기: iPad Pro 13-inch (M5), iOS 26.5 시뮬레이터
+- Bundle ID: `com.chocos.writerpad`
+- Deployment Target: iPadOS 17.0
+- Mac Catalyst: 설정 및 호환 빌드 확인 완료
 - Windows 소스: `공유/`에 읽기 전용 참조 소스 제공됨
 - Windows 테스트 작품: `집필모드/`에 1권·2권, 총 50화 제공됨
 - Supabase: 1~7단계 범위에서 제외
@@ -38,11 +43,13 @@
 - `StageCompletionCriteria.md`: 1~7단계 완료 조건
 - `Risks.md`: 위험과 대응 계획
 - `WindowsReferenceFindings.md`: Windows 소스·테스트 작품 대조 결과
+- `BuildSetup.md`: Xcode 열기·빌드·테스트·서명 설정
 - `ADR/README.md`: 확정된 설계 결정 색인
 
-## 1-2 진입 전 확인
+## 1-2 검증 결과
 
-- Xcode 26.6과 iOS/iPadOS 26.5 SDK 확인 완료
-- iPadOS 17 이상 deployment target 설정 준비
-- Bundle ID 초안 결정 위치 마련
-- Windows 참조 소스의 실제 경로 규칙을 1~7단계 프롬프트에 반영했는지 확인
+- 앱과 테스트 타깃을 Xcode가 정상 인식한다.
+- iPad 시뮬레이터 빌드가 성공한다.
+- SwiftData 인메모리 저장·조회 및 서버 no-op 경계 자동 테스트 2개가 통과한다.
+- Mac Catalyst 호환 빌드가 성공한다.
+- 실제 iPad 설치용 Apple 개발 팀과 서명은 아직 설정하지 않았다.

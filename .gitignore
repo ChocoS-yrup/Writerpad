@@ -6,9 +6,9 @@ xcuserdata/
 .env.*
 *.local.xcconfig
 Secrets.xcconfig
-UserData/
-Projects/
-Backups/
+/UserData/
+/Projects/
+/Backups/
 *.tmp
 *.swp
 __pycache__/
