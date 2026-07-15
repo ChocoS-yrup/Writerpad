@@ -1,0 +1,21 @@
+.DS_Store
+DerivedData/
+*.xcuserstate
+xcuserdata/
+.env
+.env.*
+*.local.xcconfig
+Secrets.xcconfig
+UserData/
+Projects/
+Backups/
+*.tmp
+*.swp
+__pycache__/
+*.pyc
+
+# Windows 참조 소스와 테스트 작품은 읽기 전용 참고 자료다.
+공유/
+공유.zip
+집필모드/
+집필모드.zip
