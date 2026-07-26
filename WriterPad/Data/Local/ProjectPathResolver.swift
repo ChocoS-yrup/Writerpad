@@ -79,6 +79,14 @@ struct ProjectPathResolver: @unchecked Sendable {
         policy: PathPolicy = PathPolicy(),
         fileManager: FileManager = .default
     ) throws -> ProjectPathResolver {
+        guard let documents = try? fileManager.url(
+            for: .documentDirectory,
+            in: .userDomainMask,
+            appropriateFor: nil,
+            create: true
+        ) else {
+            throw ProjectPathResolverError.applicationSupportUnavailable
+        }
         guard let applicationSupport = try? fileManager.url(
             for: .applicationSupportDirectory,
             in: .userDomainMask,
@@ -87,14 +95,50 @@ struct ProjectPathResolver: @unchecked Sendable {
         ) else {
             throw ProjectPathResolverError.applicationSupportUnavailable
         }
-        let root = applicationSupport
+        let legacyRoot = applicationSupport
             .appendingPathComponent("WriterPad", isDirectory: true)
             .appendingPathComponent("Projects", isDirectory: true)
+        // iOS 파일 앱의 “나의 iPad > ChocoS”에는 Documents 폴더만 노출된다.
+        // 작품 폴더를 바로 이 루트에 두어 목록을 별도 중간 폴더 없이 관리할 수 있게 한다.
+        let root = documents
+        try migrateLegacyProjectsIfNeeded(
+            from: legacyRoot,
+            to: root,
+            fileManager: fileManager
+        )
         return ProjectPathResolver(
             projectsRootURL: root,
             policy: policy,
             fileManager: fileManager
         )
+    }
+
+    /// 파일 앱 노출 전 Application Support에 저장된 기존 작품을 Documents로 옮긴다.
+    /// 대상에 같은 이름이 있으면 덮어쓰지 않고 그대로 둬 사용자의 파일을 보존한다.
+    private static func migrateLegacyProjectsIfNeeded(
+        from legacyRoot: URL,
+        to documentsRoot: URL,
+        fileManager: FileManager
+    ) throws {
+        guard fileManager.fileExists(atPath: legacyRoot.path) else { return }
+        try fileManager.createDirectory(
+            at: documentsRoot,
+            withIntermediateDirectories: true
+        )
+        let legacyItems = try fileManager.contentsOfDirectory(
+            at: legacyRoot,
+            includingPropertiesForKeys: nil,
+            options: []
+        )
+        for item in legacyItems {
+            let destination = documentsRoot.appendingPathComponent(item.lastPathComponent)
+            guard !fileManager.fileExists(atPath: destination.path) else { continue }
+            try fileManager.moveItem(at: item, to: destination)
+        }
+        // 비어 있는 이전 저장소만 정리한다. 충돌 파일은 복구 여지를 위해 남긴다.
+        if (try? fileManager.contentsOfDirectory(atPath: legacyRoot.path).isEmpty) == true {
+            try? fileManager.removeItem(at: legacyRoot)
+        }
     }
 
     func standardPaths(forProjectNamed projectName: String) throws -> StandardProjectPaths {

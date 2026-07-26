@@ -48,14 +48,75 @@ protocol DocumentFileMetadataUpdating: Sendable {
 
 /// 백업 생성·조회·복원을 담당할 경계다.
 protocol BackupStoring: Sendable {
-    func snapshots(for documentID: DocumentID) async throws -> [BackupSnapshot]
+    func snapshots(
+        for documentID: DocumentID,
+        projectID: ProjectID
+    ) async throws -> [BackupSnapshot]
     func createSnapshot(for document: DocumentNode, reason: BackupReason) async throws -> BackupSnapshot
-    func restore(_ snapshot: BackupSnapshot) async throws -> DocumentSaveReceipt
+    func createSnapshot(
+        for document: DocumentNode,
+        reason: BackupReason,
+        savedContent: SavedDocumentContent
+    ) async throws -> BackupSnapshot
+    func createSnapshotAndApplyRetention(
+        for document: DocumentNode,
+        reason: BackupReason,
+        savedContent: SavedDocumentContent,
+        policy: BackupPolicy
+    ) async throws -> BackupMaintenanceResult
+    func text(for snapshot: BackupSnapshot) async throws -> String
+    func setPinned(_ isPinned: Bool, snapshot: BackupSnapshot) async throws -> BackupSnapshot
+    func delete(_ snapshot: BackupSnapshot) async throws
+    func applyRetentionPolicy(
+        _ policy: BackupPolicy,
+        projectID: ProjectID
+    ) async throws -> BackupCleanupReport
+}
+
+extension BackupStoring {
+    /// 저장 결과 재사용을 지원하지 않는 테스트 대역·구현은 기존 파일 기반 경로를 사용한다.
+    func createSnapshot(
+        for document: DocumentNode,
+        reason: BackupReason,
+        savedContent: SavedDocumentContent
+    ) async throws -> BackupSnapshot {
+        try await createSnapshot(for: document, reason: reason)
+    }
+
+    /// 결합 작업을 지원하지 않는 구현은 기존 두 작업을 순서대로 수행한다.
+    func createSnapshotAndApplyRetention(
+        for document: DocumentNode,
+        reason: BackupReason,
+        savedContent: SavedDocumentContent,
+        policy: BackupPolicy
+    ) async throws -> BackupMaintenanceResult {
+        let snapshot = try await createSnapshot(
+            for: document,
+            reason: reason,
+            savedContent: savedContent
+        )
+        let cleanup = try await applyRetentionPolicy(policy, projectID: document.projectID)
+        return BackupMaintenanceResult(snapshot: snapshot, cleanup: cleanup)
+    }
+}
+
+protocol BackupPolicyStoring: Sendable {
+    func policy(for projectID: ProjectID) async throws -> BackupPolicy
+    func save(_ policy: BackupPolicy, for projectID: ProjectID) async throws
 }
 
 /// 프로젝트 전체 TXT 검색 구현이 따라야 하는 경계다.
 protocol Searching: Sendable {
-    func search(_ request: DocumentSearchRequest) async throws -> [DocumentSearchHit]
+    func search(
+        _ request: DocumentSearchRequest,
+        progress: @escaping @Sendable (DocumentSearchProgress) -> Void
+    ) async throws -> ProjectSearchReport
+}
+
+extension Searching {
+    func search(_ request: DocumentSearchRequest) async throws -> ProjectSearchReport {
+        try await search(request, progress: { _ in })
+    }
 }
 
 /// TXT 추출 구현이 따라야 하는 경계다.

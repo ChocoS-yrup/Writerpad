@@ -1,0 +1,994 @@
+WriterPad 8단계 이후 통합 개발 기획서 — 현행 코드 기준 개정본
+작성일: 2026-07-26
+기준: 현재 작업 폴더의 Swift 코드·테스트·Docs와 제공된 Windows/Supabase v2 참조 구현
+
+이 문서는 기존 `8단계 이후 기획서.txt`를 삭제하거나 덮어쓰지 않고, 1~7단계 실제 빌드 결과에 맞춰 다시 작성한 후속 개발 기준이다.
+
+마이그레이션 재실행 금지
+기존 서버 테이블 삭제 금지
+운영 원고와 운영 프로젝트를 개발 fixture로 사용 금지
+service role key를 iPad 앱에 포함 금지
+실제 서버 이름·파라미터를 추측으로 생성 금지
+각 세부 단계가 끝날 때마다 중단하고 자동 테스트·실기기 검증·미검증 항목을 보고
+
+---
+
+# 0. 이번 개정의 결론
+
+## 0-1. 현재 실제 완료 기준
+
+현재 앱은 네트워크 없이 동작하는 1~7단계 로컬 제품 마일스톤까지 구현되어 있다.
+
+- iPad 전용 SwiftUI 앱과 UIKit/TextKit 기반 편집기
+- UTF-8 TXT 단일 원본과 SwiftData 메타데이터 분리
+- 작품 생성·이름 변경·삭제 목록·Windows 작품 가져오기
+- 고정 바인더, 일반 폴더·TXT, 원고 권·화 규칙과 새 권 25화 생성
+- 한글 IME 보호, 스마트 입력, 글자 수, 화면 설정, 물리 키보드 명령
+- 좌우 듀얼 편집기와 작품별 화면 상태 복원
+- 800ms 자동 저장, 즉시 저장, 원자 저장, 저장 실패 전환 차단
+- 로컬 백업·미리보기·diff·복원·휴지통·영구 삭제
+- 현재 문서 검색·작품 전체 검색
+- 개인 소장용 UTF-8 TXT·PDF 원고 내보내기
+- 1,000화·보조 TXT 500개·백업 5,000개 성능 기준선
+
+현재 서버 기능은 구현되어 있지 않다.
+
+- `supabase-swift` 패키지 없음
+- URLSession 기반 서버 클라이언트 없음
+- 인증·Keychain 세션 없음
+- 설치별 `device_id` 없음
+- 서버 revision·operation queue·lease·Realtime·pull 없음
+- Swift 3방향 병합과 충돌 해결 화면 없음
+- `FutureChangeNotifying`와 `NoOpFutureChangeNotifier`만 존재
+
+따라서 새 8단계는 “기존 서버 구현을 이어 붙이는 단계”가 아니라 “완성된 로컬 제품을 손상시키지 않고 서버 경계를 처음 도입하는 단계”로 시작한다.
+
+## 0-2. 기존 계획에서 유지하는 것
+
+- Windows/Supabase v2의 UUID, revision, operation_id, lease, tombstone 계약
+- 로컬 저장 완료와 서버 동기화 완료의 분리
+- SQLite 영구 큐와 같은 operation_id 재시도
+- Realtime payload를 원문으로 신뢰하지 않고 snapshot pull의 신호로만 사용
+- Base·Local·Remote 3방향 병합
+- 숨은 `tree-order.json`, `trash-purge.json`
+- Windows A/B와 실제 iPad의 교차 수용 테스트
+- TestFlight 전 실제 기기 lifecycle·성능·개인정보 감사
+
+## 0-3. 기존 계획에서 변경하는 것
+
+1. 서버 상태를 기존 SwiftData `DocumentRecord`에 바로 추가하지 않는다.
+   - 현재 `WriterPadSchemaV1`은 로컬 메타데이터와 화면 복원을 안정적으로 담당한다.
+   - 서버 revision, base_content, operation, conflict, binding은 별도 `SyncV2Store` SQLite에 둔다.
+   - SwiftData V2는 실제로 로컬 화면 projection이 필요하다는 근거가 생긴 경우에만 추가한다.
+
+2. 현재의 `FutureChangeNotifying`를 그대로 큐로 바꾸지 않는다.
+   - 현재 사건에는 rename, move, reorder, project rename, path, 본문 snapshot이 부족하다.
+   - 현재 `record`는 오류를 반환하지 않아 영구 큐 등록 실패를 숨길 수 있다.
+   - 8단계에서 사건표와 저장 책임을 먼저 확정한 뒤 durable recorder로 교체한다.
+
+3. 로컬 백업과 서버 버전 기록을 합치지 않는다.
+   - `LocalBackupStore`는 사용자 복원용 로컬 안전망이다.
+   - 서버 `document_versions`와 동기화 conflict 자료는 별도 책임이다.
+
+4. 원고 내보내기는 동기화·백업·가져오기 수단으로 확장하지 않는다.
+   - ADR-010에 따라 TXT·PDF 개인 소장용 기능으로 유지한다.
+
+5. 현재 코드에 없는 서버 정책을 기획서가 임의로 확정하지 않는다.
+   - 빈 폴더, 폴더 자체 UUID, 작품 영구 삭제, 계정 가입, 공유 권한 편집은 계약 감사에서 결정하거나 보류한다.
+   - 새 RPC나 테이블이 필요하면 재현 테스트와 호환성 보고 후 순방향 migration 승인을 받는다.
+
+6. 참조 파일 경로를 현재 저장소에 맞춘다.
+   - SQL: `참조파일/20260714000000_supabase_v2_protocol.sql`
+   - SQL 보정: `참조파일/20260714010000_windows_v2_client_support.sql`
+   - Windows v2: `참조파일/sync_manager.py`, `sync_v2_store.py`, `three_way_merge.py` 등
+
+## 0-4. 기존 계획에 새로 추가하는 위험
+
+- 현재 Git 작업 트리에 1~7단계 변경이 많이 남아 있으므로 8단계 시작 전 복구 가능한 기준 commit을 확정해야 한다.
+- Swift 편집 버퍼에도 `revision`이라는 이름이 있으므로 서버 revision과 혼동하지 않게 `serverRevision` 등으로 명명한다.
+- 서버 `commit_document`는 본문 UTF-8 크기를 10MiB로 제한한다. 큰 로컬 TXT는 저장 성공을 유지하되 서버 전송 불가 상태를 별도로 보여야 한다.
+- 서버 경로 검사는 로컬 Windows 안전 이름 정책보다 느슨할 수 있다. iPad는 현재의 더 엄격한 `PathPolicy`를 유지한다.
+- 현재 로컬 바인더는 폴더 노드도 UUID를 가진다. 서버 v2 문서 모델이 빈 폴더를 직접 표현하지 않는다면 빈 폴더 교차 기기 보존 정책이 필요하다.
+- 현재 작품 삭제 목록과 서버 프로젝트 삭제는 서로 다른 개념이다. 서버 삭제 계약이 없으므로 자동 전파하지 않는다.
+- 현재 듀얼 편집기는 같은 문서를 양쪽에서 열 수 있다. lease는 편집기 칸별이 아니라 `document_id`별 하나여야 한다.
+
+---
+
+# 1. 8단계 진입 전 공통 원칙
+
+## 1-1. 데이터 원본과 저장 성공
+
+- 사용자 원고의 로컬 원본은 계속 UTF-8 TXT다.
+- SwiftData는 로컬 문서 정체성·경로·화면 상태를 담당한다.
+- SyncV2 SQLite는 서버 기준본·revision·operation·binding·conflict를 담당한다.
+- LocalBackupStore는 로컬 복구본을 담당한다.
+- 로컬 TXT 저장 성공은 네트워크·인증·서버 성공 여부와 독립이다.
+- 서버 큐 등록 실패는 로컬 저장 실패로 되돌리지 않지만, 원격 반영이 보장되지 않는 고위험 상태로 표시한다.
+
+## 1-2. 테스트와 서버 안전
+
+- 운영 작품과 운영 원고를 테스트에 사용하지 않는다.
+- 서버 테스트는 전용 계정과 매번 새 UUID 프로젝트를 사용한다.
+- 이미 적용되었다고 전달된 두 SQL 파일은 다시 실행하지 않는다.
+- 실제 적용 여부는 Supabase migration history 또는 읽기 전용 schema 확인으로 검증한다.
+- 계약 결함이 있어도 앱 코드에서 추측성 우회 테이블을 만들지 않는다.
+- 시뮬레이터 결과를 실제 iPad 결과로 기록하지 않는다.
+
+## 1-3. 단계별 중단 규칙
+
+각 `지금부터` 블록이 끝나면 다음을 보고하고 중단한다.
+
+- 변경 파일
+- 자동 테스트 결과와 실행하지 못한 테스트
+- 실제 iPad 검증 여부
+- Windows 참조 구현과의 차이
+- 로컬 TXT·SwiftData·SyncV2 SQLite에 미치는 영향
+- 다음 세부 단계 진입 조건
+
+---
+
+# 2. 8단계 — 계약·저장 경계·이관 설계 확정
+
+## 8-1. 1~7단계 기준선 동결과 진입 감사
+
+### 지금부터
+
+현재 1~7단계 변경을 검토해 복구 가능한 Git 기준점을 만든다. 사용자의 기존 변경을 되돌리거나 임의로 정리하지 않는다.
+
+다음을 다시 확인한다.
+
+- `Docs/Stage7LocalMilestoneAudit.md`
+- `Docs/StageCompletionCriteria.md`
+- `Docs/RequirementsTraceability.md`
+- `Docs/PerformanceBaseline.md`
+- `WriterPadMetadataSchema.swift`
+- `AppEnvironment.swift`
+- `FutureChangeNotifying.swift`
+- 저장·바인더·휴지통·백업·듀얼 편집기 실제 호출 경계
+
+깨끗한 DerivedData에서 단위·UI 테스트와 빌드를 다시 실행한다. 7단계 기준과 달라진 실패가 있으면 서버 작업 전에 해결하거나 명시적으로 차단한다.
+
+### 완료 조건
+
+- 1~7단계 복구 기준이 식별된다.
+- 현재 테스트 수와 실패·미실행 항목이 기록된다.
+- 서버 기능이 실제로 없다는 정적 검사가 통과한다.
+- 기존 사용자 TXT를 건드리지 않고 8-2로 진입할 수 있다.
+
+### 여기까지
+
+## 8-2. SQL·Windows v2 계약 감사
+
+### 지금부터
+
+다음 파일을 읽기 전용으로 대조한다.
+
+- `참조파일/20260714000000_supabase_v2_protocol.sql`
+- `참조파일/20260714010000_windows_v2_client_support.sql`
+- `참조파일/sync_manager.py`
+- `참조파일/sync_v2_store.py`
+- `참조파일/three_way_merge.py`
+- `참조파일/project_manager_writing.py`
+- `참조파일/writing_tree.py`
+- `참조파일/windows_v2_dual_test.py`
+- `참조파일/test_sync_v2.py`
+- `참조파일/test_sync_state.py`
+- `참조파일/test_writing_data.py`
+- `참조파일/test_dual_v2_runner.py`
+
+`Docs/SyncV2Contract.md`를 새로 작성한다. 최소한 다음을 정확히 기록한다.
+
+RPC:
+
+- `ensure_project(p_project_id, p_name)`
+- `acquire_edit_lease(p_document_id, p_device_id, p_ttl_seconds)`
+- `renew_edit_lease(p_document_id, p_device_id, p_lease_token, p_ttl_seconds)`
+- `release_edit_lease(p_document_id, p_device_id, p_lease_token)`
+- `get_edit_lease(p_document_id, p_device_id)`
+- `commit_document(p_document_id, p_project_id, p_base_revision, p_operation_id, p_device_id, p_relative_path, p_content, p_is_deleted, p_lease_token)`
+
+테이블·읽기 계약:
+
+- `projects`
+- `project_members`
+- `documents`
+- `document_versions`
+- `edit_leases`
+- RLS 정책과 authenticated 역할
+- 문서 snapshot을 읽는 실제 select·filter·정렬 방식
+
+안정 오류 코드:
+
+- `AUTH_REQUIRED`
+- `FORBIDDEN`
+- `INVALID_ARGUMENT`
+- `DOCUMENT_NOT_FOUND`
+- `DOCUMENT_ALREADY_EXISTS`
+- `REVISION_CONFLICT`
+- `OPERATION_ID_REUSED`
+- `LEASE_REQUIRED`
+- `LEASE_CONFLICT`
+- `LEASE_EXPIRED`
+- `PATH_CONFLICT`
+
+반드시 확인할 세부 규칙:
+
+- `ensure_project`는 두 번째 SQL에서 보정된 최종 정의를 기준으로 한다.
+- 새 문서는 base revision 0, non-delete, nil lease로만 생성한다.
+- 기존 문서 commit에는 유효 lease가 필요하다.
+- 같은 operation_id와 같은 payload는 멱등 성공으로 수렴한다.
+- 같은 operation_id의 다른 payload는 `OPERATION_ID_REUSED`다.
+- 본문은 UTF-8 최대 10MiB다.
+- 상대 경로 최대 길이와 금지 형태를 확인한다.
+- 서버 hash, revision, committed_at 응답 필드를 fixture로 고정한다.
+- 숨은 문서는 일반 문서와 같은 commit 계약을 쓰되 UI에서 제외한다.
+
+### 완료 조건
+
+- 추측이 없는 Swift 요청·응답·오류 타입 초안이 있다.
+- SQL 두 파일의 중복·보정 관계가 문서화된다.
+- 앱에서 직접 읽어야 할 테이블과 RPC 경계가 구분된다.
+- 새 서버 migration 필요 여부를 결론내린다.
+
+### 여기까지
+
+## 8-3. 로컬 사건과 서버 사건 매핑
+
+### 지금부터
+
+현재 코드의 실제 변경 사건을 전부 표로 만든다.
+
+- 앱 시작
+- 작품 생성·이름 변경·삭제 목록 이동·복원·영구 삭제
+- TXT 생성·저장·이름 변경·이동
+- 폴더 생성·이름 변경·이동·삭제
+- 새 권과 25화 일괄 생성
+- 문서 휴지통 이동·복원·영구 삭제·전체 비우기
+- 바인더 순서 변경
+- 백업 복원
+- Windows 작품 가져오기
+- 원고 내보내기
+
+각 사건을 다음 중 하나로 분류한다.
+
+- v2 문서 commit
+- 숨은 tree-order commit
+- 숨은 trash-purge commit
+- 프로젝트 `ensure_project`
+- 로컬 전용
+- 서버 계약이 없어 보류
+
+현재 `LocalChangeEvent`에서 빠진 path·본문 snapshot·generation·rename·move·reorder를 확인한다. durable queue 등록 실패를 호출자가 알 수 있도록 새 protocol은 오류 또는 명시적 결과를 반환해야 한다.
+
+특히 다음 정책을 확정한다.
+
+- 백업 복원은 복원된 본문을 새 로컬 수정으로 enqueue한다.
+- Windows 가져오기 문서는 사용자 확인 후 한 번에 서버 연결한다.
+- 원고 내보내기는 로컬 전용이다.
+- 로컬 백업 파일은 서버에 올리지 않는다.
+- 작품 삭제는 서버 삭제 RPC가 없으므로 기본적으로 로컬 전용이다.
+- 빈 폴더 보존은 tree-order 숨은 문서로 가능한지 검증하고, 불가능하면 기능 제한을 명시한다.
+- 듀얼 편집기의 같은 문서는 하나의 저장 generation·하나의 문서 큐 순서를 사용한다.
+
+### 완료 조건
+
+- 현재 모든 로컬 변경 사건이 누락 없이 분류된다.
+- `FutureChangeNotifying` 유지·교체·호환 adapter 계획이 확정된다.
+- 폴더와 작품 삭제의 교차 기기 정책이 문서화된다.
+
+### 여기까지
+
+## 8-4. SyncV2Store와 migration 설계
+
+### 지금부터
+
+SwiftData V1과 분리된 SQLite 저장소를 설계한다.
+
+최소 테이블:
+
+`sync_projects`
+
+- local_project_id
+- server_project_id
+- binding_kind
+- owner_user_id 또는 비민감 계정 식별자
+- created_at
+- updated_at
+
+`sync_documents`
+
+- document_id
+- project_id
+- local_path
+- server_path
+- server_revision
+- base_content
+- base_hash
+- is_deleted
+- server_updated_at
+- sync_state
+- last_error_code
+
+`sync_operations`
+
+- queue_id
+- operation_id
+- document_id
+- project_id
+- base_revision
+- base_content
+- relative_path
+- content
+- is_deleted
+- status
+- attempts
+- last_error_code
+- created_at
+- updated_at
+- next_attempt_at
+
+`sync_conflicts`
+
+- conflict_id
+- operation_id
+- document_id
+- base_content
+- local_content
+- remote_content
+- merged_content
+- remote_revision
+- remote_path
+- conflict_count
+- created_at
+- resolved_at
+
+설계 원칙:
+
+- SQLite WAL과 foreign key를 켠다.
+- 모든 접근은 `SyncV2Store` actor 하나로 직렬화한다.
+- 전체 본문 중복은 `base_content`, pending payload, conflict 원본이라는 동기화 책임에만 허용한다.
+- SwiftData V1이 열리지 않아도 TXT를 손상시키지 않는다.
+- SyncV2Store가 열리지 않아도 로컬 앱은 실행되고 저장된다.
+- SyncV2Store 생성·migration 실패는 서버 기능만 비활성화하고 진단한다.
+- 1~7단계 사용자는 별도 DB를 처음 생성하므로 SwiftData migration은 하지 않는다.
+- 향후 SyncV2Store schema version과 순방향 migration을 처음부터 둔다.
+
+### 완료 조건
+
+- SQLite schema와 transaction 경계가 문서화된다.
+- SwiftData V1 무변경 결정 또는 변경 필요성이 근거와 함께 확정된다.
+- migration 실패·저장 공간 부족·DB 손상 복구 정책이 있다.
+
+### 여기까지
+
+## 8단계 완료 조건
+
+- 1~7단계 기준선이 복구 가능하게 고정됐다.
+- 실제 SQL·Windows v2 계약 문서가 있다.
+- 모든 로컬 사건의 서버 매핑이 확정됐다.
+- SyncV2Store가 SwiftData·로컬 백업과 분리 설계됐다.
+- 빈 폴더·작품 삭제·큰 파일 정책의 미결정 사항이 숨겨지지 않았다.
+
+---
+
+# 3. 9단계 — Supabase 기반·인증·프로젝트 연결
+
+## 9-1. 공개 설정과 supabase-swift 주입
+
+### 지금부터
+
+공식 `supabase-swift` 패키지를 SPM으로 연결한다. 패키지 버전과 최소 OS 호환성을 고정하고 release note를 기록한다.
+
+`SupabaseClientProvider`를 구현하되 View와 ViewModel은 client를 직접 만들거나 참조하지 않는다. `AppEnvironment`에는 구체 client가 아니라 protocol 기반 서비스가 주입된다.
+
+설정을 다음처럼 분리한다.
+
+- Debug/Test/Release용 xcconfig 또는 생성 plist
+- Git에 포함하는 example
+- Git에서 제외하는 실제 로컬 값
+- URL과 publishable key만 앱 번들에 허용
+- service role key, access token, refresh token, 이메일, 비밀번호 금지
+
+설정 누락·잘못된 URL·네트워크 없음은 앱 시작과 로컬 저장을 막지 않는다.
+
+### 검증
+
+- 설정 없음
+- URL 형식 오류
+- Debug/Test/Release 분리
+- 전역 client 직접 참조 정적 검사
+- 비밀값 source·plist·로그 미포함 검사
+
+### 여기까지
+
+## 9-2. Keychain 세션과 인증 상태
+
+### 지금부터
+
+`SupabaseAuthService`와 `KeychainSessionStore`를 actor 경계로 구현한다.
+
+- 이메일·비밀번호 로그인
+- 비밀번호 미저장
+- access·refresh token Keychain 저장
+- 앱 시작 시 서버 검증을 거친 세션 복원
+- 만료·폐기·재사용 refresh token 구분
+- Keychain 접근 실패 구분
+- 로그아웃 시 메모리·Keychain 세션 정리
+- stale user 객체만으로 로그인 표시 금지
+- 토큰·비밀번호·전체 이메일 로그 금지
+
+회원 가입, 비밀번호 재설정, 계정 삭제는 이번 단계에 자동 포함하지 않는다. 제품 요구가 생기면 별도 승인 후 추가한다.
+
+로그인하지 않아도 로컬 저장을 허용한다. 인증이 필요한 pending operation은 삭제하지 않고 대기시킨다.
+
+### 여기까지
+
+## 9-3. 설치별 device_id
+
+### 지금부터
+
+설치별 UUID를 생성해 Keychain 또는 설치 수명과 맞는 안전한 저장소에 보존한다.
+
+- 앱 재실행마다 바뀌지 않는다.
+- 일반 로그에 전체 값 노출을 최소화한다.
+- Keychain 손상·복원·앱 재설치 정책을 ADR로 기록한다.
+- operation 생성 후 device_id가 바뀌는 예외 상황의 처리 규칙을 둔다.
+
+### 여기까지
+
+## 9-4. 프로젝트 binding과 ensure_project
+
+### 지금부터
+
+로컬 project UUID와 서버 project UUID의 관계를 SyncV2Store에 저장한다.
+
+연결 흐름을 구분한다.
+
+- 새 서버 프로젝트 생성
+- 사용자가 UUID를 확인한 기존 서버 프로젝트 연결
+- 가져온 Windows 프로젝트 연결
+- 연결 해제
+
+같은 이름만 보고 자동 병합하지 않는다. `ensure_project`는 이름 변경에도 같은 UUID를 유지한다. RLS 거부를 빈 프로젝트나 단순 네트워크 오류로 표시하지 않는다.
+
+작품 삭제 목록 이동과 서버 project 삭제는 연결하지 않는다. 서버 삭제 계약이 추가되기 전까지 binding과 원격 데이터는 보존한다.
+
+### 여기까지
+
+## 9단계 완료 조건
+
+- Supabase client가 환경 주입 경계 안에만 있다.
+- 실제 검증된 세션만 로그인 상태로 표시된다.
+- token과 device_id가 안전하게 보존된다.
+- 사용자 확인 없는 이름 기반 프로젝트 병합이 없다.
+- Supabase 미설정·로그아웃 상태에서도 1~7단계가 그대로 동작한다.
+
+---
+
+# 4. 10단계 — 영구 operation queue와 로컬 저장 연결
+
+## 10-1. SyncV2Store 구현
+
+### 지금부터
+
+8-4의 schema를 구현하고 fixture DB로 검증한다.
+
+- 새 DB 생성
+- WAL 재오픈
+- transaction rollback
+- schema version migration
+- 일부 손상 row
+- 중복 document_id·operation_id
+- 1,000건 queue
+- 앱 시작 시 inflight를 같은 operation_id의 pending으로 복구
+
+### 여기까지
+
+## 10-2. enqueue와 문서별 순서
+
+### 지금부터
+
+operation 상태는 최소 다음을 구분한다.
+
+- pending
+- inflight
+- completed
+- conflict
+- cancelled
+
+같은 문서의 작업은 순서를 보존한다. 아직 전송하지 않은 동일 본문 저장은 안전할 때만 합친다. rename, move, delete, restore는 서버 기준을 모른 채 제거하지 않는다.
+
+operation_id는 생성 후 재시도·재실행·네트워크 전환에도 바꾸지 않는다.
+
+### 여기까지
+
+## 10-3. LocalDocumentStore·저장 세션 연결
+
+### 지금부터
+
+현재 저장 순서를 유지한다.
+
+1. 편집기 snapshot 확정
+2. 로컬 TXT 원자 저장
+3. 로컬 SHA-256·SwiftData 갱신
+4. durable operation enqueue
+5. UI 상태 갱신
+
+IME 조합 중간 본문을 enqueue하지 않는다. 저장 generation이 역전되면 오래된 operation이 최신 본문으로 가장하지 않게 한다. 같은 문서를 좌우에서 열어도 document queue는 하나다.
+
+enqueue 실패는:
+
+- 로컬 저장 성공을 취소하지 않는다.
+- `로컬 저장됨 · 동기화 기록 실패`처럼 고위험 상태로 표시한다.
+- 사용자가 다시 기록할 수 있게 한다.
+- 다음 저장에서 조용히 사라지지 않는다.
+
+### 여기까지
+
+## 10-4. 구조 변경·복원·가져오기 연결
+
+### 지금부터
+
+다음을 durable 사건으로 연결한다.
+
+- TXT 생성
+- 이름 변경·이동
+- 휴지통 이동
+- 휴지통 복원
+- 백업 복원 후 본문 변경
+- 새 권 25화
+- Windows 가져오기 후 명시적 서버 연결
+- 바인더 reorder
+- 휴지통 영구 삭제·비우기
+
+로컬 거래가 완료되기 전 operation을 만들지 않는다. 대량 작업 중 일부 operation만 기록되는 문제를 막기 위해 로컬 거래 결과와 queue 등록 결과의 복구 저널을 설계한다.
+
+### 여기까지
+
+## 10-5. 10MiB preflight와 no-op 저장
+
+### 지금부터
+
+UTF-8 byte count가 서버 제한을 넘는 문서는 로컬 저장과 백업을 계속 허용한다. 서버 요청 전에 차단하고 `서버 크기 제한 초과` 상태로 보존한다.
+
+서버 revision·server_path·base_content와 같고 활성 operation이 없는 동일 본문 저장은 새 revision을 만들지 않는다.
+
+### 여기까지
+
+## 10단계 완료 조건
+
+- 로컬 저장 후 operation이 영구 보존된다.
+- 강제 종료 후 같은 operation_id로 복구된다.
+- queue 실패와 서버 크기 제한이 로컬 저장 실패로 표현되지 않는다.
+- 저장·rename·move·delete·restore·reorder 사건이 누락되지 않는다.
+
+---
+
+# 5. 11단계 — commit·재시도·lease·원격 pull
+
+## 11-1. commit_document와 오류 분류
+
+### 지금부터
+
+SQL fixture와 정확히 일치하는 `SyncV2Client.commitDocument`를 구현한다.
+
+성공 응답에는 revision, content hash, committed_at 등 계약상 필수값이 있어야 한다. 응답 누락은 성공으로 처리하지 않는다.
+
+다음을 구분한다.
+
+- 인증 필요
+- RLS forbidden
+- 네트워크·timeout
+- lease required·conflict·expired
+- revision conflict
+- path conflict
+- document already exists/not found
+- operation_id reused
+- invalid argument
+- 잘못된 서버 응답
+
+서버 성공과 SyncV2Store 반영 사이에 앱이 종료되어도 같은 operation_id 재전송으로 수렴해야 한다.
+
+### 여기까지
+
+## 11-2. dispatcher와 재시도
+
+### 지금부터
+
+문서별 순서를 지키는 제한 동시성 dispatcher를 구현한다.
+
+- 지수 backoff와 jitter
+- 로그인 성공
+- 앱 foreground
+- 사용자의 명시적 재시도
+- 실제 네트워크 복구
+
+위 사건은 즉시 재시도 기회를 준다. `NWPathMonitor`는 기회 신호일 뿐 성공 판정이 아니다. conflict 한 건이 다른 문서 pending을 막지 않는다.
+
+### 여기까지
+
+## 11-3. document_id 단위 edit lease
+
+### 지금부터
+
+`EditLeaseManager` actor를 구현한다.
+
+- revision 0 새 문서는 lease 없이 첫 commit
+- 기존 문서는 편집 진입 또는 commit 전 lease 획득
+- 활성 document_id별 heartbeat
+- 좌우에 같은 문서가 열려도 lease 하나
+- 한쪽을 닫아도 다른 쪽이 활성이라면 유지
+- 문서 전환·양쪽 닫기·삭제·충돌·앱 종료 시 가능한 범위에서 release
+- 비활성 background commit lease는 commit 직후 release
+- offline 편집은 허용하되 충돌 가능 상태 표시
+
+lease token은 메모리에 두고 일반 SwiftData·로그에 기록하지 않는다.
+
+### 여기까지
+
+## 11-4. 서버 snapshot pull
+
+### 지금부터
+
+RLS가 적용된 `documents` 읽기로 프로젝트 snapshot을 가져온다.
+
+자동 적용 조건:
+
+- remote revision이 더 높다.
+- 해당 문서에 pending·inflight·conflict가 없다.
+- 편집기가 dirty가 아니다.
+- marked text 조합 중이 아니다.
+
+clean 열린 문서는 안전하게 본문·경로·revision을 갱신한다. dirty·IME 조합 문서는 덮어쓰지 않고 merge 대상으로 보낸다.
+
+원격 rename은 UUID를 유지하고 파일 이동·SwiftData·SyncV2Store가 복구 가능한 거래로 수렴해야 한다. 다른 UUID의 로컬 path를 덮어쓰지 않는다.
+
+### 여기까지
+
+## 11-5. Realtime trigger와 상태 UI
+
+### 지금부터
+
+Realtime은 snapshot pull trigger로만 사용한다.
+
+- 중복·누락·역순 이벤트 허용
+- debounce
+- 재연결 catch-up
+- foreground pull
+- 주기 pull
+- background에서 무리한 상시 연결 금지
+
+상태 reducer 한곳에서 다음 우선순위를 정한다.
+
+- 편집 중
+- 로컬 저장 중
+- 로컬 저장됨
+- 동기화 기록 실패
+- 서버 동기화 중
+- 서버 동기화됨
+- 오프라인 저장됨
+- 동기화 대기
+- 인증 필요
+- 서버 크기 제한 초과
+- 다른 기기 편집 중
+- 자동 병합됨
+- 충돌 해결 필요
+- 동기화 실패
+
+색상만 사용하지 않고 문구·아이콘·VoiceOver·상세 오류를 제공한다.
+
+### 여기까지
+
+## 11단계 완료 조건
+
+- 같은 operation_id의 commit이 멱등 수렴한다.
+- lease가 document_id 단위로 안전하게 유지·해제된다.
+- dirty·IME 편집기를 pull이 덮어쓰지 않는다.
+- Realtime 누락과 관계없이 snapshot pull로 수렴한다.
+- 로컬 저장과 서버 동기화 상태가 명확히 분리된다.
+
+---
+
+# 6. 12단계 — 3방향 병합과 충돌 해결
+
+## 12-1. 순수 Swift ThreeWayMerge
+
+### 지금부터
+
+Windows `three_way_merge.py`의 관찰 가능한 동작을 순수 Swift로 이식한다. Python 구조는 복사하지 않고 Base·Local·Remote 입력과 결과 계약만 맞춘다.
+
+공유 가능한 JSON fixture를 만든다.
+
+- 서로 다른 줄 수정
+- 인접 삽입
+- 줄 삭제
+- 마지막 개행
+- 빈 문서
+- 한글·이모지
+- 같은 줄 겹침
+- 큰 문서
+
+같은 줄의 다른 수정은 어느 한쪽을 조용히 선택하지 않는다.
+
+### 여기까지
+
+## 12-2. 자동 rebase
+
+### 지금부터
+
+revision conflict 시 document_id로 최신 remote를 읽는다.
+
+- Base: operation의 base_content
+- Local: 디스크가 아니라 현재 세션 generation까지 고려한 최신 로컬 본문
+- Remote: 서버 최신 본문
+
+비겹침이면 remote revision과 remote content를 새 base로 operation을 rebase한다. merge 중 사용자가 더 입력했다면 generation 비교로 오래된 결과 적용을 막는다.
+
+path와 content는 독립적으로 병합하되 다른 UUID가 목적 path를 점유하면 중단한다.
+
+### 여기까지
+
+## 12-3. 충돌 원본 영구 보존
+
+### 지금부터
+
+겹침 충돌에서는 현재 로컬 TXT를 덮어쓰지 않는다.
+
+SyncV2Store에 Base·Local·Remote·Merged·remote revision·remote path·operation_id를 transaction으로 보존한다. 필요하면 기존 `LocalBackupStore`의 충돌 사유를 이용해 사용자용 TXT 사본을 추가하되, sync conflict DB와 로컬 백업의 책임을 합치지 않는다.
+
+재실행 후에도 세 원본을 열 수 있어야 한다.
+
+### 여기까지
+
+## 12-4. iPad 충돌 해결 화면
+
+### 지금부터
+
+Base·내 로컬본·서버 최신본·병합 결과를 비교한다.
+
+- 가로: 비교 패널
+- 세로: 탭 또는 단계형 UI
+- 세 원본 읽기 전용
+- 해결 결과만 편집 가능
+- VoiceOver·외장 키보드·회전 지원
+
+해결 저장은 remote revision과 remote content를 새 base로 새 operation을 만든다. 이전 conflict operation은 resolved/cancelled 이력을 남긴다.
+
+### 여기까지
+
+## 12단계 완료 조건
+
+- Windows와 Swift fixture 결과가 일치한다.
+- 비겹침은 자동 rebase된다.
+- 겹침은 로컬 TXT를 덮어쓰지 않는다.
+- 재실행 후에도 세 원본과 해결 상태가 보존된다.
+- rename과 본문 수정이 UUID 하나로 수렴한다.
+
+---
+
+# 7. 13단계 — tombstone·숨은 문서·경로 복구
+
+## 13-1. 삭제·복원·재삭제
+
+### 지금부터
+
+로컬 휴지통 이동 후 같은 document_id로 `p_is_deleted = true` commit을 등록한다. 생성 직후 삭제도 create 뒤 delete 순서를 유지한다.
+
+복원은 같은 UUID와 더 높은 revision으로 `is_deleted = false`를 commit한다. 원래 path 충돌 시 사용자가 안전한 위치를 선택한다.
+
+늦게 도착한 편집 저장이 삭제된 path를 새 문서로 부활시키지 않게 generation·tombstone 상태를 확인한다.
+
+### 여기까지
+
+## 13-2. tree-order 숨은 문서
+
+### 지금부터
+
+`__antigravity__/tree-order.json`을 프로젝트 설정 문서로 동기화한다.
+
+- 프로젝트 namespace 기반 결정적 UUID
+- 일반 바인더·검색·내보내기·휴지통에서 숨김
+- 빠른 reorder coalesce
+- remote revision 위 rebase
+- 폴더 UUID·빈 폴더 표현 가능 여부 검증
+
+빈 폴더를 표현할 수 없다면 조용히 유실시키지 말고 “다른 기기에는 내용이 생길 때까지 나타나지 않음” 등 확정 정책을 UI와 문서에 명시한다.
+
+### 여기까지
+
+## 13-3. trash-purge 숨은 문서
+
+### 지금부터
+
+`__antigravity__/trash-purge.json`에 문서별 purged revision과 전체 비우기 generation을 기록한다.
+
+stale tombstone이 다른 기기에서 다시 나타나지 않게 한다. 같은 UUID가 purge revision보다 높은 revision으로 다시 삭제되면 새 사건으로 허용한다.
+
+### 여기까지
+
+## 13-4. 누락 사본과 경로 충돌 복구
+
+### 지금부터
+
+clean live TXT 또는 tombstone 사본이 사라졌을 때 같은 revision의 remote snapshot으로만 복구한다. pending·inflight·conflict 문서는 자동 복구하지 않는다.
+
+다른 UUID가 점유한 live path는 덮어쓰지 않는다. 휴지통 사본은 document_id가 포함된 안전한 경로로 재배치할 수 있다.
+
+### 여기까지
+
+## 13단계 완료 조건
+
+- 삭제·복원·재삭제가 같은 UUID와 증가 revision으로 동작한다.
+- 숨은 문서가 일반 UI와 내보내기에 나타나지 않는다.
+- purge 이후 stale tombstone이 부활하지 않는다.
+- 빈 폴더 정책이 실제 교차 기기 동작과 일치한다.
+- 누락 clean 사본이 원고 손실 없이 복구된다.
+
+---
+
+# 8. 14단계 — Windows·iPad 교차 검증과 릴리스
+
+## 14-1. 격리 환경
+
+### 지금부터
+
+Windows A, Windows B, iPad가 각각 독립 device_id·app data·SQLite queue를 사용한다. 매 시나리오는 새 UUID 프로젝트와 비실제 원고 fixture로 시작한다.
+
+기록:
+
+- project_id
+- document_id
+- operation_id
+- device_id의 마스킹 값
+- 시작·종료 revision
+- content hash
+- local_path·server_path
+- is_deleted
+
+기록 금지:
+
+- token
+- 비밀번호
+- 전체 이메일
+- 실제 원고
+
+### 여기까지
+
+## 14-2. 교차 수용 시나리오
+
+### 지금부터
+
+최소 다음을 실제 환경에서 검증한다.
+
+1. iPad 저장 → commit 전 강제 종료 → 같은 operation_id 재시도
+2. Windows와 iPad offline 비겹침 수정 → 자동 병합
+3. 같은 줄 겹침 수정 → 세 원본 보존과 해결 화면
+4. Windows rename + iPad 본문 수정
+5. iPad rename + Windows 본문 수정
+6. Windows 삭제 + iPad offline 수정
+7. iPad 삭제 + Windows 복원
+8. 삭제→복원→재삭제 반복
+9. 휴지통 비우기 + 다른 기기 stale tombstone
+10. tree order 동시 변경
+11. 10MiB 초과 로컬 문서
+12. 빈 폴더·폴더 이동
+13. 로그아웃·세션 만료·RLS 거부 중 로컬 편집
+
+최종 UUID·revision·hash가 수렴해야 한다.
+
+### 여기까지
+
+## 14-3. 스트레스와 lifecycle
+
+### 지금부터
+
+- 문서 100개 빠른 생성
+- 중간 30개 삭제
+- reorder 50회
+- queue 1,000건
+- 네트워크 on/off
+- background·foreground
+- 화면 잠금
+- 강제 종료
+- Realtime 이벤트 폭주
+- 메모리 압박
+- protected data 접근 불가
+
+background 진입 시 로컬 snapshot과 SQLite transaction을 우선 보존하고 서버 완료를 무리하게 기다리지 않는다.
+
+### 여기까지
+
+## 14-4. 성능 재측정
+
+### 지금부터
+
+7단계 M4 Release 기준선과 같은 fixture로 비교한다.
+
+- 프로젝트 진입 median/p95
+- 화 전환 median/p95
+- 로컬 저장
+- enqueue
+- commit
+- pull 적용
+- 검색 1,500파일
+- 메모리 최고치
+- main actor heartbeat
+- 250ms 이상 hang
+- 에너지
+
+서버 지연이 타이핑·화 전환·로컬 저장 지연으로 전파되면 완료가 아니다.
+
+### 여기까지
+
+## 14-5. 진단·개인정보·업데이트
+
+### 지금부터
+
+사용자 내보내기형 동기화 진단 보고서를 만든다.
+
+기본 허용:
+
+- 마스킹된 project/document/operation 식별자
+- revision
+- 상태·안정 오류 코드
+- 시각
+- 앱·OS 버전
+- 기기 모델
+
+기본 금지:
+
+- 본문
+- token·비밀번호·publishable key 전체
+- 전체 이메일
+- 개인 절대 경로
+
+로컬 전용 1~7단계 앱에서 업데이트했을 때 기존 TXT와 SwiftData V1이 그대로 열리고 SyncV2Store가 안전하게 생성되는지 검증한다. 앱 배포 과정에서 SQL을 자동 실행하지 않는다.
+
+### 여기까지
+
+## 14-6. 최종 회귀와 TestFlight
+
+### 지금부터
+
+1~14단계 추적표를 갱신하고 다음을 확인한다.
+
+- placeholder·skipped test·가짜 서버 통합 테스트 공개
+- 실제 iPad Pro 11-inch 기능 검증
+- M4 Release 성능 비교
+- Windows A/B/iPad 교차 결과
+- Archive 빌드
+- Debug 메뉴·테스트 계정·fixture·로컬 설정 미포함
+- App Privacy·Keychain·네트워크·파일 내보내기 설명
+- 설치·업데이트·삭제 후 재설치
+
+### 여기까지
+
+## 14단계 완료 조건
+
+- Windows A/B/iPad가 UUID·revision·본문 hash로 수렴한다.
+- 강제 종료·offline·인증 실패에도 로컬 원고와 queue가 보존된다.
+- 서버 기능 추가 후에도 7단계 로컬 성능과 IME 안정성을 유지한다.
+- 진단 로그에 본문과 비밀값이 없다.
+- 1~7단계 설치본에서 안전하게 업데이트된다.
+- TestFlight 내부 배포가 가능하다.
+
+---
+
+# 9. 최종 우선순위와 중단 지점
+
+구현 순서는 반드시 다음을 따른다.
+
+1. 8단계 계약·사건표·저장 경계
+2. 9단계 설정·인증·device_id·binding
+3. 10단계 durable queue와 모든 로컬 사건 연결
+4. 11단계 commit·retry·lease·pull·Realtime·상태 UI
+5. 12단계 병합·충돌
+6. 13단계 tombstone·숨은 문서·복구
+7. 14단계 교차 수용·성능·TestFlight
+
+인증 UI가 보인다는 이유로 queue 없이 문서 commit부터 연결하지 않는다.
+Realtime이 연결된다는 이유로 snapshot pull 없이 원격 본문을 적용하지 않는다.
+서버 성공을 기다리느라 로컬 TXT 저장을 늦추지 않는다.
+SwiftData migration이 필요하다는 근거 없이 V1 모델에 서버 필드를 추가하지 않는다.
+
+14단계 자동 테스트, 실제 iPad 검증, Windows A/B/iPad 교차 테스트, Archive·TestFlight 준비가 끝나면 개발을 중단하고 완료·미검증·알려진 위험을 보고한다.

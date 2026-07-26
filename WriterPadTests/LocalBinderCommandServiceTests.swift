@@ -35,6 +35,173 @@ final class LocalBinderCommandServiceTests: XCTestCase {
         XCTAssertEqual(storedText?.parentID, folderResult.affectedDocumentID)
     }
 
+    func testCreateAutomaticallyNumbersDuplicateTextAndFolderNames() async throws {
+        let harness = try await makeHarness()
+        let notes = try await fixedRoot(.notes, harness: harness)
+
+        var textPaths: [String] = []
+        for _ in 0..<3 {
+            let result = try await harness.commands.create(
+                kind: .text,
+                named: "새 문서",
+                in: notes.id,
+                projectID: harness.project.id
+            )
+            textPaths.append(result.relativePath.rawValue)
+        }
+
+        var folderPaths: [String] = []
+        for _ in 0..<3 {
+            let result = try await harness.commands.create(
+                kind: .folder,
+                named: "새 폴더",
+                in: notes.id,
+                projectID: harness.project.id
+            )
+            folderPaths.append(result.relativePath.rawValue)
+        }
+
+        XCTAssertEqual(
+            textPaths,
+            [
+                "메인/메모장/새 문서.txt",
+                "메인/메모장/새 문서_2.txt",
+                "메인/메모장/새 문서_3.txt"
+            ]
+        )
+        XCTAssertEqual(
+            folderPaths,
+            [
+                "메인/메모장/새 폴더",
+                "메인/메모장/새 폴더_2",
+                "메인/메모장/새 폴더_3"
+            ]
+        )
+        XCTAssertTrue(fileExists(textPaths[1], harness: harness))
+        XCTAssertTrue(fileExists(folderPaths[2], harness: harness))
+    }
+
+    func testTopLevelCreationAndMoveAcceptFoldersButRejectDocuments() async throws {
+        let harness = try await makeHarness()
+        let rootID = try await harness.binder.rootContainerID(in: harness.project.id)
+        let notes = try await fixedRoot(.notes, harness: harness)
+
+        await assertBinderError(.topLevelRequiresFolder) {
+            _ = try await harness.commands.create(
+                kind: .text,
+                named: "최상위 문서",
+                in: rootID,
+                projectID: harness.project.id
+            )
+        }
+        let rootFolder = try await harness.commands.create(
+            kind: .folder,
+            named: "최상위 폴더",
+            in: rootID,
+            projectID: harness.project.id
+        )
+        XCTAssertEqual(rootFolder.relativePath.rawValue, "메인/최상위 폴더")
+
+        let text = try await harness.commands.create(
+            kind: .text,
+            named: "내부 문서",
+            in: notes.id,
+            projectID: harness.project.id
+        )
+        await assertBinderError(.topLevelRequiresFolder) {
+            _ = try await harness.commands.move(
+                documentID: text.affectedDocumentID,
+                to: .topLevel,
+                projectID: harness.project.id
+            )
+        }
+        let textAfterRejectedMove = try await harness.repository.document(
+            id: text.affectedDocumentID
+        )
+        XCTAssertEqual(textAfterRejectedMove?.relativePath, text.relativePath)
+
+        let nestedFolder = try await harness.commands.create(
+            kind: .folder,
+            named: "꺼낼 폴더",
+            in: notes.id,
+            projectID: harness.project.id
+        )
+        let moved = try await harness.commands.move(
+            documentID: nestedFolder.affectedDocumentID,
+            to: .topLevel,
+            projectID: harness.project.id
+        )
+        XCTAssertEqual(moved.relativePath.rawValue, "메인/꺼낼 폴더")
+        let movedFolder = try await harness.repository.document(
+            id: nestedFolder.affectedDocumentID
+        )
+        XCTAssertEqual(movedFolder?.parentID, rootID)
+    }
+
+    func testRestoreWithUnavailableOriginalParentUsesTopLevelOnlyForFolder() async throws {
+        let harness = try await makeHarness()
+        let notes = try await fixedRoot(.notes, harness: harness)
+
+        let folderParent = try await harness.commands.create(
+            kind: .folder,
+            named: "폴더 부모",
+            in: notes.id,
+            projectID: harness.project.id
+        )
+        let childFolder = try await harness.commands.create(
+            kind: .folder,
+            named: "복원 폴더",
+            in: folderParent.affectedDocumentID,
+            projectID: harness.project.id
+        )
+        _ = try await harness.commands.moveToTrash(
+            documentID: childFolder.affectedDocumentID,
+            projectID: harness.project.id
+        )
+        _ = try await harness.commands.moveToTrash(
+            documentID: folderParent.affectedDocumentID,
+            projectID: harness.project.id
+        )
+        let restoredFolder = try await harness.commands.restoreFromTrash(
+            documentID: childFolder.affectedDocumentID,
+            toFolderID: nil,
+            projectID: harness.project.id
+        )
+        XCTAssertEqual(restoredFolder.relativePath.rawValue, "메인/복원 폴더")
+
+        let textParent = try await harness.commands.create(
+            kind: .folder,
+            named: "문서 부모",
+            in: notes.id,
+            projectID: harness.project.id
+        )
+        let childText = try await harness.commands.create(
+            kind: .text,
+            named: "복원 문서",
+            in: textParent.affectedDocumentID,
+            projectID: harness.project.id
+        )
+        let trashedText = try await harness.commands.moveToTrash(
+            documentID: childText.affectedDocumentID,
+            projectID: harness.project.id
+        )
+        _ = try await harness.commands.moveToTrash(
+            documentID: textParent.affectedDocumentID,
+            projectID: harness.project.id
+        )
+        await assertBinderError(.documentCannotRestoreToTopLevel) {
+            _ = try await harness.commands.restoreFromTrash(
+                documentID: childText.affectedDocumentID,
+                toFolderID: nil,
+                projectID: harness.project.id
+            )
+        }
+        let textAfterRejectedRestore = try await harness.repository.document(
+            id: childText.affectedDocumentID
+        )
+        XCTAssertEqual(textAfterRejectedRestore?.relativePath, trashedText.relativePath)
+    }
+
     func testRenamePreservesDocumentIDAndContent() async throws {
         let harness = try await makeHarness()
         try writeText("본문", at: "메인/메모장/초안.txt", harness: harness)
@@ -58,6 +225,34 @@ final class LocalBinderCommandServiceTests: XCTestCase {
         XCTAssertEqual(after.relativePath.rawValue, "메인/메모장/완성.txt")
         XCTAssertEqual(try String(contentsOf: fileURL(after.relativePath.rawValue, harness: harness)), "본문")
         XCTAssertFalse(fileExists("메인/메모장/초안.txt", harness: harness))
+    }
+
+    func testRenameChapterKeepsStoredPrefixAndNormalizesSuffix() async throws {
+        let harness = try await makeHarness()
+        let manuscript = try await fixedRoot(.manuscript, harness: harness)
+        let volume = try await harness.commands.create(
+            kind: .folder,
+            named: "1권",
+            in: manuscript.id,
+            projectID: harness.project.id
+        )
+        let chapter = try await harness.commands.create(
+            kind: .text,
+            named: "001화",
+            in: volume.affectedDocumentID,
+            projectID: harness.project.id
+        )
+
+        let result = try await harness.commands.renameChapter(
+            documentID: chapter.affectedDocumentID,
+            titleSuffix: "  18화에서 회수할 복선  ",
+            projectID: harness.project.id
+        )
+
+        XCTAssertEqual(result.affectedDocumentID, chapter.affectedDocumentID)
+        XCTAssertEqual(result.relativePath.rawValue, "메인/원고/1권/001화 18화에서 회수할 복선.txt")
+        XCTAssertTrue(fileExists("메인/원고/1권/001화 18화에서 회수할 복선.txt", harness: harness))
+        XCTAssertFalse(fileExists("메인/원고/1권/018화에서 회수할 복선.txt", harness: harness))
     }
 
     func testLargeSubtreeMovePreservesEveryKnownID() async throws {
@@ -92,26 +287,82 @@ final class LocalBinderCommandServiceTests: XCTestCase {
         XCTAssertTrue(fileExists("메인/설정집/대규모/200.txt", harness: harness))
     }
 
-    func testDuplicateAndForbiddenNamesDoNotOverwriteAndOfferSafeAlternative() async throws {
+    func testMoveAutomaticallyNumbersDuplicateTextAndFolderNames() async throws {
+        let harness = try await makeHarness()
+        let notes = try await fixedRoot(.notes, harness: harness)
+        let settings = try await fixedRoot(.settings, harness: harness)
+
+        for _ in 0..<2 {
+            _ = try await harness.commands.create(
+                kind: .text,
+                named: "충돌",
+                in: settings.id,
+                projectID: harness.project.id
+            )
+            _ = try await harness.commands.create(
+                kind: .folder,
+                named: "자료",
+                in: settings.id,
+                projectID: harness.project.id
+            )
+        }
+        let sourceText = try await harness.commands.create(
+            kind: .text,
+            named: "충돌",
+            in: notes.id,
+            projectID: harness.project.id
+        )
+        try writeText("이동한 본문", at: sourceText.relativePath.rawValue, harness: harness)
+        let sourceFolder = try await harness.commands.create(
+            kind: .folder,
+            named: "자료",
+            in: notes.id,
+            projectID: harness.project.id
+        )
+        _ = try await harness.commands.create(
+            kind: .text,
+            named: "하위 문서",
+            in: sourceFolder.affectedDocumentID,
+            projectID: harness.project.id
+        )
+
+        let movedText = try await harness.commands.move(
+            documentID: sourceText.affectedDocumentID,
+            to: .folder(settings.id),
+            projectID: harness.project.id
+        )
+        let movedFolder = try await harness.commands.move(
+            documentID: sourceFolder.affectedDocumentID,
+            to: .folder(settings.id),
+            projectID: harness.project.id
+        )
+
+        XCTAssertEqual(movedText.relativePath.rawValue, "메인/설정집/충돌_3.txt")
+        XCTAssertEqual(movedFolder.relativePath.rawValue, "메인/설정집/자료_3")
+        XCTAssertEqual(
+            try String(contentsOf: fileURL(movedText.relativePath.rawValue, harness: harness)),
+            "이동한 본문"
+        )
+        XCTAssertTrue(fileExists("메인/설정집/자료_3/하위 문서.txt", harness: harness))
+        XCTAssertTrue(fileExists("메인/설정집/충돌.txt", harness: harness))
+        XCTAssertTrue(fileExists("메인/설정집/충돌_2.txt", harness: harness))
+        XCTAssertTrue(fileExists("메인/설정집/자료", harness: harness))
+        XCTAssertTrue(fileExists("메인/설정집/자료_2", harness: harness))
+    }
+
+    func testDuplicateNamesAreNumberedAndForbiddenNamesRemainRejected() async throws {
         let harness = try await makeHarness()
         try writeText("기존", at: "메인/메모장/메모.txt", harness: harness)
         let notes = try await fixedRoot(.notes, harness: harness)
         _ = try await harness.binder.children(of: notes.id, in: harness.project.id)
 
-        do {
-            _ = try await harness.commands.create(
-                kind: .text,
-                named: "메모",
-                in: notes.id,
-                projectID: harness.project.id
-            )
-            XCTFail("중복 이름이 통과했습니다.")
-        } catch let error as BinderCommandError {
-            guard case let .ruleDenied(_, suggestion) = error else {
-                return XCTFail("예상하지 못한 오류: \(error)")
-            }
-            XCTAssertEqual(suggestion, "메모 2.txt")
-        }
+        let numbered = try await harness.commands.create(
+            kind: .text,
+            named: "메모",
+            in: notes.id,
+            projectID: harness.project.id
+        )
+        XCTAssertEqual(numbered.relativePath.rawValue, "메인/메모장/메모_2.txt")
         await XCTAssertThrowsErrorAsync {
             _ = try await harness.commands.create(
                 kind: .folder,
@@ -121,6 +372,7 @@ final class LocalBinderCommandServiceTests: XCTestCase {
             )
         }
         XCTAssertEqual(try String(contentsOf: fileURL("메인/메모장/메모.txt", harness: harness)), "기존")
+        XCTAssertTrue(fileExists("메인/메모장/메모_2.txt", harness: harness))
     }
 
     func testInvalidDropsAndSelfDescendantMoveAreRejected() async throws {
@@ -262,6 +514,164 @@ final class LocalBinderCommandServiceTests: XCTestCase {
         XCTAssertEqual(originalPath.rawValue, "메인/메모장/지울 문서.txt")
     }
 
+    func testMoveToTrashAutomaticallyNumbersDuplicateFileAndFolderNames() async throws {
+        let harness = try await makeHarness()
+        let notes = try await fixedRoot(.notes, harness: harness)
+        let settings = try await fixedRoot(.settings, harness: harness)
+        let characters = try await fixedRoot(.characters, harness: harness)
+
+        let textOne = try await harness.commands.create(
+            kind: .text, named: "새 문서", in: notes.id, projectID: harness.project.id
+        )
+        let textTwo = try await harness.commands.create(
+            kind: .text, named: "새 문서", in: settings.id, projectID: harness.project.id
+        )
+        let textThree = try await harness.commands.create(
+            kind: .text, named: "새 문서", in: characters.id, projectID: harness.project.id
+        )
+
+        let firstTrash = try await harness.commands.moveToTrash(
+            documentID: textOne.affectedDocumentID, projectID: harness.project.id
+        )
+        let secondTrash = try await harness.commands.moveToTrash(
+            documentID: textTwo.affectedDocumentID, projectID: harness.project.id
+        )
+        let thirdTrash = try await harness.commands.moveToTrash(
+            documentID: textThree.affectedDocumentID, projectID: harness.project.id
+        )
+
+        XCTAssertEqual(firstTrash.relativePath.rawValue, "메인/휴지통/새 문서.txt")
+        XCTAssertEqual(secondTrash.relativePath.rawValue, "메인/휴지통/새 문서_2.txt")
+        XCTAssertEqual(thirdTrash.relativePath.rawValue, "메인/휴지통/새 문서_3.txt")
+        XCTAssertTrue(fileExists(secondTrash.relativePath.rawValue, harness: harness))
+        XCTAssertTrue(fileExists(thirdTrash.relativePath.rawValue, harness: harness))
+
+        let folderOne = try await harness.commands.create(
+            kind: .folder, named: "자료", in: notes.id, projectID: harness.project.id
+        )
+        let folderTwo = try await harness.commands.create(
+            kind: .folder, named: "자료", in: settings.id, projectID: harness.project.id
+        )
+        _ = try await harness.commands.moveToTrash(
+            documentID: folderOne.affectedDocumentID, projectID: harness.project.id
+        )
+        let numberedFolder = try await harness.commands.moveToTrash(
+            documentID: folderTwo.affectedDocumentID, projectID: harness.project.id
+        )
+        XCTAssertEqual(numberedFolder.relativePath.rawValue, "메인/휴지통/자료_2")
+
+        let restored = try await harness.commands.restoreFromTrash(
+            documentID: textTwo.affectedDocumentID,
+            toFolderID: nil,
+            projectID: harness.project.id
+        )
+        XCTAssertEqual(restored.relativePath.rawValue, "메인/설정집/새 문서.txt")
+    }
+
+    func testTrashRestoreReturnsToOriginalLocationAndPreservesID() async throws {
+        let harness = try await makeHarness()
+        let notes = try await fixedRoot(.notes, harness: harness)
+        let created = try await harness.commands.create(
+            kind: .text, named: "복원 문서", in: notes.id, projectID: harness.project.id
+        )
+        _ = try await harness.commands.moveToTrash(
+            documentID: created.affectedDocumentID, projectID: harness.project.id
+        )
+        let restored = try await harness.commands.restoreFromTrash(
+            documentID: created.affectedDocumentID,
+            toFolderID: nil,
+            projectID: harness.project.id
+        )
+        XCTAssertEqual(restored.affectedDocumentID, created.affectedDocumentID)
+        XCTAssertEqual(restored.relativePath.rawValue, "메인/메모장/복원 문서.txt")
+        XCTAssertTrue(fileExists(restored.relativePath.rawValue, harness: harness))
+        let stored = try await harness.repository.document(id: created.affectedDocumentID)
+        XCTAssertEqual(stored?.deletionStatus, .active)
+    }
+
+    func testTrashRestoreCanUseChosenDestinationFolder() async throws {
+        let harness = try await makeHarness()
+        let notes = try await fixedRoot(.notes, harness: harness)
+        let settings = try await fixedRoot(.settings, harness: harness)
+        let created = try await harness.commands.create(
+            kind: .text, named: "선택 복원", in: notes.id, projectID: harness.project.id
+        )
+        try writeText("선택 위치로 갈 본문", at: created.relativePath.rawValue, harness: harness)
+        _ = try await harness.commands.moveToTrash(
+            documentID: created.affectedDocumentID, projectID: harness.project.id
+        )
+
+        let restored = try await harness.commands.restoreFromTrash(
+            documentID: created.affectedDocumentID,
+            toFolderID: settings.id,
+            projectID: harness.project.id
+        )
+
+        XCTAssertEqual(restored.affectedDocumentID, created.affectedDocumentID)
+        XCTAssertEqual(restored.relativePath.rawValue, "메인/설정집/선택 복원.txt")
+        XCTAssertEqual(
+            try String(contentsOf: fileURL(restored.relativePath.rawValue, harness: harness), encoding: .utf8),
+            "선택 위치로 갈 본문"
+        )
+    }
+
+    func testTrashRestoreCollisionUsesNumberedNameAndNeverOverwritesExistingFile() async throws {
+        let harness = try await makeHarness()
+        let notes = try await fixedRoot(.notes, harness: harness)
+        let created = try await harness.commands.create(
+            kind: .text, named: "충돌", in: notes.id, projectID: harness.project.id
+        )
+        try writeText("휴지통 원본", at: created.relativePath.rawValue, harness: harness)
+        _ = try await harness.commands.moveToTrash(
+            documentID: created.affectedDocumentID, projectID: harness.project.id
+        )
+        _ = try await harness.commands.create(
+            kind: .text, named: "충돌", in: notes.id, projectID: harness.project.id
+        )
+        try writeText("새 파일", at: "메인/메모장/충돌.txt", harness: harness)
+
+        let restored = try await harness.commands.restoreFromTrash(
+            documentID: created.affectedDocumentID,
+            toFolderID: nil,
+            projectID: harness.project.id
+        )
+        XCTAssertEqual(restored.relativePath.rawValue, "메인/메모장/충돌_2.txt")
+        XCTAssertEqual(
+            try String(contentsOf: fileURL("메인/메모장/충돌.txt", harness: harness), encoding: .utf8),
+            "새 파일"
+        )
+        XCTAssertEqual(
+            try String(contentsOf: fileURL("메인/메모장/충돌_2.txt", harness: harness), encoding: .utf8),
+            "휴지통 원본"
+        )
+    }
+
+    func testPermanentDeletionRequiresConfirmationAndRemovesEverything() async throws {
+        let harness = try await makeHarness()
+        let notes = try await fixedRoot(.notes, harness: harness)
+        let created = try await harness.commands.create(
+            kind: .text, named: "영구 삭제", in: notes.id, projectID: harness.project.id
+        )
+        let trashed = try await harness.commands.moveToTrash(
+            documentID: created.affectedDocumentID, projectID: harness.project.id
+        )
+        await assertBinderError(.trashConfirmationRequired) {
+            try await harness.commands.permanentlyDelete(
+                documentID: created.affectedDocumentID,
+                projectID: harness.project.id,
+                confirmsPermanentDeletion: false
+            )
+        }
+        try await harness.commands.permanentlyDelete(
+            documentID: created.affectedDocumentID,
+            projectID: harness.project.id,
+            confirmsPermanentDeletion: true
+        )
+        XCTAssertFalse(fileExists(trashed.relativePath.rawValue, harness: harness))
+        let deleted = try await harness.repository.document(id: created.affectedDocumentID)
+        XCTAssertNil(deleted)
+    }
+
     func testGeneralChildrenCanReorderButManuscriptCannot() async throws {
         let harness = try await makeHarness()
         let notes = try await fixedRoot(.notes, harness: harness)
@@ -284,6 +694,9 @@ final class LocalBinderCommandServiceTests: XCTestCase {
         let volume = try await harness.commands.create(
             kind: .folder, named: "1권", in: manuscript.id, projectID: harness.project.id
         )
+        let chapter = try await harness.commands.create(
+            kind: .text, named: "001화", in: volume.affectedDocumentID, projectID: harness.project.id
+        )
         await XCTAssertThrowsErrorAsync {
             try await harness.commands.reorder(
                 childIDs: [volume.affectedDocumentID],
@@ -291,6 +704,286 @@ final class LocalBinderCommandServiceTests: XCTestCase {
                 projectID: harness.project.id
             )
         }
+        await XCTAssertThrowsErrorAsync {
+            _ = try await harness.commands.moveToTrash(
+                documentID: volume.affectedDocumentID,
+                projectID: harness.project.id
+            )
+        }
+        await XCTAssertThrowsErrorAsync {
+            _ = try await harness.commands.moveToTrash(
+                documentID: chapter.affectedDocumentID,
+                projectID: harness.project.id
+            )
+        }
+    }
+
+    func testFixedRootBindersCanReorderWhileManuscriptAndTrashStayAtEdges() async throws {
+        let harness = try await makeHarness()
+        let rootContainerID = try await harness.binder.rootContainerID(in: harness.project.id)
+        let before = try await harness.binder.rootNodes(in: harness.project.id)
+        let reorderable = before.filter {
+            $0.fixedCategory != .manuscript && $0.fixedCategory != .trash
+        }
+        let reversedIDs = reorderable.reversed().map(\.id)
+
+        try await harness.commands.reorder(
+            childIDs: reversedIDs,
+            in: rootContainerID,
+            projectID: harness.project.id
+        )
+
+        let after = try await harness.binder.rootNodes(in: harness.project.id)
+        XCTAssertEqual(after.first?.fixedCategory, .manuscript)
+        XCTAssertEqual(after.last?.fixedCategory, .trash)
+        XCTAssertEqual(
+            after.filter { $0.fixedCategory != .manuscript && $0.fixedCategory != .trash }.map(\.id),
+            reversedIDs
+        )
+        XCTAssertTrue(
+            after.filter { $0.fixedCategory != .manuscript && $0.fixedCategory != .trash }
+                .contains { $0.fixedCategory != nil }
+        )
+    }
+
+    func testAddNewVolumeCreatesTwentyFiveEmptyChaptersAndReturnsUIIntents() async throws {
+        let notifier = RecordingFutureChangeNotifier()
+        let harness = try await makeHarness(futureChangeNotifier: notifier)
+        let manuscript = try await fixedRoot(.manuscript, harness: harness)
+
+        let result = try await harness.commands.addNewVolume(projectID: harness.project.id)
+
+        XCTAssertEqual(result.volumeNumber, 1)
+        XCTAssertEqual(result.volumePath.rawValue, "메인/원고/1권")
+        XCTAssertEqual(result.chapterIDs.count, 25)
+        XCTAssertEqual(result.firstChapterID, result.chapterIDs.first)
+        XCTAssertTrue(result.shouldRefreshBinder)
+        XCTAssertEqual(result.folderToExpandID, result.volumeID)
+        XCTAssertEqual(result.documentToOpenID, result.firstChapterID)
+        XCTAssertTrue(fileExists("메인/원고/1권/001화.txt", harness: harness))
+        XCTAssertTrue(fileExists("메인/원고/1권/025화.txt", harness: harness))
+
+        for number in 1...25 {
+            let name = String(format: "%03d화.txt", number)
+            let data = try Data(contentsOf: fileURL("메인/원고/1권/\(name)", harness: harness))
+            XCTAssertTrue(data.isEmpty, "\(name)은 빈 UTF-8 TXT여야 합니다.")
+        }
+        let stored = try await harness.repository.documents(in: harness.project.id)
+            .filter { $0.relativePath.rawValue.hasPrefix("메인/원고/1권") }
+        XCTAssertEqual(stored.count, 26)
+        XCTAssertEqual(stored.first(where: { $0.id == result.volumeID })?.parentID, manuscript.id)
+        XCTAssertTrue(stored.filter { $0.kind == .text }.allSatisfy { $0.contentHash != nil })
+        let events = await notifier.recordedEvents()
+        XCTAssertEqual(
+            events,
+            [.manuscriptVolumeCreated(
+                projectID: harness.project.id,
+                volumeID: result.volumeID,
+                chapterIDs: result.chapterIDs
+            )]
+        )
+
+        let manuscriptDescriptors = try await harness.commands.commandDescriptors(
+            for: manuscript.id,
+            in: harness.project.id
+        )
+        XCTAssertEqual(
+            manuscriptDescriptors.first(where: { $0.kind == .addVolume })?.isEnabled,
+            true
+        )
+        XCTAssertEqual(
+            manuscriptDescriptors.first(where: { $0.kind == .moveToTrash })?.isEnabled,
+            false
+        )
+        XCTAssertEqual(
+            manuscriptDescriptors.first(where: { $0.kind == .reorder })?.isEnabled,
+            false
+        )
+        let notes = try await fixedRoot(.notes, harness: harness)
+        let noteDescriptors = try await harness.commands.commandDescriptors(
+            for: notes.id,
+            in: harness.project.id
+        )
+        XCTAssertEqual(
+            noteDescriptors.first(where: { $0.kind == .addVolume })?.isEnabled,
+            false
+        )
+        XCTAssertEqual(
+            noteDescriptors.first(where: { $0.kind == .moveToTrash })?.isEnabled,
+            false
+        )
+        XCTAssertEqual(
+            noteDescriptors.first(where: { $0.kind == .reorder })?.isEnabled,
+            true
+        )
+    }
+
+    func testNewVolumeNumberUsesHighestValidVolumeAndIgnoresZeroGapsAndMalformedNames() async throws {
+        let scenarios: [([String], Int, Int)] = [
+            ([], 1, 1),
+            (["0권"], 1, 1),
+            (["1권", "2권"], 3, 51),
+            (["1권", "3권", "02권", "잘못된 권"], 4, 76)
+        ]
+
+        for (names, expectedVolume, expectedStart) in scenarios {
+            let harness = try await makeHarness()
+            for name in names {
+                try FileManager.default.createDirectory(
+                    at: fileURL("메인/원고/\(name)", harness: harness),
+                    withIntermediateDirectories: false
+                )
+            }
+
+            let result = try await harness.commands.addNewVolume(projectID: harness.project.id)
+            XCTAssertEqual(result.volumeNumber, expectedVolume)
+            XCTAssertTrue(
+                fileExists(
+                    "메인/원고/\(expectedVolume)권/\(chapterName(expectedStart))",
+                    harness: harness
+                )
+            )
+            XCTAssertTrue(
+                fileExists(
+                    "메인/원고/\(expectedVolume)권/\(chapterName(expectedStart + 24))",
+                    harness: harness
+                )
+            )
+        }
+    }
+
+    func testExistingChapterCollisionPreventsAnyPartOfNewVolume() async throws {
+        let harness = try await makeHarness()
+        try FileManager.default.createDirectory(
+            at: fileURL("메인/원고/1권", harness: harness),
+            withIntermediateDirectories: false
+        )
+        try writeText("기존 원고", at: "메인/원고/1권/026화.txt", harness: harness)
+
+        do {
+            _ = try await harness.commands.addNewVolume(projectID: harness.project.id)
+            XCTFail("중복 화가 있는 새 권 생성이 통과했습니다.")
+        } catch let error as BinderCommandError {
+            XCTAssertEqual(error, .chapterAlreadyExists(26))
+        }
+
+        XCTAssertFalse(fileExists("메인/원고/2권", harness: harness))
+        XCTAssertEqual(
+            try FileManager.default.contentsOfDirectory(atPath: fileURL("메인/원고", harness: harness).path)
+                .filter { $0.hasPrefix(".writerpad-new-volume-") },
+            []
+        )
+        let stored = try await harness.repository.documents(in: harness.project.id)
+        XCTAssertFalse(stored.contains { $0.relativePath.rawValue.hasPrefix("메인/원고/2권") })
+        XCTAssertEqual(
+            try String(contentsOf: fileURL("메인/원고/1권/026화.txt", harness: harness)),
+            "기존 원고"
+        )
+    }
+
+    func testExistingTargetVolumeIsNeverOverwritten() async throws {
+        let harness = try await makeHarness()
+        try writeText("보존할 데이터", at: "메인/원고/1권", harness: harness)
+
+        await XCTAssertThrowsErrorAsync {
+            _ = try await harness.commands.addNewVolume(projectID: harness.project.id)
+        }
+
+        XCTAssertEqual(
+            try String(contentsOf: fileURL("메인/원고/1권", harness: harness)),
+            "보존할 데이터"
+        )
+    }
+
+    func testEveryChapterPreparationFailureRollsBackFilesMetadataAndJournal() async throws {
+        for index in 1...25 {
+            let harness = try await makeHarness(
+                faultPlan: BinderCommandFaultPlan(
+                    point: .afterVolumeChapterFile(index),
+                    leavesTransactionForRecovery: false
+                )
+            )
+            do {
+                _ = try await harness.commands.addNewVolume(projectID: harness.project.id)
+                XCTFail("\(index)번째 파일 실패가 발생하지 않았습니다.")
+            } catch let error as BinderCommandError {
+                XCTAssertEqual(error, .injectedFailure(recoveryPending: false))
+            }
+
+            XCTAssertFalse(fileExists("메인/원고/1권", harness: harness))
+            let manuscriptItems = try FileManager.default.contentsOfDirectory(
+                atPath: fileURL("메인/원고", harness: harness).path
+            )
+            XCTAssertFalse(manuscriptItems.contains { $0.hasPrefix(".writerpad-new-volume-") })
+            XCTAssertTrue(try journalFiles(harness: harness).isEmpty)
+            let stored = try await harness.repository.documents(in: harness.project.id)
+            XCTAssertFalse(stored.contains { $0.relativePath.rawValue.hasPrefix("메인/원고/1권") })
+        }
+    }
+
+    func testPromotedVolumeCompletesMetadataDuringRecovery() async throws {
+        let harness = try await makeHarness(
+            faultPlan: BinderCommandFaultPlan(
+                point: .afterFileMutation,
+                leavesTransactionForRecovery: true
+            )
+        )
+        do {
+            _ = try await harness.commands.addNewVolume(projectID: harness.project.id)
+            XCTFail("정식 폴더 승격 뒤 테스트 중단이 발생하지 않았습니다.")
+        } catch let error as BinderCommandError {
+            XCTAssertEqual(error, .injectedFailure(recoveryPending: true))
+        }
+
+        XCTAssertTrue(fileExists("메인/원고/1권/025화.txt", harness: harness))
+        var stored = try await harness.repository.documents(in: harness.project.id)
+        XCTAssertFalse(stored.contains { $0.relativePath.rawValue.hasPrefix("메인/원고/1권") })
+
+        let recovery = harness.makeCommands(faultPlan: nil)
+        try await recovery.recoverPendingTransactions(in: harness.project.id)
+
+        stored = try await harness.repository.documents(in: harness.project.id)
+        XCTAssertEqual(
+            stored.filter { $0.relativePath.rawValue.hasPrefix("메인/원고/1권") }.count,
+            26
+        )
+        XCTAssertTrue(try journalFiles(harness: harness).isEmpty)
+    }
+
+    func testConcurrentSecondVolumeRequestIsRejectedWhileFirstIsFinishing() async throws {
+        let notifier = BlockingFutureChangeNotifier()
+        let harness = try await makeHarness(futureChangeNotifier: notifier)
+        let first = Task {
+            try await harness.commands.addNewVolume(projectID: harness.project.id)
+        }
+        await notifier.waitUntilEntered()
+
+        do {
+            _ = try await harness.commands.addNewVolume(projectID: harness.project.id)
+            XCTFail("동시 두 번째 요청이 통과했습니다.")
+        } catch let error as BinderCommandError {
+            XCTAssertEqual(error, .volumeCreationInProgress)
+        }
+
+        await notifier.release()
+        _ = try await first.value
+        XCTAssertTrue(fileExists("메인/원고/1권", harness: harness))
+        XCTAssertFalse(fileExists("메인/원고/2권", harness: harness))
+    }
+
+    func testChapterNamesAfterOneThousandDoNotUseFixedThreeDigitWidth() async throws {
+        let harness = try await makeHarness()
+        try FileManager.default.createDirectory(
+            at: fileURL("메인/원고/40권", harness: harness),
+            withIntermediateDirectories: false
+        )
+
+        let result = try await harness.commands.addNewVolume(projectID: harness.project.id)
+
+        XCTAssertEqual(result.volumeNumber, 41)
+        XCTAssertTrue(fileExists("메인/원고/41권/1001화.txt", harness: harness))
+        XCTAssertTrue(fileExists("메인/원고/41권/1025화.txt", harness: harness))
+        XCTAssertFalse(fileExists("메인/원고/41권/001001화.txt", harness: harness))
     }
 
     private struct Harness {
@@ -304,13 +997,17 @@ final class LocalBinderCommandServiceTests: XCTestCase {
         let workspace: URL
         let clock: FixedClock
 
-        func makeCommands(faultPlan: BinderCommandFaultPlan?) -> LocalBinderCommandService {
+        func makeCommands(
+            faultPlan: BinderCommandFaultPlan?,
+            futureChangeNotifier: any FutureChangeNotifying = NoOpFutureChangeNotifier()
+        ) -> LocalBinderCommandService {
             LocalBinderCommandService(
                 metadataStore: repository,
                 workspaceStateRepository: repository,
                 workspaceLocator: locator,
                 pathPolicy: resolver.policy,
                 clock: clock,
+                futureChangeNotifier: futureChangeNotifier,
                 faultPlan: faultPlan
             )
         }
@@ -322,7 +1019,8 @@ final class LocalBinderCommandServiceTests: XCTestCase {
     }
 
     private func makeHarness(
-        faultPlan: BinderCommandFaultPlan? = nil
+        faultPlan: BinderCommandFaultPlan? = nil,
+        futureChangeNotifier: any FutureChangeNotifying = NoOpFutureChangeNotifier()
     ) async throws -> Harness {
         let root = FileManager.default.temporaryDirectory
             .appendingPathComponent("WriterPad-BinderCommands-\(UUID().uuidString)")
@@ -356,6 +1054,7 @@ final class LocalBinderCommandServiceTests: XCTestCase {
             workspaceLocator: locator,
             pathPolicy: resolver.policy,
             clock: clock,
+            futureChangeNotifier: futureChangeNotifier,
             faultPlan: faultPlan
         )
         let workspace = try resolver.standardPaths(
@@ -405,6 +1104,10 @@ final class LocalBinderCommandServiceTests: XCTestCase {
             .filter { $0.hasPrefix(".writerpad-binder-transaction-") }
     }
 
+    private func chapterName(_ number: Int) -> String {
+        (number < 1_000 ? String(format: "%03d", number) : String(number)) + "화.txt"
+    }
+
     private func assertBinderError(
         _ expected: BinderCommandError,
         operation: () async throws -> Void
@@ -430,5 +1133,43 @@ private func XCTAssertThrowsErrorAsync(
         XCTFail("예상한 오류가 발생하지 않았습니다.", file: file, line: line)
     } catch {
         // expected
+    }
+}
+
+private actor RecordingFutureChangeNotifier: FutureChangeNotifying {
+    nonisolated let mode: FutureSyncMode = .localOnly
+    private var events: [LocalChangeEvent] = []
+
+    func record(_ event: LocalChangeEvent) async {
+        events.append(event)
+    }
+
+    func recordedEvents() -> [LocalChangeEvent] {
+        events
+    }
+}
+
+private actor BlockingFutureChangeNotifier: FutureChangeNotifying {
+    nonisolated let mode: FutureSyncMode = .localOnly
+    private var entered = false
+    private var entryWaiters: [CheckedContinuation<Void, Never>] = []
+    private var releaseContinuation: CheckedContinuation<Void, Never>?
+
+    func record(_ event: LocalChangeEvent) async {
+        guard case .manuscriptVolumeCreated = event else { return }
+        entered = true
+        entryWaiters.forEach { $0.resume() }
+        entryWaiters = []
+        await withCheckedContinuation { releaseContinuation = $0 }
+    }
+
+    func waitUntilEntered() async {
+        if entered { return }
+        await withCheckedContinuation { entryWaiters.append($0) }
+    }
+
+    func release() {
+        releaseContinuation?.resume()
+        releaseContinuation = nil
     }
 }

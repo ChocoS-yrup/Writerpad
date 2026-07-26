@@ -103,6 +103,15 @@ extension SwiftDataMetadataRepository: DocumentFileMetadataUpdating {
         record.relativePath = receipt.relativePath.rawValue
         record.contentHash = receipt.contentHash.rawValue
         record.modifiedAt = receipt.modifiedAt
+        if let cursor = receipt.cursor {
+            guard let location = Int(exactly: cursor.location),
+                  let length = Int(exactly: cursor.selectionLength)
+            else {
+                throw MetadataRepositoryError.invalidCursor(receipt.documentID)
+            }
+            record.cursorLocation = location
+            record.selectionLength = length
+        }
         try modelContext.save()
     }
 }

@@ -49,6 +49,28 @@ final class SwiftDataMetadataRepositoryTests: XCTestCase {
     }
 
     @MainActor
+    func testEditorStatePreservesMissingDocumentIDForSafeFallbackResolution() async throws {
+        let container = try WriterPadMetadataStore.makeContainer(isStoredInMemoryOnly: true)
+        let repository = SwiftDataMetadataRepository(modelContainer: container)
+        try await repository.save(makeProject())
+        let missingDocumentID = DocumentID(rawValue: UUID())
+        container.mainContext.insert(
+            WorkspaceRecord(
+                projectID: projectID.rawValue,
+                leftDocumentID: missingDocumentID.rawValue
+            )
+        )
+        try container.mainContext.save()
+
+        let restored = try await repository.editorState(for: projectID)
+
+        XCTAssertEqual(restored.left.documentID, missingDocumentID)
+        XCTAssertEqual(restored.left.cursor, .start)
+        XCTAssertNil(restored.right)
+        XCTAssertEqual(restored.activePane, .left)
+    }
+
+    @MainActor
     func testMetadataRestoresAfterContainerReopen() async throws {
         let directory = FileManager.default.temporaryDirectory
             .appendingPathComponent("WriterPadMetadata-\(UUID().uuidString)", isDirectory: true)
@@ -141,6 +163,7 @@ final class SwiftDataMetadataRepositoryTests: XCTestCase {
         )
         let newDate = date.addingTimeInterval(60)
         let hash = ContentHash(rawValue: String(repeating: "a", count: 64))!
+        let cursor = TextCursorState(location: 17, selectionLength: 4)
 
         await assertMetadataError(.documentIsNotText(folderID)) {
             try await repository.updateAfterFileSave(
@@ -162,7 +185,8 @@ final class SwiftDataMetadataRepositoryTests: XCTestCase {
                 relativePath: RelativeDocumentPath(rawValue: "메인/원고/1권/002화.txt"),
                 contentHash: hash,
                 modifiedAt: newDate,
-                generation: 3
+                generation: 3,
+                cursor: cursor
             )
         )
 
@@ -170,6 +194,7 @@ final class SwiftDataMetadataRepositoryTests: XCTestCase {
         XCTAssertEqual(updated?.relativePath.rawValue, "메인/원고/1권/002화.txt")
         XCTAssertEqual(updated?.contentHash, hash)
         XCTAssertEqual(updated?.modifiedAt, newDate)
+        XCTAssertEqual(updated?.cursor, cursor)
         XCTAssertEqual(updated?.parentID, folderID)
         XCTAssertEqual(updated?.userOrder, 7)
     }

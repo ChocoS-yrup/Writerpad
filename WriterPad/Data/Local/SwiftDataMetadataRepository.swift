@@ -10,8 +10,11 @@ actor SwiftDataMetadataRepository {
 extension SwiftDataMetadataRepository {
     func uniqueProjectRecord(id: ProjectID) throws -> ProjectRecord? {
         let rawID = id.rawValue
-        let records = try modelContext.fetch(FetchDescriptor<ProjectRecord>())
-            .filter { $0.id == rawID }
+        var descriptor = FetchDescriptor<ProjectRecord>(
+            predicate: #Predicate { $0.id == rawID }
+        )
+        descriptor.fetchLimit = 2
+        let records = try modelContext.fetch(descriptor)
         guard records.count <= 1 else {
             throw MetadataRepositoryError.corruptedRecord(
                 entity: "ProjectRecord",
@@ -31,8 +34,11 @@ extension SwiftDataMetadataRepository {
 
     func uniqueDocumentRecord(id: DocumentID) throws -> DocumentRecord? {
         let rawID = id.rawValue
-        let records = try modelContext.fetch(FetchDescriptor<DocumentRecord>())
-            .filter { $0.id == rawID }
+        var descriptor = FetchDescriptor<DocumentRecord>(
+            predicate: #Predicate { $0.id == rawID }
+        )
+        descriptor.fetchLimit = 2
+        let records = try modelContext.fetch(descriptor)
         guard records.count <= 1 else {
             throw MetadataRepositoryError.corruptedRecord(
                 entity: "DocumentRecord",
@@ -52,14 +58,35 @@ extension SwiftDataMetadataRepository {
 
     func documentRecords(in projectID: ProjectID) throws -> [DocumentRecord] {
         let rawProjectID = projectID.rawValue
-        return try modelContext.fetch(FetchDescriptor<DocumentRecord>())
-            .filter { $0.projectID == rawProjectID }
+        return try modelContext.fetch(
+            FetchDescriptor<DocumentRecord>(
+                predicate: #Predicate { $0.projectID == rawProjectID }
+            )
+        )
+    }
+
+    func documentRecords(
+        in projectID: ProjectID,
+        parentID: DocumentID
+    ) throws -> [DocumentRecord] {
+        let rawProjectID = projectID.rawValue
+        let rawParentID = parentID.rawValue
+        return try modelContext.fetch(
+            FetchDescriptor<DocumentRecord>(
+                predicate: #Predicate {
+                    $0.projectID == rawProjectID && $0.parentID == rawParentID
+                }
+            )
+        )
     }
 
     func uniqueWorkspaceRecord(projectID: ProjectID) throws -> WorkspaceRecord? {
         let rawProjectID = projectID.rawValue
-        let records = try modelContext.fetch(FetchDescriptor<WorkspaceRecord>())
-            .filter { $0.projectID == rawProjectID }
+        var descriptor = FetchDescriptor<WorkspaceRecord>(
+            predicate: #Predicate { $0.projectID == rawProjectID }
+        )
+        descriptor.fetchLimit = 2
+        let records = try modelContext.fetch(descriptor)
         guard records.count <= 1 else {
             throw MetadataRepositoryError.corruptedRecord(
                 entity: "WorkspaceRecord",
@@ -72,8 +99,11 @@ extension SwiftDataMetadataRepository {
 
     func uniqueAppStateRecord() throws -> AppStateRecord? {
         let key = "writerpad.app-state"
-        let records = try modelContext.fetch(FetchDescriptor<AppStateRecord>())
-            .filter { $0.key == key }
+        var descriptor = FetchDescriptor<AppStateRecord>(
+            predicate: #Predicate { $0.key == key }
+        )
+        descriptor.fetchLimit = 2
+        let records = try modelContext.fetch(descriptor)
         guard records.count <= 1 else {
             throw MetadataRepositoryError.corruptedRecord(
                 entity: "AppStateRecord",

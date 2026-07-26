@@ -13,6 +13,41 @@ final class LocalBinderRepositoryTests: XCTestCase {
         roots = []
     }
 
+    @MainActor
+    func testTopLevelTextDiscoveredOnDiskIsRejectedWithoutRegisteringMetadata() async throws {
+        let harness = try await makeHarness(projectName: "최상위 무결성")
+        try writeText(
+            "잘못된 위치",
+            workspace: harness.workspace,
+            path: "메인/최상위 문서.txt"
+        )
+
+        do {
+            _ = try await harness.binder.rootNodes(in: harness.project.id)
+            XCTFail("최상위 문서가 바인더에 등록되었습니다.")
+        } catch let error as BinderRepositoryError {
+            XCTAssertEqual(
+                error,
+                .documentAtTopLevel("메인/최상위 문서.txt")
+            )
+        }
+
+        let metadata = try await harness.repository.documents(in: harness.project.id)
+        XCTAssertFalse(
+            metadata.contains {
+                $0.relativePath.rawValue == "메인/최상위 문서.txt"
+            }
+        )
+        XCTAssertTrue(
+            FileManager.default.fileExists(
+                atPath: harness.workspace
+                    .appendingPathComponent("메인/최상위 문서.txt")
+                    .path
+            )
+        )
+    }
+
+    @MainActor
     func testThousandChapterProjectInitiallyScansOnlyMainAndShowsEightFixedRoots() async throws {
         let harness = try await makeHarness(projectName: "천화 작품")
         let manuscript = harness.workspace.appendingPathComponent("메인/원고/1권")
@@ -33,17 +68,19 @@ final class LocalBinderRepositoryTests: XCTestCase {
         let metadata = try await harness.repository.documents(in: harness.project.id)
 
         XCTAssertEqual(
-            Array(roots.prefix(8).compactMap(\.fixedCategory)),
-            BinderFixedCategory.allCases
+            Array(roots.prefix(7).compactMap(\.fixedCategory)),
+            BinderFixedCategory.allCases.filter { $0 != .trash }
         )
         XCTAssertEqual(roots.first?.fixedCategory, .manuscript)
-        XCTAssertEqual(roots.last?.displayName, "플롯")
-        XCTAssertNil(roots.last?.fixedCategory)
+        XCTAssertEqual(roots.last?.fixedCategory, .trash)
+        XCTAssertEqual(roots.dropLast().last?.displayName, "플롯")
+        XCTAssertNil(roots.dropLast().last?.fixedCategory)
         XCTAssertEqual(metrics.relativeDirectories, ["메인"])
         XCTAssertFalse(metrics.performedMainThreadIO)
         XCTAssertFalse(metadata.contains { $0.relativePath.rawValue.contains("1권") })
     }
 
+    @MainActor
     func testFoldersAndTextUseNaturalOrderHideExtensionAndExposeContentState() async throws {
         let harness = try await makeHarness(projectName: "정렬 작품")
         for volume in ["10권", "2권", "1권"] {
@@ -105,6 +142,7 @@ final class LocalBinderRepositoryTests: XCTestCase {
         XCTAssertEqual(manuscriptOrder.map(\.displayName), ["1권", "2권", "10권"])
     }
 
+    @MainActor
     func testStoredUserOrderOverridesNaturalOrder() async throws {
         let harness = try await makeHarness(projectName: "사용자 정렬")
         try writeText("첫째", workspace: harness.workspace, path: "메인/메모장/1.txt")
@@ -170,6 +208,124 @@ final class LocalBinderRepositoryTests: XCTestCase {
         XCTAssertEqual(metrics.relativeDirectories, ["메인", "메인/원고", "메인/원고/1권"])
     }
 
+    @MainActor
+    func testCreateRefreshesOnlyParentBranchAndKeepsOtherExpandedBranches() async throws {
+        let harness = try await makeHarness(projectName: "부분 생성 갱신")
+        try writeText("본문", workspace: harness.workspace, path: "메인/원고/1권/001화.txt")
+        let roots = try await harness.binder.rootNodes(in: harness.project.id)
+        let manuscript = try XCTUnwrap(roots.first { $0.fixedCategory == .manuscript })
+        let notes = try XCTUnwrap(roots.first { $0.fixedCategory == .notes })
+        let volumes = try await harness.binder.children(
+            of: manuscript.id,
+            in: harness.project.id
+        )
+        let volume = try XCTUnwrap(volumes.first)
+        try await harness.binder.setExpanded(true, for: manuscript.id)
+        try await harness.binder.setExpanded(true, for: volume.id)
+        try await harness.binder.setExpanded(true, for: notes.id)
+
+        let model = BinderViewModel(repository: harness.binder, commands: harness.commands)
+        await model.load(projectID: harness.project.id)
+        await harness.scanner.resetMetrics()
+
+        await model.create(kind: .folder, named: "빠른 폴더", in: notes)
+        let metrics = await harness.scanner.metrics()
+
+        XCTAssertEqual(metrics.relativeDirectories, ["메인/메모장"])
+        XCTAssertNotNil(model.visibleRows.first { $0.node.displayName == "빠른 폴더" })
+        XCTAssertNotNil(model.visibleRows.first { $0.node.displayName == "001화" })
+        XCTAssertEqual(
+            model.selectedNodeID,
+            model.visibleRows.first { $0.node.displayName == "빠른 폴더" }?.node.id
+        )
+    }
+
+    @MainActor
+    func testCreateRootFolderRefreshesOnlyRootsAndPreservesLoadedChildren() async throws {
+        let harness = try await makeHarness(projectName: "최상위 부분 갱신")
+        try writeText("기존", workspace: harness.workspace, path: "메인/메모장/기존.txt")
+        let roots = try await harness.binder.rootNodes(in: harness.project.id)
+        let notes = try XCTUnwrap(roots.first { $0.fixedCategory == .notes })
+        try await harness.binder.setExpanded(true, for: notes.id)
+        let model = BinderViewModel(repository: harness.binder, commands: harness.commands)
+        await model.load(projectID: harness.project.id)
+        await harness.scanner.resetMetrics()
+
+        await model.createRootFolder(named: "자료")
+        let metrics = await harness.scanner.metrics()
+
+        XCTAssertEqual(metrics.relativeDirectories, ["메인"])
+        XCTAssertNotNil(model.roots.first { $0.displayName == "자료" })
+        XCTAssertNotNil(model.visibleRows.first { $0.node.displayName == "기존" })
+        XCTAssertEqual(
+            model.selectedNodeID,
+            model.roots.first { $0.displayName == "자료" }?.id
+        )
+    }
+
+    @MainActor
+    func testTrashMoveInvalidatesCollapsedEmptyCacheAndAppearsOnNextExpansion() async throws {
+        let harness = try await makeHarness(projectName: "휴지통 실시간 갱신")
+        let roots = try await harness.binder.rootNodes(in: harness.project.id)
+        let notes = try XCTUnwrap(roots.first { $0.fixedCategory == .notes })
+        let trash = try XCTUnwrap(roots.first { $0.fixedCategory == .trash })
+        try await harness.binder.setExpanded(true, for: notes.id)
+        try await harness.binder.setExpanded(true, for: trash.id)
+
+        let model = BinderViewModel(repository: harness.binder, commands: harness.commands)
+        await model.load(projectID: harness.project.id)
+        let initiallyExpandedTrash = try XCTUnwrap(
+            model.roots.first { $0.id == trash.id }
+        )
+        XCTAssertEqual(model.childrenByParent[trash.id], [])
+        await model.toggleExpansion(of: initiallyExpandedTrash)
+
+        await model.create(kind: .folder, named: "바로 삭제", in: notes)
+        let folder = try XCTUnwrap(
+            model.childrenByParent[notes.id]?.first { $0.displayName == "바로 삭제" }
+        )
+        await model.create(kind: .text, named: "하위 문서", in: folder)
+        await model.moveToTrash(folder)
+
+        XCTAssertNil(model.childrenByParent[trash.id])
+        let refreshedTrash = try XCTUnwrap(model.roots.first { $0.id == trash.id })
+        await model.toggleExpansion(of: refreshedTrash)
+
+        XCTAssertEqual(
+            model.childrenByParent[trash.id]?.map(\.displayName),
+            ["바로 삭제"]
+        )
+    }
+
+    @MainActor
+    func testMixedFolderAndTextSiblingsCanBeReordered() async throws {
+        let harness = try await makeHarness(projectName: "혼합 순서 변경")
+        let roots = try await harness.binder.rootNodes(in: harness.project.id)
+        let notes = try XCTUnwrap(roots.first { $0.fixedCategory == .notes })
+        try await harness.binder.setExpanded(true, for: notes.id)
+        let model = BinderViewModel(repository: harness.binder, commands: harness.commands)
+        await model.load(projectID: harness.project.id)
+        await model.create(kind: .folder, named: "새폴더", in: notes)
+        await model.create(kind: .text, named: "새문서", in: notes)
+        await model.create(kind: .text, named: "새문서_2", in: notes)
+
+        let initial = try XCTUnwrap(model.childrenByParent[notes.id])
+        let folder = try XCTUnwrap(initial.first { $0.displayName == "새폴더" })
+        let secondText = try XCTUnwrap(initial.first { $0.displayName == "새문서_2" })
+        let didReorder = await model.reorder(
+            folder.id,
+            relativeTo: secondText.id,
+            placeAfter: true
+        )
+
+        XCTAssertTrue(didReorder)
+        XCTAssertEqual(
+            model.childrenByParent[notes.id]?.map(\.displayName),
+            ["새문서", "새문서_2", "새폴더"]
+        )
+    }
+
+    @MainActor
     func testExternalTextRenameKeepsUUIDWhenHashMatchIsUnique() async throws {
         let harness = try await makeHarness(projectName: "외부 변경")
         try writeText("동일한 본문", workspace: harness.workspace, path: "메인/메모장/초안.txt")
@@ -188,6 +344,7 @@ final class LocalBinderRepositoryTests: XCTestCase {
         XCTAssertEqual(stored?.relativePath.rawValue, "메인/메모장/완성.txt")
     }
 
+    @MainActor
     func testExternalAdditionKeepsExistingUUIDAndCreatesOnlyOneNewIdentity() async throws {
         let harness = try await makeHarness(projectName: "외부 추가")
         try writeText("기존", workspace: harness.workspace, path: "메인/설정집/기존.txt")
@@ -220,6 +377,7 @@ final class LocalBinderRepositoryTests: XCTestCase {
         func now() -> Date { date }
     }
 
+    @MainActor
     private func makeHarness(projectName: String) async throws -> Harness {
         let root = FileManager.default.temporaryDirectory
             .appendingPathComponent("WriterPad-BinderTests-\(UUID().uuidString)")

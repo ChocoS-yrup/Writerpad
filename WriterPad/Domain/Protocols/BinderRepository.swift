@@ -1,6 +1,7 @@
 import Foundation
 
 protocol BinderRepository: Sendable {
+    func rootContainerID(in projectID: ProjectID) async throws -> DocumentID
     func rootNodes(in projectID: ProjectID) async throws -> [BinderNode]
     func children(
         of folderID: DocumentID,
@@ -33,6 +34,10 @@ protocol BinderCommanding: Sendable {
         for documentID: DocumentID,
         in projectID: ProjectID
     ) async throws -> [BinderCommandDescriptor]
+    func commandDescriptors(
+        for documentIDs: [DocumentID],
+        in projectID: ProjectID
+    ) async throws -> [DocumentID: [BinderCommandDescriptor]]
     func create(
         kind: DocumentKind,
         named displayName: String,
@@ -42,6 +47,11 @@ protocol BinderCommanding: Sendable {
     func rename(
         documentID: DocumentID,
         to displayName: String,
+        projectID: ProjectID
+    ) async throws -> BinderCommandResult
+    func renameChapter(
+        documentID: DocumentID,
+        titleSuffix: String,
         projectID: ProjectID
     ) async throws -> BinderCommandResult
     func move(
@@ -58,6 +68,37 @@ protocol BinderCommanding: Sendable {
         documentID: DocumentID,
         projectID: ProjectID
     ) async throws -> BinderCommandResult
+    func restoreFromTrash(
+        documentID: DocumentID,
+        toFolderID: DocumentID?,
+        projectID: ProjectID
+    ) async throws -> BinderCommandResult
+    func permanentlyDelete(
+        documentID: DocumentID,
+        projectID: ProjectID,
+        confirmsPermanentDeletion: Bool
+    ) async throws
+    func emptyTrash(
+        projectID: ProjectID,
+        confirmsPermanentDeletion: Bool
+    ) async throws -> TrashDeletionResult
+    func addNewVolume(projectID: ProjectID) async throws -> BinderVolumeCreationResult
+}
+
+extension BinderCommanding {
+    func commandDescriptors(
+        for documentIDs: [DocumentID],
+        in projectID: ProjectID
+    ) async throws -> [DocumentID: [BinderCommandDescriptor]] {
+        var result: [DocumentID: [BinderCommandDescriptor]] = [:]
+        for documentID in documentIDs {
+            result[documentID] = try await commandDescriptors(
+                for: documentID,
+                in: projectID
+            )
+        }
+        return result
+    }
 }
 
 protocol BinderDirectoryScanning: Sendable {

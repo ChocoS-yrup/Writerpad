@@ -35,9 +35,7 @@ extension SwiftDataMetadataRepository: BinderMetadataStoring {
         parentID: DocumentID
     ) async throws -> [DocumentNode] {
         _ = try requireProjectRecord(id: projectID)
-        let rawParentID = parentID.rawValue
-        return try documentRecords(in: projectID)
-            .filter { $0.parentID == rawParentID }
+        return try documentRecords(in: projectID, parentID: parentID)
             .map(domainDocument)
     }
 
@@ -53,6 +51,10 @@ extension SwiftDataMetadataRepository: BinderMetadataStoring {
         }
 
         let currentRecords = try documentRecords(in: projectID)
+        let currentByID = Dictionary(
+            currentRecords.map { ($0.id, $0) },
+            uniquingKeysWith: { first, _ in first }
+        )
         let rootRecords = currentRecords.filter { record in
             rootedAt.contains { $0.rawValue == record.id }
         }
@@ -62,6 +64,7 @@ extension SwiftDataMetadataRepository: BinderMetadataStoring {
             return rootKeys.contains { key == $0 || key.hasPrefix($0 + "/") }
         }
         let removedIDs = Set(removedRecords.map(\.id))
+        let incomingByID = Dictionary(uniqueKeysWithValues: documents.map { ($0.id, $0) })
 
         var remainingPathKeys = Set(
             currentRecords
@@ -74,7 +77,7 @@ extension SwiftDataMetadataRepository: BinderMetadataStoring {
             }
             try PathPolicy().validateRelativePath(document.relativePath)
             let key = binderPathKey(document.relativePath.rawValue)
-            if let existing = try uniqueDocumentRecord(id: document.id) {
+            if let existing = currentByID[document.id.rawValue] {
                 remainingPathKeys.remove(binderPathKey(existing.relativePath))
             }
             guard remainingPathKeys.insert(key).inserted else {
@@ -85,13 +88,23 @@ extension SwiftDataMetadataRepository: BinderMetadataStoring {
                 )
             }
             if let parentID = document.parentID {
-                guard parentID != document.id,
-                      let parent = try uniqueDocumentRecord(id: parentID),
-                      parent.projectID == projectID.rawValue,
-                      parent.kindRawValue == DocumentKind.folder.rawValue,
-                      !removedIDs.contains(parent.id)
-                else {
+                guard parentID != document.id else {
                     throw MetadataRepositoryError.missingParent(parentID)
+                }
+                if let incomingParent = incomingByID[parentID] {
+                    guard incomingParent.projectID == projectID,
+                          incomingParent.kind == .folder
+                    else {
+                        throw MetadataRepositoryError.missingParent(parentID)
+                    }
+                } else {
+                    guard let parent = currentByID[parentID.rawValue],
+                          parent.projectID == projectID.rawValue,
+                          parent.kindRawValue == DocumentKind.folder.rawValue,
+                          !removedIDs.contains(parent.id)
+                    else {
+                        throw MetadataRepositoryError.missingParent(parentID)
+                    }
                 }
             }
         }
@@ -108,7 +121,7 @@ extension SwiftDataMetadataRepository: BinderMetadataStoring {
             modelContext.delete(record)
         }
         for document in documents {
-            if let record = try uniqueDocumentRecord(id: document.id) {
+            if let record = currentByID[document.id.rawValue] {
                 try apply(document, to: record)
             } else {
                 let record = DocumentRecord(

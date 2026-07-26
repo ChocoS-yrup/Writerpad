@@ -7,6 +7,7 @@ actor LocalBinderRepository: BinderRepository {
     private let scanner: any BinderDirectoryScanning
     private let pathPolicy: PathPolicy
     private let ruleService: BinderRuleService
+    private let hierarchyPolicy = BinderHierarchyPolicy()
     private let clock: any AppClock
     private let uuidGenerator: any UUIDGenerating
 
@@ -29,6 +30,11 @@ actor LocalBinderRepository: BinderRepository {
         self.uuidGenerator = uuidGenerator
     }
 
+    func rootContainerID(in projectID: ProjectID) async throws -> DocumentID {
+        let mainPath = RelativeDocumentPath(rawValue: "메인")
+        return try await ensureMainDocument(in: projectID, path: mainPath).id
+    }
+
     func rootNodes(in projectID: ProjectID) async throws -> [BinderNode] {
         let workspaceRoot = try await workspaceLocator.workspaceRoot(for: projectID)
         let mainPath = RelativeDocumentPath(rawValue: "메인")
@@ -37,10 +43,27 @@ actor LocalBinderRepository: BinderRepository {
             parentPath: mainPath
         )
         let main = try await ensureMainDocument(in: projectID, path: mainPath)
+        if let invalidEntry = entries.first(where: { $0.kind == .text }) {
+            throw BinderRepositoryError.documentAtTopLevel(
+                invalidEntry.relativePath.rawValue
+            )
+        }
+        let storedChildren = try await metadataStore.binderChildren(
+            in: projectID,
+            parentID: main.id
+        )
+        if let invalidDocument = hierarchyPolicy.invalidTopLevelDocuments(
+            in: [main] + storedChildren
+        ).first {
+            throw BinderRepositoryError.documentAtTopLevel(
+                invalidDocument.relativePath.rawValue
+            )
+        }
         let nodes = try await reconcile(
             entries: entries,
             parent: main,
-            projectID: projectID
+            projectID: projectID,
+            existingChildren: storedChildren
         )
 
         for category in BinderFixedCategory.allCases {
@@ -116,12 +139,17 @@ actor LocalBinderRepository: BinderRepository {
     private func reconcile(
         entries: [BinderDiskEntry],
         parent: DocumentNode,
-        projectID: ProjectID
+        projectID: ProjectID,
+        existingChildren: [DocumentNode]? = nil
     ) async throws -> [BinderNode] {
-        let existing = try await metadataStore.binderChildren(
-            in: projectID,
-            parentID: parent.id
-        )
+        let existing = if let existingChildren {
+            existingChildren
+        } else {
+            try await metadataStore.binderChildren(
+                in: projectID,
+                parentID: parent.id
+            )
+        }
         var unmatchedExisting = Dictionary(uniqueKeysWithValues: existing.map { ($0.id, $0) })
         var matchByEntryPath: [String: DocumentNode] = [:]
 
@@ -170,11 +198,17 @@ actor LocalBinderRepository: BinderRepository {
             entryByDocumentID[document.id] = entry
         }
 
-        try await metadataStore.reconcileBinderMetadata(
-            in: projectID,
-            upserting: documents,
-            removingSubtrees: Array(unmatchedExisting.keys)
-        )
+        let existingByID = Dictionary(uniqueKeysWithValues: existing.map { ($0.id, $0) })
+        let requiresMetadataUpdate = !unmatchedExisting.isEmpty || documents.contains {
+            existingByID[$0.id] != $0
+        }
+        if requiresMetadataUpdate {
+            try await metadataStore.reconcileBinderMetadata(
+                in: projectID,
+                upserting: documents,
+                removingSubtrees: Array(unmatchedExisting.keys)
+            )
+        }
         return documents.compactMap { document in
             entryByDocumentID[document.id].map { makeNode(document: document, entry: $0) }
         }
@@ -213,6 +247,17 @@ actor LocalBinderRepository: BinderRepository {
     }
 
     private func rootOrdering(_ lhs: BinderNode, _ rhs: BinderNode) -> Bool {
+        // 원고와 휴지통만 양 끝에 보호하고, 나머지 고정·사용자 루트는 사용자 순서를 따른다.
+        if lhs.fixedCategory == .manuscript { return true }
+        if rhs.fixedCategory == .manuscript { return false }
+        if lhs.fixedCategory == .trash { return false }
+        if rhs.fixedCategory == .trash { return true }
+        let leftCustomized = lhs.userOrder >= BinderOrderingPolicy.customizedRootOrderOffset
+        let rightCustomized = rhs.userOrder >= BinderOrderingPolicy.customizedRootOrderOffset
+        if leftCustomized || rightCustomized {
+            if leftCustomized != rightCustomized { return leftCustomized }
+            return childOrdering(lhs, rhs)
+        }
         switch (lhs.fixedCategory, rhs.fixedCategory) {
         case let (left?, right?):
             return left.fixedOrder < right.fixedOrder

@@ -4,6 +4,49 @@ import XCTest
 final class BinderRuleServiceTests: XCTestCase {
     private let service = BinderRuleService()
 
+    func testHierarchyPolicyAllowsOnlyFoldersAtTopLevel() {
+        let policy = BinderHierarchyPolicy()
+        let projectID = ProjectID(rawValue: UUID())
+        let root = DocumentNode(
+            id: DocumentID(rawValue: UUID()),
+            projectID: projectID,
+            kind: .folder,
+            parentID: nil,
+            relativePath: BinderHierarchyPolicy.topLevelPath,
+            userOrder: 0,
+            modifiedAt: .distantPast,
+            contentHash: nil
+        )
+        let folder = DocumentNode(
+            id: DocumentID(rawValue: UUID()),
+            projectID: projectID,
+            kind: .folder,
+            parentID: root.id,
+            relativePath: RelativeDocumentPath(rawValue: "메인/자료"),
+            userOrder: 0,
+            modifiedAt: .distantPast,
+            contentHash: nil
+        )
+        let text = DocumentNode(
+            id: DocumentID(rawValue: UUID()),
+            projectID: projectID,
+            kind: .text,
+            parentID: root.id,
+            relativePath: RelativeDocumentPath(rawValue: "메인/초안.txt"),
+            userOrder: 1,
+            modifiedAt: .distantPast,
+            contentHash: nil
+        )
+
+        XCTAssertNil(policy.placementViolation(for: .folder, in: root))
+        XCTAssertEqual(
+            policy.placementViolation(for: .text, in: root),
+            .documentAtTopLevel
+        )
+        XCTAssertNil(policy.placementViolation(for: .text, in: folder))
+        XCTAssertEqual(policy.invalidTopLevelDocuments(in: [root, folder, text]), [text])
+    }
+
     func testVolumeNameMatrixUsesCanonicalASCIINumbers() {
         let cases: [(String, Int?)] = [
             ("1권", 1), ("10권", 10), ("1000권", 1_000),
@@ -37,6 +80,25 @@ final class BinderRuleServiceTests: XCTestCase {
                 "화 이름 경계 실패: \(name)"
             )
         }
+    }
+
+    func testChapterRenameNameSeparatesOnlyTheFirstPrefix() {
+        let cases: [(String, String, String)] = [
+            ("1화 제목", "1화 ", "제목"),
+            ("17화 제목", "17화 ", "제목"),
+            ("128화 결전 준비", "128화 ", "결전 준비"),
+            ("17화", "17화 ", ""),
+            ("17화 ", "17화 ", ""),
+            ("17화 18화에서 회수할 복선", "17화 ", "18화에서 회수할 복선")
+        ]
+
+        for (displayName, prefix, suffix) in cases {
+            let result = ChapterRenameName.parse(displayName: displayName)
+            XCTAssertEqual(result?.displayPrefix, prefix, "분리 실패: \(displayName)")
+            XCTAssertEqual(result?.editableSuffix, suffix, "분리 실패: \(displayName)")
+        }
+        XCTAssertNil(ChapterRenameName.parse(displayName: "등장인물 설정"))
+        XCTAssertNil(ChapterRenameName.parse(displayName: "17화제목"))
     }
 
     func testCreationMatrixSeparatesManuscriptStructureFromGeneralNames() {

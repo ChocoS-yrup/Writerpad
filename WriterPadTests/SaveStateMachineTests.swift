@@ -32,6 +32,30 @@ final class SaveStateMachineTests: XCTestCase {
         XCTAssertEqual(result, current)
     }
 
+    func testLocalBadgeTransitionsAndRetryPresentation() {
+        let editing = SaveStateMachine.reduce(.idle, event: .edited(generation: 1))
+        let saving = SaveStateMachine.reduce(editing, event: .saveStarted(generation: 1))
+        let saved = SaveStateMachine.reduce(
+            saving,
+            event: .saveSucceeded(generation: 1, savedAt: date, contentHash: contentHash)
+        )
+        let editedAgain = SaveStateMachine.reduce(saved, event: .edited(generation: 2))
+        let failed = SaveStateMachine.reduce(
+            .saving(generation: 3),
+            event: .saveFailed(generation: 3, message: "disk full")
+        )
+
+        XCTAssertEqual(SaveStateMachine.presentation(for: editing).label, "편집 중")
+        XCTAssertEqual(SaveStateMachine.presentation(for: saving).label, "로컬 저장 중")
+        XCTAssertEqual(SaveStateMachine.presentation(for: saved).label, "로컬 저장됨")
+        XCTAssertEqual(SaveStateMachine.presentation(for: editedAgain).label, "편집 중")
+        XCTAssertTrue(SaveStateMachine.presentation(for: failed).allowsRetry)
+        XCTAssertEqual(
+            SaveStateMachine.presentation(for: failed).systemImage,
+            "exclamationmark.triangle"
+        )
+    }
+
     func testNoOpSyncBoundaryStaysLocalOnly() async {
         let notifier = NoOpFutureChangeNotifier()
         XCTAssertEqual(notifier.mode, .localOnly)

@@ -156,7 +156,12 @@ extension SwiftDataMetadataRepository: WorkspaceStateRepository {
             return EditorPaneState(documentID: nil, cursor: .start)
         }
         let id = DocumentID(rawValue: rawDocumentID)
-        let document = try domainDocument(from: requireDocumentRecord(id: id))
+        guard let record = try uniqueDocumentRecord(id: id) else {
+            // 작업 공간 레코드보다 문서 메타데이터가 먼저 정리된 비정상 종료나
+            // 외부 변경도 상위 복원 정책에서 안전하게 대체할 수 있게 ID를 보존한다.
+            return EditorPaneState(documentID: id, cursor: .start)
+        }
+        let document = try domainDocument(from: record)
         guard document.projectID == projectID else {
             throw MetadataRepositoryError.corruptedRecord(
                 entity: "WorkspaceRecord",

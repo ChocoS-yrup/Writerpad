@@ -22,14 +22,23 @@ final class ProjectListModel: ObservableObject {
     }
 
     var selectedProject: ManagedProject? {
-        projects.first { $0.id == selectedProjectID }
+        libraryProjects.first { $0.id == selectedProjectID }
     }
 
-    func load() async {
+    var libraryProjects: [ManagedProject] {
+        projects.filter { !$0.isInDeletedList }
+    }
+
+    var deletedProjects: [ManagedProject] {
+        projects.filter(\.isInDeletedList)
+    }
+
+    func load(opensLastProject: Bool = true) async {
         await perform {
             try await projectImporter.recoverPendingImports()
             projects = try await projectManager.projects()
-            selectedProjectID = try await projectManager.restoreLastProject()?.id
+            let lastProjectID = try await projectManager.restoreLastProject()?.id
+            selectedProjectID = opensLastProject ? lastProjectID : nil
         }
     }
 
@@ -66,10 +75,17 @@ final class ProjectListModel: ObservableObject {
         }
     }
 
-    func select(_ id: ProjectID?) async {
-        guard let id else { return }
+    func open(_ id: ProjectID) async {
         await perform {
             try await projectManager.selectProject(id: id)
+            selectedProjectID = id
+        }
+    }
+
+    func returnToLibrary() async {
+        await perform {
+            projects = try await projectManager.projects()
+            selectedProjectID = nil
         }
     }
 
@@ -82,7 +98,7 @@ final class ProjectListModel: ObservableObject {
     }
 
     func move(fromOffsets: IndexSet, toOffset: Int) async {
-        var reordered = projects
+        var reordered = libraryProjects
         reordered.move(fromOffsets: fromOffsets, toOffset: toOffset)
         await perform {
             projects = try await projectManager.reorderProjects(reordered.map(\.id))
@@ -94,7 +110,8 @@ final class ProjectListModel: ObservableObject {
             let confirmation = try await projectManager.prepareDeletion(id: project.id)
             try await projectManager.confirmDeletion(confirmation)
             projects = try await projectManager.projects()
-            selectedProjectID = try await projectManager.restoreLastProject()?.id
+            _ = try await projectManager.restoreLastProject()
+            selectedProjectID = nil
         }
     }
 
@@ -102,6 +119,36 @@ final class ProjectListModel: ObservableObject {
         await perform {
             try await projectManager.cancelDeletion(id: project.id)
             projects = try await projectManager.projects()
+        }
+    }
+
+    func moveToDeletedList(_ project: ManagedProject) async {
+        await perform {
+            let confirmation = try await projectManager.prepareMoveToDeletedList(
+                id: project.id
+            )
+            _ = try await projectManager.moveToDeletedList(confirmation)
+            projects = try await projectManager.projects()
+            selectedProjectID = nil
+        }
+    }
+
+    func restoreFromDeletedList(_ project: ManagedProject) async {
+        await perform {
+            try await projectManager.restoreFromDeletedList(id: project.id)
+            projects = try await projectManager.projects()
+            selectedProjectID = nil
+        }
+    }
+
+    func permanentlyDelete(_ project: ManagedProject) async {
+        await perform {
+            let confirmation = try await projectManager.preparePermanentDeletion(
+                id: project.id
+            )
+            _ = try await projectManager.permanentlyDelete(confirmation)
+            projects = try await projectManager.projects()
+            selectedProjectID = nil
         }
     }
 

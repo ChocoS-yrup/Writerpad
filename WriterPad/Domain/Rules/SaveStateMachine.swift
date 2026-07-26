@@ -1,5 +1,51 @@
 import Foundation
 
+typealias AutosaveSleep = @Sendable (Duration) async throws -> Void
+
+/// 입력이 이어지는 동안 예약을 교체하고 마지막 입력 뒤 한 번만 저장 작업을 실행한다.
+@MainActor
+final class AutosaveDebouncer {
+    static let defaultDelay: Duration = .milliseconds(800)
+
+    private var delay: Duration
+    private let sleep: AutosaveSleep
+    private var pendingTask: Task<Void, Never>?
+
+    init(
+        delay: Duration = AutosaveDebouncer.defaultDelay,
+        sleep: @escaping AutosaveSleep = { duration in
+            try await ContinuousClock().sleep(for: duration)
+        }
+    ) {
+        self.delay = delay
+        self.sleep = sleep
+    }
+
+    func schedule(_ operation: @escaping @MainActor @Sendable () async -> Void) {
+        pendingTask?.cancel()
+        let delay = delay
+        let sleep = sleep
+        pendingTask = Task {
+            do {
+                try await sleep(delay)
+                try Task.checkCancellation()
+                await operation()
+            } catch {
+                // 새 입력이나 즉시 저장이 기존 예약을 취소한 정상 경로다.
+            }
+        }
+    }
+
+    func updateDelay(_ delay: Duration) {
+        self.delay = delay
+    }
+
+    func cancel() {
+        pendingTask?.cancel()
+        pendingTask = nil
+    }
+}
+
 enum SaveEvent: Equatable, Sendable {
     case edited(generation: UInt64)
     case saveStarted(generation: UInt64)
@@ -34,4 +80,46 @@ enum SaveStateMachine {
             return .failed(generation: generation, message: message)
         }
     }
+
+    /// 배지에 표시할 로컬 저장 의미를 상태 전이와 같은 경계에서 결정한다.
+    static func presentation(for state: SaveState) -> LocalSaveStatusPresentation {
+        switch state {
+        case .idle:
+            LocalSaveStatusPresentation(
+                label: "로컬 저장 준비",
+                systemImage: "externaldrive",
+                allowsRetry: false
+            )
+        case .editing:
+            LocalSaveStatusPresentation(
+                label: "편집 중",
+                systemImage: "pencil",
+                allowsRetry: false
+            )
+        case .saving:
+            LocalSaveStatusPresentation(
+                label: "로컬 저장 중",
+                systemImage: "arrow.triangle.2.circlepath",
+                allowsRetry: false
+            )
+        case .saved:
+            LocalSaveStatusPresentation(
+                label: "로컬 저장됨",
+                systemImage: "checkmark.circle",
+                allowsRetry: false
+            )
+        case .failed:
+            LocalSaveStatusPresentation(
+                label: "로컬 저장 실패 · 재시도",
+                systemImage: "exclamationmark.triangle",
+                allowsRetry: true
+            )
+        }
+    }
+}
+
+struct LocalSaveStatusPresentation: Equatable, Sendable {
+    let label: String
+    let systemImage: String
+    let allowsRetry: Bool
 }

@@ -113,13 +113,19 @@ actor LocalDocumentStore: LocalDocumentStoring {
         do {
             try writer.writeTemporaryFile(data: data, at: temporaryURL)
             let modifiedAt = temporaryModificationDate(temporaryURL)
+            let contentHash = hasher.sha256(for: data)
             let receipt = DocumentSaveReceipt(
                 projectID: request.projectID,
                 documentID: request.documentID,
                 relativePath: request.relativePath,
-                contentHash: hasher.sha256(for: data),
+                contentHash: contentHash,
                 modifiedAt: modifiedAt,
-                generation: request.generation
+                generation: request.generation,
+                cursor: request.cursor,
+                savedContent: SavedDocumentContent(
+                    utf8Data: data,
+                    contentHash: contentHash
+                )
             )
             try writeReconciliationMarker(receipt, to: markerURL)
             try writer.replaceItem(at: destinationURL, with: temporaryURL)

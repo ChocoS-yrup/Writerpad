@@ -75,6 +75,26 @@ final class WindowsProjectImporterTests: XCTestCase {
         XCTAssertTrue(report.fatalIssues.contains { $0.kind == .invalidUTF8 })
     }
 
+    func testTopLevelDocumentIsFatalBeforeImport() async throws {
+        let harness = try makeHarness()
+        let fixture = try makeFixture(in: harness.root, name: "최상위 문서 오류")
+        try writeText(
+            "잘못된 위치",
+            to: fixture.workspace,
+            path: "메인/최상위 문서.txt"
+        )
+
+        let report = try await harness.importer.inspect(fixture.container)
+
+        XCTAssertFalse(report.canImport)
+        XCTAssertTrue(
+            report.fatalIssues.contains {
+                $0.kind == .documentAtTopLevel
+                    && $0.relativePath == "메인/최상위 문서.txt"
+            }
+        )
+    }
+
     func testDuplicateChapterNumberAcrossVolumesIsFatal() async throws {
         let harness = try makeHarness()
         let fixture = try makeFixture(in: harness.root, name: "중복 화")

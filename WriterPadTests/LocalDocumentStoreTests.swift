@@ -37,6 +37,29 @@ final class LocalDocumentStoreTests: XCTestCase {
         )
     }
 
+    func testSaveReceiptCarriesReusableContentWithoutPersistingItInMarkerEncoding() async throws {
+        let workspace = try LocalDocumentTestWorkspace.create()
+        defer { workspace.remove() }
+        let text = String(repeating: "저장 결과 재사용🙂\n", count: 1_000)
+        let expectedData = Data(text.utf8)
+        let cursor = TextCursorState(location: 41, selectionLength: 3)
+        let store = makeStore(workspace, updater: RecordingMetadataUpdater())
+
+        let receipt = try await store.save(
+            workspace.request(text: text, generation: 1, cursor: cursor)
+        )
+
+        XCTAssertEqual(receipt.savedContent?.utf8Data, expectedData)
+        XCTAssertEqual(receipt.savedContent?.contentHash, receipt.contentHash)
+        XCTAssertEqual(receipt.cursor, cursor)
+        let encoded = try JSONEncoder().encode(receipt)
+        XCTAssertNil(String(data: encoded, encoding: .utf8)?.range(of: "savedContent"))
+        let decoded = try JSONDecoder().decode(DocumentSaveReceipt.self, from: encoded)
+        XCTAssertNil(decoded.savedContent)
+        XCTAssertEqual(decoded.cursor, cursor)
+        XCTAssertEqual(decoded.contentHash, receipt.contentHash)
+    }
+
     func testInvalidUTF8IsRejectedWithoutLossyDecoding() async throws {
         let workspace = try LocalDocumentTestWorkspace.create()
         defer { workspace.remove() }

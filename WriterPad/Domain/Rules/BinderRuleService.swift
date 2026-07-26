@@ -26,6 +26,7 @@ enum BinderRuleViolation: Equatable, Sendable {
     case volumeNameLocked
     case chapterPrefixLocked(String)
     case manuscriptRootLocked
+    case manuscriptDeletionLocked
     case manuscriptCannotLeave
     case externalItemCannotEnterManuscript
     case invalidManuscriptDestination
@@ -53,6 +54,8 @@ enum BinderRuleViolation: Equatable, Sendable {
             "화 이름의 ‘\(prefix)’ 접두사는 변경할 수 없습니다."
         case .manuscriptRootLocked:
             "원고 최상위 항목은 이동하거나 이름을 변경할 수 없습니다."
+        case .manuscriptDeletionLocked:
+            "원고와 권·화는 삭제할 수 없습니다."
         case .manuscriptCannotLeave:
             "원고 안의 항목을 다른 최상위 카테고리로 이동할 수 없습니다."
         case .externalItemCannotEnterManuscript:
@@ -84,6 +87,7 @@ struct BinderMoveRuleRequest: Equatable, Sendable {
     let sourcePath: RelativeDocumentPath
     let kind: DocumentKind
     let destinationFolderPath: RelativeDocumentPath
+    var proposedStoredName: String? = nil
     var existingDestinationNames: [String] = []
     var existingManuscriptChapterPaths: [RelativeDocumentPath] = []
 }
@@ -92,6 +96,35 @@ struct ManuscriptChapterIdentity: Equatable, Sendable {
     let number: Int
     let protectedPrefix: String
     let titleSuffix: String
+}
+
+/// 회차 이름 변경 화면에서 번호와 사용자가 기록하는 메모를 분리한 값이다.
+///
+/// 원고 파일의 정식 이름 규칙(001화.txt 등)과 별개로, 기존 회차의 표시 이름은
+/// 자릿수 제한 없이 읽는다. 저장 시에는 항상 `displayPrefix`를 다시 붙인다.
+struct ChapterRenameName: Equatable, Sendable {
+    let protectedPrefix: String
+    let editableSuffix: String
+
+    var displayPrefix: String { protectedPrefix + " " }
+
+    static func parse(displayName: String) -> Self? {
+        var digits = ""
+        var remainder = displayName[...]
+        while let scalar = remainder.unicodeScalars.first,
+              (48...57).contains(scalar.value) {
+            digits.unicodeScalars.append(scalar)
+            remainder = remainder.dropFirst()
+        }
+        guard !digits.isEmpty, remainder.hasPrefix("화") else { return nil }
+
+        let title = remainder.dropFirst()
+        guard title.isEmpty || title.first?.isWhitespace == true else { return nil }
+        return Self(
+            protectedPrefix: digits + "화",
+            editableSuffix: String(title).trimmingCharacters(in: .whitespacesAndNewlines)
+        )
+    }
 }
 
 struct BinderRuleService: Sendable {
@@ -206,17 +239,20 @@ struct BinderRuleService: Sendable {
     /// 원고 권·화도 원래 경로를 보존하는 조건으로 휴지통에 놓을 수 있다.
     func evaluateTrash(
         sourcePath: RelativeDocumentPath,
+        destinationStoredName: String,
         kind: DocumentKind,
         existingTrashNames: [String]
     ) -> BinderRuleDecision {
         switch manuscriptLocation(of: sourcePath) {
         case .root:
             return .denied(.manuscriptRootLocked)
+        case .volume, .chapter:
+            return .denied(.manuscriptDeletionLocked)
         case .invalid:
             return .denied(.invalidManuscriptDestination)
-        case .outside, .volume, .chapter:
+        case .outside:
             return nameDenial(
-                storedName(of: sourcePath),
+                destinationStoredName,
                 existingNames: existingTrashNames
             ) ?? .allowed
         }
@@ -325,7 +361,7 @@ struct BinderRuleService: Sendable {
             return .denied(.externalItemCannotEnterManuscript)
         }
 
-        let name = storedName(of: request.sourcePath)
+        let name = request.proposedStoredName ?? storedName(of: request.sourcePath)
         let sourceParent = parentPath(of: request.sourcePath)
         let destinationNames = sourceParent == request.destinationFolderPath
             ? removingOneExactMatch(name, from: request.existingDestinationNames)

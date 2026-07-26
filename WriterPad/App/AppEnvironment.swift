@@ -12,6 +12,12 @@ final class AppEnvironment: ObservableObject {
     let projectImporter: any ProjectImporting
     let binderRepository: any BinderRepository
     let binderCommands: any BinderCommanding
+    let localDocumentStore: any LocalDocumentStoring
+    let searchService: any Searching
+    let exporter: any Exporting
+    let backupStore: any BackupStoring
+    let backupPolicyStore: any BackupPolicyStoring
+    let restoreCoordinator: DocumentRestoreCoordinator
     let clock: any AppClock
     let futureChangeNotifier: any FutureChangeNotifying
 
@@ -26,8 +32,14 @@ final class AppEnvironment: ObservableObject {
         projectImporter: any ProjectImporting,
         binderRepository: any BinderRepository,
         binderCommands: any BinderCommanding,
+        localDocumentStore: any LocalDocumentStoring,
+        searchService: any Searching,
+        backupStore: any BackupStoring,
+        backupPolicyStore: any BackupPolicyStoring,
+        restoreCoordinator: DocumentRestoreCoordinator,
         clock: any AppClock,
-        futureChangeNotifier: any FutureChangeNotifying
+        futureChangeNotifier: any FutureChangeNotifying,
+        exporter: (any Exporting)? = nil
     ) {
         self.modelContainer = modelContainer
         self.projectRepository = projectRepository
@@ -37,6 +49,16 @@ final class AppEnvironment: ObservableObject {
         self.projectImporter = projectImporter
         self.binderRepository = binderRepository
         self.binderCommands = binderCommands
+        self.localDocumentStore = localDocumentStore
+        self.searchService = searchService
+        self.exporter = exporter ?? LocalManuscriptExporter(
+            projectRepository: projectRepository,
+            documentRepository: documentRepository,
+            documentStore: localDocumentStore
+        )
+        self.backupStore = backupStore
+        self.backupPolicyStore = backupPolicyStore
+        self.restoreCoordinator = restoreCoordinator
         self.clock = clock
         self.futureChangeNotifier = futureChangeNotifier
     }
@@ -92,12 +114,46 @@ final class AppEnvironment: ObservableObject {
             pathPolicy: pathResolver.policy,
             clock: clock
         )
+        let futureChangeNotifier = NoOpFutureChangeNotifier()
+        let localDocumentStore = LocalDocumentStore(
+            workspaceLocator: workspaceLocator,
+            metadataUpdater: repository,
+            clock: clock
+        )
+        let searchService = LocalProjectSearchService(
+            documentRepository: repository,
+            documentStore: localDocumentStore
+        )
+        let exporter = LocalManuscriptExporter(
+            projectRepository: repository,
+            documentRepository: repository,
+            documentStore: localDocumentStore,
+            pathPolicy: pathResolver.policy
+        )
+        let backupStore = LocalBackupStore(
+            workspaceLocator: workspaceLocator,
+            clock: clock
+        )
+        let backupPolicyStore = LocalBackupPolicyStore(
+            globalPolicyURL: pathResolver.projectsRootURL
+                .appendingPathComponent(".writerpad-backup-policy.json"),
+            legacyWorkspaceLocator: workspaceLocator
+        )
+        let restoreCoordinator = DocumentRestoreCoordinator(
+            documentStore: localDocumentStore,
+            backupStore: backupStore,
+            futureChangeNotifier: futureChangeNotifier,
+            pathPolicy: pathResolver.policy
+        )
         let binderCommands = LocalBinderCommandService(
             metadataStore: repository,
             workspaceStateRepository: repository,
             workspaceLocator: workspaceLocator,
             pathPolicy: pathResolver.policy,
-            clock: clock
+            clock: clock,
+            futureChangeNotifier: futureChangeNotifier,
+            backupStore: backupStore,
+            backupPolicyStore: backupPolicyStore
         )
 
         return AppEnvironment(
@@ -109,8 +165,14 @@ final class AppEnvironment: ObservableObject {
             projectImporter: projectImporter,
             binderRepository: binderRepository,
             binderCommands: binderCommands,
+            localDocumentStore: localDocumentStore,
+            searchService: searchService,
+            backupStore: backupStore,
+            backupPolicyStore: backupPolicyStore,
+            restoreCoordinator: restoreCoordinator,
             clock: clock,
-            futureChangeNotifier: NoOpFutureChangeNotifier()
+            futureChangeNotifier: futureChangeNotifier,
+            exporter: exporter
         )
     }
 }

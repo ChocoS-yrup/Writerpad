@@ -1,6 +1,140 @@
 import Foundation
 
 extension LocalBinderCommandService {
+    func addNewVolume(projectID: ProjectID) async throws -> BinderVolumeCreationResult {
+        guard volumeCreationProjects.insert(projectID).inserted else {
+            throw BinderCommandError.volumeCreationInProgress
+        }
+        defer { volumeCreationProjects.remove(projectID) }
+
+        try await recoverPendingTransactions(in: projectID)
+        let documents = try await documentsAndRequireProject(projectID)
+        guard let manuscript = documents.first(where: {
+            fixedCategory(for: $0.relativePath) == .manuscript && $0.kind == .folder
+        }) else {
+            throw BinderCommandError.missingManuscriptRoot
+        }
+
+        let workspaceRoot = try await workspaceLocator.workspaceRoot(for: projectID)
+        let volumeNumbers = try validVolumeNumbers(workspaceRoot: workspaceRoot)
+        let highestVolume = volumeNumbers.max() ?? 0
+        guard highestVolume < Int.max else {
+            throw BinderCommandError.volumeNumberOverflow
+        }
+        let volumeNumber = highestVolume + 1
+        let (endChapter, overflow) = volumeNumber.multipliedReportingOverflow(by: 25)
+        guard !overflow else { throw BinderCommandError.volumeNumberOverflow }
+        let startChapter = endChapter - 24
+        let chapterNumbers = Array(startChapter...endChapter)
+
+        let volumeName = "\(volumeNumber)권"
+        let volumePath = appending(volumeName, to: manuscript.relativePath)
+        let manuscriptNames = try names(
+            in: manuscript.relativePath,
+            workspaceRoot: workspaceRoot
+        )
+        try requireAllowed(
+            ruleService.evaluateCreation(
+                BinderCreationRuleRequest(
+                    parentPath: manuscript.relativePath,
+                    kind: .folder,
+                    storedName: volumeName,
+                    existingSiblingNames: manuscriptNames
+                )
+            ),
+            candidate: volumeName,
+            existingNames: manuscriptNames
+        )
+
+        let existingChapterPaths = try manuscriptChapterPaths(workspaceRoot: workspaceRoot)
+        let existingChapterNumbers = Set(existingChapterPaths.compactMap {
+            ruleService.titledChapterIdentity(fromStoredName: storedName(of: $0))?.number
+        })
+        if let collision = chapterNumbers.first(where: existingChapterNumbers.contains) {
+            throw BinderCommandError.chapterAlreadyExists(collision)
+        }
+
+        let chapterNames = chapterNumbers.map(chapterFileName)
+        for (index, name) in chapterNames.enumerated() {
+            try requireAllowed(
+                ruleService.evaluateCreation(
+                    BinderCreationRuleRequest(
+                        parentPath: volumePath,
+                        kind: .text,
+                        storedName: name,
+                        existingSiblingNames: Array(chapterNames.prefix(index)),
+                        existingManuscriptChapterPaths: existingChapterPaths
+                    )
+                ),
+                candidate: name,
+                existingNames: Array(chapterNames.prefix(index))
+            )
+        }
+
+        let now = clock.now()
+        let volumeID = DocumentID(rawValue: uuidGenerator.makeUUID())
+        let manuscriptSiblings = documents.filter { $0.parentID == manuscript.id }
+        let volume = DocumentNode(
+            id: volumeID,
+            projectID: projectID,
+            kind: .folder,
+            parentID: manuscript.id,
+            relativePath: volumePath,
+            userOrder: (manuscriptSiblings.map(\.userOrder).max() ?? -1) + 1,
+            modifiedAt: now,
+            contentHash: nil,
+            isExpanded: true
+        )
+        let emptyHash = hasher.sha256(for: Data())
+        let chapters = zip(chapterNumbers, chapterNames).enumerated().map { index, pair in
+            let (_, name) = pair
+            return DocumentNode(
+                id: DocumentID(rawValue: uuidGenerator.makeUUID()),
+                projectID: projectID,
+                kind: .text,
+                parentID: volumeID,
+                relativePath: appending(name, to: volumePath),
+                userOrder: index,
+                modifiedAt: now,
+                contentHash: emptyHash
+            )
+        }
+        guard let firstChapter = chapters.first else {
+            throw BinderCommandError.volumeNumberOverflow
+        }
+
+        let journal = BinderCommandJournal(
+            transactionID: uuidGenerator.makeUUID(),
+            projectID: projectID,
+            kind: .createVolume,
+            phase: .prepared,
+            sourcePath: nil,
+            destinationPath: volumePath,
+            createdKind: .folder,
+            oldNodes: [],
+            newNodes: [volume] + chapters,
+            trashRecord: nil
+        )
+        try await execute(journal, workspaceRoot: workspaceRoot)
+        await futureChangeNotifier.record(
+            .manuscriptVolumeCreated(
+                projectID: projectID,
+                volumeID: volumeID,
+                chapterIDs: chapters.map(\.id)
+            )
+        )
+        return BinderVolumeCreationResult(
+            volumeNumber: volumeNumber,
+            volumeID: volumeID,
+            firstChapterID: firstChapter.id,
+            chapterIDs: chapters.map(\.id),
+            volumePath: volumePath,
+            shouldRefreshBinder: true,
+            folderToExpandID: volumeID,
+            documentToOpenID: firstChapter.id
+        )
+    }
+
     func move(
         documentID: DocumentID,
         toFolderID destinationID: DocumentID,
@@ -13,6 +147,7 @@ extension LocalBinderCommandService {
         guard destination.kind == .folder else {
             throw BinderCommandError.destinationIsNotFolder(destinationID)
         }
+        try requireValidHierarchyPlacement(kind: source.kind, in: destination)
         if normalizedPathKey(destination.relativePath)
             == normalizedPathKey(BinderFixedCategory.trash.relativePath) {
             return try await moveToTrash(documentID: documentID, projectID: projectID)
@@ -23,6 +158,7 @@ extension LocalBinderCommandService {
 
         let subtree = subtreeRooted(at: source, in: documents)
         try await requireNoOpenDocument(subtree, projectID: projectID)
+        try await createStructuralBackups(for: subtree)
         if source.id == destination.id
             || normalizedPathKey(destination.relativePath)
                 .hasPrefix(normalizedPathKey(source.relativePath) + "/") {
@@ -34,24 +170,30 @@ extension LocalBinderCommandService {
             in: destination.relativePath,
             workspaceRoot: workspaceRoot
         )
+        let originalStoredName = storedName(of: source.relativePath)
+        let isSameParent = source.parentID == destination.id
+        let candidate = isSameParent || isInManuscript(source.relativePath)
+            ? originalStoredName
+            : numberedCollisionName(originalStoredName, existingNames: existingNames)
         let manuscriptPaths = try manuscriptChapterPaths(workspaceRoot: workspaceRoot)
         let decision = ruleService.evaluateDrop(
             BinderMoveRuleRequest(
                 sourcePath: source.relativePath,
                 kind: source.kind,
                 destinationFolderPath: destination.relativePath,
+                proposedStoredName: candidate,
                 existingDestinationNames: existingNames,
                 existingManuscriptChapterPaths: manuscriptPaths
             )
         )
         try requireAllowed(
             decision,
-            candidate: storedName(of: source.relativePath),
+            candidate: candidate,
             existingNames: existingNames
         )
 
         let destinationPath = appending(
-            storedName(of: source.relativePath),
+            candidate,
             to: destination.relativePath
         )
         if destinationPath == source.relativePath {
@@ -104,6 +246,16 @@ extension LocalBinderCommandService {
             try writeJournal(journal, to: journalURL)
             try inject(.afterMetadataSave)
 
+            if journal.kind == .permanentDelete {
+                try removeIfExists(
+                    try validatedURL(journal.destinationPath, workspaceRoot: workspaceRoot)
+                )
+            }
+            if journal.kind == .restore || journal.kind == .permanentDelete,
+               let record = journal.trashRecord {
+                try removeIfExists(trashRecordURL(record.documentID, workspaceRoot: workspaceRoot))
+            }
+
             try removeIfExists(journalURL)
         } catch let error as BinderCommandError {
             if case .injectedFailure(recoveryPending: true) = error {
@@ -128,10 +280,23 @@ extension LocalBinderCommandService {
     }
 
     func saveMetadata(for journal: BinderCommandJournal) async throws {
+        let existing = try await metadataStore.binderDocuments(in: journal.projectID)
+        let rootIDs = Set(
+            (existing + journal.newNodes)
+                .filter(hierarchyPolicy.isTopLevelContainer)
+                .map(\.id)
+        )
+        if journal.newNodes.contains(where: {
+            $0.kind == .text && $0.parentID.map(rootIDs.contains) == true
+        }) {
+            throw BinderCommandError.topLevelRequiresFolder
+        }
         try await metadataStore.reconcileBinderMetadata(
             in: journal.projectID,
             upserting: journal.newNodes,
-            removingSubtrees: []
+            removingSubtrees: journal.kind == .permanentDelete
+                ? journal.oldNodes.first.map { [$0.id] } ?? []
+                : []
         )
     }
 
@@ -140,7 +305,7 @@ extension LocalBinderCommandService {
         workspaceRoot: URL
     ) async throws {
         try rollbackFiles(for: journal, workspaceRoot: workspaceRoot)
-        if journal.kind == .create {
+        if journal.kind == .create || journal.kind == .createVolume {
             try await metadataStore.reconcileBinderMetadata(
                 in: journal.projectID,
                 upserting: [],
@@ -153,12 +318,19 @@ extension LocalBinderCommandService {
                 removingSubtrees: []
             )
         }
+        if journal.kind == .trash, let record = journal.trashRecord {
+            try removeIfExists(trashRecordURL(record.documentID, workspaceRoot: workspaceRoot))
+        }
     }
 
     func applyFiles(
         for journal: BinderCommandJournal,
         workspaceRoot: URL
     ) throws {
+        if journal.kind == .createVolume {
+            try applyVolumeFiles(for: journal, workspaceRoot: workspaceRoot)
+            return
+        }
         let destination = try validatedURL(
             journal.destinationPath,
             workspaceRoot: workspaceRoot
@@ -189,6 +361,18 @@ extension LocalBinderCommandService {
         for journal: BinderCommandJournal,
         workspaceRoot: URL
     ) throws {
+        if journal.kind == .createVolume {
+            try removeIfExists(
+                try validatedURL(
+                    volumeTemporaryPath(for: journal),
+                    workspaceRoot: workspaceRoot
+                )
+            )
+            try removeIfExists(
+                try validatedURL(journal.destinationPath, workspaceRoot: workspaceRoot)
+            )
+            return
+        }
         let destination = try validatedURL(
             journal.destinationPath,
             workspaceRoot: workspaceRoot
@@ -212,7 +396,15 @@ extension LocalBinderCommandService {
     func documentsAndRequireProject(
         _ projectID: ProjectID
     ) async throws -> [DocumentNode] {
-        try await metadataStore.binderDocuments(in: projectID)
+        let documents = try await metadataStore.binderDocuments(in: projectID)
+        let invalid = hierarchyPolicy.invalidTopLevelDocuments(in: documents)
+        if !invalid.isEmpty {
+            let paths = invalid.map(\.relativePath.rawValue).joined(separator: ", ")
+            hierarchyLogger.fault(
+                "Invalid top-level binder documents detected; no automatic mutation performed: \(paths)"
+            )
+        }
+        return documents
     }
 
     func requireDocument(
@@ -288,11 +480,18 @@ extension LocalBinderCommandService {
                     isExpanded: document.isExpanded
                 )
             }
-            return document.relocated(
-                to: newPath,
+            return DocumentNode(
+                id: document.id,
+                projectID: document.projectID,
+                kind: document.kind,
                 parentID: parentID,
+                relativePath: newPath,
                 userOrder: order,
-                at: now
+                modifiedAt: now,
+                contentHash: document.contentHash,
+                deletionStatus: .active,
+                cursor: document.cursor,
+                isExpanded: document.isExpanded
             )
         }
     }
@@ -314,8 +513,53 @@ extension LocalBinderCommandService {
             destinationPath: destinationPath,
             createdKind: nil,
             oldNodes: oldNodes,
-            newNodes: newNodes
+            newNodes: newNodes,
+            trashRecord: kind == .trash ? TrashRecord(
+                documentID: source.id,
+                originalPath: source.relativePath,
+                originalParentID: source.parentID!,
+                originalUserOrder: source.userOrder,
+                deletedAt: clock.now()
+            ) : nil
         )
+    }
+
+    func trashRecordURL(_ id: DocumentID, workspaceRoot: URL) -> URL {
+        workspaceRoot.appendingPathComponent(
+            ".writerpad-trash-" + id.rawValue.uuidString.lowercased() + ".json"
+        )
+    }
+
+    func writeTrashRecord(_ record: TrashRecord, workspaceRoot: URL) throws {
+        let encoder = JSONEncoder()
+        encoder.dateEncodingStrategy = .iso8601
+        try encoder.encode(record).write(
+            to: trashRecordURL(record.documentID, workspaceRoot: workspaceRoot),
+            options: [.atomic]
+        )
+    }
+
+    func readTrashRecord(_ id: DocumentID, workspaceRoot: URL) throws -> TrashRecord {
+        let url = trashRecordURL(id, workspaceRoot: workspaceRoot)
+        guard fileManager.fileExists(atPath: url.path) else {
+            throw BinderCommandError.trashRecordMissing(id)
+        }
+        let decoder = JSONDecoder()
+        decoder.dateDecodingStrategy = .iso8601
+        return try decoder.decode(TrashRecord.self, from: Data(contentsOf: url))
+    }
+
+    func createStructuralBackups(for subtree: [DocumentNode]) async throws {
+        guard let backupStore, let backupPolicyStore,
+              let projectID = subtree.first?.projectID else { return }
+        let policy = try await backupPolicyStore.policy(for: projectID)
+        guard policy.isAutomaticBackupEnabled else { return }
+        for document in subtree where document.kind == .text {
+            _ = try await backupStore.createSnapshot(
+                for: document,
+                reason: .beforeStructureChange
+            )
+        }
     }
 
     func requireNoOpenDocument(
@@ -355,6 +599,18 @@ extension LocalBinderCommandService {
         )
     }
 
+    func requireValidHierarchyPlacement(
+        kind: DocumentKind,
+        in destinationParent: DocumentNode
+    ) throws {
+        guard hierarchyPolicy.placementViolation(
+            for: kind,
+            in: destinationParent
+        ) == nil else {
+            throw BinderCommandError.topLevelRequiresFolder
+        }
+    }
+
     func storedName(
         from displayName: String,
         kind: DocumentKind
@@ -380,6 +636,26 @@ extension LocalBinderCommandService {
             }
         }
         return nil
+    }
+
+    /// 같은 이름을 거부하지 않고 확장자 앞에 `_2`, `_3`을 붙여 안전하게 공존시킨다.
+    func numberedCollisionName(
+        _ candidate: String,
+        existingNames: [String]
+    ) -> String {
+        if (try? pathPolicy.validateUniqueName(candidate, among: existingNames)) != nil {
+            return candidate
+        }
+        let hasTextExtension = candidate.lowercased().hasSuffix(".txt")
+        let base = hasTextExtension ? String(candidate.dropLast(4)) : candidate
+        let suffix = hasTextExtension ? ".txt" : ""
+        for number in 2...999 {
+            let proposed = "\(base)_\(number)\(suffix)"
+            if (try? pathPolicy.validateUniqueName(proposed, among: existingNames)) != nil {
+                return proposed
+            }
+        }
+        return candidate
     }
 
     func names(
@@ -445,6 +721,16 @@ extension LocalBinderCommandService {
         return key == trashKey || key.hasPrefix(trashKey + "/")
     }
 
+    func isInManuscript(_ path: RelativeDocumentPath) -> Bool {
+        let key = normalizedPathKey(path)
+        let manuscriptKey = normalizedPathKey(BinderFixedCategory.manuscript.relativePath)
+        return key == manuscriptKey || key.hasPrefix(manuscriptKey + "/")
+    }
+
+    func isReorderProtected(_ document: DocumentNode) -> Bool {
+        isInManuscript(document.relativePath) || isInTrash(document.relativePath)
+    }
+
     func normalizedPathKey(_ path: RelativeDocumentPath) -> String {
         path.rawValue.split(separator: "/")
             .map { pathPolicy.collisionKey(for: String($0)) }
@@ -471,6 +757,82 @@ extension LocalBinderCommandService {
                 + transactionID.uuidString.lowercased()
                 + Self.journalSuffix
         )
+    }
+
+    func validVolumeNumbers(workspaceRoot: URL) throws -> [Int] {
+        let manuscriptURL = try validatedURL(
+            BinderFixedCategory.manuscript.relativePath,
+            workspaceRoot: workspaceRoot
+        )
+        return try fileManager.contentsOfDirectory(
+            at: manuscriptURL,
+            includingPropertiesForKeys: [.isDirectoryKey],
+            options: [.skipsHiddenFiles]
+        ).compactMap { url in
+            guard (try? url.resourceValues(forKeys: [.isDirectoryKey]).isDirectory) == true
+            else { return nil }
+            return ruleService.volumeNumber(fromStoredName: url.lastPathComponent)
+        }
+    }
+
+    func chapterFileName(_ number: Int) -> String {
+        let digits = number < 1_000 ? String(format: "%03d", number) : String(number)
+        return digits + "화.txt"
+    }
+
+    func volumeTemporaryPath(for journal: BinderCommandJournal) -> RelativeDocumentPath {
+        appending(
+            ".writerpad-new-volume-\(journal.transactionID.uuidString.lowercased())",
+            to: BinderFixedCategory.manuscript.relativePath
+        )
+    }
+
+    func applyVolumeFiles(
+        for journal: BinderCommandJournal,
+        workspaceRoot: URL
+    ) throws {
+        let destination = try validatedURL(
+            journal.destinationPath,
+            workspaceRoot: workspaceRoot
+        )
+        guard !fileManager.fileExists(atPath: destination.path) else {
+            throw BinderCommandError.destinationAlreadyExists(
+                destination.path,
+                suggestedName: nil
+            )
+        }
+        let temporary = try validatedURL(
+            volumeTemporaryPath(for: journal),
+            workspaceRoot: workspaceRoot
+        )
+        guard !fileManager.fileExists(atPath: temporary.path) else {
+            throw BinderCommandError.destinationAlreadyExists(
+                temporary.path,
+                suggestedName: nil
+            )
+        }
+        guard journal.newNodes.count == 26,
+              journal.newNodes.first?.kind == .folder,
+              journal.newNodes.dropFirst().allSatisfy({ $0.kind == .text })
+        else {
+            throw BinderCommandError.recoveryRequired(temporary.path)
+        }
+
+        try fileManager.createDirectory(
+            at: temporary,
+            withIntermediateDirectories: false
+        )
+        for (index, chapter) in journal.newNodes.dropFirst().enumerated() {
+            let fileName = storedName(of: chapter.relativePath)
+            try pathPolicy.validateName(fileName)
+            let fileURL = temporary.appendingPathComponent(fileName)
+            guard !fileManager.fileExists(atPath: fileURL.path) else {
+                throw BinderCommandError.destinationAlreadyExists(fileURL.path, suggestedName: nil)
+            }
+            try Data().write(to: fileURL, options: [.atomic])
+            try inject(.afterVolumeChapterFile(index + 1))
+        }
+        try fileManager.moveItem(at: temporary, to: destination)
     }
 
     func writeJournal(

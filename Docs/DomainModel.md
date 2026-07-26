@@ -33,7 +33,7 @@ erDiagram
 - `LocalDocumentStoring`: UTF-8 TXT 읽기와 원자 저장
 - `BackupStoring`: 백업 생성·조회·복원
 - `Searching`: 프로젝트 TXT 검색
-- `Exporting`: TXT 추출
+- `Exporting`: 소장용 UTF-8 TXT·PDF 원고 내보내기
 - `AppClock`, `UUIDGenerating`, `ContentHashing`: 시간·UUID·SHA-256 교체 지점
 
 본문 문자열은 Codable 메타데이터에 존재하지 않는다. 파일 저장 때만 Codable이 아닌 `DocumentSaveRequest`에 일시적으로 담긴다.

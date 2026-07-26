@@ -1,5 +1,10 @@
 import Foundation
 
+enum BinderOrderingPolicy {
+    /// 기존 고정 바인더 순서를 유지하면서 사용자가 루트 순서를 처음 바꾼 시점을 구분한다.
+    static let customizedRootOrderOffset = 1_000_000
+}
+
 enum BinderFixedCategory: String, CaseIterable, Codable, Sendable {
     case manuscript
     case characters
@@ -86,6 +91,7 @@ enum BinderRepositoryError: Error, Equatable, LocalizedError, Sendable {
     case unsupportedSymbolicLink(String)
     case unreadableDirectory(String)
     case normalizedNameCollision(String, String)
+    case documentAtTopLevel(String)
 
     var errorDescription: String? {
         switch self {
@@ -105,6 +111,8 @@ enum BinderRepositoryError: Error, Equatable, LocalizedError, Sendable {
             "폴더를 읽을 수 없습니다: \(path)"
         case let .normalizedNameCollision(first, second):
             "대소문자 또는 Unicode 정규화 후 이름이 충돌합니다: \(first), \(second)"
+        case let .documentAtTopLevel(path):
+            "최상위 바인더에는 문서 파일을 배치할 수 없습니다: \(path)"
         }
     }
 }

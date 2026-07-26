@@ -95,6 +95,7 @@ actor WindowsProjectImporter: ProjectImporting {
     private let uuidGenerator: any UUIDGenerating
     private let hasher: any ContentHashing
     private let binderRuleService: BinderRuleService
+    private let binderHierarchyPolicy = BinderHierarchyPolicy()
     private let fileManager: FileManager
     private let faultPlan: ImportFaultPlan?
 
@@ -683,6 +684,21 @@ actor WindowsProjectImporter: ProjectImporting {
     ) {
         let components = relativePath.split(separator: "/").map(String.init)
         let isText = relativePath.lowercased().hasSuffix(".txt")
+        if components.count == 2,
+           binderHierarchyPolicy.placementViolation(
+               for: .text,
+               destinationParentPath: RelativeDocumentPath(rawValue: components[0])
+           ) != nil {
+            issues.append(
+                ImportIssue(
+                    severity: .fatal,
+                    kind: .documentAtTopLevel,
+                    relativePath: relativePath,
+                    message: "최상위 바인더에는 폴더만 배치할 수 있습니다."
+                )
+            )
+            return
+        }
         if isText, String(data: data, encoding: .utf8) == nil {
             issues.append(
                 ImportIssue(

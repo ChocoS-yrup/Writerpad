@@ -64,6 +64,19 @@ struct POSIXAtomicFileWriter: Sendable {
         flushDirectory(destinationURL.deletingLastPathComponent())
     }
 
+    /// 다른 스트리밍 작성기가 만든 고유 임시 파일을 rename하기 전에 디스크에 반영한다.
+    func synchronizeFile(at url: URL) throws {
+        let descriptor = open(url.path, O_RDONLY)
+        guard descriptor >= 0 else {
+            throw mappedError(operation: .flush, url: url, code: errno)
+        }
+        defer { close(descriptor) }
+        try inject(.duringFlush, operation: .flush, url: url)
+        guard fsync(descriptor) == 0 else {
+            throw mappedError(operation: .flush, url: url, code: errno)
+        }
+    }
+
     func injectedJournalFailure(at url: URL) throws {
         try inject(.beforeReconciliationJournal, operation: .reconciliation, url: url)
     }

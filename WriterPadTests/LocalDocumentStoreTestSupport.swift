@@ -85,13 +85,18 @@ struct LocalDocumentTestWorkspace {
         )
     }
 
-    func request(text: String, generation: UInt64) -> DocumentSaveRequest {
+    func request(
+        text: String,
+        generation: UInt64,
+        cursor: TextCursorState? = nil
+    ) -> DocumentSaveRequest {
         DocumentSaveRequest(
             projectID: projectID,
             documentID: documentID,
             relativePath: relativePath,
             text: text,
-            generation: generation
+            generation: generation,
+            cursor: cursor
         )
     }
 

@@ -5,6 +5,9 @@ enum ProjectManagerError: Error, Equatable, LocalizedError, Sendable {
     case projectFolderMissing(String)
     case invalidOrder
     case deletionAlreadyRequested(ProjectID)
+    case deletionNotRequested(ProjectID)
+    case projectAlreadyInDeletedList(ProjectID)
+    case projectNotInDeletedList(ProjectID)
     case staleDeletionConfirmation
     case recoveryRequired(String)
     case injectedFailure(recoveryPending: Bool)
@@ -19,6 +22,12 @@ enum ProjectManagerError: Error, Equatable, LocalizedError, Sendable {
             "작품 순서에 빠지거나 중복된 항목이 있습니다."
         case let .deletionAlreadyRequested(id):
             "이미 삭제 대기 중인 작품입니다: \(id.rawValue.uuidString)"
+        case let .deletionNotRequested(id):
+            "삭제 대기 중인 작품만 삭제 목록으로 옮길 수 있습니다: \(id.rawValue.uuidString)"
+        case let .projectAlreadyInDeletedList(id):
+            "이미 삭제 목록에 있는 작품입니다: \(id.rawValue.uuidString)"
+        case let .projectNotInDeletedList(id):
+            "삭제 목록에 있는 작품만 영구 삭제할 수 있습니다: \(id.rawValue.uuidString)"
         case .staleDeletionConfirmation:
             "작품 정보가 바뀌어 삭제 확인을 다시 받아야 합니다."
         case let .recoveryRequired(path):
@@ -35,6 +44,8 @@ enum ProjectManagerFaultPoint: Equatable, Sendable {
     case afterStaging
     case afterMetadataSave
     case afterFileMove
+    case afterProjectQuarantine
+    case afterProjectMetadataRemoval
 }
 
 struct ProjectManagerFaultPlan: Equatable, Sendable {
@@ -52,11 +63,13 @@ private struct ProjectCatalog: Codable, Equatable {
         let projectID: ProjectID
         var userOrder: Int
         var deletionRequestedAt: Date?
+        var deletedListAt: Date?
 
         private enum CodingKeys: String, CodingKey {
             case projectID = "project_id"
             case userOrder = "user_order"
             case deletionRequestedAt = "deletion_requested_at"
+            case deletedListAt = "deleted_list_at"
         }
     }
 }
@@ -65,12 +78,15 @@ private struct ProjectTransactionJournal: Codable {
     enum Kind: String, Codable {
         case create
         case rename
+        case delete
     }
 
     enum Phase: String, Codable {
         case staged
         case metadataSaved = "metadata_saved"
         case fileMoved = "file_moved"
+        case quarantined
+        case metadataRemoved = "metadata_removed"
     }
 
     let transactionID: UUID
@@ -208,7 +224,7 @@ actor LocalProjectManager: ProjectManaging {
 
     func restoreLastProject() async throws -> ManagedProject? {
         let managed = try await projects()
-        let active = managed.filter { !$0.isDeletionRequested }
+        let active = managed.filter(\.isActive)
         guard !active.isEmpty else {
             try await workspaceStateRepository.setLastProjectID(nil)
             return nil
@@ -224,7 +240,10 @@ actor LocalProjectManager: ProjectManaging {
 
     func selectProject(id: ProjectID) async throws {
         let project = try await requireManagedProject(id: id)
-        guard !project.isDeletionRequested else {
+        guard project.isActive else {
+            if project.isInDeletedList {
+                throw ProjectManagerError.projectAlreadyInDeletedList(id)
+            }
             throw ProjectManagerError.deletionAlreadyRequested(id)
         }
         try await workspaceStateRepository.setLastProjectID(id)
@@ -309,23 +328,20 @@ actor LocalProjectManager: ProjectManaging {
 
     func reorderProjects(_ orderedIDs: [ProjectID]) async throws -> [ManagedProject] {
         var catalog = try loadCatalog()
-        let projectIDs = Set(try await projectRepository.projects().map(\.id))
-        guard orderedIDs.count == projectIDs.count,
-              Set(orderedIDs) == projectIDs
+        let managed = try await managedProjectsWithoutRecovery()
+        let visibleIDs = Set(managed.filter { !$0.isInDeletedList }.map(\.id))
+        guard orderedIDs.count == visibleIDs.count,
+              Set(orderedIDs) == visibleIDs
         else {
             throw ProjectManagerError.invalidOrder
         }
-        let priorDeletionDates = Dictionary(
-            uniqueKeysWithValues: catalog.entries.map {
-                ($0.projectID, $0.deletionRequestedAt)
+        for (index, id) in orderedIDs.enumerated() {
+            guard let entryIndex = catalog.entries.firstIndex(
+                where: { $0.projectID == id }
+            ) else {
+                throw ProjectManagerError.missingProject(id)
             }
-        )
-        catalog.entries = orderedIDs.enumerated().map { index, id in
-            ProjectCatalog.Entry(
-                projectID: id,
-                userOrder: index,
-                deletionRequestedAt: priorDeletionDates[id] ?? nil
-            )
+            catalog.entries[entryIndex].userOrder = index
         }
         try saveCatalog(catalog)
         return try await managedProjectsWithoutRecovery()
@@ -333,7 +349,10 @@ actor LocalProjectManager: ProjectManaging {
 
     func prepareDeletion(id: ProjectID) async throws -> ProjectDeletionConfirmation {
         let managed = try await requireManagedProject(id: id)
-        guard !managed.isDeletionRequested else {
+        guard managed.isActive else {
+            if managed.isInDeletedList {
+                throw ProjectManagerError.projectAlreadyInDeletedList(id)
+            }
             throw ProjectManagerError.deletionAlreadyRequested(id)
         }
         return ProjectDeletionConfirmation(
@@ -347,6 +366,14 @@ actor LocalProjectManager: ProjectManaging {
         guard managed.name == confirmation.expectedName else {
             throw ProjectManagerError.staleDeletionConfirmation
         }
+        guard managed.isActive else {
+            if managed.isInDeletedList {
+                throw ProjectManagerError.projectAlreadyInDeletedList(
+                    confirmation.projectID
+                )
+            }
+            throw ProjectManagerError.deletionAlreadyRequested(confirmation.projectID)
+        }
         var catalog = try loadCatalog()
         guard let index = catalog.entries.firstIndex(
             where: { $0.projectID == confirmation.projectID }
@@ -356,18 +383,152 @@ actor LocalProjectManager: ProjectManaging {
         catalog.entries[index].deletionRequestedAt = clock.now()
         try saveCatalog(catalog)
         if try await workspaceStateRepository.lastProjectID() == confirmation.projectID {
-            try await workspaceStateRepository.setLastProjectID(nil)
+            _ = try await selectLastActiveProject()
         }
     }
 
     func cancelDeletion(id: ProjectID) async throws {
-        _ = try await requireManagedProject(id: id)
+        let managed = try await requireManagedProject(id: id)
+        guard managed.isDeletionRequested else {
+            throw ProjectManagerError.deletionNotRequested(id)
+        }
         var catalog = try loadCatalog()
         guard let index = catalog.entries.firstIndex(where: { $0.projectID == id }) else {
             throw ProjectManagerError.missingProject(id)
         }
         catalog.entries[index].deletionRequestedAt = nil
         try saveCatalog(catalog)
+    }
+
+    func prepareMoveToDeletedList(
+        id: ProjectID
+    ) async throws -> ProjectDeletedListConfirmation {
+        let managed = try await requireManagedProject(id: id)
+        guard managed.isDeletionRequested else {
+            if managed.isInDeletedList {
+                throw ProjectManagerError.projectAlreadyInDeletedList(id)
+            }
+            throw ProjectManagerError.deletionNotRequested(id)
+        }
+        return ProjectDeletedListConfirmation(
+            projectID: id,
+            expectedName: managed.name
+        )
+    }
+
+    @discardableResult
+    func moveToDeletedList(
+        _ confirmation: ProjectDeletedListConfirmation
+    ) async throws -> ManagedProject? {
+        let managed = try await requireManagedProject(id: confirmation.projectID)
+        guard managed.name == confirmation.expectedName else {
+            throw ProjectManagerError.staleDeletionConfirmation
+        }
+        guard managed.isDeletionRequested else {
+            if managed.isInDeletedList {
+                throw ProjectManagerError.projectAlreadyInDeletedList(
+                    confirmation.projectID
+                )
+            }
+            throw ProjectManagerError.deletionNotRequested(confirmation.projectID)
+        }
+        var catalog = try loadCatalog()
+        guard let index = catalog.entries.firstIndex(
+            where: { $0.projectID == confirmation.projectID }
+        ) else {
+            throw ProjectManagerError.missingProject(confirmation.projectID)
+        }
+        catalog.entries[index].deletionRequestedAt = nil
+        catalog.entries[index].deletedListAt = clock.now()
+        try saveCatalog(catalog)
+        return try await selectLastActiveProject()
+    }
+
+    func restoreFromDeletedList(id: ProjectID) async throws {
+        let managed = try await requireManagedProject(id: id)
+        guard managed.isInDeletedList else {
+            throw ProjectManagerError.projectNotInDeletedList(id)
+        }
+        var catalog = try loadCatalog()
+        guard let index = catalog.entries.firstIndex(where: { $0.projectID == id }) else {
+            throw ProjectManagerError.missingProject(id)
+        }
+        let lastVisibleOrder = catalog.entries
+            .filter { $0.deletedListAt == nil && $0.projectID != id }
+            .map(\.userOrder)
+            .max() ?? -1
+        catalog.entries[index].userOrder = lastVisibleOrder + 1
+        catalog.entries[index].deletionRequestedAt = nil
+        catalog.entries[index].deletedListAt = nil
+        try saveCatalog(catalog)
+    }
+
+    func preparePermanentDeletion(
+        id: ProjectID
+    ) async throws -> ProjectPermanentDeletionConfirmation {
+        let managed = try await requireManagedProject(id: id)
+        guard managed.isInDeletedList else {
+            throw ProjectManagerError.projectNotInDeletedList(id)
+        }
+        return ProjectPermanentDeletionConfirmation(
+            projectID: id,
+            expectedName: managed.name
+        )
+    }
+
+    @discardableResult
+    func permanentlyDelete(
+        _ confirmation: ProjectPermanentDeletionConfirmation
+    ) async throws -> ManagedProject? {
+        let managed = try await requireManagedProject(id: confirmation.projectID)
+        guard managed.name == confirmation.expectedName else {
+            throw ProjectManagerError.staleDeletionConfirmation
+        }
+        guard managed.isInDeletedList else {
+            throw ProjectManagerError.projectNotInDeletedList(confirmation.projectID)
+        }
+
+        let project = managed.project
+        let projectURL = try pathResolver.standardPaths(
+            forProjectNamed: project.name
+        ).projectContainerURL
+        guard fileManager.fileExists(atPath: projectURL.path) else {
+            throw ProjectManagerError.projectFolderMissing(project.name)
+        }
+
+        let transactionID = UUID()
+        let quarantineFolderName =
+            ".writerpad-delete-\(transactionID.uuidString).quarantine"
+        let quarantineURL = pathResolver.projectsRootURL.appendingPathComponent(
+            quarantineFolderName,
+            isDirectory: true
+        )
+        var journal = ProjectTransactionJournal(
+            transactionID: transactionID,
+            kind: .delete,
+            phase: .staged,
+            oldProject: nil,
+            newProject: project,
+            stagingFolderName: quarantineFolderName
+        )
+        let journalURL = transactionJournalURL(transactionID)
+
+        try writeJournal(journal, to: journalURL)
+        try fileManager.moveItem(at: projectURL, to: quarantineURL)
+        journal.phase = .quarantined
+        try writeJournal(journal, to: journalURL)
+        try inject(.afterProjectQuarantine)
+
+        try await projectRepository.remove(id: project.id)
+        journal.phase = .metadataRemoved
+        try writeJournal(journal, to: journalURL)
+        try inject(.afterProjectMetadataRemoval)
+
+        try removeCatalogEntry(project.id)
+        let replacement = try await selectLastActiveProject()
+        try removeIfExists(quarantineURL)
+        try removeIfExists(journalURL)
+        return replacement
     }
 
     func exportDescriptor(id: ProjectID) async throws -> ProjectExportDescriptor {
@@ -413,6 +574,8 @@ actor LocalProjectManager: ProjectManaging {
                 try await recoverCreation(journal, journalURL: url)
             case .rename:
                 try await recoverRename(journal, journalURL: url)
+            case .delete:
+                try await recoverPermanentDeletion(journal, journalURL: url)
             }
         }
     }
@@ -492,6 +655,54 @@ actor LocalProjectManager: ProjectManaging {
         try removeIfExists(journalURL)
     }
 
+    private func recoverPermanentDeletion(
+        _ journal: ProjectTransactionJournal,
+        journalURL: URL
+    ) async throws {
+        guard let quarantineFolderName = journal.stagingFolderName else {
+            throw ProjectManagerError.recoveryRequired(journalURL.path)
+        }
+        let project = journal.newProject
+        let projectURL = try pathResolver.standardPaths(
+            forProjectNamed: project.name
+        ).projectContainerURL
+        let quarantineURL = pathResolver.projectsRootURL.appendingPathComponent(
+            quarantineFolderName,
+            isDirectory: true
+        )
+        let hasProjectFolder = fileManager.fileExists(atPath: projectURL.path)
+        let hasQuarantine = fileManager.fileExists(atPath: quarantineURL.path)
+
+        guard !(hasProjectFolder && hasQuarantine) else {
+            throw ProjectManagerError.recoveryRequired(journalURL.path)
+        }
+
+        if hasProjectFolder {
+            try fileManager.moveItem(at: projectURL, to: quarantineURL)
+        } else if !hasQuarantine,
+                  try await projectRepository.project(id: project.id) != nil {
+            throw ProjectManagerError.recoveryRequired(journalURL.path)
+        }
+
+        if try await projectRepository.project(id: project.id) != nil {
+            try await projectRepository.remove(id: project.id)
+        }
+        try removeCatalogEntry(project.id)
+        _ = try await selectLastActiveProject()
+        try removeIfExists(quarantineURL)
+        try removeIfExists(journalURL)
+    }
+
+    private func selectLastActiveProject() async throws -> ManagedProject? {
+        let activeProjects = try await managedProjectsWithoutRecovery().filter(\.isActive)
+        let currentID = try await workspaceStateRepository.lastProjectID()
+        let selected = currentID.flatMap { id in
+            activeProjects.first { $0.id == id }
+        } ?? activeProjects.first
+        try await workspaceStateRepository.setLastProjectID(selected?.id)
+        return selected
+    }
+
     private func managedProjectsWithoutRecovery() async throws -> [ManagedProject] {
         let projects = try await projectRepository.projects()
         var catalog = try loadCatalog()
@@ -510,9 +721,7 @@ actor LocalProjectManager: ProjectManaging {
             return ManagedProject(
                 project: project,
                 userOrder: entry.userOrder,
-                lifecycleState: entry.deletionRequestedAt.map {
-                    .deletionRequested(at: $0)
-                } ?? .active
+                lifecycleState: lifecycleState(for: entry)
             )
         }.sorted {
             if $0.userOrder == $1.userOrder {
@@ -520,6 +729,18 @@ actor LocalProjectManager: ProjectManaging {
             }
             return $0.userOrder < $1.userOrder
         }
+    }
+
+    private func lifecycleState(
+        for entry: ProjectCatalog.Entry
+    ) -> ProjectLifecycleState {
+        if let deletedListAt = entry.deletedListAt {
+            return .deletedList(at: deletedListAt)
+        }
+        if let deletionRequestedAt = entry.deletionRequestedAt {
+            return .deletionRequested(at: deletionRequestedAt)
+        }
+        return .active
     }
 
     private func requireManagedProject(id: ProjectID) async throws -> ManagedProject {
@@ -650,7 +871,8 @@ actor LocalProjectManager: ProjectManaging {
             ProjectCatalog.Entry(
                 projectID: id,
                 userOrder: nextOrder,
-                deletionRequestedAt: nil
+                deletionRequestedAt: nil,
+                deletedListAt: nil
             )
         )
     }

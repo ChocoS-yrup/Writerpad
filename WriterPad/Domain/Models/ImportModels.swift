@@ -20,6 +20,7 @@ enum ImportIssueKind: String, Codable, Equatable, Sendable {
     case nameCollision
     case invalidName
     case symbolicLink
+    case documentAtTopLevel
     case legacyPlot
     case legacyMainStory
     case legacyPreMigrationBackup
