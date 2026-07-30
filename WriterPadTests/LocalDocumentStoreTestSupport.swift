@@ -50,6 +50,44 @@ actor BlockingMetadataUpdater: DocumentFileMetadataUpdating {
     }
 }
 
+actor ScriptedDurableChangeRecorder: DurableLocalChangeRecording {
+    private var results: [DurableRecordResult]
+    private let restoredResult: DurableRecordResult?
+    private let metadataUpdater: RecordingMetadataUpdater?
+    private(set) var batches: [LocalMutationBatch] = []
+    private(set) var metadataReceiptCounts: [Int] = []
+
+    init(
+        results: [DurableRecordResult],
+        restoredResult: DurableRecordResult? = nil,
+        metadataUpdater: RecordingMetadataUpdater? = nil
+    ) {
+        self.results = results
+        self.restoredResult = restoredResult
+        self.metadataUpdater = metadataUpdater
+    }
+
+    func record(_ batch: LocalMutationBatch) async -> DurableRecordResult {
+        batches.append(batch)
+        if let metadataUpdater {
+            metadataReceiptCounts.append(await metadataUpdater.receipts.count)
+        }
+        guard !results.isEmpty else {
+            return .localSavedButNotQueued(reason: "script exhausted")
+        }
+        return results.removeFirst()
+    }
+
+    func preservedResult(
+        for projectID: ProjectID,
+        documentID: DocumentID
+    ) async -> DurableRecordResult? {
+        _ = projectID
+        _ = documentID
+        return restoredResult
+    }
+}
+
 struct FixedClock: AppClock {
     let date: Date
     func now() -> Date { date }

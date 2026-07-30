@@ -12,13 +12,19 @@ final class ProjectListModel: ObservableObject {
 
     private let projectManager: any ProjectManaging
     private let projectImporter: any ProjectImporting
+    private let authenticationService: (any AuthenticationServicing)?
+    private let projectBindingService: (any ProjectBindingServicing)?
 
     init(
         projectManager: any ProjectManaging,
-        projectImporter: any ProjectImporting
+        projectImporter: any ProjectImporting,
+        authenticationService: (any AuthenticationServicing)? = nil,
+        projectBindingService: (any ProjectBindingServicing)? = nil
     ) {
         self.projectManager = projectManager
         self.projectImporter = projectImporter
+        self.authenticationService = authenticationService
+        self.projectBindingService = projectBindingService
     }
 
     var selectedProject: ManagedProject? {
@@ -59,7 +65,14 @@ final class ProjectListModel: ObservableObject {
             projects = try await projectManager.projects()
             selectedProjectID = result.project.id
             importReport = nil
-            importSuccessMessage = "‘\(result.project.name)’ 작품과 문서 \(result.documentCount)개를 가져왔습니다."
+            let baseMessage =
+                "‘\(result.project.name)’ 작품과 문서 \(result.documentCount)개를 가져왔습니다."
+            if GlobalSyncPreference.isEnabled() {
+                importSuccessMessage = baseMessage
+                    + "\n기존 서버 작품의 중복 생성을 막기 위해 자동 연결하지 않았습니다. 설정 > 서버 계정 및 작품 연결에서 확인하세요."
+            } else {
+                importSuccessMessage = baseMessage
+            }
         }
     }
 
@@ -71,6 +84,7 @@ final class ProjectListModel: ObservableObject {
         await perform {
             let created = try await projectManager.createProject(named: name)
             projects = try await projectManager.projects()
+            await connectNewProjectIfNeeded(created)
             selectedProjectID = created.id
         }
     }
@@ -90,10 +104,11 @@ final class ProjectListModel: ObservableObject {
     }
 
     func rename(_ project: ManagedProject, to newName: String) async {
+        let previousSelection = selectedProjectID
         await perform {
             _ = try await projectManager.renameProject(id: project.id, to: newName)
             projects = try await projectManager.projects()
-            selectedProjectID = project.id
+            selectedProjectID = previousSelection
         }
     }
 
@@ -172,5 +187,19 @@ final class ProjectListModel: ObservableObject {
         } catch {
             errorMessage = error.localizedDescription
         }
+    }
+
+    private func connectNewProjectIfNeeded(
+        _ project: ManagedProject
+    ) async {
+        guard
+            GlobalSyncPreference.isEnabled(),
+            let authenticationService,
+            let projectBindingService,
+            case .authenticated = await authenticationService.currentState()
+        else {
+            return
+        }
+        _ = await projectBindingService.createServerProject(for: project.id)
     }
 }

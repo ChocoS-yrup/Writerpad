@@ -1,0 +1,2866 @@
+import Combine
+import Foundation
+import XCTest
+@testable import WriterPad
+
+final class SyncV2ClientTests: XCTestCase {
+    func testCommitParametersUseExactSQLKeysIncludingNullLease() throws {
+        let parameters = makeParameters()
+        let data = try JSONEncoder().encode(parameters)
+        let object = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: data) as? [String: Any]
+        )
+
+        XCTAssertEqual(
+            Set(object.keys),
+            Set([
+                "p_document_id",
+                "p_project_id",
+                "p_base_revision",
+                "p_operation_id",
+                "p_device_id",
+                "p_relative_path",
+                "p_content",
+                "p_is_deleted",
+                "p_lease_token",
+            ])
+        )
+        XCTAssertTrue(object["p_lease_token"] is NSNull)
+    }
+
+    func testCommitParametersCanonicalizeNFDKoreanPathToNFC() throws {
+        let expected = "메인/원고/1권/001화.txt"
+        let decomposed = expected.decomposedStringWithCanonicalMapping
+        XCTAssertFalse(
+            decomposed.utf8.elementsEqual(expected.utf8),
+            "fixture가 NFD여야 합니다."
+        )
+        let base = makeParameters()
+        let parameters = SyncV2CommitDocumentParameters(
+            documentID: base.documentID,
+            projectID: base.projectID,
+            baseServerRevision: base.baseServerRevision,
+            operationID: base.operationID,
+            deviceID: base.deviceID,
+            relativePath: decomposed,
+            content: base.content,
+            isDeleted: base.isDeleted,
+            leaseToken: base.leaseToken
+        )
+
+        XCTAssertTrue(parameters.relativePath.utf8.elementsEqual(expected.utf8))
+        let data = try JSONEncoder().encode(parameters)
+        let object = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: data) as? [String: Any]
+        )
+        let encodedPath = try XCTUnwrap(
+            object["p_relative_path"] as? String
+        )
+        XCTAssertTrue(encodedPath.utf8.elementsEqual(expected.utf8))
+    }
+
+    func testCommitResultDecodesFractionalTimestampAndRequiredFields() throws {
+        let parameters = makeParameters()
+        let hash = hash(parameters.content)
+        let data = Data(
+            """
+            {
+              "status":"committed",
+              "document_id":"\(parameters.documentID.uuidString)",
+              "version_id":"00000000-0000-0000-0000-000000000902",
+              "operation_id":"\(parameters.operationID.uuidString)",
+              "operation_kind":"create",
+              "revision":1,
+              "relative_path":"\(parameters.relativePath)",
+              "is_deleted":false,
+              "content_hash":"\(hash)",
+              "committed_at":"2026-07-27T01:02:03.123456+00:00"
+            }
+            """.utf8
+        )
+
+        let result = try JSONDecoder().decode(
+            SyncV2CommitDocumentResult.self,
+            from: data
+        )
+
+        XCTAssertEqual(result.serverRevision, 1)
+        XCTAssertEqual(result.contentHash, hash)
+    }
+
+    func testMissingRequiredResponseFieldFailsDecoding() {
+        let data = Data(
+            """
+            {
+              "status":"committed",
+              "document_id":"00000000-0000-0000-0000-000000000901"
+            }
+            """.utf8
+        )
+
+        XCTAssertThrowsError(
+            try JSONDecoder().decode(
+                SyncV2CommitDocumentResult.self,
+                from: data
+            )
+        )
+    }
+
+    func testEveryStableServerErrorIsClassifiedWithoutStringSearch() async {
+        for code in SyncV2RemoteErrorCode.allCases {
+            let transport = SyncV2CommitTransportStub(
+                result: .failure(.postgrest(
+                    message: code.rawValue,
+                    postgresCode: "P0001",
+                    detail: #"{"fixture":true}"#
+                ))
+            )
+            let client = SyncV2Client(transport: transport)
+
+            do {
+                _ = try await client.commitDocument(makeParameters())
+                XCTFail("Expected \(code.rawValue).")
+            } catch let error as SyncV2ClientError {
+                XCTAssertEqual(
+                    error,
+                    .remote(
+                        code: code,
+                        detail: #"{"fixture":true}"#
+                    )
+                )
+            } catch {
+                XCTFail("Unexpected error: \(error)")
+            }
+        }
+    }
+
+    func testRLSAndJWTPostgrestCodesRemainDistinct() async {
+        let forbidden = await classifiedError(
+            .postgrest(
+                message: "permission denied",
+                postgresCode: "42501",
+                detail: nil
+            )
+        )
+        let authentication = await classifiedError(
+            .postgrest(
+                message: "JWT expired",
+                postgresCode: "PGRST301",
+                detail: nil
+            )
+        )
+
+        XCTAssertEqual(
+            forbidden,
+            .remote(code: .forbidden, detail: nil)
+        )
+        XCTAssertEqual(
+            authentication,
+            .remote(code: .authRequired, detail: nil)
+        )
+    }
+
+    func testTimeoutNetworkAndUnknownServerFailureStayDistinct() async {
+        let timeout = await classifiedError(.url(code: .timedOut))
+        let offline = await classifiedError(
+            .url(code: .notConnectedToInternet)
+        )
+        let unknown = await classifiedError(
+            .postgrest(
+                message: "UNRECOGNIZED_SERVER_ERROR",
+                postgresCode: "XX000",
+                detail: "original detail"
+            )
+        )
+
+        XCTAssertEqual(timeout, .timedOut)
+        XCTAssertEqual(offline, .networkUnavailable)
+        XCTAssertEqual(
+            unknown,
+            .serverRejected(
+                SyncV2RemoteRejection(
+                    postgresCode: "XX000",
+                    message: "UNRECOGNIZED_SERVER_ERROR",
+                    detail: "original detail"
+                )
+            )
+        )
+    }
+
+    func testMalformedSuccessfulResponseIsNeverAccepted() async {
+        let parameters = makeParameters()
+        let mismatched = makeResult(
+            parameters: parameters,
+            contentHash: String(repeating: "0", count: 64)
+        )
+        let transport = SyncV2CommitTransportStub(
+            result: .success(mismatched)
+        )
+        let client = SyncV2Client(transport: transport)
+
+        do {
+            _ = try await client.commitDocument(parameters)
+            XCTFail("A mismatched content hash must not be accepted.")
+        } catch let error as SyncV2ClientError {
+            XCTAssertEqual(error, .invalidResponse)
+        } catch {
+            XCTFail("Unexpected error: \(error)")
+        }
+    }
+
+    func testCanonicallyEquivalentNFDResponseIsRejectedWhenNFCWasSent()
+        async {
+        let parameters = makeParameters()
+        let result = SyncV2CommitDocumentResult(
+            status: .committed,
+            documentID: parameters.documentID,
+            versionID: UUID(),
+            operationID: parameters.operationID,
+            operationKind: .create,
+            serverRevision: 1,
+            relativePath: parameters.relativePath
+                .decomposedStringWithCanonicalMapping,
+            isDeleted: false,
+            contentHash: hash(parameters.content),
+            committedAt: Date(timeIntervalSince1970: 1_700_000_000)
+        )
+        let client = SyncV2Client(
+            transport: SyncV2CommitTransportStub(
+                result: .success(result)
+            )
+        )
+
+        do {
+            _ = try await client.commitDocument(parameters)
+            XCTFail("서버가 NFC 경로를 그대로 확정하지 않으면 안 됩니다.")
+        } catch let error as SyncV2ClientError {
+            XCTAssertEqual(error, .invalidResponse)
+        } catch {
+            XCTFail("Unexpected error: \(error)")
+        }
+    }
+
+    func testCommittedThenReplayedSameOperationConvergesToSameResult() async throws {
+        let parameters = makeParameters()
+        let committed = makeResult(parameters: parameters, status: .committed)
+        let replayed = makeResult(parameters: parameters, status: .replayed)
+        let transport = SyncV2CommitSequenceTransport(
+            results: [committed, replayed]
+        )
+        let client = SyncV2Client(transport: transport)
+
+        let first = try await client.commitDocument(parameters)
+        let second = try await client.commitDocument(parameters)
+
+        XCTAssertEqual(first.status, .committed)
+        XCTAssertEqual(second.status, .replayed)
+        XCTAssertEqual(first.versionID, second.versionID)
+        XCTAssertEqual(first.serverRevision, second.serverRevision)
+        XCTAssertEqual(first.committedAt, second.committedAt)
+        let requests = await transport.requests()
+        XCTAssertEqual(requests, [parameters, parameters])
+    }
+
+    func testInvalidCreateAndOversizedContentNeverReachTransport() async {
+        let transport = SyncV2CommitTransportStub(
+            result: .success(makeResult(parameters: makeParameters()))
+        )
+        let client = SyncV2Client(transport: transport)
+        var invalidCreate = makeParameters()
+        invalidCreate = SyncV2CommitDocumentParameters(
+            documentID: invalidCreate.documentID,
+            projectID: invalidCreate.projectID,
+            baseServerRevision: 0,
+            operationID: invalidCreate.operationID,
+            deviceID: invalidCreate.deviceID,
+            relativePath: invalidCreate.relativePath,
+            content: invalidCreate.content,
+            isDeleted: true,
+            leaseToken: nil
+        )
+
+        do {
+            _ = try await client.commitDocument(invalidCreate)
+            XCTFail("Invalid create must be blocked locally.")
+        } catch let error as SyncV2ClientError {
+            XCTAssertEqual(
+                error,
+                .remote(code: .invalidArgument, detail: nil)
+            )
+        } catch {
+            XCTFail("Unexpected error: \(error)")
+        }
+
+        let oversized = SyncV2CommitDocumentParameters(
+            documentID: invalidCreate.documentID,
+            projectID: invalidCreate.projectID,
+            baseServerRevision: 0,
+            operationID: UUID(),
+            deviceID: invalidCreate.deviceID,
+            relativePath: invalidCreate.relativePath,
+            content: String(
+                repeating: "a",
+                count: SyncV2Store.maximumContentByteCount + 1
+            ),
+            isDeleted: false,
+            leaseToken: nil
+        )
+        do {
+            _ = try await client.commitDocument(oversized)
+            XCTFail("Oversized content must be blocked locally.")
+        } catch let error as SyncV2ClientError {
+            XCTAssertEqual(
+                error,
+                .remote(code: .invalidArgument, detail: nil)
+            )
+        } catch {
+            XCTFail("Unexpected error: \(error)")
+        }
+
+        let callCount = await transport.callCount()
+        XCTAssertEqual(callCount, 0)
+    }
+
+    func testExistingRevisionWithoutLeaseNeverReachesTransport() async {
+        let create = makeParameters()
+        let existing = SyncV2CommitDocumentParameters(
+            documentID: create.documentID,
+            projectID: create.projectID,
+            baseServerRevision: 1,
+            operationID: create.operationID,
+            deviceID: create.deviceID,
+            relativePath: create.relativePath,
+            content: create.content,
+            isDeleted: false,
+            leaseToken: nil
+        )
+        let transport = SyncV2CommitTransportStub(
+            result: .success(makeResult(parameters: create))
+        )
+
+        do {
+            _ = try await SyncV2Client(transport: transport)
+                .commitDocument(existing)
+            XCTFail("An existing revision must carry an edit lease.")
+        } catch let error as SyncV2ClientError {
+            XCTAssertEqual(
+                error,
+                .remote(code: .invalidArgument, detail: nil)
+            )
+        } catch {
+            XCTFail("Unexpected error: \(error)")
+        }
+        let callCount = await transport.callCount()
+        XCTAssertEqual(callCount, 0)
+    }
+
+    private func classifiedError(
+        _ transportError: SyncV2CommitTransportError
+    ) async -> SyncV2ClientError? {
+        let transport = SyncV2CommitTransportStub(
+            result: .failure(transportError)
+        )
+        let client = SyncV2Client(transport: transport)
+        do {
+            _ = try await client.commitDocument(makeParameters())
+            return nil
+        } catch let error as SyncV2ClientError {
+            return error
+        } catch {
+            return nil
+        }
+    }
+
+    private func makeParameters() -> SyncV2CommitDocumentParameters {
+        SyncV2CommitDocumentParameters(
+            documentID: UUID(
+                uuidString: "00000000-0000-0000-0000-000000000901"
+            )!,
+            projectID: UUID(
+                uuidString: "00000000-0000-0000-0000-000000000900"
+            )!,
+            baseServerRevision: 0,
+            operationID: UUID(
+                uuidString: "00000000-0000-0000-0000-000000000903"
+            )!,
+            deviceID: UUID(
+                uuidString: "00000000-0000-0000-0000-000000000904"
+            )!,
+            relativePath: "메인/원고/1권/001화.txt",
+            content: "서버 commit 원고🙂",
+            isDeleted: false,
+            leaseToken: nil
+        )
+    }
+
+    private func makeResult(
+        parameters: SyncV2CommitDocumentParameters,
+        status: SyncV2CommitStatus = .committed,
+        contentHash: String? = nil
+    ) -> SyncV2CommitDocumentResult {
+        SyncV2CommitDocumentResult(
+            status: status,
+            documentID: parameters.documentID,
+            versionID: UUID(
+                uuidString: "00000000-0000-0000-0000-000000000902"
+            )!,
+            operationID: parameters.operationID,
+            operationKind: .create,
+            serverRevision: 1,
+            relativePath: parameters.relativePath,
+            isDeleted: parameters.isDeleted,
+            contentHash: contentHash ?? hash(parameters.content),
+            committedAt: Date(timeIntervalSince1970: 1_700_000_000)
+        )
+    }
+
+    private func hash(_ content: String) -> String {
+        SHA256ContentHasher()
+            .sha256(for: Data(content.utf8))
+            .rawValue
+    }
+}
+
+final class EditLeaseManagerTests: XCTestCase {
+    func testNewDocumentDoesNotAcquireLease() async throws {
+        let documentID = UUID()
+        let deviceID = UUID()
+        let client = EditLeaseClientStub()
+        let manager = EditLeaseManager(
+            client: client,
+            revisionProvider: FixedRevisionProvider(revision: 0),
+            deviceIdentityProvider: FixedDeviceIdentityProvider(
+                identifier: DeviceIdentifier(uuid: deviceID)
+            )
+        )
+
+        let state = await manager.beginEditing(documentID: documentID)
+        let token = try await manager.leaseTokenForCommit(
+            documentID: documentID,
+            deviceID: deviceID,
+            baseRevision: 0
+        )
+        await manager.endEditing(documentID: documentID)
+
+        XCTAssertEqual(state, .localOnly)
+        XCTAssertNil(token)
+        let acquireCount = await client.acquireCount()
+        let releaseCount = await client.releaseCount()
+        XCTAssertEqual(acquireCount, 0)
+        XCTAssertEqual(releaseCount, 0)
+    }
+
+    func testDisabledGlobalSyncNeverAcquiresLeaseOnEditorEntry() async {
+        let client = EditLeaseClientStub()
+        let manager = EditLeaseManager(
+            client: client,
+            revisionProvider: FixedRevisionProvider(revision: 4),
+            deviceIdentityProvider: FixedDeviceIdentityProvider(
+                identifier: DeviceIdentifier(uuid: UUID())
+            ),
+            isEnabled: { false }
+        )
+
+        let state = await manager.beginEditing(documentID: UUID())
+        let acquireCount = await client.acquireCount()
+
+        XCTAssertEqual(state, .localOnly)
+        XCTAssertEqual(acquireCount, 0)
+    }
+
+    @MainActor
+    func testViewingDocumentAcquiresLeaseOnlyAfterFirstMutation()
+        async throws {
+        let environment = try AppEnvironment.testing()
+        let project = try await environment.projectManager.createProject(
+            named: "읽기 중 잠금 없음"
+        )
+        _ = try await environment.binderRepository.rootNodes(in: project.id)
+        let volume = try await environment.binderCommands.addNewVolume(
+            projectID: project.id
+        )
+        let loadedDocument = try await environment.documentRepository
+            .document(id: volume.documentToOpenID)
+        let document = try XCTUnwrap(
+            loadedDocument
+        )
+        let client = EditLeaseClientStub()
+        let manager = EditLeaseManager(
+            client: client,
+            revisionProvider: FixedRevisionProvider(revision: 2),
+            deviceIdentityProvider: FixedDeviceIdentityProvider(
+                identifier: DeviceIdentifier(uuid: UUID())
+            )
+        )
+        let model = EditorSessionModel(
+            documentRepository: environment.documentRepository,
+            documentStore: environment.localDocumentStore,
+            workspaceStateRepository: environment.workspaceStateRepository,
+            editLeaseManager: manager,
+            editLeaseConnectivityMonitor:
+                EditLeaseConnectivityMonitorStub()
+        )
+        let node = BinderNode(
+            id: document.id,
+            projectID: document.projectID,
+            kind: .text,
+            relativePath: document.relativePath,
+            displayName: "001화",
+            fixedCategory: nil,
+            userOrder: document.userOrder,
+            contentState: .empty,
+            isExpanded: false
+        )
+
+        await model.select(node)
+        XCTAssertEqual(model.editLeaseState, .localOnly)
+        var acquireCount = await client.acquireCount()
+        XCTAssertEqual(acquireCount, 0)
+
+        model.updateText("첫 수정")
+        await waitUntil {
+            if case .held = model.editLeaseState {
+                return true
+            }
+            return false
+        }
+        acquireCount = await client.acquireCount()
+        XCTAssertEqual(acquireCount, 1)
+    }
+
+    func testSessionRestoreNeverStartsLeaseRPCAndCommitAcquiresAfterAuth()
+        async throws {
+        let documentID = UUID()
+        let deviceID = UUID()
+        let client = EditLeaseClientStub()
+        let authentication = MutableAuthenticationStateProvider(
+            state: .restoring
+        )
+        let manager = EditLeaseManager(
+            client: client,
+            revisionProvider: FixedRevisionProvider(revision: 4),
+            deviceIdentityProvider: FixedDeviceIdentityProvider(
+                identifier: DeviceIdentifier(uuid: deviceID)
+            ),
+            authenticationState: {
+                await authentication.current()
+            }
+        )
+
+        let startupState = await manager.beginEditing(
+            documentID: documentID
+        )
+        let startupAcquireCount = await client.acquireCount()
+
+        XCTAssertEqual(startupState, .localOnly)
+        XCTAssertEqual(startupAcquireCount, 0)
+
+        await authentication.set(
+            .authenticated(
+                AuthenticatedAccount(userID: UUID(), maskedEmail: nil)
+            )
+        )
+        let token = try await manager.leaseTokenForCommit(
+            documentID: documentID,
+            deviceID: deviceID,
+            baseRevision: 4
+        )
+        await manager.commitSucceeded(
+            documentID: documentID,
+            deviceID: deviceID,
+            isDeleted: false
+        )
+        let acquireCount = await client.acquireCount()
+        let releaseBeforeClosing = await client.releaseCount()
+
+        XCTAssertNotNil(token)
+        XCTAssertEqual(acquireCount, 1)
+        XCTAssertEqual(releaseBeforeClosing, 0)
+
+        await manager.endEditing(documentID: documentID)
+        await waitForRelease(1, client: client)
+        let finalReleaseCount = await client.releaseCount()
+        XCTAssertEqual(finalReleaseCount, 1)
+    }
+
+    func testTwoPanesShareLeaseUntilLastPaneCloses() async {
+        let documentID = UUID()
+        let deviceID = UUID()
+        let client = EditLeaseClientStub()
+        let manager = EditLeaseManager(
+            client: client,
+            revisionProvider: FixedRevisionProvider(revision: 3),
+            deviceIdentityProvider: FixedDeviceIdentityProvider(
+                identifier: DeviceIdentifier(uuid: deviceID)
+            )
+        )
+
+        _ = await manager.beginEditing(documentID: documentID)
+        _ = await manager.beginEditing(documentID: documentID)
+        await manager.endEditing(documentID: documentID)
+
+        let acquireCount = await client.acquireCount()
+        let firstReleaseCount = await client.releaseCount()
+        XCTAssertEqual(acquireCount, 1)
+        XCTAssertEqual(firstReleaseCount, 0)
+
+        await manager.endEditing(documentID: documentID)
+        await waitForRelease(1, client: client)
+
+        let finalReleaseCount = await client.releaseCount()
+        XCTAssertEqual(finalReleaseCount, 1)
+    }
+
+    func testDocumentTransitionDoesNotWaitForLeaseReleaseNetwork()
+        async {
+        let documentID = UUID()
+        let deviceID = UUID()
+        let releaseGate = LeaseReleaseGate()
+        let client = EditLeaseClientStub(releaseGate: releaseGate)
+        let manager = EditLeaseManager(
+            client: client,
+            revisionProvider: FixedRevisionProvider(revision: 3),
+            deviceIdentityProvider: FixedDeviceIdentityProvider(
+                identifier: DeviceIdentifier(uuid: deviceID)
+            )
+        )
+        let completion = AsyncCompletionProbe()
+
+        _ = await manager.beginEditing(documentID: documentID)
+        Task {
+            await manager.endEditing(documentID: documentID)
+            await completion.markCompleted()
+        }
+        for _ in 0..<100 {
+            if await completion.isCompleted() {
+                break
+            }
+            await Task.yield()
+        }
+
+        let didComplete = await completion.isCompleted()
+        XCTAssertTrue(
+            didComplete,
+            "문서 전환은 release RPC 응답을 기다리면 안 됩니다."
+        )
+        await releaseGate.open()
+    }
+
+    func testInactiveCommitAcquiresThenReleasesLease() async throws {
+        let documentID = UUID()
+        let deviceID = UUID()
+        let client = EditLeaseClientStub()
+        let manager = EditLeaseManager(
+            client: client,
+            revisionProvider: FixedRevisionProvider(revision: 7),
+            deviceIdentityProvider: FixedDeviceIdentityProvider(
+                identifier: DeviceIdentifier(uuid: deviceID)
+            )
+        )
+
+        let token = try await manager.leaseTokenForCommit(
+            documentID: documentID,
+            deviceID: deviceID,
+            baseRevision: 7
+        )
+        await manager.commitSucceeded(
+            documentID: documentID,
+            deviceID: deviceID,
+            isDeleted: false
+        )
+        await waitForRelease(1, client: client)
+
+        XCTAssertNotNil(token)
+        let acquireCount = await client.acquireCount()
+        let releaseCount = await client.releaseCount()
+        XCTAssertEqual(acquireCount, 1)
+        XCTAssertEqual(releaseCount, 1)
+    }
+
+    func testLeaseConflictBecomesHeldByOtherState() async {
+        let documentID = UUID()
+        let deviceID = UUID()
+        let client = EditLeaseClientStub(
+            acquireError: .remote(
+                code: .leaseConflict,
+                detail: #"{"expires_at":"2030-01-02T03:04:05Z"}"#
+            )
+        )
+        let manager = EditLeaseManager(
+            client: client,
+            revisionProvider: FixedRevisionProvider(revision: 1),
+            deviceIdentityProvider: FixedDeviceIdentityProvider(
+                identifier: DeviceIdentifier(uuid: deviceID)
+            )
+        )
+
+        let state = await manager.beginEditing(documentID: documentID)
+
+        guard case .heldByOther(let expiresAt) = state else {
+            return XCTFail("Expected heldByOther, got \(state).")
+        }
+        XCTAssertNotNil(expiresAt)
+    }
+
+    func testActiveEditorKeepsHeldByOtherStateAcrossCommitRetry()
+        async throws {
+        let documentID = UUID()
+        let deviceID = UUID()
+        let detail = #"{"expires_at":"2030-01-02T03:04:05Z"}"#
+        let conflict = SyncV2ClientError.remote(
+            code: .leaseConflict,
+            detail: detail
+        )
+        let client = EditLeaseClientStub(acquireError: conflict)
+        let manager = EditLeaseManager(
+            client: client,
+            revisionProvider: FixedRevisionProvider(revision: 1),
+            deviceIdentityProvider: FixedDeviceIdentityProvider(
+                identifier: DeviceIdentifier(uuid: deviceID)
+            )
+        )
+
+        _ = await manager.beginEditing(documentID: documentID)
+        await manager.commitFailed(
+            documentID: documentID,
+            deviceID: deviceID,
+            error: conflict
+        )
+
+        let lockedState = await manager.state(
+            documentID: documentID,
+            deviceID: deviceID
+        )
+        guard case .heldByOther = lockedState else {
+            return XCTFail(
+                "Expected active editor to retain heldByOther, got "
+                    + String(describing: lockedState)
+            )
+        }
+
+        await client.setAcquireError(nil)
+        let token = try await manager.leaseTokenForCommit(
+            documentID: documentID,
+            deviceID: deviceID,
+            baseRevision: 1
+        )
+        let recoveredState = await manager.state(
+            documentID: documentID,
+            deviceID: deviceID
+        )
+
+        XCTAssertNotNil(token)
+        if case .held = recoveredState {
+            // expected
+        } else {
+            XCTFail(
+                "Expected held after the other device released, got "
+                    + String(describing: recoveredState)
+            )
+        }
+        await manager.endEditing(documentID: documentID)
+    }
+
+    func testMissingServerDocumentUsesRecoveringStateAndReacquiresAfterCreate()
+        async {
+        let documentID = UUID()
+        let deviceID = UUID()
+        let client = EditLeaseClientStub(
+            acquireError: .remote(
+                code: .documentNotFound,
+                detail: nil
+            )
+        )
+        let manager = EditLeaseManager(
+            client: client,
+            revisionProvider: FixedRevisionProvider(revision: 1),
+            deviceIdentityProvider: FixedDeviceIdentityProvider(
+                identifier: DeviceIdentifier(uuid: deviceID)
+            )
+        )
+
+        let missingState = await manager.beginEditing(
+            documentID: documentID
+        )
+        await client.setAcquireError(nil)
+        await manager.commitSucceeded(
+            documentID: documentID,
+            deviceID: deviceID,
+            isDeleted: false
+        )
+        let recoveredState = await manager.state(
+            documentID: documentID,
+            deviceID: deviceID
+        )
+        let acquireCount = await client.acquireCount()
+        await manager.endEditing(documentID: documentID)
+
+        XCTAssertEqual(missingState, .offlineEditing)
+        if case .held = recoveredState {
+            // expected
+        } else {
+            XCTFail(
+                "Expected held after recreate, got "
+                    + String(describing: recoveredState)
+            )
+        }
+        XCTAssertEqual(acquireCount, 2)
+    }
+
+    @MainActor
+    func testEditorRefreshesOfflineLeaseAfterServerDocumentRecovery()
+        async throws {
+        let environment = try AppEnvironment.testing()
+        let project = try await environment.projectManager.createProject(
+            named: "서버 문서 복구 표시"
+        )
+        _ = try await environment.binderRepository.rootNodes(in: project.id)
+        let volume = try await environment.binderCommands.addNewVolume(
+            projectID: project.id
+        )
+        let loadedDocument = try await environment.documentRepository
+            .document(id: volume.documentToOpenID)
+        let document = try XCTUnwrap(
+            loadedDocument
+        )
+        let client = EditLeaseClientStub(
+            acquireError: .remote(
+                code: .documentNotFound,
+                detail: nil
+            )
+        )
+        let deviceID = UUID()
+        let manager = EditLeaseManager(
+            client: client,
+            revisionProvider: FixedRevisionProvider(revision: 1),
+            deviceIdentityProvider: FixedDeviceIdentityProvider(
+                identifier: DeviceIdentifier(uuid: deviceID)
+            )
+        )
+        let model = EditorSessionModel(
+            documentRepository: environment.documentRepository,
+            documentStore: environment.localDocumentStore,
+            workspaceStateRepository:
+                environment.workspaceStateRepository,
+            editLeaseManager: manager,
+            editLeaseConnectivityMonitor:
+                EditLeaseConnectivityMonitorStub()
+        )
+        let node = BinderNode(
+            id: document.id,
+            projectID: document.projectID,
+            kind: .text,
+            relativePath: document.relativePath,
+            displayName: "001화",
+            fixedCategory: nil,
+            userOrder: document.userOrder,
+            contentState: .empty,
+            isExpanded: false
+        )
+
+        await model.select(node)
+        model.updateText("복구 후 동기화")
+        for _ in 0..<100 {
+            if model.editLeaseState == .offlineEditing {
+                break
+            }
+            try await Task.sleep(for: .milliseconds(2))
+        }
+        XCTAssertEqual(model.editLeaseState, .offlineEditing)
+
+        await client.setAcquireError(nil)
+        await manager.commitSucceeded(
+            documentID: document.id.rawValue,
+            deviceID: deviceID,
+            isDeleted: false
+        )
+        for _ in 0..<100 {
+            if case .held = model.editLeaseState {
+                break
+            }
+            try await Task.sleep(for: .milliseconds(2))
+        }
+        if case .held = model.editLeaseState {
+            // expected
+        } else {
+            XCTFail("복구된 잠금 상태가 편집기에 반영되지 않았습니다.")
+        }
+    }
+
+    func testActiveDocumentRenewsLeaseOnHeartbeat() async {
+        let documentID = UUID()
+        let deviceID = UUID()
+        let client = EditLeaseClientStub()
+        let sleeper = OneShotLeaseSleeper()
+        let manager = EditLeaseManager(
+            client: client,
+            revisionProvider: FixedRevisionProvider(revision: 2),
+            deviceIdentityProvider: FixedDeviceIdentityProvider(
+                identifier: DeviceIdentifier(uuid: deviceID)
+            ),
+            sleep: { duration in
+                try await sleeper.sleep(duration)
+            }
+        )
+
+        _ = await manager.beginEditing(documentID: documentID)
+        await sleeper.waitUntilSleeping()
+        await sleeper.wake()
+        await client.waitForRenewal()
+        let renewCount = await client.renewCount()
+        await manager.endEditing(documentID: documentID)
+
+        XCTAssertEqual(renewCount, 1)
+    }
+
+    @MainActor
+    func testEditorShowsOfflineImmediatelyAndRefreshesOnReconnect()
+        async throws {
+        let environment = try AppEnvironment.testing()
+        let project = try await environment.projectManager.createProject(
+            named: "임대 네트워크 표시"
+        )
+        _ = try await environment.binderRepository.rootNodes(in: project.id)
+        let volume = try await environment.binderCommands.addNewVolume(
+            projectID: project.id
+        )
+        let loadedDocument = try await environment.documentRepository
+            .document(id: volume.documentToOpenID)
+        let document = try XCTUnwrap(
+            loadedDocument
+        )
+        let deviceID = UUID()
+        let leaseClient = EditLeaseClientStub()
+        let manager = EditLeaseManager(
+            client: leaseClient,
+            revisionProvider: FixedRevisionProvider(revision: 2),
+            deviceIdentityProvider: FixedDeviceIdentityProvider(
+                identifier: DeviceIdentifier(uuid: deviceID)
+            )
+        )
+        let connectivity = EditLeaseConnectivityMonitorStub()
+        let model = EditorSessionModel(
+            documentRepository: environment.documentRepository,
+            documentStore: environment.localDocumentStore,
+            workspaceStateRepository: environment.workspaceStateRepository,
+            editLeaseManager: manager,
+            editLeaseConnectivityMonitor: connectivity
+        )
+        let node = BinderNode(
+            id: document.id,
+            projectID: document.projectID,
+            kind: .text,
+            relativePath: document.relativePath,
+            displayName: "001화",
+            fixedCategory: nil,
+            userOrder: document.userOrder,
+            contentState: .empty,
+            isExpanded: false
+        )
+
+        await model.select(node)
+        model.updateText("편집 시작")
+        await waitForLeaseState(model) {
+            if case .held = $0 {
+                return true
+            }
+            return false
+        }
+        guard case .held = model.editLeaseState else {
+            return XCTFail("Expected a held lease before airplane mode.")
+        }
+
+        connectivity.send(isConnected: false)
+        await waitForLeaseState(model) {
+            $0 == .offlineEditing
+        }
+        XCTAssertEqual(model.editLeaseState, .offlineEditing)
+
+        connectivity.send(isConnected: true)
+        await waitForLeaseState(model) {
+            if case .held = $0 {
+                return true
+            }
+            return false
+        }
+        guard case .held = model.editLeaseState else {
+            return XCTFail("Expected the lease to refresh after reconnect.")
+        }
+    }
+
+    @MainActor
+    func testEditorShowsOfflineBeforeFirstServerRevision() async throws {
+        let environment = try AppEnvironment.testing()
+        let project = try await environment.projectManager.createProject(
+            named: "최초 업로드 전 네트워크 표시"
+        )
+        _ = try await environment.binderRepository.rootNodes(in: project.id)
+        let volume = try await environment.binderCommands.addNewVolume(
+            projectID: project.id
+        )
+        let loadedDocument = try await environment.documentRepository
+            .document(id: volume.documentToOpenID)
+        let document = try XCTUnwrap(loadedDocument)
+        let manager = EditLeaseManager(
+            client: EditLeaseClientStub(),
+            revisionProvider: FixedRevisionProvider(revision: 0),
+            deviceIdentityProvider: FixedDeviceIdentityProvider(
+                identifier: DeviceIdentifier(uuid: UUID())
+            )
+        )
+        let connectivity = EditLeaseConnectivityMonitorStub()
+        let model = EditorSessionModel(
+            documentRepository: environment.documentRepository,
+            documentStore: environment.localDocumentStore,
+            workspaceStateRepository: environment.workspaceStateRepository,
+            editLeaseManager: manager,
+            editLeaseConnectivityMonitor: connectivity
+        )
+        let node = BinderNode(
+            id: document.id,
+            projectID: document.projectID,
+            kind: .text,
+            relativePath: document.relativePath,
+            displayName: "001화",
+            fixedCategory: nil,
+            userOrder: document.userOrder,
+            contentState: .empty,
+            isExpanded: false
+        )
+
+        await model.select(node)
+        model.updateText("편집 시작")
+        await waitUntil {
+            connectivity.isStarted()
+        }
+        XCTAssertEqual(model.editLeaseState, .localOnly)
+
+        connectivity.send(isConnected: false)
+        await waitUntil {
+            model.editLeaseState == .offlineEditing
+        }
+
+        XCTAssertEqual(model.editLeaseState, .offlineEditing)
+    }
+
+    @MainActor
+    private func waitForLeaseState(
+        _ model: EditorSessionModel,
+        matching predicate: @escaping (EditLeaseDisplayState) -> Bool
+    ) async {
+        guard !predicate(model.editLeaseState) else { return }
+        let expectation = XCTestExpectation(
+            description: "Expected edit lease state"
+        )
+        let observation = model.$editLeaseState
+            .filter(predicate)
+            .prefix(1)
+            .sink { _ in expectation.fulfill() }
+        await fulfillment(of: [expectation], timeout: 2)
+        withExtendedLifetime(observation) {}
+    }
+
+    @MainActor
+    private func waitUntil(
+        _ condition: @escaping @MainActor () -> Bool
+    ) async {
+        for _ in 0 ..< 100 where !condition() {
+            await Task.yield()
+        }
+    }
+
+    private func waitForRelease(
+        _ expectedCount: Int,
+        client: EditLeaseClientStub
+    ) async {
+        for _ in 0..<100 {
+            if await client.releaseCount() >= expectedCount {
+                return
+            }
+            await Task.yield()
+        }
+    }
+}
+
+private actor SyncV2CommitTransportStub: SyncV2CommitTransporting {
+    private let result: Result<
+        SyncV2CommitDocumentResult,
+        SyncV2CommitTransportError
+    >
+    private var calls = 0
+
+    init(
+        result: Result<
+            SyncV2CommitDocumentResult,
+            SyncV2CommitTransportError
+        >
+    ) {
+        self.result = result
+    }
+
+    func commitDocument(
+        parameters: SyncV2CommitDocumentParameters
+    ) throws -> SyncV2CommitDocumentResult {
+        _ = parameters
+        calls += 1
+        return try result.get()
+    }
+
+    func callCount() -> Int {
+        calls
+    }
+}
+
+private actor SyncV2CommitSequenceTransport: SyncV2CommitTransporting {
+    private var results: [SyncV2CommitDocumentResult]
+    private var received: [SyncV2CommitDocumentParameters] = []
+
+    init(results: [SyncV2CommitDocumentResult]) {
+        self.results = results
+    }
+
+    func commitDocument(
+        parameters: SyncV2CommitDocumentParameters
+    ) throws -> SyncV2CommitDocumentResult {
+        received.append(parameters)
+        guard !results.isEmpty else {
+            throw SyncV2CommitTransportError.unknown(
+                message: "No scripted result."
+            )
+        }
+        return results.removeFirst()
+    }
+
+    func requests() -> [SyncV2CommitDocumentParameters] {
+        received
+    }
+}
+
+final class SyncV2DispatcherTests: XCTestCase {
+    func testRetryPolicyIsExponentialCappedAndJittered() {
+        let policy = SyncV2RetryPolicy(
+            initialDelay: 2,
+            maximumDelay: 10,
+            jitterFraction: 0.25
+        )
+
+        XCTAssertEqual(policy.delay(attempt: 1, randomUnit: 0), 1.5)
+        XCTAssertEqual(policy.delay(attempt: 2, randomUnit: 0.5), 4)
+        XCTAssertEqual(policy.delay(attempt: 3, randomUnit: 1), 10)
+        XCTAssertEqual(policy.delay(attempt: 20, randomUnit: 0.5), 10)
+    }
+
+    func testLeaseConflictUsesShortFixedDelayInsteadOfBackoff() {
+        let policy = SyncV2RetryPolicy(
+            initialDelay: 2,
+            maximumDelay: 5 * 60,
+            jitterFraction: 0.2,
+            leaseConflictDelay: 3
+        )
+
+        XCTAssertEqual(
+            policy.delay(
+                errorCode: "LEASE_CONFLICT",
+                attempt: 1,
+                randomUnit: 0
+            ),
+            3
+        )
+        XCTAssertEqual(
+            policy.delay(
+                errorCode: "LEASE_CONFLICT",
+                attempt: 20,
+                randomUnit: 1
+            ),
+            3
+        )
+        XCTAssertGreaterThan(
+            policy.delay(
+                errorCode: "NETWORK_UNAVAILABLE",
+                attempt: 20,
+                randomUnit: 0.5
+            ),
+            3
+        )
+    }
+
+    func testNetworkRecoveryRequiresDisconnectedToConnectedTransition() {
+        var initiallyOnline = SyncV2NetworkRecoveryDetector()
+        XCTAssertFalse(initiallyOnline.receive(isSatisfied: true))
+        XCTAssertFalse(initiallyOnline.receive(isSatisfied: true))
+
+        var recovery = SyncV2NetworkRecoveryDetector()
+        XCTAssertFalse(recovery.receive(isSatisfied: false))
+        XCTAssertFalse(recovery.receive(isSatisfied: false))
+        XCTAssertTrue(recovery.receive(isSatisfied: true))
+        XCTAssertFalse(recovery.receive(isSatisfied: true))
+    }
+
+    func testRepeatedRecoverySignalsShareOneGlobalRecoveryFlight()
+        async {
+        let hub = SyncV2NetworkRecoveryHub()
+        let probe = NetworkRecoveryProbe()
+        await hub.install {
+            await probe.run()
+        }
+
+        await hub.signal()
+        await hub.signal()
+        for _ in 0..<100 {
+            if await probe.startedCount() == 1 {
+                break
+            }
+            await Task.yield()
+        }
+        let startsWhileBlocked = await probe.startedCount()
+        XCTAssertEqual(startsWhileBlocked, 1)
+
+        await probe.finish()
+        for _ in 0..<100 {
+            if await probe.completedCount() == 1 {
+                break
+            }
+            await Task.yield()
+        }
+        let completions = await probe.completedCount()
+        XCTAssertEqual(completions, 1)
+    }
+
+    func testLimitedConcurrencyAndConflictIsolation() async {
+        let localProjectID = ProjectID(rawValue: UUID())
+        let operations = (0 ..< 4).map {
+            dispatchOperation(
+                documentID: UUID(),
+                sequence: 1,
+                suffix: $0,
+                localProjectID: localProjectID
+            )
+        }
+        let store = DispatcherStoreStub(operations: operations)
+        let client = DispatcherClientStub(
+            conflictOperationIDs: [operations[0].operationID],
+            delayNanoseconds: 40_000_000
+        )
+        let dispatcher = SyncV2Dispatcher(
+            store: store,
+            client: client,
+            maximumConcurrentDocuments: 2,
+            randomUnit: { 0.5 }
+        )
+
+        await dispatcher.prioritizeProject(localProjectID)
+        await dispatcher.dispatchReadyOperations(
+            now: Date(timeIntervalSince1970: 1_800_000_000)
+        )
+
+        let maximumActive = await client.maximumActiveCalls()
+        let completed = await store.completedOperationIDs()
+        let conflicts = await store.conflictOperationIDs()
+        XCTAssertEqual(maximumActive, 2)
+        XCTAssertEqual(
+            completed,
+            Set(operations.dropFirst().map(\.operationID))
+        )
+        XCTAssertEqual(conflicts, [operations[0].operationID])
+    }
+
+    func testEveryImmediateOpportunityReleasesRetryWait() async throws {
+        let operations = (0 ..< 4).map {
+            dispatchOperation(
+                documentID: UUID(),
+                sequence: 1,
+                suffix: 10 + $0
+            )
+        }
+        let store = DispatcherStoreStub(
+            operations: operations,
+            initialStatus: .retryWait
+        )
+        let client = DispatcherClientStub()
+        let dispatcher = SyncV2Dispatcher(store: store, client: client)
+        await dispatcher.start()
+
+        await dispatcher.loginSucceeded()
+        try await waitUntilCompleted(operations[0], store: store)
+        await store.resetToRetryWait(operation: operations[1])
+        await dispatcher.appEnteredForeground()
+        try await waitUntilCompleted(operations[1], store: store)
+        await store.resetToRetryWait(operation: operations[2])
+        await dispatcher.userRequestedRetry()
+        try await waitUntilCompleted(operations[2], store: store)
+        await store.resetToRetryWait(operation: operations[3])
+        await dispatcher.networkRecovered()
+        try await waitUntilCompleted(operations[3], store: store)
+        await dispatcher.stop()
+
+        let completed = await store.completedOperationIDs()
+        let opportunityCount = await store.immediateOpportunityCount()
+        XCTAssertEqual(completed, Set(operations.map(\.operationID)))
+        XCTAssertEqual(opportunityCount, 4)
+    }
+
+    func testNewQueueSignalDispatchesWithoutForegroundOrManualRetry()
+        async throws {
+        let operation = dispatchOperation(
+            documentID: UUID(),
+            sequence: 1,
+            suffix: 15
+        )
+        let store = DispatcherStoreStub(operations: [])
+        let client = DispatcherClientStub()
+        let wakeup = SyncV2DispatchWakeup()
+        let dispatcher = SyncV2Dispatcher(
+            store: store,
+            client: client,
+            wakeup: wakeup
+        )
+        await dispatcher.start()
+
+        var completed = await store.completedOperationIDs()
+        XCTAssertTrue(completed.isEmpty)
+
+        await store.enqueue(operation)
+        await wakeup.signal()
+        for _ in 0..<100 where completed.isEmpty {
+            try await Task.sleep(for: .milliseconds(10))
+            completed = await store.completedOperationIDs()
+        }
+        await dispatcher.stop()
+
+        XCTAssertEqual(completed, Set([operation.operationID]))
+    }
+
+    func testStartDrainsOperationsPersistedBeforeLaunch() async throws {
+        let operation = dispatchOperation(
+            documentID: UUID(),
+            sequence: 1,
+            suffix: 16
+        )
+        let store = DispatcherStoreStub(operations: [operation])
+        let dispatcher = SyncV2Dispatcher(
+            store: store,
+            client: DispatcherClientStub()
+        )
+
+        await dispatcher.start()
+        try await waitUntilCompleted(operation, store: store)
+        let completed = await store.completedOperationIDs()
+        await dispatcher.stop()
+
+        XCTAssertEqual(completed, Set([operation.operationID]))
+    }
+
+    func testSlowProjectDoesNotBlockAnotherProjectLane() async throws {
+        let slowProjectID = ProjectID(rawValue: UUID())
+        let fastProjectID = ProjectID(rawValue: UUID())
+        let slow = dispatchOperation(
+            documentID: UUID(),
+            sequence: 1,
+            suffix: 17,
+            localProjectID: slowProjectID
+        )
+        let fast = dispatchOperation(
+            documentID: UUID(),
+            sequence: 1,
+            suffix: 18,
+            localProjectID: fastProjectID
+        )
+        let store = DispatcherStoreStub(operations: [slow, fast])
+        let client = DispatcherClientStub(
+            delayNanosecondsByOperation: [
+                slow.operationID: 300_000_000
+            ]
+        )
+        let dispatcher = SyncV2Dispatcher(store: store, client: client)
+
+        await dispatcher.start()
+        try await waitUntilCompleted(fast, store: store)
+
+        var completed = await store.completedOperationIDs()
+        XCTAssertTrue(completed.contains(fast.operationID))
+        XCTAssertFalse(completed.contains(slow.operationID))
+
+        try await waitUntilCompleted(slow, store: store)
+        completed = await store.completedOperationIDs()
+        await dispatcher.stop()
+        XCTAssertEqual(
+            completed,
+            Set([slow.operationID, fast.operationID])
+        )
+    }
+
+    private func waitUntilCompleted(
+        _ operation: SyncV2DispatchOperation,
+        store: DispatcherStoreStub
+    ) async throws {
+        for _ in 0..<100 {
+            if await store.completedOperationIDs().contains(
+                operation.operationID
+            ) {
+                return
+            }
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        XCTFail("operation completion timeout: \(operation.operationID)")
+    }
+
+    func testTransientFailureUsesAttemptCountForBackoff() async {
+        let operation = dispatchOperation(
+            documentID: UUID(),
+            sequence: 1,
+            suffix: 20
+        )
+        let store = DispatcherStoreStub(operations: [operation])
+        let client = DispatcherClientStub(
+            retryOperationIDs: [operation.operationID]
+        )
+        let policy = SyncV2RetryPolicy(
+            initialDelay: 3,
+            maximumDelay: 60,
+            jitterFraction: 0
+        )
+        let dispatcher = SyncV2Dispatcher(
+            store: store,
+            client: client,
+            retryPolicy: policy,
+            randomUnit: { 0.5 }
+        )
+        let now = Date(timeIntervalSince1970: 1_800_000_000)
+
+        await dispatcher.dispatchReadyOperations(now: now)
+
+        let retry = await store.retryRecord(
+            operationID: operation.operationID
+        )
+        XCTAssertEqual(retry?.errorCode, "NETWORK_UNAVAILABLE")
+        XCTAssertEqual(
+            retry?.nextAttemptAt.timeIntervalSince1970,
+            now.addingTimeInterval(3).timeIntervalSince1970
+        )
+    }
+
+    func testExistingCommitUsesLeaseTokenAndReleasesInactiveLease() async {
+        let documentID = UUID()
+        let deviceID = UUID()
+        let operation = SyncV2DispatchOperation(
+            operationID: UUID(),
+            batchID: UUID(),
+            projectID: UUID(),
+            documentID: documentID,
+            deviceID: deviceID,
+            documentSequence: 1,
+            kind: .documentCommit,
+            baseRevision: 5,
+            relativePath: "원고/1권/005.txt",
+            content: "기존 문서 수정",
+            isDeleted: false,
+            attempts: 0
+        )
+        let store = DispatcherStoreStub(operations: [operation])
+        let client = DispatcherClientStub()
+        let leaseClient = EditLeaseClientStub()
+        let manager = EditLeaseManager(
+            client: leaseClient,
+            revisionProvider: FixedRevisionProvider(revision: 5),
+            deviceIdentityProvider: FixedDeviceIdentityProvider(
+                identifier: DeviceIdentifier(uuid: deviceID)
+            )
+        )
+        let dispatcher = SyncV2Dispatcher(
+            store: store,
+            client: client,
+            leaseManager: manager
+        )
+
+        await dispatcher.dispatchReadyOperations(
+            now: Date(timeIntervalSince1970: 1_800_000_000)
+        )
+
+        let request = (await client.receivedRequests()).first
+        let acquireCount = await leaseClient.acquireCount()
+        let releaseCount = await leaseClient.releaseCount()
+        XCTAssertNotNil(request?.leaseToken)
+        XCTAssertEqual(acquireCount, 1)
+        XCTAssertEqual(releaseCount, 1)
+    }
+
+    func testLeaseConflictRetriesSameOperationAfterOtherDeviceReleases()
+        async throws {
+        let documentID = UUID()
+        let operation = rebaseOperation(
+            documentID: documentID,
+            baseContent: "마지막 서버 기준본\n",
+            content: "잠금 중 저장된 iPad 로컬 본문\n"
+        )
+        let store = DispatcherStoreStub(operations: [operation])
+        let leaseClient = EditLeaseClientStub(
+            acquireError: .remote(
+                code: .leaseConflict,
+                detail: #"{"expires_at":"2030-01-02T03:04:05Z"}"#
+            )
+        )
+        let manager = EditLeaseManager(
+            client: leaseClient,
+            revisionProvider: FixedRevisionProvider(revision: 3),
+            deviceIdentityProvider: FixedDeviceIdentityProvider(
+                identifier: DeviceIdentifier(uuid: operation.deviceID)
+            )
+        )
+        let client = DispatcherClientStub()
+        let dispatcher = SyncV2Dispatcher(
+            store: store,
+            client: client,
+            retryPolicy: SyncV2RetryPolicy(
+                initialDelay: 2,
+                maximumDelay: 10,
+                jitterFraction: 0
+            ),
+            randomUnit: { 0.5 },
+            leaseManager: manager
+        )
+        let firstAttempt = Date(timeIntervalSince1970: 1_800_000_000)
+
+        await dispatcher.dispatchReadyOperations(now: firstAttempt)
+
+        let retry = await store.retryRecord(
+            operationID: operation.operationID
+        )
+        let conflicts = await store.conflictOperationIDs()
+        let requestsWhileLocked = await client.receivedRequests()
+        XCTAssertEqual(retry?.errorCode, "LEASE_CONFLICT")
+        XCTAssertEqual(
+            retry?.nextAttemptAt.timeIntervalSince1970,
+            firstAttempt.addingTimeInterval(3).timeIntervalSince1970
+        )
+        XCTAssertTrue(conflicts.isEmpty)
+        XCTAssertTrue(requestsWhileLocked.isEmpty)
+
+        await leaseClient.setAcquireError(nil)
+        await store.makeRetryWaitOperationsReady(localProjectID: nil)
+        await dispatcher.dispatchReadyOperations(
+            now: firstAttempt.addingTimeInterval(3)
+        )
+
+        let completed = await store.completedOperationIDs()
+        let requests = await client.receivedRequests()
+        XCTAssertEqual(completed, [operation.operationID])
+        XCTAssertEqual(requests.map(\.operationID), [operation.operationID])
+        XCTAssertNotNil(requests.first?.leaseToken)
+        XCTAssertEqual(requests.first?.content, operation.content)
+    }
+
+    func testDocumentNotFoundIsRequeuedAsCreateInsteadOfConflict()
+        async {
+        let operation = SyncV2DispatchOperation(
+            operationID: UUID(),
+            batchID: UUID(),
+            projectID: UUID(),
+            documentID: UUID(),
+            deviceID: UUID(),
+            documentSequence: 1,
+            kind: .documentCommit,
+            baseRevision: 1,
+            relativePath: "원고/1권/001화.txt",
+            content: "서버에서 사라진 문서의 로컬 본문",
+            isDeleted: false,
+            attempts: 0
+        )
+        let store = DispatcherStoreStub(operations: [operation])
+        let client = DispatcherClientStub(
+            missingOperationIDs: [operation.operationID]
+        )
+        let dispatcher = SyncV2Dispatcher(store: store, client: client)
+
+        await dispatcher.dispatchReadyOperations(
+            now: Date(timeIntervalSince1970: 1_800_000_000)
+        )
+
+        let requests = await client.receivedRequests()
+        let recoveries = await store.missingRecoveryCount()
+        let completed = await store.completedOperationIDs()
+        let conflicts = await store.conflictOperationIDs()
+        XCTAssertEqual(requests.map(\.baseServerRevision), [1, 0])
+        XCTAssertEqual(recoveries, 1)
+        XCTAssertEqual(completed, [operation.operationID])
+        XCTAssertTrue(conflicts.isEmpty)
+    }
+
+    func testForbiddenCreateEnsuresMissingProjectBeforeRetry()
+        async {
+        let projectID = UUID()
+        let operation = SyncV2DispatchOperation(
+            operationID: UUID(),
+            batchID: UUID(),
+            projectID: projectID,
+            documentID: UUID(),
+            deviceID: UUID(),
+            documentSequence: 1,
+            kind: .documentCommit,
+            baseRevision: 0,
+            relativePath: "원고/1권/004화.txt",
+            content: "작품 재생성 뒤 보낼 본문",
+            isDeleted: false,
+            attempts: 0
+        )
+        let store = DispatcherStoreStub(operations: [operation])
+        let client = DispatcherClientStub(
+            forbiddenCreateOperationIDs: [operation.operationID]
+        )
+        let recovery = ProjectRecoveryTransportStub()
+        let dispatcher = SyncV2Dispatcher(
+            store: store,
+            client: client,
+            projectRecoveryTransport: recovery
+        )
+
+        await dispatcher.dispatchReadyOperations(
+            now: Date(timeIntervalSince1970: 1_800_000_000)
+        )
+        await store.makeRetryWaitOperationsReady(localProjectID: nil)
+        await dispatcher.dispatchReadyOperations(
+            now: Date(timeIntervalSince1970: 1_800_000_001)
+        )
+
+        let ensured = await recovery.receivedParameters()
+        let requests = await client.receivedRequests()
+        let completed = await store.completedOperationIDs()
+        let projectRecoveries = await store.missingProjectRecoveryCount()
+        XCTAssertEqual(ensured.count, 1)
+        XCTAssertEqual(ensured.first?.projectID, projectID)
+        XCTAssertEqual(ensured.first?.name, "복구 작품")
+        XCTAssertEqual(projectRecoveries, 1)
+        XCTAssertEqual(requests.map(\.baseServerRevision), [0, 0])
+        XCTAssertEqual(completed, [operation.operationID])
+    }
+
+    func testForbiddenUpdateRepairsOwnerMembershipBeforeRetry()
+        async {
+        let projectID = UUID()
+        let operation = SyncV2DispatchOperation(
+            operationID: UUID(),
+            batchID: UUID(),
+            projectID: projectID,
+            documentID: UUID(),
+            deviceID: UUID(),
+            documentSequence: 1,
+            kind: .documentCommit,
+            baseRevision: 3,
+            relativePath: "원고/1권/006화.txt",
+            content: "오프라인에서 작성한 본문",
+            isDeleted: false,
+            attempts: 0
+        )
+        let store = DispatcherStoreStub(operations: [operation])
+        let client = DispatcherClientStub(
+            forbiddenCreateOperationIDs: [operation.operationID]
+        )
+        let recovery = ProjectRecoveryTransportStub()
+        let dispatcher = SyncV2Dispatcher(
+            store: store,
+            client: client,
+            projectRecoveryTransport: recovery
+        )
+
+        await dispatcher.dispatchReadyOperations(
+            now: Date(timeIntervalSince1970: 1_800_000_000)
+        )
+        await store.makeRetryWaitOperationsReady(localProjectID: nil)
+        await dispatcher.dispatchReadyOperations(
+            now: Date(timeIntervalSince1970: 1_800_000_001)
+        )
+
+        let ensured = await recovery.receivedParameters()
+        let requests = await client.receivedRequests()
+        let completed = await store.completedOperationIDs()
+        let projectRecoveries = await store.missingProjectRecoveryCount()
+        XCTAssertEqual(ensured.count, 1)
+        XCTAssertEqual(ensured.first?.projectID, projectID)
+        XCTAssertEqual(ensured.first?.name, "복구 작품")
+        XCTAssertEqual(projectRecoveries, 0)
+        XCTAssertEqual(requests.map(\.baseServerRevision), [3, 3])
+        XCTAssertEqual(completed, [operation.operationID])
+    }
+
+    func testAutomaticRebaseMergesNonOverlappingContentAndRemoteRename()
+        async throws {
+        let documentID = UUID()
+        let operation = rebaseOperation(
+            documentID: documentID,
+            baseContent: "첫 줄\n둘째 줄\n셋째 줄\n",
+            content: "로컬 첫 줄\n둘째 줄\n셋째 줄\n"
+        )
+        let remote = remoteSnapshot(
+            documentID: documentID,
+            path: "원고/1권/새이름.txt",
+            content: "첫 줄\n둘째 줄\n서버 셋째 줄\n"
+        )
+        let store = AutomaticRebaseStoreStub(
+            local: SyncV2RebaseLocalSnapshot(
+                content: operation.content,
+                localPath: operation.localPath,
+                relativePath: operation.relativePath,
+                localSaveGeneration: operation.localSaveGeneration
+            )
+        )
+        let rebaser = SyncV2AutomaticRebaser(
+            store: store,
+            snapshotClient: AutomaticRebaseSnapshotClientStub(
+                snapshot: remote
+            )
+        )
+
+        let outcome = try await rebaser.rebase(operation)
+        let recorded = await store.recordedRebase()
+
+        XCTAssertEqual(outcome, .rebased)
+        XCTAssertEqual(recorded?.remote, remote)
+        XCTAssertEqual(
+            recorded?.mergedContent,
+            "로컬 첫 줄\n둘째 줄\n서버 셋째 줄\n"
+        )
+        XCTAssertEqual(recorded?.mergedPath, remote.relativePath)
+    }
+
+    func testAutomaticRebaseKeepsLocalRenameWhenRemotePathIsUnchanged()
+        async throws {
+        let documentID = UUID()
+        let operation = rebaseOperation(
+            documentID: documentID,
+            baseContent: "공통\n",
+            content: "로컬 수정\n",
+            relativePath: "원고/1권/로컬이름.txt"
+        )
+        let store = AutomaticRebaseStoreStub(
+            local: SyncV2RebaseLocalSnapshot(
+                content: operation.content,
+                localPath: operation.localPath,
+                relativePath: operation.relativePath,
+                localSaveGeneration: operation.localSaveGeneration
+            )
+        )
+        let rebaser = SyncV2AutomaticRebaser(
+            store: store,
+            snapshotClient: AutomaticRebaseSnapshotClientStub(
+                snapshot: remoteSnapshot(
+                    documentID: documentID,
+                    path: operation.baseServerPath,
+                    content: "공통\n서버 삽입\n"
+                )
+            )
+        )
+
+        let outcome = try await rebaser.rebase(operation)
+        let recorded = await store.recordedRebase()
+
+        XCTAssertEqual(outcome, .rebased)
+        XCTAssertEqual(
+            recorded?.mergedPath,
+            operation.relativePath
+        )
+    }
+
+    func testAutomaticRebaseLeavesOverlappingEditAsConflict()
+        async throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent(
+                "WriterPad-conflict-local-\(UUID().uuidString)",
+                isDirectory: true
+            )
+        try FileManager.default.createDirectory(
+            at: directory,
+            withIntermediateDirectories: true
+        )
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let localTXT = directory.appendingPathComponent("001화.txt")
+        let originalLocalContent = "내 문장\n"
+        try Data(originalLocalContent.utf8).write(
+            to: localTXT,
+            options: [.atomic]
+        )
+        let documentID = UUID()
+        let operation = rebaseOperation(
+            documentID: documentID,
+            baseContent: "공통 문장\n",
+            content: originalLocalContent
+        )
+        let store = AutomaticRebaseStoreStub(
+            local: SyncV2RebaseLocalSnapshot(
+                content: operation.content,
+                localPath: operation.localPath,
+                relativePath: operation.relativePath,
+                localSaveGeneration: operation.localSaveGeneration
+            )
+        )
+        let localApplier = AutomaticRebaseLocalApplierSpy(
+            fileURL: localTXT
+        )
+        let rebaser = SyncV2AutomaticRebaser(
+            store: store,
+            snapshotClient: AutomaticRebaseSnapshotClientStub(
+                snapshot: remoteSnapshot(
+                    documentID: documentID,
+                    path: operation.relativePath,
+                    content: "서버 문장\n"
+                )
+            ),
+            localApplier: localApplier
+        )
+
+        let outcome = try await rebaser.rebase(operation)
+        let recorded = await store.recordedRebase()
+        let preserved = await store.recordedConflict()
+        let applyCount = await localApplier.applyCount()
+
+        XCTAssertEqual(outcome, .conflictPreserved)
+        XCTAssertNil(recorded)
+        XCTAssertEqual(preserved?.operation, operation)
+        XCTAssertEqual(preserved?.remote.content, "서버 문장\n")
+        XCTAssertEqual(preserved?.local.content, "내 문장\n")
+        XCTAssertEqual(preserved?.conflictCount, 1)
+        XCTAssertEqual(applyCount, 0)
+        XCTAssertEqual(
+            try String(contentsOf: localTXT, encoding: .utf8),
+            originalLocalContent
+        )
+    }
+
+    func testAutomaticRebaseRejectsResultWhenOpenGenerationAdvances()
+        async throws {
+        let documentID = UUID()
+        let operation = rebaseOperation(
+            documentID: documentID,
+            baseContent: "공통\n서버 대상\n",
+            content: "로컬\n서버 대상\n"
+        )
+        let local = SyncV2RebaseLocalSnapshot(
+            content: operation.content + "최신 입력\n",
+            localPath: operation.localPath,
+            relativePath: operation.relativePath,
+            localSaveGeneration: 9
+        )
+        let store = AutomaticRebaseStoreStub(
+            local: SyncV2RebaseLocalSnapshot(
+                content: operation.content,
+                localPath: operation.localPath,
+                relativePath: operation.relativePath,
+                localSaveGeneration: operation.localSaveGeneration
+            )
+        )
+        let openProvider = AutomaticRebaseOpenProviderStub(
+            snapshot: local,
+            remainsCurrent: false
+        )
+        let rebaser = SyncV2AutomaticRebaser(
+            store: store,
+            snapshotClient: AutomaticRebaseSnapshotClientStub(
+                snapshot: remoteSnapshot(
+                    documentID: documentID,
+                    path: operation.relativePath,
+                    content: "공통\n서버 수정\n"
+                )
+            ),
+            openLocalProvider: openProvider
+        )
+
+        let outcome = try await rebaser.rebase(operation)
+        let recorded = await store.recordedRebase()
+
+        XCTAssertEqual(outcome, .generationAdvanced)
+        XCTAssertNil(recorded)
+    }
+
+    func testAutomaticRebaseStopsWhenAnotherUUIDOccupiesDestinationPath()
+        async throws {
+        let documentID = UUID()
+        let operation = rebaseOperation(
+            documentID: documentID,
+            baseContent: "공통\n둘째\n",
+            content: "로컬\n둘째\n"
+        )
+        let store = AutomaticRebaseStoreStub(
+            local: SyncV2RebaseLocalSnapshot(
+                content: operation.content,
+                localPath: operation.localPath,
+                relativePath: operation.relativePath,
+                localSaveGeneration: operation.localSaveGeneration
+            ),
+            result: .pathOccupiedByDifferentDocument
+        )
+        let rebaser = SyncV2AutomaticRebaser(
+            store: store,
+            snapshotClient: AutomaticRebaseSnapshotClientStub(
+                snapshot: remoteSnapshot(
+                    documentID: documentID,
+                    path: "원고/1권/점유됨.txt",
+                    content: "공통\n서버 둘째\n"
+                )
+            )
+        )
+
+        let outcome = try await rebaser.rebase(operation)
+
+        guard case let .conflict(code, _) = outcome else {
+            return XCTFail("점유 경로는 자동 rebase를 중단해야 합니다.")
+        }
+        XCTAssertEqual(code, "PATH_CONFLICT")
+    }
+
+    private func rebaseOperation(
+        documentID: UUID,
+        baseContent: String,
+        content: String,
+        relativePath: String = "원고/1권/001화.txt"
+    ) -> SyncV2DispatchOperation {
+        SyncV2DispatchOperation(
+            operationID: UUID(),
+            batchID: UUID(),
+            localProjectID: ProjectID(rawValue: UUID()),
+            projectID: UUID(),
+            documentID: documentID,
+            deviceID: UUID(),
+            documentSequence: 1,
+            localSaveGeneration: 5,
+            kind: .documentCommit,
+            baseRevision: 3,
+            baseContent: baseContent,
+            baseServerPath: "원고/1권/001화.txt",
+            localPath: relativePath,
+            relativePath: relativePath,
+            content: content,
+            isDeleted: false,
+            attempts: 1
+        )
+    }
+
+    private func remoteSnapshot(
+        documentID: UUID,
+        path: String,
+        content: String
+    ) -> SyncV2RemoteDocumentSnapshot {
+        SyncV2RemoteDocumentSnapshot(
+            documentID: documentID,
+            relativePath: path,
+            content: content,
+            revision: 4,
+            isDeleted: false,
+            deletedAt: nil,
+            updatedAt: Date(timeIntervalSince1970: 400)
+        )
+    }
+
+    private func dispatchOperation(
+        documentID: UUID,
+        sequence: Int,
+        suffix: Int,
+        localProjectID: ProjectID? = nil
+    ) -> SyncV2DispatchOperation {
+        let projectID = localProjectID?.rawValue ?? UUID()
+        return SyncV2DispatchOperation(
+            operationID: UUID(),
+            batchID: UUID(),
+            localProjectID:
+                localProjectID ?? ProjectID(rawValue: projectID),
+            projectID: projectID,
+            documentID: documentID,
+            deviceID: UUID(),
+            documentSequence: sequence,
+            kind: .documentCommit,
+            baseRevision: 0,
+            relativePath: "원고/1권/\(suffix).txt",
+            content: "본문 \(suffix)",
+            isDeleted: false,
+            attempts: 0
+        )
+    }
+}
+
+private actor AutomaticRebaseSnapshotClientStub:
+    SyncV2SnapshotClienting {
+    private let snapshot: SyncV2RemoteDocumentSnapshot?
+
+    init(snapshot: SyncV2RemoteDocumentSnapshot?) {
+        self.snapshot = snapshot
+    }
+
+    func fetchDocuments(
+        projectID: UUID
+    ) -> [SyncV2RemoteDocumentSnapshot] {
+        _ = projectID
+        return snapshot.map { [$0] } ?? []
+    }
+
+    func fetchDocument(
+        projectID: UUID,
+        documentID: UUID
+    ) -> SyncV2RemoteDocumentSnapshot? {
+        _ = projectID
+        guard snapshot?.documentID == documentID else { return nil }
+        return snapshot
+    }
+}
+
+private actor AutomaticRebaseStoreStub: SyncV2DispatchStoring {
+    struct Recorded: Equatable {
+        let remote: SyncV2RemoteDocumentSnapshot
+        let local: SyncV2RebaseLocalSnapshot
+        let mergedContent: String
+        let mergedPath: String
+    }
+
+    struct RecordedConflict: Equatable {
+        let operation: SyncV2DispatchOperation
+        let remote: SyncV2RemoteDocumentSnapshot
+        let local: SyncV2RebaseLocalSnapshot
+        let mergedContent: String
+        let conflictCount: Int
+    }
+
+    private let local: SyncV2RebaseLocalSnapshot
+    private let result: SyncV2AutomaticRebaseStoreResult
+    private var recorded: Recorded?
+    private var preservedConflict: RecordedConflict?
+
+    init(
+        local: SyncV2RebaseLocalSnapshot,
+        result: SyncV2AutomaticRebaseStoreResult = .rebased
+    ) {
+        self.local = local
+        self.result = result
+    }
+
+    func recoverInterruptedWork() {}
+
+    func readyLocalProjectIDs(now: Date) -> [ProjectID] {
+        _ = now
+        return []
+    }
+
+    func claimReadyOperations(
+        localProjectID: ProjectID,
+        limit: Int,
+        now: Date
+    ) -> [SyncV2DispatchOperation] {
+        _ = (localProjectID, limit, now)
+        return []
+    }
+
+    func complete(
+        _ operation: SyncV2DispatchOperation,
+        result: SyncV2CommitDocumentResult
+    ) {
+        _ = (operation, result)
+    }
+
+    func deferRetry(
+        _ operation: SyncV2DispatchOperation,
+        errorCode: String,
+        detail: String?,
+        nextAttemptAt: Date
+    ) {
+        _ = (operation, errorCode, detail, nextAttemptAt)
+    }
+
+    func markConflict(
+        _ operation: SyncV2DispatchOperation,
+        errorCode: String,
+        detail: String?
+    ) {
+        _ = (operation, errorCode, detail)
+    }
+
+    func preserveConflict(
+        _ operation: SyncV2DispatchOperation,
+        remote: SyncV2RemoteDocumentSnapshot,
+        local: SyncV2RebaseLocalSnapshot,
+        mergedContent: String,
+        conflictCount: Int,
+        errorCode: String,
+        detail: String?
+    ) -> SyncV2ConflictPreservationResult {
+        _ = (errorCode, detail)
+        preservedConflict = RecordedConflict(
+            operation: operation,
+            remote: remote,
+            local: local,
+            mergedContent: mergedContent,
+            conflictCount: conflictCount
+        )
+        return .preserved
+    }
+
+    func markBlocked(
+        _ operation: SyncV2DispatchOperation,
+        errorCode: String,
+        detail: String?
+    ) {
+        _ = (operation, errorCode, detail)
+    }
+
+    func latestLocalSnapshot(
+        for operation: SyncV2DispatchOperation
+    ) -> SyncV2RebaseLocalSnapshot {
+        _ = operation
+        return local
+    }
+
+    func rebaseAfterRevisionConflict(
+        _ operation: SyncV2DispatchOperation,
+        remote: SyncV2RemoteDocumentSnapshot,
+        local: SyncV2RebaseLocalSnapshot,
+        mergedContent: String,
+        mergedPath: String
+    ) -> SyncV2AutomaticRebaseStoreResult {
+        _ = operation
+        recorded = Recorded(
+            remote: remote,
+            local: local,
+            mergedContent: mergedContent,
+            mergedPath: mergedPath
+        )
+        return result
+    }
+
+    func makeRetryWaitOperationsReady(localProjectID: ProjectID?) {
+        _ = localProjectID
+    }
+    func nextRetryDate(localProjectID: ProjectID?) -> Date? {
+        _ = localProjectID
+        return nil
+    }
+    func recordedRebase() -> Recorded? { recorded }
+    func recordedConflict() -> RecordedConflict? { preservedConflict }
+}
+
+private actor AutomaticRebaseLocalApplierSpy:
+    SyncV2LocalSnapshotApplying {
+    private let fileURL: URL?
+    private var count = 0
+
+    init(fileURL: URL? = nil) {
+        self.fileURL = fileURL
+    }
+
+    func apply(
+        localProjectID: ProjectID,
+        snapshot: SyncV2RemoteDocumentSnapshot
+    ) throws {
+        _ = localProjectID
+        count += 1
+        if let fileURL {
+            try Data(snapshot.content.utf8).write(
+                to: fileURL,
+                options: [.atomic]
+            )
+        }
+    }
+
+    func applyCount() -> Int { count }
+}
+
+private actor AutomaticRebaseOpenProviderStub:
+    SyncV2OpenLocalSnapshotProviding {
+    private let snapshot: SyncV2RebaseLocalSnapshot
+    private let remainsCurrent: Bool
+
+    init(
+        snapshot: SyncV2RebaseLocalSnapshot,
+        remainsCurrent: Bool
+    ) {
+        self.snapshot = snapshot
+        self.remainsCurrent = remainsCurrent
+    }
+
+    func latestOpenSnapshot(
+        documentID: UUID
+    ) -> SyncV2RebaseLocalSnapshot? {
+        _ = documentID
+        return snapshot
+    }
+
+    func isCurrent(
+        documentID: UUID,
+        snapshot: SyncV2RebaseLocalSnapshot
+    ) -> Bool {
+        _ = (documentID, snapshot)
+        return remainsCurrent
+    }
+
+    func applyMergedIfCurrent(
+        documentID: UUID,
+        expected: SyncV2RebaseLocalSnapshot,
+        mergedContent: String,
+        mergedPath: String
+    ) -> Bool {
+        _ = (documentID, expected, mergedContent, mergedPath)
+        return remainsCurrent
+    }
+}
+
+private actor DispatcherStoreStub: SyncV2DispatchStoring {
+    enum Status {
+        case pending
+        case inflight
+        case retryWait
+        case conflict
+        case blocked
+        case completed
+    }
+
+    struct RetryRecord {
+        let errorCode: String
+        let nextAttemptAt: Date
+    }
+
+    private var operations: [UUID: SyncV2DispatchOperation]
+    private var order: [UUID]
+    private var statuses: [UUID: Status]
+    private var retries: [UUID: RetryRecord] = [:]
+    private var opportunities = 0
+    private var missingRecoveries = 0
+    private var missingProjectRecoveries = 0
+
+    init(
+        operations: [SyncV2DispatchOperation],
+        initialStatus: Status = .pending
+    ) {
+        self.operations = Dictionary(
+            uniqueKeysWithValues: operations.map { ($0.operationID, $0) }
+        )
+        self.order = operations.map(\.operationID)
+        self.statuses = Dictionary(
+            uniqueKeysWithValues: operations.map {
+                ($0.operationID, initialStatus)
+            }
+        )
+    }
+
+    func recoverInterruptedWork() {}
+
+    func readyLocalProjectIDs(now: Date) -> [ProjectID] {
+        _ = now
+        var projectIDs: [ProjectID] = []
+        for identifier in order {
+            guard statuses[identifier] == .pending,
+                  let operation = operations[identifier] else {
+                continue
+            }
+            let projectID = operation.localProjectID
+                ?? ProjectID(rawValue: operation.projectID)
+            if !projectIDs.contains(projectID) {
+                projectIDs.append(projectID)
+            }
+        }
+        return projectIDs
+    }
+
+    func claimReadyOperations(
+        localProjectID: ProjectID,
+        limit: Int,
+        now: Date
+    ) -> [SyncV2DispatchOperation] {
+        var claimed: [SyncV2DispatchOperation] = []
+        for identifier in order {
+            guard claimed.count < limit,
+                  statuses[identifier] == .pending,
+                  let stored = operations[identifier],
+                  (
+                      stored.localProjectID
+                          ?? ProjectID(rawValue: stored.projectID)
+                  ) == localProjectID
+            else { continue }
+            let hasEarlierActive = operations.values.contains {
+                $0.documentID == stored.documentID
+                    && $0.documentSequence < stored.documentSequence
+                    && statuses[$0.operationID] != .completed
+            }
+            guard !hasEarlierActive else { continue }
+            let operation = SyncV2DispatchOperation(
+                operationID: stored.operationID,
+                batchID: stored.batchID,
+                localProjectID: stored.localProjectID,
+                projectID: stored.projectID,
+                documentID: stored.documentID,
+                deviceID: stored.deviceID,
+                documentSequence: stored.documentSequence,
+                localSaveGeneration: stored.localSaveGeneration,
+                kind: stored.kind,
+                baseRevision: stored.baseRevision,
+                baseContent: stored.baseContent,
+                baseServerPath: stored.baseServerPath,
+                localPath: stored.localPath,
+                relativePath: stored.relativePath,
+                content: stored.content,
+                isDeleted: stored.isDeleted,
+                attempts: stored.attempts + 1
+            )
+            operations[identifier] = operation
+            statuses[identifier] = .inflight
+            claimed.append(operation)
+        }
+        return claimed
+    }
+
+    func complete(
+        _ operation: SyncV2DispatchOperation,
+        result: SyncV2CommitDocumentResult
+    ) {
+        _ = result
+        statuses[operation.operationID] = .completed
+    }
+
+    func deferRetry(
+        _ operation: SyncV2DispatchOperation,
+        errorCode: String,
+        detail: String?,
+        nextAttemptAt: Date
+    ) {
+        _ = detail
+        statuses[operation.operationID] = .retryWait
+        retries[operation.operationID] = RetryRecord(
+            errorCode: errorCode,
+            nextAttemptAt: nextAttemptAt
+        )
+    }
+
+    func markConflict(
+        _ operation: SyncV2DispatchOperation,
+        errorCode: String,
+        detail: String?
+    ) {
+        _ = (errorCode, detail)
+        statuses[operation.operationID] = .conflict
+    }
+
+    func preserveConflict(
+        _ operation: SyncV2DispatchOperation,
+        remote: SyncV2RemoteDocumentSnapshot,
+        local: SyncV2RebaseLocalSnapshot,
+        mergedContent: String,
+        conflictCount: Int,
+        errorCode: String,
+        detail: String?
+    ) -> SyncV2ConflictPreservationResult {
+        _ = (
+            remote,
+            local,
+            mergedContent,
+            conflictCount,
+            errorCode,
+            detail
+        )
+        statuses[operation.operationID] = .conflict
+        return .preserved
+    }
+
+    func markBlocked(
+        _ operation: SyncV2DispatchOperation,
+        errorCode: String,
+        detail: String?
+    ) {
+        _ = (errorCode, detail)
+        statuses[operation.operationID] = .blocked
+    }
+
+    func recoverMissingRemoteDocument(
+        _ operation: SyncV2DispatchOperation
+    ) {
+        guard statuses[operation.operationID] == .inflight else {
+            return
+        }
+        operations[operation.operationID] = SyncV2DispatchOperation(
+            operationID: operation.operationID,
+            batchID: operation.batchID,
+            localProjectID: operation.localProjectID,
+            projectID: operation.projectID,
+            documentID: operation.documentID,
+            deviceID: operation.deviceID,
+            documentSequence: operation.documentSequence,
+            localSaveGeneration: operation.localSaveGeneration,
+            kind: operation.kind,
+            baseRevision: 0,
+            baseContent: "",
+            baseServerPath: operation.relativePath,
+            localPath: operation.localPath,
+            relativePath: operation.relativePath,
+            content: operation.content,
+            isDeleted: operation.isDeleted,
+            attempts: 0
+        )
+        statuses[operation.operationID] = .pending
+        missingRecoveries += 1
+    }
+
+    func recoverMissingRemoteProject(
+        _ operation: SyncV2DispatchOperation
+    ) {
+        _ = operation
+        missingProjectRecoveries += 1
+    }
+
+    func projectName(
+        for operation: SyncV2DispatchOperation
+    ) -> String {
+        _ = operation
+        return "복구 작품"
+    }
+
+    func makeRetryWaitOperationsReady(localProjectID: ProjectID?) {
+        opportunities += 1
+        for identifier in order where statuses[identifier] == .retryWait {
+            if let localProjectID,
+               let operation = operations[identifier],
+               effectiveLocalProjectID(operation) != localProjectID {
+                continue
+            }
+            statuses[identifier] = .pending
+            retries[identifier] = nil
+        }
+    }
+
+    func nextRetryDate(localProjectID: ProjectID?) -> Date? {
+        retries.compactMap { operationID, record in
+            if let localProjectID,
+               let operation = operations[operationID],
+               effectiveLocalProjectID(operation) != localProjectID {
+                return nil
+            }
+            return record.nextAttemptAt
+        }.min()
+    }
+
+    private func effectiveLocalProjectID(
+        _ operation: SyncV2DispatchOperation
+    ) -> ProjectID {
+        operation.localProjectID
+            ?? ProjectID(rawValue: operation.projectID)
+    }
+
+    func completedOperationIDs() -> Set<UUID> {
+        Set(statuses.compactMap { key, status in
+            status == .completed ? key : nil
+        })
+    }
+
+    func conflictOperationIDs() -> Set<UUID> {
+        Set(statuses.compactMap { key, status in
+            status == .conflict ? key : nil
+        })
+    }
+
+    func immediateOpportunityCount() -> Int {
+        opportunities
+    }
+
+    func missingProjectRecoveryCount() -> Int {
+        missingProjectRecoveries
+    }
+
+    func resetToRetryWait(operation: SyncV2DispatchOperation) {
+        statuses[operation.operationID] = .retryWait
+    }
+
+    func enqueue(_ operation: SyncV2DispatchOperation) {
+        operations[operation.operationID] = operation
+        order.append(operation.operationID)
+        statuses[operation.operationID] = .pending
+    }
+
+    func retryRecord(operationID: UUID) -> RetryRecord? {
+        retries[operationID]
+    }
+
+    func missingRecoveryCount() -> Int {
+        missingRecoveries
+    }
+}
+
+private actor DispatcherClientStub: SyncV2CommitClienting {
+    private let conflictOperationIDs: Set<UUID>
+    private let retryOperationIDs: Set<UUID>
+    private let missingOperationIDs: Set<UUID>
+    private let forbiddenOperationIDs: Set<UUID>
+    private let delayNanoseconds: UInt64
+    private let delayNanosecondsByOperation: [UUID: UInt64]
+    private var activeCalls = 0
+    private var maximumCalls = 0
+    private var requests: [SyncV2CommitDocumentParameters] = []
+    private var forbiddenAttempts: Set<UUID> = []
+
+    init(
+        conflictOperationIDs: Set<UUID> = [],
+        retryOperationIDs: Set<UUID> = [],
+        missingOperationIDs: Set<UUID> = [],
+        forbiddenCreateOperationIDs: Set<UUID> = [],
+        delayNanoseconds: UInt64 = 0,
+        delayNanosecondsByOperation: [UUID: UInt64] = [:]
+    ) {
+        self.conflictOperationIDs = conflictOperationIDs
+        self.retryOperationIDs = retryOperationIDs
+        self.missingOperationIDs = missingOperationIDs
+        self.forbiddenOperationIDs =
+            forbiddenCreateOperationIDs
+        self.delayNanoseconds = delayNanoseconds
+        self.delayNanosecondsByOperation =
+            delayNanosecondsByOperation
+    }
+
+    func commitDocument(
+        _ parameters: SyncV2CommitDocumentParameters
+    ) async throws -> SyncV2CommitDocumentResult {
+        requests.append(parameters)
+        activeCalls += 1
+        maximumCalls = max(maximumCalls, activeCalls)
+        let operationDelay =
+            delayNanosecondsByOperation[parameters.operationID]
+            ?? delayNanoseconds
+        if operationDelay > 0 {
+            try? await Task.sleep(nanoseconds: operationDelay)
+        }
+        activeCalls -= 1
+        if conflictOperationIDs.contains(parameters.operationID) {
+            throw SyncV2ClientError.remote(
+                code: .revisionConflict,
+                detail: "fixture"
+            )
+        }
+        if missingOperationIDs.contains(parameters.operationID),
+           parameters.baseServerRevision > 0 {
+            throw SyncV2ClientError.remote(
+                code: .documentNotFound,
+                detail: nil
+            )
+        }
+        if forbiddenOperationIDs.contains(
+            parameters.operationID
+        ),
+           forbiddenAttempts.insert(
+               parameters.operationID
+           ).inserted {
+            throw SyncV2ClientError.remote(
+                code: .forbidden,
+                detail: nil
+            )
+        }
+        if retryOperationIDs.contains(parameters.operationID) {
+            throw SyncV2ClientError.networkUnavailable
+        }
+        return SyncV2CommitDocumentResult(
+            status: .committed,
+            documentID: parameters.documentID,
+            versionID: UUID(),
+            operationID: parameters.operationID,
+            operationKind: parameters.baseServerRevision == 0
+                ? .create
+                : .update,
+            serverRevision: parameters.baseServerRevision + 1,
+            relativePath: parameters.relativePath,
+            isDeleted: parameters.isDeleted,
+            contentHash: SHA256ContentHasher()
+                .sha256(for: Data(parameters.content.utf8))
+                .rawValue,
+            committedAt: Date(timeIntervalSince1970: 1_800_000_001)
+        )
+    }
+
+    func maximumActiveCalls() -> Int {
+        maximumCalls
+    }
+
+    func receivedRequests() -> [SyncV2CommitDocumentParameters] {
+        requests
+    }
+}
+
+private actor ProjectRecoveryTransportStub:
+    EnsureProjectTransporting {
+    private var parameters: [EnsureProjectParameters] = []
+
+    func ensureProject(
+        parameters: EnsureProjectParameters
+    ) -> EnsuredServerProject {
+        self.parameters.append(parameters)
+        return EnsuredServerProject(
+            projectID: parameters.projectID,
+            name: parameters.name
+        )
+    }
+
+    func receivedParameters() -> [EnsureProjectParameters] {
+        parameters
+    }
+}
+
+private struct FixedRevisionProvider: SyncV2DocumentRevisionProviding {
+    let revision: Int64?
+
+    func serverRevision(for documentID: UUID) -> Int64? {
+        _ = documentID
+        return revision
+    }
+}
+
+private struct FixedDeviceIdentityProvider: DeviceIdentityProviding {
+    let identifier: DeviceIdentifier
+
+    func currentState() async -> DeviceIdentityState {
+        .ready(identifier)
+    }
+
+    func currentIdentifier() async throws -> DeviceIdentifier {
+        identifier
+    }
+
+    func prepareIdentity() async {}
+}
+
+private actor EditLeaseClientStub: EditLeaseClienting {
+    private let token = UUID()
+    private var acquireError: SyncV2ClientError?
+    private var acquisitions = 0
+    private var releases = 0
+    private var renewals = 0
+    private var renewalWaiters: [CheckedContinuation<Void, Never>] = []
+    private let releaseGate: LeaseReleaseGate?
+
+    init(
+        acquireError: SyncV2ClientError? = nil,
+        releaseGate: LeaseReleaseGate? = nil
+    ) {
+        self.acquireError = acquireError
+        self.releaseGate = releaseGate
+    }
+
+    func acquire(
+        documentID: UUID,
+        deviceID: UUID,
+        ttlSeconds: Int
+    ) throws -> EditLeaseMutationResult {
+        _ = ttlSeconds
+        acquisitions += 1
+        if let acquireError {
+            throw acquireError
+        }
+        return result(documentID: documentID, deviceID: deviceID)
+    }
+
+    func renew(
+        documentID: UUID,
+        deviceID: UUID,
+        leaseToken: UUID,
+        ttlSeconds: Int
+    ) -> EditLeaseMutationResult {
+        _ = (leaseToken, ttlSeconds)
+        renewals += 1
+        let waiters = renewalWaiters
+        renewalWaiters.removeAll()
+        waiters.forEach { $0.resume() }
+        return result(documentID: documentID, deviceID: deviceID)
+    }
+
+    func release(
+        documentID: UUID,
+        deviceID: UUID,
+        leaseToken: UUID
+    ) async -> Bool {
+        _ = (documentID, deviceID, leaseToken)
+        releases += 1
+        await releaseGate?.wait()
+        return true
+    }
+
+    func inspect(
+        documentID: UUID,
+        deviceID: UUID
+    ) -> EditLeaseInspectionResult {
+        _ = deviceID
+        return EditLeaseInspectionResult(
+            documentID: documentID,
+            state: .heldByMe,
+            expiresAt: Date().addingTimeInterval(90)
+        )
+    }
+
+    func acquireCount() -> Int {
+        acquisitions
+    }
+
+    func releaseCount() -> Int {
+        releases
+    }
+
+    func renewCount() -> Int {
+        renewals
+    }
+
+    func waitForRenewal() async {
+        guard renewals == 0 else { return }
+        await withCheckedContinuation { continuation in
+            renewalWaiters.append(continuation)
+        }
+    }
+
+    func setAcquireError(_ error: SyncV2ClientError?) {
+        acquireError = error
+    }
+
+    private func result(
+        documentID: UUID,
+        deviceID: UUID
+    ) -> EditLeaseMutationResult {
+        EditLeaseMutationResult(
+            documentID: documentID,
+            leaseToken: token,
+            deviceID: deviceID,
+            expiresAt: Date().addingTimeInterval(90)
+        )
+    }
+}
+
+private actor LeaseReleaseGate {
+    private var isOpen = false
+    private var waiters: [CheckedContinuation<Void, Never>] = []
+
+    func wait() async {
+        guard !isOpen else { return }
+        await withCheckedContinuation { continuation in
+            waiters.append(continuation)
+        }
+    }
+
+    func open() {
+        isOpen = true
+        let pending = waiters
+        waiters.removeAll()
+        pending.forEach { $0.resume() }
+    }
+}
+
+private actor AsyncCompletionProbe {
+    private var completed = false
+
+    func markCompleted() {
+        completed = true
+    }
+
+    func isCompleted() -> Bool {
+        completed
+    }
+}
+
+private actor NetworkRecoveryProbe {
+    private var starts = 0
+    private var completions = 0
+    private var finishWaiters:
+        [CheckedContinuation<Void, Never>] = []
+    private var canFinish = false
+
+    func run() async {
+        starts += 1
+        if !canFinish {
+            await withCheckedContinuation { continuation in
+                finishWaiters.append(continuation)
+            }
+        }
+        completions += 1
+    }
+
+    func finish() {
+        canFinish = true
+        let waiters = finishWaiters
+        finishWaiters.removeAll()
+        waiters.forEach { $0.resume() }
+    }
+
+    func startedCount() -> Int {
+        starts
+    }
+
+    func completedCount() -> Int {
+        completions
+    }
+}
+
+private actor OneShotLeaseSleeper {
+    private var calls = 0
+    private var sleepContinuation:
+        CheckedContinuation<Void, any Error>?
+    private var waitingContinuations:
+        [CheckedContinuation<Void, Never>] = []
+
+    func sleep(_ duration: Duration) async throws {
+        _ = duration
+        calls += 1
+        if calls > 1 {
+            throw CancellationError()
+        }
+        let waiters = waitingContinuations
+        waitingContinuations.removeAll()
+        waiters.forEach { $0.resume() }
+        try await withCheckedThrowingContinuation { continuation in
+            sleepContinuation = continuation
+        }
+    }
+
+    func waitUntilSleeping() async {
+        guard calls == 0 else { return }
+        await withCheckedContinuation { continuation in
+            waitingContinuations.append(continuation)
+        }
+    }
+
+    func wake() {
+        sleepContinuation?.resume()
+        sleepContinuation = nil
+    }
+}
+
+private actor MutableAuthenticationStateProvider {
+    private var state: AuthenticationState
+
+    init(state: AuthenticationState) {
+        self.state = state
+    }
+
+    func current() -> AuthenticationState {
+        state
+    }
+
+    func set(_ state: AuthenticationState) {
+        self.state = state
+    }
+}
+
+private final class EditLeaseConnectivityMonitorStub:
+    EditLeaseConnectivityMonitoring,
+    @unchecked Sendable {
+    private let lock = NSLock()
+    private var handler: (@Sendable (Bool) -> Void)?
+
+    func start(
+        handler: @escaping @Sendable (_ isConnected: Bool) -> Void
+    ) {
+        lock.lock()
+        self.handler = handler
+        lock.unlock()
+    }
+
+    func cancel() {
+        lock.lock()
+        handler = nil
+        lock.unlock()
+    }
+
+    func send(isConnected: Bool) {
+        lock.lock()
+        let callback = handler
+        lock.unlock()
+        callback?(isConnected)
+    }
+
+    func isStarted() -> Bool {
+        lock.lock()
+        let started = handler != nil
+        lock.unlock()
+        return started
+    }
+}

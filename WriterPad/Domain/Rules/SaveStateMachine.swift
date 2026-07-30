@@ -116,6 +116,45 @@ enum SaveStateMachine {
             )
         }
     }
+
+    static func presentation(
+        for state: SaveState,
+        syncHandoffState: SyncHandoffState
+    ) -> LocalSaveStatusPresentation {
+        if case .failed = state {
+            return presentation(for: state)
+        }
+        if case .failed = syncHandoffState {
+            return LocalSaveStatusPresentation(
+                label: "로컬 저장됨 · 동기화 기록 실패",
+                systemImage: "exclamationmark.triangle",
+                allowsRetry: true
+            )
+        }
+        if case .saved = state,
+           case .serverSizeLimitExceeded = syncHandoffState {
+            return LocalSaveStatusPresentation(
+                label: "로컬 저장됨 · 서버 크기 제한 초과",
+                systemImage: "externaldrive.badge.exclamationmark",
+                allowsRetry: false
+            )
+        }
+        if case .saved = state, case .upToDate = syncHandoffState {
+            return LocalSaveStatusPresentation(
+                label: "로컬 저장됨 · 서버와 동일",
+                systemImage: "checkmark.icloud",
+                allowsRetry: false
+            )
+        }
+        if case .saved = state, case .queued = syncHandoffState {
+            return LocalSaveStatusPresentation(
+                label: "로컬 저장됨 · 동기화 대기",
+                systemImage: "clock.arrow.circlepath",
+                allowsRetry: false
+            )
+        }
+        return presentation(for: state)
+    }
 }
 
 struct LocalSaveStatusPresentation: Equatable, Sendable {

@@ -30,6 +30,17 @@ struct ProjectWorkspaceView: View {
     private let restoreCoordinator: DocumentRestoreCoordinator
     private let workspaceStateRepository: any WorkspaceStateRepository
     private let futureChangeNotifier: any FutureChangeNotifying
+    private let projectManager: any ProjectManaging
+    private let authenticationService: any AuthenticationServicing
+    private let projectBindingService: any ProjectBindingServicing
+    private let syncDispatcher: SyncV2Dispatcher?
+    private let conflictResolutionService:
+        (any SyncV2ConflictResolving)?
+    private let snapshotPullService: SyncV2SnapshotPullService?
+    private let realtimeTrigger: (any SyncV2RealtimeTriggering)?
+    private let backgroundSyncCoordinator:
+        SyncV2BackgroundSyncCoordinator?
+    private let editLeaseManager: EditLeaseManager?
     @Binding private var isDarkMode: Bool
     @Binding private var smartPairsEnabled: Bool
 
@@ -47,6 +58,16 @@ struct ProjectWorkspaceView: View {
         restoreCoordinator: DocumentRestoreCoordinator,
         workspaceStateRepository: any WorkspaceStateRepository,
         futureChangeNotifier: any FutureChangeNotifying,
+        authenticationService: any AuthenticationServicing,
+        projectBindingService: any ProjectBindingServicing,
+        syncDispatcher: SyncV2Dispatcher?,
+        conflictResolutionService:
+            (any SyncV2ConflictResolving)? = nil,
+        snapshotPullService: SyncV2SnapshotPullService? = nil,
+        realtimeTrigger: (any SyncV2RealtimeTriggering)? = nil,
+        backgroundSyncCoordinator:
+            SyncV2BackgroundSyncCoordinator? = nil,
+        editLeaseManager: EditLeaseManager? = nil,
         isDarkMode: Binding<Bool>,
         smartPairsEnabled: Binding<Bool>
     ) {
@@ -61,12 +82,23 @@ struct ProjectWorkspaceView: View {
         self.restoreCoordinator = restoreCoordinator
         self.workspaceStateRepository = workspaceStateRepository
         self.futureChangeNotifier = futureChangeNotifier
+        self.projectManager = projectManager
+        self.authenticationService = authenticationService
+        self.projectBindingService = projectBindingService
+        self.syncDispatcher = syncDispatcher
+        self.conflictResolutionService = conflictResolutionService
+        self.snapshotPullService = snapshotPullService
+        self.realtimeTrigger = realtimeTrigger
+        self.backgroundSyncCoordinator = backgroundSyncCoordinator
+        self.editLeaseManager = editLeaseManager
         _isDarkMode = isDarkMode
         _smartPairsEnabled = smartPairsEnabled
         _model = StateObject(
             wrappedValue: ProjectListModel(
                 projectManager: projectManager,
-                projectImporter: projectImporter
+                projectImporter: projectImporter,
+                authenticationService: authenticationService,
+                projectBindingService: projectBindingService
             )
         )
     }
@@ -88,6 +120,14 @@ struct ProjectWorkspaceView: View {
                         restoreCoordinator: restoreCoordinator,
                         workspaceStateRepository: workspaceStateRepository,
                         futureChangeNotifier: futureChangeNotifier,
+                        authenticationService: authenticationService,
+                        projectBindingService: projectBindingService,
+                        syncDispatcher: syncDispatcher,
+                        conflictResolutionService:
+                            conflictResolutionService,
+                        snapshotPullService: snapshotPullService,
+                        realtimeTrigger: realtimeTrigger,
+                        editLeaseManager: editLeaseManager,
                         isShowingSettings: $isShowingSettings,
                         smartPairsEnabled: $smartPairsEnabled,
                         onChangeProject: { await model.returnToLibrary() }
@@ -100,13 +140,28 @@ struct ProjectWorkspaceView: View {
                 }
             }
         }
+        .task(id: model.selectedProjectID) {
+            await syncDispatcher?.prioritizeProject(
+                model.selectedProjectID
+            )
+            await backgroundSyncCoordinator?.prioritizeProject(
+                model.selectedProjectID
+            )
+        }
         .sheet(isPresented: $isShowingSettings) {
             AppearanceSettingsView(
                 isDarkMode: $isDarkMode,
                 smartPairsEnabled: $smartPairsEnabled,
                 projectID: model.selectedProject?.id,
                 backupStore: backupStore,
-                backupPolicyStore: backupPolicyStore
+                backupPolicyStore: backupPolicyStore,
+                projectManager: projectManager,
+                authenticationService: authenticationService,
+                projectBindingService: projectBindingService,
+                syncDispatcher: syncDispatcher,
+                backgroundSyncCoordinator:
+                    backgroundSyncCoordinator,
+                editLeaseManager: editLeaseManager
             )
         }
         .sheet(isPresented: $isShowingDeletedProjects) {
@@ -167,10 +222,13 @@ struct ProjectWorkspaceView: View {
             TextField("새 이름", text: $renameText)
             Button("취소", role: .cancel) { renameTarget = nil }
             Button("변경") {
-                guard let target = renameTarget else { return }
-                renameTarget = nil
-                Task { await model.rename(target, to: renameText) }
+                submitProjectRename()
             }
+            .disabled(
+                renameText.isEmpty
+                    || renameText == renameTarget?.name
+                    || model.isWorking
+            )
         }
         .confirmationDialog(
             "‘\(deleteTarget?.name ?? "")’ 작품을 삭제 대기 상태로 옮길까요?",
@@ -297,6 +355,12 @@ struct ProjectWorkspaceView: View {
                     }
                     .disabled(model.isWorking)
 
+                    Button("설정", systemImage: "gearshape") {
+                        isShowingSettings = true
+                    }
+                    .disabled(model.isWorking)
+                    .accessibilityIdentifier("writerpad.library-settings")
+
                     Button("새 작품", systemImage: "plus") {
                         newProjectName = ""
                         isCreating = true
@@ -401,6 +465,18 @@ struct ProjectWorkspaceView: View {
                     .foregroundStyle(Color.writerPadWarning)
                     .accessibilityLabel("삭제 대기 중")
             }
+            if isEditingProjects {
+                Button {
+                    beginProjectRename(project)
+                } label: {
+                    Image(systemName: "pencil")
+                        .font(.body.weight(.semibold))
+                        .frame(width: 34, height: 34)
+                }
+                .buttonStyle(.borderless)
+                .accessibilityLabel("‘\(project.name)’ 작품명 수정")
+                .accessibilityHint("작품 이름 입력 창을 엽니다.")
+            }
             Image(systemName: "chevron.right")
                 .font(.caption.weight(.semibold))
                 .foregroundStyle(.tertiary)
@@ -425,8 +501,7 @@ struct ProjectWorkspaceView: View {
     @ViewBuilder
     private func projectContextMenu(_ project: ManagedProject) -> some View {
         Button("이름 변경", systemImage: "pencil") {
-            renameText = project.name
-            renameTarget = project
+            beginProjectRename(project)
         }
         if project.isDeletionRequested {
             Button("삭제 대기 취소", systemImage: "arrow.uturn.backward") {
@@ -441,5 +516,22 @@ struct ProjectWorkspaceView: View {
             }
         }
     }
-}
 
+    private func beginProjectRename(_ project: ManagedProject) {
+        renameText = project.name
+        renameTarget = project
+    }
+
+    private func submitProjectRename() {
+        guard let target = renameTarget,
+              !renameText.isEmpty,
+              renameText != target.name,
+              !model.isWorking
+        else { return }
+        let submittedName = renameText
+        renameTarget = nil
+        Task {
+            await model.rename(target, to: submittedName)
+        }
+    }
+}

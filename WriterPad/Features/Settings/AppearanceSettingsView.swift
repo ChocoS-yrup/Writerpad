@@ -28,6 +28,12 @@ struct AppearanceSettingsView: View {
     let projectID: ProjectID?
     let backupStore: (any BackupStoring)?
     let backupPolicyStore: (any BackupPolicyStoring)?
+    let projectManager: any ProjectManaging
+    let authenticationService: any AuthenticationServicing
+    let projectBindingService: any ProjectBindingServicing
+    let syncDispatcher: SyncV2Dispatcher?
+    let backgroundSyncCoordinator: SyncV2BackgroundSyncCoordinator?
+    let editLeaseManager: (any EditLeaseManaging)?
     @Environment(\.dismiss) private var dismiss
 
     @AppStorage("writerpad.editor-font-family")
@@ -60,6 +66,29 @@ struct AppearanceSettingsView: View {
     var body: some View {
         NavigationStack {
             Form {
+                Section("동기화") {
+                    NavigationLink {
+                        SyncSettingsView(
+                            projectManager: projectManager,
+                            authenticationService: authenticationService,
+                            projectBindingService: projectBindingService,
+                            syncDispatcher: syncDispatcher,
+                            backgroundSyncCoordinator:
+                                backgroundSyncCoordinator,
+                            editLeaseManager: editLeaseManager
+                        )
+                    } label: {
+                        Label(
+                            "서버 계정 및 작품 연결",
+                            systemImage: "arrow.triangle.2.circlepath.icloud"
+                        )
+                    }
+                    .accessibilityIdentifier("writerpad.sync-settings")
+                    Text("한 번 로그인한 뒤 전체 작품 동기화와 작품별 예외 연결을 관리합니다.")
+                        .font(.footnote)
+                        .foregroundStyle(.secondary)
+                }
+
                 Section("화면") {
                     Toggle("다크 모드", isOn: $isDarkMode)
                         .accessibilityIdentifier("writerpad.dark-mode-toggle")

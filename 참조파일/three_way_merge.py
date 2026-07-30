@@ -82,6 +82,41 @@ def _line_tokens(value):
     return [line + "\n" for line in value.splitlines()]
 
 
+def _visible_difference(value):
+    if not value:
+        return None
+    visible = value.replace("\t", "⇥").replace("\n", " ↵ ")
+    visible = " ".join(visible.split())
+    return visible or None
+
+
+def _changed_differences(base_text, changed_text):
+    matcher = SequenceMatcher(a=base_text, b=changed_text, autojunk=False)
+    differences = []
+    for tag, _i1, _i2, j1, j2 in matcher.get_opcodes():
+        if tag == "equal":
+            continue
+        value = _visible_difference(changed_text[j1:j2])
+        if value:
+            differences.append(value)
+    return differences
+
+
+def _difference_summary(base_segment, local_segment, remote_segment):
+    base_text = "".join(base_segment)
+    local_text = "".join(local_segment)
+    remote_text = "".join(remote_segment)
+    local_differences = _changed_differences(base_text, local_text)
+    remote_differences = _changed_differences(base_text, remote_text)
+
+    output = []
+    if local_differences:
+        output.append(f"로컬 : {' '.join(local_differences)}\n")
+    if remote_differences:
+        output.append(f"서버 : {' '.join(remote_differences)}\n")
+    return output
+
+
 def three_way_merge(base, local, remote):
     """Line-based diff3 merge with explicit markers for overlapping edits."""
     if local == remote:
@@ -113,13 +148,25 @@ def three_way_merge(base, local, remote):
                 output.extend(local_segment)
             else:
                 conflicts += 1
-                output.append("<<<<<<< 내 로컬 편집본\n")
-                output.append(_ensure_newline(local_segment))
-                output.append("||||||| 마지막 공통본\n")
+                output.append("=========\n\n")
+                output.append("바꾸기 전 원본\n\n")
                 output.append(_ensure_newline(base_lines[start:end]))
-                output.append("=======\n")
+                output.append("\n=========\n\n")
+                output.append("로컬 편집본\n\n")
+                output.append(_ensure_newline(local_segment))
+                output.append("\n=========\n\n")
+                output.append("서버 최신본\n\n")
                 output.append(_ensure_newline(remote_segment))
-                output.append(">>>>>>> 서버 최신본\n")
+                output.append("\n=========\n\n")
+                output.append("로컬과 서버 차이점\n\n")
+                output.append(_ensure_newline(
+                    _difference_summary(
+                        base_lines[start:end],
+                        local_segment,
+                        remote_segment,
+                    )
+                ))
+                output.append("\n=========\n")
         else:
             output.extend(
                 _apply_segment(base_lines, start, end, local_changes or remote_changes)

@@ -8,6 +8,8 @@ struct BinderCommandJournal: Codable {
         case relocate
         case trash
         case restore
+        case reorder
+        case emptyTrash = "empty_trash"
         case permanentDelete = "permanent_delete"
     }
 
@@ -27,6 +29,33 @@ struct BinderCommandJournal: Codable {
     let oldNodes: [DocumentNode]
     let newNodes: [DocumentNode]
     let trashRecord: TrashRecord?
+    var durableBatch: LocalMutationBatch?
+
+    init(
+        transactionID: UUID,
+        projectID: ProjectID,
+        kind: Kind,
+        phase: Phase,
+        sourcePath: RelativeDocumentPath?,
+        destinationPath: RelativeDocumentPath,
+        createdKind: DocumentKind?,
+        oldNodes: [DocumentNode],
+        newNodes: [DocumentNode],
+        trashRecord: TrashRecord?,
+        durableBatch: LocalMutationBatch? = nil
+    ) {
+        self.transactionID = transactionID
+        self.projectID = projectID
+        self.kind = kind
+        self.phase = phase
+        self.sourcePath = sourcePath
+        self.destinationPath = destinationPath
+        self.createdKind = createdKind
+        self.oldNodes = oldNodes
+        self.newNodes = newNodes
+        self.trashRecord = trashRecord
+        self.durableBatch = durableBatch
+    }
 }
 
 /// 파일 시스템과 SwiftData 사이의 바인더 변경을 직렬화하고 복구한다.
@@ -45,6 +74,7 @@ actor LocalBinderCommandService: BinderCommanding {
     let uuidGenerator: any UUIDGenerating
     let hasher: any ContentHashing
     let futureChangeNotifier: any FutureChangeNotifying
+    let durableChangeRecorder: any DurableLocalChangeRecording
     let backupStore: (any BackupStoring)?
     let backupPolicyStore: (any BackupPolicyStoring)?
     let faultPlan: BinderCommandFaultPlan?
@@ -64,6 +94,8 @@ actor LocalBinderCommandService: BinderCommanding {
         uuidGenerator: any UUIDGenerating = SystemUUIDGenerator(),
         hasher: any ContentHashing = SHA256ContentHasher(),
         futureChangeNotifier: any FutureChangeNotifying = NoOpFutureChangeNotifier(),
+        durableChangeRecorder: any DurableLocalChangeRecording =
+            NoOpDurableLocalChangeRecorder(),
         backupStore: (any BackupStoring)? = nil,
         backupPolicyStore: (any BackupPolicyStoring)? = nil,
         faultPlan: BinderCommandFaultPlan? = nil
@@ -79,6 +111,7 @@ actor LocalBinderCommandService: BinderCommanding {
         self.uuidGenerator = uuidGenerator
         self.hasher = hasher
         self.futureChangeNotifier = futureChangeNotifier
+        self.durableChangeRecorder = durableChangeRecorder
         self.backupStore = backupStore
         self.backupPolicyStore = backupPolicyStore
         self.faultPlan = faultPlan
@@ -97,7 +130,7 @@ actor LocalBinderCommandService: BinderCommanding {
             do {
                 let decoder = JSONDecoder()
                 decoder.dateDecodingStrategy = .iso8601
-                let journal = try decoder.decode(
+                var journal = try decoder.decode(
                     BinderCommandJournal.self,
                     from: Data(contentsOf: url)
                 )
@@ -105,8 +138,12 @@ actor LocalBinderCommandService: BinderCommanding {
                 switch journal.phase {
                 case .prepared:
                     try await rollback(journal, workspaceRoot: workspaceRoot)
+                    try removeIfExists(url)
+                    continue
                 case .filesApplied:
                     try await saveMetadata(for: journal)
+                    journal.phase = .metadataSaved
+                    try writeJournal(journal, to: url)
                 case .metadataSaved:
                     let destination = try validatedURL(
                         journal.destinationPath,
@@ -116,6 +153,13 @@ actor LocalBinderCommandService: BinderCommanding {
                        journal.kind != .permanentDelete {
                         throw BinderCommandError.sourceMissing(destination.path)
                     }
+                }
+                guard try await completeDurableHandoff(
+                    journal: &journal,
+                    journalURL: url,
+                    workspaceRoot: workspaceRoot
+                ) else {
+                    throw BinderCommandError.recoveryRequired(url.path)
                 }
                 if journal.kind == .permanentDelete, journal.phase != .prepared {
                     try removeIfExists(try validatedURL(journal.destinationPath, workspaceRoot: workspaceRoot))
@@ -460,11 +504,22 @@ actor LocalBinderCommandService: BinderCommanding {
                 at: now
             )
         }
-        try await metadataStore.reconcileBinderMetadata(
-            in: projectID,
-            upserting: reordered,
-            removingSubtrees: []
+        let journal = BinderCommandJournal(
+            transactionID: uuidGenerator.makeUUID(),
+            projectID: projectID,
+            kind: .reorder,
+            phase: .prepared,
+            sourcePath: nil,
+            destinationPath: parent.relativePath,
+            createdKind: nil,
+            oldNodes: reorderableChildren,
+            newNodes: reordered,
+            trashRecord: nil
         )
+        let workspaceRoot = try await workspaceLocator.workspaceRoot(
+            for: projectID
+        )
+        try await execute(journal, workspaceRoot: workspaceRoot)
     }
 
     func moveToTrash(
@@ -669,6 +724,11 @@ actor LocalBinderCommandService: BinderCommanding {
             throw BinderCommandError.missingDocument(DocumentID(rawValue: UUID()))
         }
         let roots = documents.filter { $0.parentID == trash.id }
+        let originalSubtrees = Dictionary(
+            uniqueKeysWithValues: roots.map {
+                ($0.id, subtreeRooted(at: $0, in: documents))
+            }
+        )
         var deleted: [DocumentID] = []
         var failures: [TrashDeletionFailure] = []
         for item in roots {
@@ -683,6 +743,12 @@ actor LocalBinderCommandService: BinderCommanding {
                 failures.append(.init(documentID: item.id, message: error.localizedDescription))
             }
         }
+        let deletedNodes = deleted.flatMap { originalSubtrees[$0] ?? [] }
+        await recordEmptyTrashHandoff(
+            projectID: projectID,
+            deletedNodes: deletedNodes,
+            trashPath: trash.relativePath
+        )
         return TrashDeletionResult(deletedDocumentIDs: deleted, failures: failures)
     }
 }

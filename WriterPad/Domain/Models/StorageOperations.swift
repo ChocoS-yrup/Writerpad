@@ -8,6 +8,7 @@ struct DocumentSaveRequest: Equatable, Sendable {
     let text: String
     let generation: UInt64
     let cursor: TextCursorState?
+    let durableBatchKind: DurableLocalBatchKind
 
     init(
         projectID: ProjectID,
@@ -15,7 +16,8 @@ struct DocumentSaveRequest: Equatable, Sendable {
         relativePath: RelativeDocumentPath,
         text: String,
         generation: UInt64,
-        cursor: TextCursorState? = nil
+        cursor: TextCursorState? = nil,
+        durableBatchKind: DurableLocalBatchKind = .documentSave
     ) {
         self.projectID = projectID
         self.documentID = documentID
@@ -23,6 +25,7 @@ struct DocumentSaveRequest: Equatable, Sendable {
         self.text = text
         self.generation = generation
         self.cursor = cursor
+        self.durableBatchKind = durableBatchKind
     }
 }
 
@@ -42,6 +45,7 @@ struct DocumentSaveReceipt: Codable, Equatable, Sendable {
     let generation: UInt64
     let cursor: TextCursorState?
     let savedContent: SavedDocumentContent?
+    let durableRecordResult: DurableRecordResult?
 
     init(
         projectID: ProjectID,
@@ -51,7 +55,8 @@ struct DocumentSaveReceipt: Codable, Equatable, Sendable {
         modifiedAt: Date,
         generation: UInt64,
         cursor: TextCursorState? = nil,
-        savedContent: SavedDocumentContent? = nil
+        savedContent: SavedDocumentContent? = nil,
+        durableRecordResult: DurableRecordResult? = nil
     ) {
         self.projectID = projectID
         self.documentID = documentID
@@ -61,6 +66,7 @@ struct DocumentSaveReceipt: Codable, Equatable, Sendable {
         self.generation = generation
         self.cursor = cursor
         self.savedContent = savedContent
+        self.durableRecordResult = durableRecordResult
     }
 
     private enum CodingKeys: String, CodingKey {
@@ -83,6 +89,7 @@ struct DocumentSaveReceipt: Codable, Equatable, Sendable {
         generation = try container.decode(UInt64.self, forKey: .generation)
         cursor = try container.decodeIfPresent(TextCursorState.self, forKey: .cursor)
         savedContent = nil
+        durableRecordResult = nil
     }
 
     func encode(to encoder: Encoder) throws {
@@ -94,6 +101,20 @@ struct DocumentSaveReceipt: Codable, Equatable, Sendable {
         try container.encode(modifiedAt, forKey: .modifiedAt)
         try container.encode(generation, forKey: .generation)
         try container.encodeIfPresent(cursor, forKey: .cursor)
+    }
+
+    func recording(_ result: DurableRecordResult) -> DocumentSaveReceipt {
+        DocumentSaveReceipt(
+            projectID: projectID,
+            documentID: documentID,
+            relativePath: relativePath,
+            contentHash: contentHash,
+            modifiedAt: modifiedAt,
+            generation: generation,
+            cursor: cursor,
+            savedContent: savedContent,
+            durableRecordResult: result
+        )
     }
 }
 

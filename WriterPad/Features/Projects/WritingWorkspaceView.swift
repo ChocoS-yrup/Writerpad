@@ -28,6 +28,7 @@ struct WritingWorkspaceShell: View {
     let repository: any BinderRepository
     let commands: any BinderCommanding
     let documentRepository: any DocumentRepository
+    let documentStore: any LocalDocumentStoring
     let searchService: any Searching
     let exporter: any Exporting
     let workspaceStateRepository: any WorkspaceStateRepository
@@ -35,6 +36,8 @@ struct WritingWorkspaceShell: View {
     let backupPolicyStore: any BackupPolicyStoring
     let restoreCoordinator: DocumentRestoreCoordinator
     let futureChangeNotifier: any FutureChangeNotifying
+    let conflictResolutionService:
+        (any SyncV2ConflictResolving)?
     private let storageCoordinator: WorkspaceStorageCoordinator
     @Binding var isShowingSettings: Bool
     @Binding var smartPairsEnabled: Bool
@@ -43,11 +46,14 @@ struct WritingWorkspaceShell: View {
     /// 모델 인스턴스의 수명만 소유한다. 변경 구독은 패널과 저장 배지 경계에서 수행한다.
     @State private var leftEditorModel: EditorSessionModel
     @State private var rightEditorModel: EditorSessionModel
+    @StateObject private var workspaceSyncModel:
+        SyncV2WorkspaceSyncModel
     @State private var isBinderVisible = true
     @State private var binderDragStartWidth: CGFloat?
     /// 드래그 중에는 UserDefaults에 기록하지 않고 화면 폭만 갱신한다.
     @State private var liveBinderWidth: CGFloat?
     @State private var binderContentStateOverrides: [DocumentID: BinderTextContentState] = [:]
+    @State private var binderSnapshotRefreshGeneration: UInt64 = 0
     /// 방향 관찰자가 첫 값을 전달하기 전에는 분할을 노출하지 않는 안전한 기본값을 사용한다.
     @State private var usesCompactLayout = true
     /// 사용자가 선택한 분할 선호다. 세로·좁은 창에서는 표시만 숨기고 이 값은 보존한다.
@@ -58,6 +64,10 @@ struct WritingWorkspaceShell: View {
     @State private var isRestoringWorkspace = false
     @State private var presentedSheet: WorkspaceSheet?
     @State private var backupDocument: BackupHistoryRoute?
+    @State private var conflictResolutionRoute:
+        ConflictResolutionRoute?
+    @State private var conflictResolutionErrorMessage: String?
+    @State private var isLoadingConflictResolution = false
     @State private var binderErrorMessage: String?
     @State private var isBinderOrdering = false
     @State private var binderEditOperation = BinderEditOperation.reorder
@@ -90,6 +100,14 @@ struct WritingWorkspaceShell: View {
         restoreCoordinator: DocumentRestoreCoordinator,
         workspaceStateRepository: any WorkspaceStateRepository,
         futureChangeNotifier: any FutureChangeNotifying,
+        authenticationService: any AuthenticationServicing,
+        projectBindingService: any ProjectBindingServicing,
+        syncDispatcher: SyncV2Dispatcher? = nil,
+        conflictResolutionService:
+            (any SyncV2ConflictResolving)? = nil,
+        snapshotPullService: SyncV2SnapshotPullService? = nil,
+        realtimeTrigger: (any SyncV2RealtimeTriggering)? = nil,
+        editLeaseManager: (any EditLeaseManaging)? = nil,
         isShowingSettings: Binding<Bool>,
         smartPairsEnabled: Binding<Bool>,
         onChangeProject: @escaping () async -> Void
@@ -98,6 +116,7 @@ struct WritingWorkspaceShell: View {
         self.repository = repository
         self.commands = commands
         self.documentRepository = documentRepository
+        self.documentStore = documentStore
         self.searchService = searchService
         self.exporter = exporter
         self.workspaceStateRepository = workspaceStateRepository
@@ -105,6 +124,7 @@ struct WritingWorkspaceShell: View {
         self.backupPolicyStore = backupPolicyStore
         self.restoreCoordinator = restoreCoordinator
         self.futureChangeNotifier = futureChangeNotifier
+        self.conflictResolutionService = conflictResolutionService
         self.storageCoordinator = WorkspaceStorageCoordinator(
             projectID: project.id,
             binderRepository: repository,
@@ -114,28 +134,46 @@ struct WritingWorkspaceShell: View {
         self.onChangeProject = onChangeProject
         _isShowingSettings = isShowingSettings
         _smartPairsEnabled = smartPairsEnabled
-        let draftStore = EditorDraftStore()
-        _leftEditorModel = State(
-            initialValue: EditorSessionModel(
-                documentRepository: documentRepository,
-                documentStore: documentStore,
-                backupStore: backupStore,
-                backupPolicyStore: backupPolicyStore,
-                workspaceStateRepository: workspaceStateRepository,
-                draftStore: draftStore,
-                futureChangeNotifier: futureChangeNotifier
+        _workspaceSyncModel = StateObject(
+            wrappedValue: SyncV2WorkspaceSyncModel(
+                localProjectID: project.id,
+                puller: snapshotPullService,
+                realtime: realtimeTrigger,
+                authenticationService: authenticationService,
+                projectBindingService: projectBindingService,
+                requestDispatchRetry: {
+                    await syncDispatcher?.userRequestedRetry()
+                }
             )
         )
+        let draftStore = EditorDraftStore()
+        let leftEditorModel = EditorSessionModel(
+            documentRepository: documentRepository,
+            documentStore: documentStore,
+            backupStore: backupStore,
+            backupPolicyStore: backupPolicyStore,
+            workspaceStateRepository: workspaceStateRepository,
+            draftStore: draftStore,
+            futureChangeNotifier: futureChangeNotifier,
+            editLeaseManager: editLeaseManager
+        )
+        let rightEditorModel = EditorSessionModel(
+            documentRepository: documentRepository,
+            documentStore: documentStore,
+            backupStore: backupStore,
+            backupPolicyStore: backupPolicyStore,
+            workspaceStateRepository: workspaceStateRepository,
+            draftStore: draftStore,
+            futureChangeNotifier: futureChangeNotifier,
+            editLeaseManager: editLeaseManager
+        )
+        SyncV2EditorSessionRegistry.shared.register(leftEditorModel)
+        SyncV2EditorSessionRegistry.shared.register(rightEditorModel)
+        _leftEditorModel = State(
+            initialValue: leftEditorModel
+        )
         _rightEditorModel = State(
-            initialValue: EditorSessionModel(
-                documentRepository: documentRepository,
-                documentStore: documentStore,
-                backupStore: backupStore,
-                backupPolicyStore: backupPolicyStore,
-                workspaceStateRepository: workspaceStateRepository,
-                draftStore: draftStore,
-                futureChangeNotifier: futureChangeNotifier
-            )
+            initialValue: rightEditorModel
         )
     }
 
@@ -155,6 +193,8 @@ struct WritingWorkspaceShell: View {
                                 editOperation: $binderEditOperation,
                                 allowsKeyboardFocus: !shouldPresentSplit
                                     || usesCompactLayoutForCurrentSize,
+                                refreshGeneration:
+                                    binderSnapshotRefreshGeneration,
                                 contentStateOverrides: binderContentStateOverrides,
                                 onSelection: { node in
                                     Task { await handleBinderSelection(node) }
@@ -276,6 +316,10 @@ struct WritingWorkspaceShell: View {
             applyAutosaveDelaySetting(autosaveDelayMilliseconds)
             Task {
                 await restoreWorkspaceIfNeeded()
+                await workspaceSyncModel.start(
+                    editingGuards: currentSyncEditingGuards,
+                    applyOpenSnapshot: applyOpenServerSnapshot
+                )
                 await updateSceneActivity(scenePhase == .active)
             }
         }
@@ -287,6 +331,11 @@ struct WritingWorkspaceShell: View {
         }
         .onDisappear {
             projectSearchTask?.cancel()
+            Task {
+                await workspaceSyncModel.stop()
+                await leftEditorModel.releaseEditLease()
+                await rightEditorModel.releaseEditLease()
+            }
         }
         .sheet(item: $presentedSheet) { sheet in
             if sheet == .trash {
@@ -310,8 +359,26 @@ struct WritingWorkspaceShell: View {
                 backupStore: backupStore,
                 restoreCoordinator: restoreCoordinator,
                 currentText: { activeEditorModel.currentText },
+                currentUTF16Length: { activeEditorModel.currentUTF16Length },
                 onRestored: { restoredText in
                     activeEditorModel.applyRestoredText(restoredText)
+                },
+                onCopyCreated: { result in
+                    binderSnapshotRefreshGeneration &+= 1
+                    binderContentStateOverrides[result.document.id] =
+                        result.copiedText.isEmpty ? .empty : .written
+                }
+            )
+        }
+        .sheet(item: $conflictResolutionRoute) { route in
+            ConflictResolutionView(
+                route: route,
+                onResolve: { content, kind in
+                    try await resolveConflict(
+                        route,
+                        content: content,
+                        kind: kind
+                    )
                 }
             )
         }
@@ -320,6 +387,26 @@ struct WritingWorkspaceShell: View {
                 title: Text(notice.title),
                 message: Text(notice.message),
                 dismissButton: .default(Text("확인"))
+            )
+        }
+        .alert(
+            "충돌 해결을 완료하지 못했습니다",
+            isPresented: Binding(
+                get: { conflictResolutionErrorMessage != nil },
+                set: { isPresented in
+                    if !isPresented {
+                        conflictResolutionErrorMessage = nil
+                    }
+                }
+            )
+        ) {
+            Button("확인", role: .cancel) {
+                conflictResolutionErrorMessage = nil
+            }
+        } message: {
+            Text(
+                conflictResolutionErrorMessage
+                    ?? "충돌 상태를 다시 확인해 주세요."
             )
         }
     }
@@ -376,6 +463,16 @@ struct WritingWorkspaceShell: View {
                     .accessibilityLabel(pane == .left ? "왼쪽 편집기" : "오른쪽 편집기")
                     .accessibilityValue(pane == activePane ? "활성" : "비활성")
                 Spacer(minLength: 8)
+                if let leaseStatus = leaseStatus(for: model.editLeaseState) {
+                    Label(leaseStatus.text, systemImage: leaseStatus.symbol)
+                        .font(.caption)
+                        .foregroundStyle(leaseStatus.color)
+                        .fixedSize(horizontal: true, vertical: false)
+                        .layoutPriority(2)
+                        .accessibilityIdentifier(
+                            "writerpad.edit-lease-status-\(pane.rawValue)"
+                        )
+                }
                 if model.currentDocumentID != nil {
                     HStack(spacing: 6) {
                         if let selectionCharacterCount = selectionCharacterCount(in: model) {
@@ -597,14 +694,24 @@ struct WritingWorkspaceShell: View {
             .disabled(splitTransitionPhase != .idle)
             .focusable()
 
-            EditorSaveStatusBadge(model: activeEditorModel) {
-                Task {
-                    guard await activeEditorModel.saveNow() else {
-                        notice = .localSaveFailure
-                        return
+            EditorSaveStatusBadge(
+                model: activeEditorModel,
+                workspaceSyncModel: workspaceSyncModel,
+                onRetry: {
+                    Task {
+                        guard await activeEditorModel.saveNow() else {
+                            notice = .localSaveFailure
+                            return
+                        }
+                        await workspaceSyncModel.retry()
                     }
+                },
+                onResolveConflict: conflictResolutionService == nil
+                    ? nil
+                    : {
+                        Task { await presentConflictResolution() }
                 }
-            }
+            )
 
             Menu {
                 Button("설정", systemImage: "gearshape") {
@@ -991,6 +1098,25 @@ struct WritingWorkspaceShell: View {
         return "글자 수 \(model.statistics.characterCount)자"
     }
 
+    private func leaseStatus(
+        for state: EditLeaseDisplayState
+    ) -> (text: String, symbol: String, color: Color)? {
+        switch state {
+        case .localOnly, .held:
+            return nil
+        case .acquiring:
+            return ("편집 잠금 확인 중", "clock", .secondary)
+        case .heldByOther:
+            return ("다른 기기에서 편집 중", "lock.fill", .writerPadWarning)
+        case .offlineEditing:
+            return ("오프라인 편집 · 충돌 가능", "wifi.slash", .writerPadWarning)
+        case .authenticationRequired:
+            return ("동기화 로그인 필요", "person.crop.circle.badge.exclamationmark", .writerPadWarning)
+        case .unavailable:
+            return ("편집 잠금 확인 실패", "exclamationmark.triangle.fill", .writerPadWarning)
+        }
+    }
+
     private func resizeBinder(from currentWidth: CGFloat, translation: CGFloat) {
         let startWidth = binderDragStartWidth ?? currentWidth
         binderDragStartWidth = startWidth
@@ -1105,6 +1231,10 @@ struct WritingWorkspaceShell: View {
         do {
             try await saveWorkspaceState(isSplitEnabled: false)
             isSplitPreferred = false
+            let hiddenPane: EditorPane = activePane == .left
+                ? .right
+                : .left
+            await editorModel(for: hiddenPane).releaseEditLease()
         } catch {
             notice = .workspaceStateFailure
         }
@@ -1135,6 +1265,7 @@ struct WritingWorkspaceShell: View {
             }
         }
         isSplitPreferred = true
+        await openingModel.resumeEditLease()
         // 분할 표시를 다시 열어도 닫기 직전에 작업하던 패널을 유지한다.
         await persistWorkspaceState()
     }
@@ -1712,9 +1843,171 @@ struct WritingWorkspaceShell: View {
     private func updateSceneActivity(_ active: Bool) async {
         await leftEditorModel.updateSceneActivity(active)
         await rightEditorModel.updateSceneActivity(active)
+        await workspaceSyncModel.updateSceneActivity(active)
         if !active {
             await persistWorkspaceState()
         }
+    }
+
+    private func currentSyncEditingGuards()
+        -> [UUID: SyncV2EditingGuard] {
+        var result: [UUID: SyncV2EditingGuard] = [:]
+        for model in [leftEditorModel, rightEditorModel] {
+            guard let documentID = model.currentDocumentID?.rawValue else {
+                continue
+            }
+            let previous = result[documentID] ?? .closed
+            result[documentID] = SyncV2EditingGuard(
+                isOpen: true,
+                isDirty: previous.isDirty || model.hasUnsavedChanges,
+                isComposing:
+                    previous.isComposing || model.isComposing
+            )
+        }
+        return result
+    }
+
+    private func applyOpenServerSnapshot(
+        _ snapshot: SyncV2RemoteDocumentSnapshot
+    ) {
+        binderSnapshotRefreshGeneration &+= 1
+        applyRemoteBinderContentState(
+            snapshot,
+            to: &binderContentStateOverrides
+        )
+        let documentID = DocumentID(rawValue: snapshot.documentID)
+        _ = leftEditorModel.applyRemoteSnapshotIfClean(
+            documentID: documentID,
+            content: snapshot.content,
+            relativePath: snapshot.relativePath
+        )
+        _ = rightEditorModel.applyRemoteSnapshotIfClean(
+            documentID: documentID,
+            content: snapshot.content,
+            relativePath: snapshot.relativePath
+        )
+    }
+
+    private func presentConflictResolution() async {
+        guard !isLoadingConflictResolution,
+              let conflictResolutionService
+        else { return }
+        isLoadingConflictResolution = true
+        defer { isLoadingConflictResolution = false }
+        do {
+            let activeID = activeEditorModel.currentDocumentID?.rawValue
+            let activeConflict: SyncV2ConflictRecord?
+            if let activeID {
+                activeConflict = try await conflictResolutionService
+                    .unresolvedConflict(documentID: activeID)
+            } else {
+                activeConflict = nil
+            }
+            let conflict: SyncV2ConflictRecord
+            if let activeConflict {
+                conflict = activeConflict
+            } else {
+                guard let first = try await conflictResolutionService
+                    .unresolvedConflicts(localProjectID: project.id)
+                    .first
+                else {
+                    throw ConflictResolutionPresentationError
+                        .conflictNotFound
+                }
+                conflict = first
+            }
+            let documentID = DocumentID(rawValue: conflict.documentID)
+            guard let document = try await documentRepository.document(
+                id: documentID
+            ), document.kind == .text else {
+                throw ConflictResolutionPresentationError
+                    .documentNotFound
+            }
+            for model in [leftEditorModel, rightEditorModel]
+            where model.currentDocumentID == documentID {
+                guard !model.isComposing else {
+                    throw ConflictResolutionPresentationError
+                        .finishComposition
+                }
+                guard await model.saveNow() else {
+                    throw ConflictResolutionPresentationError
+                        .localSaveFailed
+                }
+            }
+            conflictResolutionRoute = ConflictResolutionRoute(
+                conflict: conflict,
+                document: document
+            )
+        } catch {
+            conflictResolutionErrorMessage = error.localizedDescription
+        }
+    }
+
+    private func resolveConflict(
+        _ route: ConflictResolutionRoute,
+        content: String,
+        kind: SyncV2ConflictResolutionKind
+    ) async throws {
+        guard let conflictResolutionService else {
+            throw SyncV2ConflictResolutionError.unavailable
+        }
+        guard let document = try await documentRepository.document(
+            id: route.document.id
+        ), document.kind == .text else {
+            throw ConflictResolutionPresentationError.documentNotFound
+        }
+        let generation = DispatchTime.now().uptimeNanoseconds
+        let receipt = try await documentStore.save(
+            DocumentSaveRequest(
+                projectID: document.projectID,
+                documentID: document.id,
+                relativePath: document.relativePath,
+                text: content,
+                generation: generation,
+                cursor: document.cursor
+            )
+        )
+        let resolutionOperationID: UUID
+        switch receipt.durableRecordResult {
+        case .queued(let operationIDs):
+            guard let operationID = operationIDs.last else {
+                throw SyncV2ConflictResolutionError
+                    .resolutionOperationNotReady
+            }
+            resolutionOperationID = operationID
+        case let .serverSizeLimitExceeded(byteCount, limit):
+            throw SyncV2ConflictResolutionError.contentTooLarge(
+                byteCount: byteCount,
+                limit: limit
+            )
+        case .localSavedButNotQueued, .localOnly, .notNeeded, .none:
+            throw SyncV2ConflictResolutionError
+                .resolutionOperationNotReady
+        }
+
+        for model in [leftEditorModel, rightEditorModel]
+        where model.currentDocumentID == document.id {
+            model.applyRestoredText(content)
+        }
+        binderContentStateOverrides[document.id] =
+            content.isEmpty ? .empty : .written
+        await futureChangeNotifier.record(
+            .documentSaved(
+                projectID: receipt.projectID,
+                documentID: receipt.documentID,
+                contentHash: receipt.contentHash
+            )
+        )
+        try await conflictResolutionService.resolveConflict(
+            SyncV2ConflictResolutionRequest(
+                conflictID: route.conflict.conflictID,
+                documentID: route.conflict.documentID,
+                resolutionOperationID: resolutionOperationID,
+                resolvedContent: content,
+                kind: kind
+            )
+        )
+        await workspaceSyncModel.retry()
     }
 
     private func persistAllSessionState() async -> Bool {
@@ -1792,35 +2085,90 @@ struct WritingWorkspaceShell: View {
 /// 저장 상태 변경이 작업 공간 전체가 아닌 배지만 다시 그리도록 구독 범위를 제한한다.
 private struct EditorSaveStatusBadge: View {
     @ObservedObject var model: EditorSessionModel
+    @ObservedObject var workspaceSyncModel: SyncV2WorkspaceSyncModel
     let onRetry: () -> Void
+    let onResolveConflict: (() -> Void)?
 
     var body: some View {
-        SaveStatusBadge(state: model.saveState, onRetry: onRetry)
+        SaveStatusBadge(
+            state: model.saveState,
+            syncHandoffState: model.syncHandoffState,
+            serverState: workspaceSyncModel.serverState,
+            leaseState: model.editLeaseState,
+            onRetry: onRetry,
+            onResolveConflict: onResolveConflict
+        )
     }
 }
 
 private struct SaveStatusBadge: View {
+    @State private var isShowingDetail = false
     let state: SaveState
+    let syncHandoffState: SyncHandoffState
+    let serverState: SyncV2WorkspaceServerState
+    let leaseState: EditLeaseDisplayState
     let onRetry: () -> Void
+    let onResolveConflict: (() -> Void)?
 
-    private var presentation: LocalSaveStatusPresentation {
-        SaveStateMachine.presentation(for: state)
+    private var presentation: WorkspaceSyncStatusPresentation {
+        WorkspaceSyncStatusReducer.presentation(
+            saveState: state,
+            handoffState: syncHandoffState,
+            serverState: serverState,
+            leaseState: leaseState
+        )
     }
 
     var body: some View {
-        Group {
-            if presentation.allowsRetry {
-                Button(action: onRetry) {
-                    badgeLabel
+        Button {
+            isShowingDetail = true
+        } label: {
+            badgeLabel
+        }
+        .buttonStyle(.plain)
+        .popover(isPresented: $isShowingDetail) {
+            VStack(alignment: .leading, spacing: 12) {
+                Label(
+                    presentation.label,
+                    systemImage: presentation.systemImage
+                )
+                .font(.headline)
+                Text(presentation.detail)
+                    .font(.subheadline)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+                if requiresConflictResolution,
+                   let onResolveConflict {
+                    Button("충돌 해결") {
+                        isShowingDetail = false
+                        onResolveConflict()
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .accessibilityIdentifier(
+                        "writerpad.resolve-conflict"
+                    )
+                } else if presentation.allowsRetry {
+                    Button("다시 시도") {
+                        isShowingDetail = false
+                        onRetry()
+                    }
+                    .buttonStyle(.borderedProminent)
                 }
-                .buttonStyle(.plain)
-                .accessibilityHint("최신 원고의 로컬 저장을 다시 시도합니다.")
-            } else {
-                badgeLabel
             }
+            .padding(18)
+            .frame(width: 320, alignment: .leading)
         }
         .accessibilityIdentifier("writerpad.save-status")
-        .accessibilityLabel("저장 상태: \(presentation.label)")
+        .accessibilityLabel("저장 및 동기화 상태: \(presentation.label)")
+        .accessibilityValue(presentation.detail)
+        .accessibilityHint("상태 상세 정보를 엽니다.")
+    }
+
+    private var requiresConflictResolution: Bool {
+        if case .conflictRequired = serverState {
+            return true
+        }
+        return false
     }
 
     private var badgeLabel: some View {
@@ -1834,13 +2182,469 @@ private struct SaveStatusBadge: View {
     }
 
     private var foregroundStyle: Color {
-        presentation.allowsRetry ? .red : .secondary
+        switch presentation.severity {
+        case .neutral: .secondary
+        case .success: .green
+        case .warning: Color.writerPadWarning
+        case .failure: .red
+        }
     }
+}
+
+func applyRemoteBinderContentState(
+    _ snapshot: SyncV2RemoteDocumentSnapshot,
+    to overrides: inout [DocumentID: BinderTextContentState]
+) {
+    guard !snapshot.isDeleted else { return }
+    let documentID = DocumentID(rawValue: snapshot.documentID)
+    overrides[documentID] = snapshot.content.isEmpty ? .empty : .written
 }
 
 private struct BackupHistoryRoute: Identifiable {
     let document: DocumentNode
     var id: DocumentID { document.id }
+}
+
+private struct ConflictResolutionRoute: Identifiable {
+    let conflict: SyncV2ConflictRecord
+    let document: DocumentNode
+
+    var id: UUID { conflict.conflictID }
+
+    var displayName: String {
+        document.relativePath.rawValue
+            .split(separator: "/")
+            .last
+            .map(String.init)
+            ?? document.relativePath.rawValue
+    }
+}
+
+private enum ConflictResolutionPresentationError: Error {
+    case conflictNotFound
+    case documentNotFound
+    case finishComposition
+    case localSaveFailed
+}
+
+extension ConflictResolutionPresentationError: LocalizedError {
+    var errorDescription: String? {
+        switch self {
+        case .conflictNotFound:
+            "이 작품에서 보존 중인 본문 충돌을 찾지 못했습니다."
+        case .documentNotFound:
+            "충돌이 발생한 로컬 TXT 문서를 찾지 못했습니다."
+        case .finishComposition:
+            "한글 조합 중인 글자를 확정한 뒤 다시 열어 주세요."
+        case .localSaveFailed:
+            "현재 로컬 원고를 먼저 저장하지 못해 충돌 해결을 열지 않았습니다."
+        }
+    }
+}
+
+private struct ConflictResolutionView: View {
+    @Environment(\.dismiss) private var dismiss
+    let route: ConflictResolutionRoute
+    let onResolve:
+        (String, SyncV2ConflictResolutionKind) async throws -> Void
+
+    @State private var selectedSource = ConflictComparisonSource.merged
+    @State private var resolvedContent: String
+    @State private var isSaving = false
+    @State private var errorMessage: String?
+
+    init(
+        route: ConflictResolutionRoute,
+        onResolve:
+            @escaping
+            (String, SyncV2ConflictResolutionKind) async throws -> Void
+    ) {
+        self.route = route
+        self.onResolve = onResolve
+        _resolvedContent = State(
+            initialValue: route.conflict.snapshot.mergedContent
+        )
+    }
+
+    var body: some View {
+        NavigationStack {
+            GeometryReader { proxy in
+                VStack(alignment: .leading, spacing: 14) {
+                    conflictSummary
+                    comparisonHeading
+                    if proxy.size.width >= 860 {
+                        horizontalComparison
+                    } else {
+                        verticalComparison
+                    }
+                    resolutionEditor
+                }
+                .padding(16)
+                .frame(
+                    maxWidth: .infinity,
+                    maxHeight: .infinity,
+                    alignment: .topLeading
+                )
+            }
+            .navigationTitle("충돌 해결")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) {
+                    Button("취소") { dismiss() }
+                        .keyboardShortcut(.cancelAction)
+                        .disabled(isSaving)
+                }
+                ToolbarItem(placement: .confirmationAction) {
+                    Button("이 결과로 해결") {
+                        saveResolution()
+                    }
+                    .keyboardShortcut("s", modifiers: .command)
+                    .disabled(isSaving)
+                    .accessibilityIdentifier(
+                        "writerpad.conflict-save"
+                    )
+                }
+            }
+        }
+        .interactiveDismissDisabled(isSaving)
+        .accessibilityIdentifier("writerpad.conflict-resolution")
+    }
+
+    private var conflictSummary: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            Text(route.displayName)
+                .font(.headline)
+            Text(
+                "\(route.conflict.snapshot.conflictCount)곳의 겹치는 변경 · "
+                    + "서버 revision "
+                    + "\(route.conflict.snapshot.remoteRevision)"
+            )
+            .font(.subheadline)
+            .foregroundStyle(.secondary)
+            Text("원본은 바뀌지 않습니다. 적용할 내용을 아래 해결 결과로 복사해 편집하세요.")
+                .font(.footnote)
+                .foregroundStyle(.secondary)
+        }
+        .accessibilityElement(children: .combine)
+    }
+
+    private var comparisonHeading: some View {
+        HStack(spacing: 8) {
+            Text("1. 원본 비교")
+                .font(.headline)
+            Text("읽기 전용")
+                .font(.caption2.weight(.semibold))
+                .foregroundStyle(.secondary)
+                .padding(.horizontal, 7)
+                .padding(.vertical, 3)
+                .background(
+                    Color.secondary.opacity(0.12),
+                    in: Capsule()
+                )
+            Spacer()
+            Text("탭은 보기만 바꿉니다")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+        }
+        .accessibilityElement(children: .combine)
+    }
+
+    private var horizontalComparison: some View {
+        HStack(alignment: .top, spacing: 10) {
+            ForEach(ConflictComparisonSource.allCases) { source in
+                comparisonPanel(
+                    source,
+                    showsApplyAction: true
+                )
+                    .frame(maxWidth: .infinity)
+            }
+        }
+        .frame(maxHeight: 275)
+        .accessibilityIdentifier(
+            "writerpad.conflict-horizontal-comparison"
+        )
+    }
+
+    private var verticalComparison: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Picker("비교할 원본", selection: $selectedSource) {
+                ForEach(ConflictComparisonSource.allCases) { source in
+                    Text(source.title).tag(source)
+                }
+            }
+            .pickerStyle(.segmented)
+            .accessibilityIdentifier(
+                "writerpad.conflict-source-tabs"
+            )
+            comparisonPanel(selectedSource)
+                .frame(maxHeight: 250)
+            Button {
+                applyToResolution(selectedSource)
+            } label: {
+                Label(
+                    "‘\(selectedSource.title)’을 아래 해결 결과에 적용",
+                    systemImage: "arrow.down.doc"
+                )
+                .frame(maxWidth: .infinity)
+            }
+            .buttonStyle(.borderedProminent)
+            .disabled(isSaving)
+            .accessibilityHint(
+                "선택한 원본을 아래 편집 가능한 해결 결과에 복사합니다."
+            )
+            .accessibilityIdentifier(
+                "writerpad.conflict-apply-selected"
+            )
+        }
+    }
+
+    private func comparisonPanel(
+        _ source: ConflictComparisonSource,
+        showsApplyAction: Bool = false
+    ) -> some View {
+        VStack(alignment: .leading, spacing: 6) {
+            HStack(spacing: 6) {
+                Text(source.title)
+                    .font(.caption.weight(.semibold))
+                Spacer()
+                if showsApplyAction {
+                    Button {
+                        applyToResolution(source)
+                    } label: {
+                        Label(
+                            "결과에 적용",
+                            systemImage: "arrow.down"
+                        )
+                    }
+                    .buttonStyle(.bordered)
+                    .controlSize(.small)
+                    .disabled(isSaving)
+                    .accessibilityHint(
+                        "\(source.title)을 아래 편집 가능한 해결 결과에 복사합니다."
+                    )
+                    .accessibilityIdentifier(
+                        "writerpad.conflict-apply-\(source.rawValue)"
+                    )
+                }
+            }
+            ConflictReadOnlyTextView(text: content(for: source))
+                .frame(
+                    maxWidth: .infinity,
+                    minHeight: 120,
+                    maxHeight: .infinity
+                )
+                .background(
+                    Color.secondary.opacity(0.08),
+                    in: RoundedRectangle(cornerRadius: 8)
+                )
+        }
+        .accessibilityElement(children: .contain)
+        .accessibilityLabel("\(source.title), 읽기 전용")
+        .accessibilityIdentifier(
+            "writerpad.conflict-source-\(source.rawValue)"
+        )
+    }
+
+    private var resolutionEditor: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(spacing: 8) {
+                Text("2. 해결 결과")
+                    .font(.headline)
+                Text("편집 가능")
+                    .font(.caption2.weight(.semibold))
+                    .foregroundStyle(.tint)
+                    .padding(.horizontal, 7)
+                    .padding(.vertical, 3)
+                    .background(
+                        Color.accentColor.opacity(0.14),
+                        in: Capsule()
+                    )
+                Spacer()
+                if isSaving {
+                    ProgressView()
+                        .controlSize(.small)
+                }
+            }
+            Text("이 편집기의 내용만 저장됩니다. 확인한 뒤 오른쪽 위의 ‘이 결과로 해결’을 누르세요.")
+                .font(.footnote)
+                .foregroundStyle(.secondary)
+
+            TextEditor(text: $resolvedContent)
+                .font(.system(.body, design: .monospaced))
+                .scrollContentBackground(.hidden)
+                .padding(8)
+                .background(
+                    Color.secondary.opacity(0.06),
+                    in: RoundedRectangle(cornerRadius: 10)
+                )
+                .overlay {
+                    RoundedRectangle(cornerRadius: 10)
+                        .stroke(Color.secondary.opacity(0.24))
+                }
+                .disabled(isSaving)
+                .accessibilityLabel("충돌 해결 결과 편집기")
+                .accessibilityHint(
+                    "서버로 보낼 최종 원고만 편집합니다."
+                )
+                .accessibilityIdentifier(
+                    "writerpad.conflict-resolution-editor"
+                )
+            if let errorMessage {
+                Label(
+                    errorMessage,
+                    systemImage: "exclamationmark.triangle.fill"
+                )
+                .font(.footnote)
+                .foregroundStyle(Color.writerPadWarning)
+                .fixedSize(horizontal: false, vertical: true)
+                .accessibilityIdentifier(
+                    "writerpad.conflict-resolution-error"
+                )
+            }
+        }
+        .frame(maxHeight: .infinity)
+    }
+
+    private func content(
+        for source: ConflictComparisonSource
+    ) -> String {
+        switch source {
+        case .base:
+            route.conflict.snapshot.baseContent
+        case .local:
+            route.conflict.snapshot.localContent
+        case .remote:
+            route.conflict.snapshot.remoteContent
+        case .merged:
+            route.conflict.snapshot.mergedContent
+        }
+    }
+
+    private func applyToResolution(
+        _ source: ConflictComparisonSource
+    ) {
+        resolvedContent = content(for: source)
+    }
+
+    private var resolutionKind: SyncV2ConflictResolutionKind {
+        if resolvedContent == route.conflict.snapshot.localContent {
+            return .keepLocal
+        }
+        if resolvedContent == route.conflict.snapshot.remoteContent {
+            return .useRemote
+        }
+        return .manualMerge
+    }
+
+    private func saveResolution() {
+        guard !isSaving else { return }
+        isSaving = true
+        errorMessage = nil
+        Task { @MainActor in
+            do {
+                try await onResolve(
+                    resolvedContent,
+                    resolutionKind
+                )
+                isSaving = false
+                dismiss()
+            } catch {
+                isSaving = false
+                errorMessage = error.localizedDescription
+            }
+        }
+    }
+}
+
+struct ConflictTextRenderTracker: Sendable {
+    private(set) var renderedText: String?
+
+    mutating func shouldRender(_ text: String) -> Bool {
+        guard renderedText != text else { return false }
+        renderedText = text
+        return true
+    }
+}
+
+private struct ConflictReadOnlyTextView: UIViewRepresentable {
+    let text: String
+
+    func makeCoordinator() -> Coordinator {
+        Coordinator()
+    }
+
+    func makeUIView(context: Context) -> UITextView {
+        let textView = UITextView()
+        textView.backgroundColor = .clear
+        textView.isEditable = false
+        textView.isSelectable = true
+        textView.isScrollEnabled = true
+        textView.alwaysBounceVertical = true
+        textView.alwaysBounceHorizontal = false
+        textView.showsHorizontalScrollIndicator = false
+        textView.adjustsFontForContentSizeCategory = true
+        textView.font = .monospacedSystemFont(
+            ofSize: UIFont.preferredFont(
+                forTextStyle: .footnote
+            ).pointSize,
+            weight: .regular
+        )
+        textView.textColor = .label
+        textView.textContainerInset = UIEdgeInsets(
+            top: 10,
+            left: 10,
+            bottom: 10,
+            right: 10
+        )
+        textView.textContainer.lineFragmentPadding = 0
+        textView.layoutManager.allowsNonContiguousLayout = true
+        textView.accessibilityLabel = "충돌 원본 읽기 전용 내용"
+        apply(text, to: textView, coordinator: context.coordinator)
+        return textView
+    }
+
+    func updateUIView(
+        _ textView: UITextView,
+        context: Context
+    ) {
+        apply(text, to: textView, coordinator: context.coordinator)
+        textView.textColor = .label
+    }
+
+    private func apply(
+        _ text: String,
+        to textView: UITextView,
+        coordinator: Coordinator
+    ) {
+        guard coordinator.tracker.shouldRender(text) else { return }
+        textView.text = text
+        textView.setContentOffset(.zero, animated: false)
+    }
+
+    final class Coordinator {
+        var tracker = ConflictTextRenderTracker()
+    }
+}
+
+private enum ConflictComparisonSource:
+    String,
+    CaseIterable,
+    Identifiable {
+    case base
+    case local
+    case remote
+    case merged
+
+    var id: String { rawValue }
+
+    var title: String {
+        switch self {
+        case .base: "기준본"
+        case .local: "내 로컬본"
+        case .remote: "서버 최신본"
+        case .merged: "병합 후보"
+        }
+    }
 }
 
 private struct ProjectSearchResultGroup: Identifiable {

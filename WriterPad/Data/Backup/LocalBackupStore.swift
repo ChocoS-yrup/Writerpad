@@ -1,6 +1,9 @@
 import Foundation
 
 actor LocalBackupStore: BackupStoring {
+    static let largeAutomaticSnapshotByteCount = 1_048_576
+    static let largeAutomaticSnapshotMinimumInterval: TimeInterval = 5 * 60
+
     private let workspaceLocator: any ProjectWorkspaceLocating
     private let fileManager: FileManager
     private let clock: any AppClock
@@ -65,7 +68,15 @@ actor LocalBackupStore: BackupStoring {
         let root = try await workspaceLocator.workspaceRoot(for: document.projectID)
         var inventory = try allSnapshots(projectID: document.projectID, workspaceRoot: root)
         let snapshot: BackupSnapshot
-        if reason.mayCoalesceDuplicate,
+        if let reusable = Self.reusableLargeAutomaticSnapshot(
+            in: inventory,
+            documentID: document.id,
+            reason: reason,
+            byteCount: savedContent.utf8Data.count,
+            now: clock.now()
+        ) {
+            snapshot = reusable
+        } else if reason.mayCoalesceDuplicate,
            let latest = inventory
             .filter({ $0.documentID == document.id })
             .sorted(by: Self.newestFirst)
@@ -88,6 +99,29 @@ actor LocalBackupStore: BackupStoring {
             workspaceRoot: root
         )
         return BackupMaintenanceResult(snapshot: snapshot, cleanup: cleanup)
+    }
+
+    static func reusableLargeAutomaticSnapshot(
+        in snapshots: [BackupSnapshot],
+        documentID: DocumentID,
+        reason: BackupReason,
+        byteCount: Int,
+        now: Date
+    ) -> BackupSnapshot? {
+        guard reason == .automaticSave,
+              byteCount >= largeAutomaticSnapshotByteCount,
+              let latest = snapshots
+                .filter({
+                    $0.documentID == documentID && $0.reason == .automaticSave
+                })
+                .sorted(by: newestFirst)
+                .first
+        else { return nil }
+        let age = now.timeIntervalSince(latest.createdAt)
+        guard age >= 0, age < largeAutomaticSnapshotMinimumInterval else {
+            return nil
+        }
+        return latest
     }
 
     func createSnapshot(
@@ -419,35 +453,31 @@ private extension BackupReason {
 actor DocumentRestoreCoordinator {
     private let documentStore: any LocalDocumentStoring
     private let backupStore: any BackupStoring
+    private let documentRepository: (any DocumentRepository)?
+    private let binderCommands: (any BinderCommanding)?
     private let futureChangeNotifier: any FutureChangeNotifying
     private let pathPolicy: PathPolicy
 
     init(
         documentStore: any LocalDocumentStoring,
         backupStore: any BackupStoring,
+        documentRepository: (any DocumentRepository)? = nil,
+        binderCommands: (any BinderCommanding)? = nil,
         futureChangeNotifier: any FutureChangeNotifying = NoOpFutureChangeNotifier(),
         pathPolicy: PathPolicy = PathPolicy()
     ) {
         self.documentStore = documentStore
         self.backupStore = backupStore
+        self.documentRepository = documentRepository
+        self.binderCommands = binderCommands
         self.futureChangeNotifier = futureChangeNotifier
         self.pathPolicy = pathPolicy
     }
 
     func restore(_ request: DocumentRestoreRequest) async throws -> DocumentRestoreResult {
-        guard request.snapshot.projectID == request.document.projectID else {
-            throw BackupStoreError.wrongProject
-        }
-        guard request.snapshot.documentID == request.document.id else {
-            throw BackupStoreError.wrongDocument
-        }
-        do {
-            try pathPolicy.validateRelativePath(request.snapshot.relativePath)
-        } catch {
-            throw BackupStoreError.wrongPath
-        }
+        try validate(snapshot: request.snapshot, for: request.document)
 
-        _ = try await documentStore.save(
+        let currentReceipt = try await documentStore.save(
             DocumentSaveRequest(
                 projectID: request.document.projectID,
                 documentID: request.document.id,
@@ -456,7 +486,18 @@ actor DocumentRestoreCoordinator {
                 generation: request.saveGeneration
             )
         )
-        _ = try await backupStore.createSnapshot(for: request.document, reason: .beforeRestore)
+        if let savedContent = currentReceipt.savedContent {
+            _ = try await backupStore.createSnapshot(
+                for: request.document,
+                reason: .beforeRestore,
+                savedContent: savedContent
+            )
+        } else {
+            _ = try await backupStore.createSnapshot(
+                for: request.document,
+                reason: .beforeRestore
+            )
+        }
         let restoredText = try await backupStore.text(for: request.snapshot)
         let receipt = try await documentStore.save(
             DocumentSaveRequest(
@@ -464,7 +505,8 @@ actor DocumentRestoreCoordinator {
                 documentID: request.document.id,
                 relativePath: request.document.relativePath,
                 text: restoredText,
-                generation: request.saveGeneration &+ 1
+                generation: request.saveGeneration &+ 1,
+                durableBatchKind: .backupRestore
             )
         )
         await futureChangeNotifier.record(
@@ -475,6 +517,129 @@ actor DocumentRestoreCoordinator {
             )
         )
         return DocumentRestoreResult(receipt: receipt, restoredText: restoredText)
+    }
+
+    func restoreAsCopy(
+        _ request: DocumentBackupCopyRequest
+    ) async throws -> DocumentBackupCopyResult {
+        try validate(snapshot: request.snapshot, for: request.document)
+        guard let documentRepository, let binderCommands else {
+            throw BackupStoreError.copyServiceUnavailable
+        }
+
+        // 손상된 백업 때문에 빈 문서가 생기지 않도록 생성 작업보다 먼저 검증해 읽는다.
+        let copiedText = try await backupStore.text(for: request.snapshot)
+        let documents = try await documentRepository.documents(
+            in: request.document.projectID
+        )
+        let destinationParentID = try copyDestinationParentID(
+            for: request.document,
+            documents: documents
+        )
+        let creation = try await binderCommands.create(
+            kind: .text,
+            named: copyDisplayName(for: request.document.relativePath),
+            in: destinationParentID,
+            projectID: request.document.projectID
+        )
+        guard let copiedDocument = try await documentRepository.document(
+            id: creation.affectedDocumentID
+        ) else {
+            throw BackupStoreError.copyDestinationUnavailable
+        }
+        let receipt = try await documentStore.save(
+            DocumentSaveRequest(
+                projectID: copiedDocument.projectID,
+                documentID: copiedDocument.id,
+                relativePath: copiedDocument.relativePath,
+                text: copiedText,
+                generation: request.saveGeneration
+            )
+        )
+        await futureChangeNotifier.record(
+            .documentSaved(
+                projectID: receipt.projectID,
+                documentID: receipt.documentID,
+                contentHash: receipt.contentHash
+            )
+        )
+        return DocumentBackupCopyResult(
+            document: copiedDocument,
+            receipt: receipt,
+            copiedText: copiedText
+        )
+    }
+
+    private func validate(
+        snapshot: BackupSnapshot,
+        for document: DocumentNode
+    ) throws {
+        guard snapshot.projectID == document.projectID else {
+            throw BackupStoreError.wrongProject
+        }
+        guard snapshot.documentID == document.id else {
+            throw BackupStoreError.wrongDocument
+        }
+        do {
+            try pathPolicy.validateRelativePath(snapshot.relativePath)
+        } catch {
+            throw BackupStoreError.wrongPath
+        }
+    }
+
+    private func copyDestinationParentID(
+        for document: DocumentNode,
+        documents: [DocumentNode]
+    ) throws -> DocumentID {
+        if isInsideManuscript(document.relativePath) {
+            guard let notes = documents.first(where: {
+                $0.kind == .folder
+                    && $0.relativePath == BinderFixedCategory.notes.relativePath
+                    && $0.deletionStatus == .active
+            }) else {
+                throw BackupStoreError.copyDestinationUnavailable
+            }
+            return notes.id
+        }
+        guard let parentID = document.parentID,
+              documents.contains(where: {
+                  $0.id == parentID
+                      && $0.kind == .folder
+                      && $0.deletionStatus == .active
+              })
+        else {
+            throw BackupStoreError.copyDestinationUnavailable
+        }
+        return parentID
+    }
+
+    private func isInsideManuscript(_ path: RelativeDocumentPath) -> Bool {
+        let components = path.rawValue.split(separator: "/").map(String.init)
+        guard components.count >= 2 else { return false }
+        return pathPolicy.collisionKey(for: components[0])
+                == pathPolicy.collisionKey(for: "메인")
+            && pathPolicy.collisionKey(for: components[1])
+                == pathPolicy.collisionKey(for: "원고")
+    }
+
+    private func copyDisplayName(for path: RelativeDocumentPath) -> String {
+        let storedName = path.rawValue.split(separator: "/").last.map(String.init)
+            ?? "문서.txt"
+        let original = pathPolicy.binderDisplayName(forStoredName: storedName)
+        let suffix = " 백업 사본"
+        let maximumOriginalLength = max(
+            1,
+            pathPolicy.limits.maximumNameUTF16Length
+                - ".txt".utf16.count
+                - suffix.utf16.count
+        )
+        let source = original as NSString
+        guard source.length > maximumOriginalLength else {
+            return original + suffix
+        }
+        let proposed = NSRange(location: 0, length: maximumOriginalLength)
+        let safeRange = source.rangeOfComposedCharacterSequences(for: proposed)
+        return source.substring(with: safeRange) + suffix
     }
 }
 

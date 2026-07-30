@@ -71,6 +71,7 @@ struct WriterPadCommands: Commands {
 @main
 @MainActor
 struct WriterPadApp: App {
+    @Environment(\.scenePhase) private var scenePhase
     @StateObject private var environment: AppEnvironment
 
     init() {
@@ -89,8 +90,50 @@ struct WriterPadApp: App {
         WindowGroup {
             RootView()
                 .environmentObject(environment)
+                .task {
+                    await startCloudServices()
+                }
+                .onChange(of: scenePhase) { _, phase in
+                    Task {
+                        if phase == .active {
+                            await resumeCloudServices()
+                        } else {
+                            await environment.backgroundSyncCoordinator?
+                                .stop()
+                        }
+                    }
+                }
         }
         .modelContainer(environment.modelContainer)
         .commands { WriterPadCommands() }
+    }
+
+    private func startCloudServices() async {
+        let isSyncEnabled = GlobalSyncPreference.isEnabled()
+        async let authentication =
+            environment.authenticationService.restoreSession()
+        async let identity: Void =
+            environment.deviceIdentityService.prepareIdentity()
+        if isSyncEnabled {
+            // 인증 네트워크 요청이 지연돼도 기존 queue 복구와 새 operation
+            // 감시는 즉시 시작한다.
+            await environment.syncDispatcher?.start()
+        }
+        let (state, _) = await (authentication, identity)
+        guard isSyncEnabled, state.isAuthenticated else { return }
+        await environment.syncDispatcher?.loginSucceeded()
+        await environment.backgroundSyncCoordinator?.start()
+    }
+
+    private func resumeCloudServices() async {
+        guard GlobalSyncPreference.isEnabled() else { return }
+        // 시작 task가 scene 전환으로 취소됐더라도 idempotent start로 복구한다.
+        await environment.syncDispatcher?.start()
+        await environment.syncDispatcher?.appEnteredForeground()
+        let state = await environment.authenticationService.restoreSession()
+        guard state.isAuthenticated else { return }
+        await environment.syncDispatcher?.loginSucceeded()
+        await environment.backgroundSyncCoordinator?.start()
+        await environment.backgroundSyncCoordinator?.appEnteredForeground()
     }
 }

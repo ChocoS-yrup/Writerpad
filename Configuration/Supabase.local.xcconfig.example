@@ -1,0 +1,11 @@
+// 이 파일은 값의 형식만 보여 주는 Git 포함 예시다.
+// 필요한 환경 이름으로 복사한다.
+//   Supabase.Debug.local.xcconfig
+//   Supabase.Test.local.xcconfig
+//   Supabase.Release.local.xcconfig
+// 복사본은 *.local.xcconfig 규칙으로 Git에서 제외된다.
+//
+// xcconfig에서 //가 주석으로 해석되지 않도록 URL의 두 번째 /는 $()로 쓴다.
+
+WRITERPAD_SUPABASE_URL = https:/$()/your-project.supabase.co
+WRITERPAD_SUPABASE_PUBLISHABLE_KEY = sb_publishable_example

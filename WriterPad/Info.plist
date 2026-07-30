@@ -27,5 +27,9 @@
 	</array>
 	<key>UIFileSharingEnabled</key>
 	<true/>
+	<key>WriterPadSupabasePublishableKey</key>
+	<string>$(WRITERPAD_SUPABASE_PUBLISHABLE_KEY)</string>
+	<key>WriterPadSupabaseURL</key>
+	<string>$(WRITERPAD_SUPABASE_URL)</string>
 </dict>
 </plist>

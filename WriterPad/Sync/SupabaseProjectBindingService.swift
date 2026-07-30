@@ -1,0 +1,657 @@
+import Foundation
+import Supabase
+
+enum ProjectBindingKind: String, Codable, Equatable, Sendable {
+    case localOnly = "local_only"
+    case newServerProject = "new_server_project"
+    case existingServerProject = "existing_server_project"
+    case windowsImport = "windows_import"
+}
+
+struct ProjectSyncBinding: Codable, Equatable, Sendable {
+    let localProjectID: ProjectID
+    let serverProjectID: UUID?
+    let kind: ProjectBindingKind
+    let projectName: String
+    let ownerSubject: UUID?
+
+    static func localOnly(
+        projectID: ProjectID,
+        name: String
+    ) -> ProjectSyncBinding {
+        ProjectSyncBinding(
+            localProjectID: projectID,
+            serverProjectID: nil,
+            kind: .localOnly,
+            projectName: name,
+            ownerSubject: nil
+        )
+    }
+
+    static func connected(
+        localProjectID: ProjectID,
+        serverProjectID: UUID,
+        kind: ProjectBindingKind,
+        projectName: String,
+        ownerSubject: UUID
+    ) -> ProjectSyncBinding {
+        ProjectSyncBinding(
+            localProjectID: localProjectID,
+            serverProjectID: serverProjectID,
+            kind: kind,
+            projectName: projectName,
+            ownerSubject: ownerSubject
+        )
+    }
+}
+
+enum ProjectBindingStoreAvailability: Equatable, Sendable {
+    case available
+    case unavailable
+}
+
+enum ProjectBindingStoreError: Error, Equatable, Sendable {
+    case unavailable
+    case invalidBinding
+    case serverProjectAlreadyBound
+}
+
+protocol ProjectBindingStoring: Sendable {
+    func availability() async -> ProjectBindingStoreAvailability
+    func binding(for localProjectID: ProjectID) async throws
+        -> ProjectSyncBinding?
+    func binding(forServerProjectID serverProjectID: UUID) async throws
+        -> ProjectSyncBinding?
+    func allBindings() async throws -> [ProjectSyncBinding]
+    func save(_ binding: ProjectSyncBinding) async throws
+}
+
+extension ProjectBindingStoring {
+    func allBindings() async throws -> [ProjectSyncBinding] {
+        []
+    }
+}
+
+actor InMemoryProjectBindingStore: ProjectBindingStoring {
+    private var bindings: [ProjectID: ProjectSyncBinding] = [:]
+
+    func availability() -> ProjectBindingStoreAvailability {
+        .available
+    }
+
+    func binding(
+        for localProjectID: ProjectID
+    ) -> ProjectSyncBinding? {
+        bindings[localProjectID]
+    }
+
+    func binding(
+        forServerProjectID serverProjectID: UUID
+    ) -> ProjectSyncBinding? {
+        bindings.values.first { $0.serverProjectID == serverProjectID }
+    }
+
+    func allBindings() async -> [ProjectSyncBinding] {
+        Array(bindings.values)
+    }
+
+    func save(_ binding: ProjectSyncBinding) throws {
+        try Self.validate(binding)
+        if let serverProjectID = binding.serverProjectID,
+           bindings.values.contains(where: {
+               $0.serverProjectID == serverProjectID
+                   && $0.localProjectID != binding.localProjectID
+           }) {
+            throw ProjectBindingStoreError.serverProjectAlreadyBound
+        }
+        bindings[binding.localProjectID] = binding
+    }
+
+    private static func validate(_ binding: ProjectSyncBinding) throws {
+        let name = binding.projectName.trimmingCharacters(
+            in: .whitespacesAndNewlines
+        )
+        guard !name.isEmpty else {
+            throw ProjectBindingStoreError.invalidBinding
+        }
+        switch binding.kind {
+        case .localOnly:
+            guard
+                binding.serverProjectID == nil,
+                binding.ownerSubject == nil
+            else {
+                throw ProjectBindingStoreError.invalidBinding
+            }
+        case .newServerProject, .existingServerProject, .windowsImport:
+            guard
+                binding.serverProjectID != nil,
+                binding.ownerSubject != nil
+            else {
+                throw ProjectBindingStoreError.invalidBinding
+            }
+        }
+    }
+}
+
+actor UnavailableProjectBindingStore: ProjectBindingStoring {
+    func availability() -> ProjectBindingStoreAvailability {
+        .unavailable
+    }
+
+    func binding(
+        for localProjectID: ProjectID
+    ) throws -> ProjectSyncBinding? {
+        _ = localProjectID
+        throw ProjectBindingStoreError.unavailable
+    }
+
+    func binding(
+        forServerProjectID serverProjectID: UUID
+    ) throws -> ProjectSyncBinding? {
+        _ = serverProjectID
+        throw ProjectBindingStoreError.unavailable
+    }
+
+    func allBindings() async throws -> [ProjectSyncBinding] {
+        throw ProjectBindingStoreError.unavailable
+    }
+
+    func save(_ binding: ProjectSyncBinding) throws {
+        _ = binding
+        throw ProjectBindingStoreError.unavailable
+    }
+}
+
+struct EnsureProjectParameters: Encodable, Equatable, Sendable {
+    let projectID: UUID
+    let name: String
+
+    enum CodingKeys: String, CodingKey {
+        case projectID = "p_project_id"
+        case name = "p_name"
+    }
+}
+
+struct EnsuredServerProject: Decodable, Equatable, Sendable {
+    let projectID: UUID
+    let name: String
+
+    enum CodingKeys: String, CodingKey {
+        case projectID = "project_id"
+        case name
+    }
+}
+
+enum EnsureProjectTransportError: Error, Equatable, Sendable {
+    case authenticationRequired
+    case forbidden
+    case invalidArgument
+    case networkUnavailable
+    case invalidResponse
+    case serverRejected
+}
+
+protocol EnsureProjectTransporting: Sendable {
+    func ensureProject(
+        parameters: EnsureProjectParameters
+    ) async throws -> EnsuredServerProject
+}
+
+actor LiveEnsureProjectTransport: EnsureProjectTransporting {
+    private let client: SupabaseClient
+
+    init(client: SupabaseClient) {
+        self.client = client
+    }
+
+    func ensureProject(
+        parameters: EnsureProjectParameters
+    ) async throws -> EnsuredServerProject {
+        do {
+            let response: PostgrestResponse<EnsuredServerProject> =
+                try await client
+                    .rpc("ensure_project", params: parameters)
+                    .execute()
+            return response.value
+        } catch let error as PostgrestError {
+            switch error.message {
+            case "AUTH_REQUIRED":
+                throw EnsureProjectTransportError.authenticationRequired
+            case "FORBIDDEN":
+                throw EnsureProjectTransportError.forbidden
+            case "INVALID_ARGUMENT":
+                throw EnsureProjectTransportError.invalidArgument
+            default:
+                throw EnsureProjectTransportError.serverRejected
+            }
+        } catch let error as URLError {
+            if error.code != .userAuthenticationRequired {
+                throw EnsureProjectTransportError.networkUnavailable
+            }
+            throw EnsureProjectTransportError.authenticationRequired
+        } catch is DecodingError {
+            throw EnsureProjectTransportError.invalidResponse
+        } catch {
+            let nsError = error as NSError
+            if nsError.domain == NSURLErrorDomain {
+                throw EnsureProjectTransportError.networkUnavailable
+            }
+            throw EnsureProjectTransportError.serverRejected
+        }
+    }
+}
+
+enum ProjectBindingConfirmationError: Error, Equatable, Sendable {
+    case invalidUUID
+    case mismatch
+}
+
+struct ConfirmedServerProjectID: Equatable, Sendable {
+    let value: UUID
+
+    init(
+        expectedServerProjectID: UUID,
+        userEnteredUUID: String
+    ) throws {
+        let trimmed = userEnteredUUID.trimmingCharacters(
+            in: .whitespacesAndNewlines
+        )
+        guard let entered = UUID(uuidString: trimmed) else {
+            throw ProjectBindingConfirmationError.invalidUUID
+        }
+        guard entered == expectedServerProjectID else {
+            throw ProjectBindingConfirmationError.mismatch
+        }
+        value = expectedServerProjectID
+    }
+}
+
+enum ProjectBindingFailure: Equatable, Sendable {
+    case configurationUnavailable
+    case authenticationRequired
+    case bindingStoreUnavailable
+    case localStorageUnavailable
+    case localProjectNotFound
+    case invalidProjectName
+    case confirmationRequired
+    case serverProjectAlreadyBound
+    case forbidden
+    case networkUnavailable
+    case invalidServerResponse
+    case serverRejected
+    case notBound
+}
+
+enum ProjectBindingResult: Equatable, Sendable {
+    case connected(ProjectSyncBinding)
+    case disconnected(ProjectSyncBinding)
+    case failed(ProjectBindingFailure)
+}
+
+protocol InitialProjectSyncRecording: Sendable {
+    func recordInitialSnapshot(
+        projectID: ProjectID,
+        projectName: String,
+        batchKind: DurableLocalBatchKind
+    ) async -> DurableRecordResult
+}
+
+struct NoOpInitialProjectSyncRecorder: InitialProjectSyncRecording {
+    func recordInitialSnapshot(
+        projectID: ProjectID,
+        projectName: String,
+        batchKind: DurableLocalBatchKind
+    ) async -> DurableRecordResult {
+        _ = batchKind
+        return .localOnly
+    }
+}
+
+protocol ProjectBindingServicing: Sendable {
+    func bindingUpdates(
+        for localProjectID: ProjectID
+    ) async -> AsyncStream<ProjectSyncBinding?>
+    func currentBinding(for localProjectID: ProjectID) async
+        -> ProjectSyncBinding?
+    func connectedBindings() async -> [ProjectSyncBinding]
+    func createServerProject(for localProjectID: ProjectID) async
+        -> ProjectBindingResult
+    func connectExistingProject(
+        localProjectID: ProjectID,
+        confirmation: ConfirmedServerProjectID
+    ) async -> ProjectBindingResult
+    func connectWindowsProject(
+        localProjectID: ProjectID,
+        confirmation: ConfirmedServerProjectID
+    ) async -> ProjectBindingResult
+    func refreshServerName(for localProjectID: ProjectID) async
+        -> ProjectBindingResult
+    func disconnect(localProjectID: ProjectID) async -> ProjectBindingResult
+}
+
+extension ProjectBindingServicing {
+    func bindingUpdates(
+        for localProjectID: ProjectID
+    ) async -> AsyncStream<ProjectSyncBinding?> {
+        _ = localProjectID
+        return AsyncStream { continuation in
+            continuation.finish()
+        }
+    }
+
+    func currentBinding(
+        for localProjectID: ProjectID
+    ) async -> ProjectSyncBinding? {
+        _ = localProjectID
+        return nil
+    }
+
+    func connectedBindings() async -> [ProjectSyncBinding] {
+        []
+    }
+}
+
+actor SupabaseProjectBindingService: ProjectBindingServicing {
+    private let transport: (any EnsureProjectTransporting)?
+    private let bindingStore: any ProjectBindingStoring
+    private let projectRepository: any ProjectRepository
+    private let authenticationService: any AuthenticationServicing
+    private let initialSyncRecorder: any InitialProjectSyncRecording
+    private var bindingObservers: [
+        ProjectID: [UUID: AsyncStream<ProjectSyncBinding?>.Continuation]
+    ] = [:]
+
+    init(
+        transport: (any EnsureProjectTransporting)?,
+        bindingStore: any ProjectBindingStoring,
+        projectRepository: any ProjectRepository,
+        authenticationService: any AuthenticationServicing,
+        initialSyncRecorder: any InitialProjectSyncRecording =
+            NoOpInitialProjectSyncRecorder()
+    ) {
+        self.transport = transport
+        self.bindingStore = bindingStore
+        self.projectRepository = projectRepository
+        self.authenticationService = authenticationService
+        self.initialSyncRecorder = initialSyncRecorder
+    }
+
+    func currentBinding(
+        for localProjectID: ProjectID
+    ) async -> ProjectSyncBinding? {
+        guard await bindingStore.availability() == .available else {
+            return nil
+        }
+        return try? await bindingStore.binding(for: localProjectID)
+    }
+
+    func bindingUpdates(
+        for localProjectID: ProjectID
+    ) -> AsyncStream<ProjectSyncBinding?> {
+        let observerID = UUID()
+        return AsyncStream(bufferingPolicy: .bufferingNewest(1)) {
+            continuation in
+            bindingObservers[localProjectID, default: [:]][observerID] =
+                continuation
+            continuation.onTermination = { [weak self] _ in
+                Task {
+                    await self?.removeBindingObserver(
+                        localProjectID: localProjectID,
+                        observerID: observerID
+                    )
+                }
+            }
+        }
+    }
+
+    func connectedBindings() async -> [ProjectSyncBinding] {
+        guard await bindingStore.availability() == .available else {
+            return []
+        }
+        return (try? await bindingStore.allBindings())?
+            .filter { $0.serverProjectID != nil } ?? []
+    }
+
+    func createServerProject(
+        for localProjectID: ProjectID
+    ) async -> ProjectBindingResult {
+        await connect(
+            localProjectID: localProjectID,
+            serverProjectID: localProjectID.rawValue,
+            kind: .newServerProject
+        )
+    }
+
+    func connectExistingProject(
+        localProjectID: ProjectID,
+        confirmation: ConfirmedServerProjectID
+    ) async -> ProjectBindingResult {
+        await connect(
+            localProjectID: localProjectID,
+            serverProjectID: confirmation.value,
+            kind: .existingServerProject
+        )
+    }
+
+    func connectWindowsProject(
+        localProjectID: ProjectID,
+        confirmation: ConfirmedServerProjectID
+    ) async -> ProjectBindingResult {
+        await connect(
+            localProjectID: localProjectID,
+            serverProjectID: confirmation.value,
+            kind: .windowsImport
+        )
+    }
+
+    func refreshServerName(
+        for localProjectID: ProjectID
+    ) async -> ProjectBindingResult {
+        guard await bindingStore.availability() == .available else {
+            return .failed(.bindingStoreUnavailable)
+        }
+        let existing: ProjectSyncBinding
+        let serverProjectID: UUID
+        do {
+            guard
+                let binding = try await bindingStore.binding(
+                    for: localProjectID
+                ),
+                binding.kind != .localOnly,
+                let storedServerProjectID = binding.serverProjectID
+            else {
+                return .failed(.notBound)
+            }
+            existing = binding
+            serverProjectID = storedServerProjectID
+        } catch {
+            return .failed(storeFailure(error))
+        }
+        return await connect(
+            localProjectID: localProjectID,
+            serverProjectID: serverProjectID,
+            kind: existing.kind
+        )
+    }
+
+    func disconnect(
+        localProjectID: ProjectID
+    ) async -> ProjectBindingResult {
+        guard await bindingStore.availability() == .available else {
+            return .failed(.bindingStoreUnavailable)
+        }
+        let project: Project
+        do {
+            guard
+                let storedProject = try await projectRepository.project(
+                    id: localProjectID
+                )
+            else {
+                return .failed(.localProjectNotFound)
+            }
+            project = storedProject
+        } catch {
+            return .failed(.localStorageUnavailable)
+        }
+        let name = normalizedName(project.name)
+        guard !name.isEmpty else {
+            return .failed(.invalidProjectName)
+        }
+        let localOnly = ProjectSyncBinding.localOnly(
+            projectID: localProjectID,
+            name: name
+        )
+        do {
+            try await bindingStore.save(localOnly)
+            publish(localOnly, localProjectID: localProjectID)
+            return .disconnected(localOnly)
+        } catch {
+            return .failed(storeFailure(error))
+        }
+    }
+
+    private func connect(
+        localProjectID: ProjectID,
+        serverProjectID: UUID,
+        kind: ProjectBindingKind
+    ) async -> ProjectBindingResult {
+        guard let transport else {
+            return .failed(.configurationUnavailable)
+        }
+        guard await bindingStore.availability() == .available else {
+            return .failed(.bindingStoreUnavailable)
+        }
+        let project: Project
+        do {
+            guard
+                let storedProject = try await projectRepository.project(
+                    id: localProjectID
+                )
+            else {
+                return .failed(.localProjectNotFound)
+            }
+            project = storedProject
+        } catch {
+            return .failed(.localStorageUnavailable)
+        }
+        let name = normalizedName(project.name)
+        guard !name.isEmpty else {
+            return .failed(.invalidProjectName)
+        }
+        guard
+            case let .authenticated(account) =
+                await authenticationService.currentState()
+        else {
+            return .failed(.authenticationRequired)
+        }
+
+        do {
+            if let collision = try await bindingStore.binding(
+                forServerProjectID: serverProjectID
+            ), collision.localProjectID != localProjectID {
+                return .failed(.serverProjectAlreadyBound)
+            }
+        } catch {
+            return .failed(storeFailure(error))
+        }
+
+        let ensured: EnsuredServerProject
+        do {
+            ensured = try await transport.ensureProject(
+                parameters: EnsureProjectParameters(
+                    projectID: serverProjectID,
+                    name: name
+                )
+            )
+        } catch let error as EnsureProjectTransportError {
+            return .failed(transportFailure(error))
+        } catch {
+            return .failed(.serverRejected)
+        }
+        guard
+            ensured.projectID == serverProjectID,
+            normalizedName(ensured.name) == name
+        else {
+            return .failed(.invalidServerResponse)
+        }
+
+        let binding = ProjectSyncBinding.connected(
+            localProjectID: localProjectID,
+            serverProjectID: serverProjectID,
+            kind: kind,
+            projectName: name,
+            ownerSubject: account.userID
+        )
+        do {
+            try await bindingStore.save(binding)
+            if kind == .newServerProject || kind == .windowsImport {
+                _ = await initialSyncRecorder.recordInitialSnapshot(
+                    projectID: localProjectID,
+                    projectName: name,
+                    batchKind: kind == .windowsImport
+                        ? .windowsImport
+                        : .projectBinding
+                )
+            }
+            publish(binding, localProjectID: localProjectID)
+            return .connected(binding)
+        } catch {
+            return .failed(storeFailure(error))
+        }
+    }
+
+    private func normalizedName(_ name: String) -> String {
+        name.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    private func publish(
+        _ binding: ProjectSyncBinding?,
+        localProjectID: ProjectID
+    ) {
+        bindingObservers[localProjectID]?.values.forEach {
+            $0.yield(binding)
+        }
+    }
+
+    private func removeBindingObserver(
+        localProjectID: ProjectID,
+        observerID: UUID
+    ) {
+        bindingObservers[localProjectID]?[observerID] = nil
+        if bindingObservers[localProjectID]?.isEmpty == true {
+            bindingObservers[localProjectID] = nil
+        }
+    }
+
+    private func storeFailure(_ error: any Error) -> ProjectBindingFailure {
+        switch error as? ProjectBindingStoreError {
+        case .serverProjectAlreadyBound:
+            return .serverProjectAlreadyBound
+        case .unavailable:
+            return .bindingStoreUnavailable
+        case .invalidBinding:
+            return .serverRejected
+        case nil:
+            return .bindingStoreUnavailable
+        }
+    }
+
+    private func transportFailure(
+        _ error: EnsureProjectTransportError
+    ) -> ProjectBindingFailure {
+        switch error {
+        case .authenticationRequired:
+            return .authenticationRequired
+        case .forbidden:
+            return .forbidden
+        case .invalidArgument:
+            return .invalidProjectName
+        case .networkUnavailable:
+            return .networkUnavailable
+        case .invalidResponse:
+            return .invalidServerResponse
+        case .serverRejected:
+            return .serverRejected
+        }
+    }
+}

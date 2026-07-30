@@ -2,6 +2,7 @@ import hashlib
 import os
 import sqlite3
 import threading
+import unicodedata
 import uuid
 from contextlib import contextmanager
 from datetime import datetime, timezone
@@ -15,7 +16,9 @@ def _utc_now():
 
 
 def _normalize_path(path):
-    return (path or "").replace("\\", "/").strip("/")
+    return unicodedata.normalize(
+        "NFC", (path or "").replace("\\", "/").strip("/")
+    )
 
 
 class SyncV2Store:
@@ -69,6 +72,22 @@ class SyncV2Store:
                     local_key TEXT PRIMARY KEY,
                     project_id TEXT NOT NULL UNIQUE,
                     project_name TEXT NOT NULL,
+                    server_name TEXT NOT NULL DEFAULT '',
+                    server_state TEXT NOT NULL DEFAULT 'active',
+                    server_state_updated_at TEXT NOT NULL DEFAULT '',
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS sync_project_imports (
+                    project_id TEXT PRIMARY KEY
+                        REFERENCES sync_projects(project_id) ON DELETE CASCADE,
+                    local_key TEXT NOT NULL UNIQUE
+                        REFERENCES sync_projects(local_key) ON DELETE CASCADE,
+                    project_name TEXT NOT NULL,
+                    state TEXT NOT NULL
+                        CHECK (state IN ('preparing', 'pulling', 'failed', 'complete')),
+                    last_error TEXT NOT NULL DEFAULT '',
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL
                 );
@@ -124,6 +143,34 @@ class SyncV2Store:
             connection.execute(
                 "UPDATE sync_operations SET status = 'pending' WHERE status = 'inflight'"
             )
+            project_columns = {
+                row["name"]
+                for row in connection.execute(
+                    "PRAGMA table_info(sync_projects)"
+                ).fetchall()
+            }
+            if "server_name" not in project_columns:
+                connection.execute(
+                    "ALTER TABLE sync_projects "
+                    "ADD COLUMN server_name TEXT NOT NULL DEFAULT ''"
+                )
+            if "server_state" not in project_columns:
+                connection.execute(
+                    "ALTER TABLE sync_projects "
+                    "ADD COLUMN server_state TEXT NOT NULL DEFAULT 'active'"
+                )
+            if "server_state_updated_at" not in project_columns:
+                connection.execute(
+                    "ALTER TABLE sync_projects "
+                    "ADD COLUMN server_state_updated_at TEXT NOT NULL DEFAULT ''"
+                )
+            connection.execute(
+                """
+                UPDATE sync_projects
+                SET server_name = project_name
+                WHERE server_name = ''
+                """
+            )
 
     @staticmethod
     def local_key_for(writing_root_path):
@@ -143,10 +190,16 @@ class SyncV2Store:
                 connection.execute(
                     """
                     INSERT INTO sync_projects
-                        (local_key, project_id, project_name, created_at, updated_at)
-                    VALUES (?, ?, ?, ?, ?)
+                        (
+                            local_key, project_id, project_name, server_name,
+                            created_at, updated_at
+                        )
+                    VALUES (?, ?, ?, ?, ?, ?)
                     """,
-                    (local_key, project_id, project_name, now, now),
+                    (
+                        local_key, project_id, project_name, project_name,
+                        now, now,
+                    ),
                 )
             else:
                 if project_id and project_id != row["project_id"]:
@@ -156,10 +209,13 @@ class SyncV2Store:
                     "UPDATE sync_projects SET project_name = ?, updated_at = ? WHERE local_key = ?",
                     (project_name, now, local_key),
                 )
+        project = self.get_project(local_key)
         return {
             "local_key": local_key,
             "project_id": project_id,
             "project_name": project_name,
+            "server_name": project.get("server_name") or project_name,
+            "server_state": project.get("server_state") or "active",
         }
 
     def get_project(self, local_key):
@@ -168,6 +224,191 @@ class SyncV2Store:
                 "SELECT * FROM sync_projects WHERE local_key = ?", (local_key,)
             ).fetchone()
             return dict(row) if row else None
+
+    def get_project_by_id(self, project_id):
+        try:
+            project_id = str(uuid.UUID(str(project_id)))
+        except (AttributeError, TypeError, ValueError):
+            return None
+        with self._reader() as connection:
+            row = connection.execute(
+                "SELECT * FROM sync_projects WHERE project_id = ?", (project_id,)
+            ).fetchone()
+            return dict(row) if row else None
+
+    def list_projects(self):
+        with self._reader() as connection:
+            rows = connection.execute(
+                "SELECT * FROM sync_projects ORDER BY project_name, project_id"
+            ).fetchall()
+            return [dict(row) for row in rows]
+
+    def remove_project_binding(self, project_id):
+        try:
+            project_id = str(uuid.UUID(str(project_id)))
+        except (AttributeError, TypeError, ValueError):
+            return False
+        with self._transaction() as connection:
+            cursor = connection.execute(
+                "DELETE FROM sync_projects WHERE project_id = ?",
+                (project_id,),
+            )
+            return cursor.rowcount > 0
+
+    def set_project_server_state(self, project_id, state):
+        if state not in {"active", "trashed", "purged"}:
+            raise ValueError("유효하지 않은 서버 작품 상태입니다.")
+        try:
+            project_id = str(uuid.UUID(str(project_id)))
+        except (AttributeError, TypeError, ValueError):
+            return None
+        now = _utc_now()
+        with self._transaction() as connection:
+            cursor = connection.execute(
+                """
+                UPDATE sync_projects
+                SET server_state = ?, server_state_updated_at = ?,
+                    updated_at = ?
+                WHERE project_id = ?
+                """,
+                (state, now, now, project_id),
+            )
+            if cursor.rowcount != 1:
+                return None
+            row = connection.execute(
+                "SELECT * FROM sync_projects WHERE project_id = ?",
+                (project_id,),
+            ).fetchone()
+            return dict(row)
+
+    def begin_project_import(
+        self,
+        writing_root_path,
+        project_name,
+        project_id,
+        server_name=None,
+        reset_complete=False,
+    ):
+        local_key = self.local_key_for(writing_root_path)
+        project_id = str(uuid.UUID(str(project_id)))
+        server_name = str(server_name or project_name)
+        now = _utc_now()
+        with self._transaction() as connection:
+            by_id = connection.execute(
+                "SELECT * FROM sync_projects WHERE project_id = ?", (project_id,)
+            ).fetchone()
+            by_path = connection.execute(
+                "SELECT * FROM sync_projects WHERE local_key = ?", (local_key,)
+            ).fetchone()
+            if by_id is not None and by_id["local_key"] != local_key:
+                raise ValueError(
+                    "이 Supabase project_id는 이미 다른 로컬 프로젝트에 연결되어 있습니다."
+                )
+            if by_path is not None and by_path["project_id"] != project_id:
+                raise ValueError(
+                    "이 로컬 프로젝트는 이미 다른 Supabase project_id에 연결되어 있습니다."
+                )
+            if by_id is None:
+                connection.execute(
+                    """
+                    INSERT INTO sync_projects
+                        (
+                            local_key, project_id, project_name, server_name,
+                            created_at, updated_at
+                        )
+                    VALUES (?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        local_key, project_id, project_name, server_name,
+                        now, now,
+                    ),
+                )
+            else:
+                connection.execute(
+                    """
+                    UPDATE sync_projects
+                    SET project_name = ?, updated_at = ?
+                    WHERE project_id = ?
+                    """,
+                    (project_name, now, project_id),
+                )
+
+            journal = connection.execute(
+                "SELECT * FROM sync_project_imports WHERE project_id = ?",
+                (project_id,),
+            ).fetchone()
+            previous_state = journal["state"] if journal else None
+            if journal is None:
+                connection.execute(
+                    """
+                    INSERT INTO sync_project_imports (
+                        project_id, local_key, project_name, state,
+                        last_error, created_at, updated_at
+                    ) VALUES (?, ?, ?, 'preparing', '', ?, ?)
+                    """,
+                    (project_id, local_key, project_name, now, now),
+                )
+            elif journal["local_key"] != local_key:
+                raise ValueError(
+                    "이 Supabase project_id의 가져오기 위치가 기존 기록과 다릅니다."
+                )
+            elif journal["state"] != "complete" or reset_complete:
+                connection.execute(
+                    """
+                    UPDATE sync_project_imports
+                    SET project_name = ?, state = 'preparing',
+                        last_error = '', updated_at = ?
+                    WHERE project_id = ?
+                    """,
+                    (project_name, now, project_id),
+                )
+
+            current = connection.execute(
+                "SELECT * FROM sync_project_imports WHERE project_id = ?",
+                (project_id,),
+            ).fetchone()
+        return {
+            "local_key": local_key,
+            "project_id": project_id,
+            "project_name": project_name,
+            "server_name": server_name,
+            "previous_state": previous_state,
+            "import_state": current["state"],
+        }
+
+    def get_project_import(self, project_id):
+        try:
+            project_id = str(uuid.UUID(str(project_id)))
+        except (AttributeError, TypeError, ValueError):
+            return None
+        with self._reader() as connection:
+            row = connection.execute(
+                "SELECT * FROM sync_project_imports WHERE project_id = ?",
+                (project_id,),
+            ).fetchone()
+            return dict(row) if row else None
+
+    def set_project_import_state(self, project_id, state, error_message=""):
+        if state not in {"preparing", "pulling", "failed", "complete"}:
+            raise ValueError("유효하지 않은 가져오기 상태입니다.")
+        project_id = str(uuid.UUID(str(project_id)))
+        now = _utc_now()
+        with self._transaction() as connection:
+            cursor = connection.execute(
+                """
+                UPDATE sync_project_imports
+                SET state = ?, last_error = ?, updated_at = ?
+                WHERE project_id = ?
+                """,
+                (state, str(error_message or ""), now, project_id),
+            )
+            if cursor.rowcount != 1:
+                raise ValueError("가져오기 기록을 찾을 수 없습니다.")
+            row = connection.execute(
+                "SELECT * FROM sync_project_imports WHERE project_id = ?",
+                (project_id,),
+            ).fetchone()
+            return dict(row)
 
     def ensure_document(self, local_key, local_path, content="", document_id=None):
         local_path = _normalize_path(local_path)
@@ -359,6 +600,62 @@ class SyncV2Store:
                 "reason": "applied",
                 "previous_path": previous_path,
                 "document": dict(document),
+            }
+
+    def repair_clean_document_path(
+        self, document_id, local_path, server_path=None
+    ):
+        """Canonicalize a clean document path without changing its revision."""
+        document_id = str(uuid.UUID(str(document_id)))
+        local_path = _normalize_path(local_path)
+        server_path = _normalize_path(server_path or local_path)
+        now = _utc_now()
+        with self._transaction() as connection:
+            document = connection.execute(
+                "SELECT * FROM sync_documents WHERE document_id = ?",
+                (document_id,),
+            ).fetchone()
+            if document is None:
+                return {"applied": False, "reason": "missing_document"}
+            active = connection.execute(
+                """
+                SELECT 1 FROM sync_operations
+                WHERE document_id = ?
+                  AND status IN ('pending', 'inflight', 'conflict')
+                LIMIT 1
+                """,
+                (document_id,),
+            ).fetchone()
+            if active:
+                return {"applied": False, "reason": "active_operations"}
+            collision = connection.execute(
+                """
+                SELECT document_id FROM sync_documents
+                WHERE local_key = ? AND local_path = ? AND document_id <> ?
+                LIMIT 1
+                """,
+                (document["local_key"], local_path, document_id),
+            ).fetchone()
+            if collision:
+                return {"applied": False, "reason": "path_conflict"}
+            previous_path = document["local_path"]
+            connection.execute(
+                """
+                UPDATE sync_documents
+                SET local_path = ?, server_path = ?, updated_at = ?
+                WHERE document_id = ?
+                """,
+                (local_path, server_path, now, document_id),
+            )
+            repaired = connection.execute(
+                "SELECT * FROM sync_documents WHERE document_id = ?",
+                (document_id,),
+            ).fetchone()
+            return {
+                "applied": True,
+                "reason": "canonical_path_repaired",
+                "previous_path": previous_path,
+                "document": dict(repaired),
             }
 
     def relocate_deleted_document(self, document_id, local_path):

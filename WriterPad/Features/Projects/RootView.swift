@@ -20,6 +20,16 @@ struct RootView: View {
             restoreCoordinator: environment.restoreCoordinator,
             workspaceStateRepository: environment.workspaceStateRepository,
             futureChangeNotifier: environment.futureChangeNotifier,
+            authenticationService: environment.authenticationService,
+            projectBindingService: environment.projectBindingService,
+            syncDispatcher: environment.syncDispatcher,
+            conflictResolutionService:
+                environment.conflictResolutionService,
+            snapshotPullService: environment.snapshotPullService,
+            realtimeTrigger: environment.realtimeTrigger,
+            backgroundSyncCoordinator:
+                environment.backgroundSyncCoordinator,
+            editLeaseManager: environment.editLeaseManager,
             isDarkMode: $isDarkMode,
             smartPairsEnabled: $smartPairsEnabled
         )

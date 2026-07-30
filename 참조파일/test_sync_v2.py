@@ -39,9 +39,45 @@ class ThreeWayMergeTestCase(unittest.TestCase):
 
         self.assertTrue(result.has_conflicts)
         self.assertEqual(result.conflict_count, 1)
-        self.assertIn("<<<<<<< 내 로컬 편집본", result.content)
-        self.assertIn("||||||| 마지막 공통본", result.content)
-        self.assertIn(">>>>>>> 서버 최신본", result.content)
+        self.assertIn("바꾸기 전 원본", result.content)
+        self.assertIn("로컬 편집본", result.content)
+        self.assertIn("서버 최신본", result.content)
+        difference = result.content.split("로컬과 서버 차이점\n\n", 1)[1]
+        self.assertIn("로컬 : 내", difference)
+        self.assertIn("서버 : 서버", difference)
+        self.assertNotIn(" 문장", difference)
+        self.assertTrue(
+            result.content.startswith("=========\n\n바꾸기 전 원본")
+        )
+
+    def test_difference_summary_aggregates_each_side_on_one_line(self):
+        result = three_way_merge(
+            "기준 공통 기준\n",
+            "야이 공통 씨발아\n",
+            "테스트테스트 공통 문재인\n",
+        )
+
+        difference = result.content.split("로컬과 서버 차이점\n\n", 1)[1]
+        self.assertIn("로컬 : 야이 씨발아", difference)
+        self.assertIn("서버 : 테스트테스트 문재인", difference)
+        self.assertNotIn("차이 1", difference)
+        self.assertNotIn("(없음)", difference)
+
+    def test_difference_summary_keeps_shared_words_added_by_both_sides(self):
+        base = "내 아이디어를 훔쳐 간 팀장이 임원들 앞에서 웃고 있었다."
+        result = three_way_merge(
+            base,
+            base + "이 씨발놈들아",
+            base + "예? 저요? 제가 왜 씨발놈이죠 씨발놈아ㅁㄴㅇㅎㅇㅇ",
+        )
+
+        difference = result.content.split("로컬과 서버 차이점\n\n", 1)[1]
+        self.assertIn("로컬 : 이 씨발놈들아", difference)
+        self.assertIn(
+            "서버 : 예? 저요? 제가 왜 씨발놈이죠 씨발놈아ㅁㄴㅇㅎㅇㅇ",
+            difference,
+        )
+        self.assertNotIn("로컬 : 이 들", difference)
 
     def test_line_edit_and_adjacent_line_insertion_merge_cleanly(self):
         base = "이름 변경 테스트\nA가 파일 이름을 바꿉니다.\nB가 이 줄을 수정합니다.\n"
@@ -312,6 +348,23 @@ class _FakeClient:
 
 
 class SyncV2RpcTestCase(unittest.TestCase):
+    def test_lease_conflict_schedules_short_follow_up_only_for_lock_wait(self):
+        self.assertEqual(
+            SyncManager._v2_follow_up_delay_ms(
+                "retry", "LEASE_CONFLICT: 다른 기기에서 편집 중"
+            ),
+            3000,
+        )
+        self.assertEqual(
+            SyncManager._v2_follow_up_delay_ms("committed"),
+            0,
+        )
+        self.assertIsNone(
+            SyncManager._v2_follow_up_delay_ms(
+                "retry", "NETWORK_UNAVAILABLE"
+            )
+        )
+
     def test_background_commit_releases_lease_after_document_switch(self):
         manager = SyncManager()
         previous = (

@@ -109,6 +109,18 @@ struct DocumentRestoreResult: Equatable, Sendable {
     let restoredText: String
 }
 
+struct DocumentBackupCopyRequest: Equatable, Sendable {
+    let document: DocumentNode
+    let snapshot: BackupSnapshot
+    let saveGeneration: UInt64
+}
+
+struct DocumentBackupCopyResult: Equatable, Sendable {
+    let document: DocumentNode
+    let receipt: DocumentSaveReceipt
+    let copiedText: String
+}
+
 enum BackupStoreError: Error, Equatable, LocalizedError, Sendable {
     case textDocumentRequired
     case snapshotNotFound(BackupID)
@@ -117,6 +129,8 @@ enum BackupStoreError: Error, Equatable, LocalizedError, Sendable {
     case wrongProject
     case wrongDocument
     case wrongPath
+    case copyServiceUnavailable
+    case copyDestinationUnavailable
 
     var errorDescription: String? {
         switch self {
@@ -127,6 +141,8 @@ enum BackupStoreError: Error, Equatable, LocalizedError, Sendable {
         case .wrongProject: "다른 작품의 백업은 복원할 수 없습니다."
         case .wrongDocument: "다른 문서의 백업은 복원할 수 없습니다."
         case .wrongPath: "백업의 원래 경로가 현재 문서와 일치하지 않습니다."
+        case .copyServiceUnavailable: "백업 사본을 만들 준비가 되지 않았습니다."
+        case .copyDestinationUnavailable: "백업 사본을 만들 폴더를 찾을 수 없습니다."
         }
     }
 }

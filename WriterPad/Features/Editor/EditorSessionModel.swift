@@ -2,6 +2,114 @@ import Foundation
 import SwiftUI
 
 @MainActor
+final class SyncV2EditorSessionRegistry:
+    SyncV2OpenLocalSnapshotProviding {
+    static let shared = SyncV2EditorSessionRegistry()
+
+    private final class WeakSession {
+        weak var value: EditorSessionModel?
+
+        init(_ value: EditorSessionModel) {
+            self.value = value
+        }
+    }
+
+    private var sessions: [ObjectIdentifier: WeakSession] = [:]
+
+    func register(_ session: EditorSessionModel) {
+        compact()
+        sessions[ObjectIdentifier(session)] = WeakSession(session)
+    }
+
+    func latestOpenSnapshot(
+        documentID: UUID
+    ) -> SyncV2RebaseLocalSnapshot? {
+        compact()
+        return sessions.values
+            .compactMap(\.value)
+            .compactMap {
+                $0.automaticRebaseSnapshot(
+                    documentID: DocumentID(rawValue: documentID)
+                )
+            }
+            .max { lhs, rhs in
+                (lhs.localSaveGeneration ?? 0)
+                    < (rhs.localSaveGeneration ?? 0)
+            }
+    }
+
+    func isCurrent(
+        documentID: UUID,
+        snapshot: SyncV2RebaseLocalSnapshot
+    ) -> Bool {
+        guard let current = latestOpenSnapshot(documentID: documentID)
+        else {
+            return false
+        }
+        return current.content == snapshot.content
+            && current.localSaveGeneration
+                == snapshot.localSaveGeneration
+    }
+
+    func applyMergedIfCurrent(
+        documentID: UUID,
+        expected: SyncV2RebaseLocalSnapshot,
+        mergedContent: String,
+        mergedPath: String
+    ) -> Bool {
+        _ = mergedPath
+        compact()
+        let matching = sessions.values
+            .compactMap(\.value)
+            .filter {
+                $0.currentDocumentID?.rawValue == documentID
+            }
+        guard !matching.isEmpty,
+              matching.allSatisfy({
+                  $0.canApplyAutomaticRebase(expected: expected)
+              })
+        else {
+            return false
+        }
+        return matching.allSatisfy {
+            $0.applyAutomaticRebase(
+                expected: expected,
+                mergedContent: mergedContent
+            )
+        }
+    }
+
+    private func compact() {
+        sessions = sessions.filter { $0.value.value != nil }
+    }
+}
+
+actor EditLeaseRequestOutcome {
+    private var result: EditLeaseDisplayState?
+    private var waiters:
+        [CheckedContinuation<EditLeaseDisplayState, Never>] = []
+
+    func resolve(_ state: EditLeaseDisplayState) {
+        guard result == nil else { return }
+        result = state
+        let pending = waiters
+        waiters.removeAll()
+        for waiter in pending {
+            waiter.resume(returning: state)
+        }
+    }
+
+    func value() async -> EditLeaseDisplayState {
+        if let result {
+            return result
+        }
+        return await withCheckedContinuation { continuation in
+            waiters.append(continuation)
+        }
+    }
+}
+
+@MainActor
 final class EditorDraftStore {
     @MainActor
     struct Draft {
@@ -72,6 +180,8 @@ final class EditorSessionModel: ObservableObject {
     @Published private(set) var isComposing = false
     @Published private(set) var focusPhase = EditorFocusPhase.idle
     @Published private(set) var saveState = SaveState.idle
+    @Published private(set) var syncHandoffState = SyncHandoffState.idle
+    @Published private(set) var editLeaseState = EditLeaseDisplayState.localOnly
     @Published private(set) var backupWarning: String?
     @Published private(set) var documentSearch = DocumentSearchState()
     @Published private(set) var searchNavigationRequest: UInt64 = 0
@@ -86,6 +196,9 @@ final class EditorSessionModel: ObservableObject {
     private let backupStore: (any BackupStoring)?
     private let backupPolicyStore: (any BackupPolicyStoring)?
     private let autosaveDebouncer: AutosaveDebouncer
+    private let editLeaseManager: (any EditLeaseManaging)?
+    private let editLeaseConnectivityMonitor:
+        (any EditLeaseConnectivityMonitoring)?
     private var selectionSequence: UInt64 = 0
     private var pendingSelection: BinderNode?
     private var pendingSearchNavigation: PendingSearchNavigation?
@@ -95,9 +208,15 @@ final class EditorSessionModel: ObservableObject {
     private var dirtyGeneration: UInt64 = 0
     private var lastSavedDirtyGeneration: UInt64 = 0
     private var pendingSaveAfterComposition = false
+    private var syncHandoffStates: [DocumentID: SyncHandoffState] = [:]
     private var statisticsGeneration: UInt64 = 0
     private var statisticsTask: Task<Void, Never>?
     private var statisticsBurstStartedAt: ContinuousClock.Instant?
+    private var leaseTrackedDocumentID: DocumentID?
+    private var isEditLeaseStartScheduled = false
+    private var hasStartedEditLeaseConnectivityMonitor = false
+    private var editLeaseRequestSequence: UInt64 = 0
+    private var editLeaseStateObservationTask: Task<Void, Never>?
     /// SwiftData의 문서 커서는 앱 재실행을 위한 최종 위치다. 같은 문서를 좌우 패널에
     /// 동시에 열 수 있으므로 실행 중 왕복에는 세션별 위치를 우선 사용한다.
     private var sessionCursors: [DocumentID: TextCursorState] = [:]
@@ -110,6 +229,9 @@ final class EditorSessionModel: ObservableObject {
         workspaceStateRepository: any WorkspaceStateRepository,
         draftStore: EditorDraftStore = EditorDraftStore(),
         futureChangeNotifier: any FutureChangeNotifying = NoOpFutureChangeNotifier(),
+        editLeaseManager: (any EditLeaseManaging)? = nil,
+        editLeaseConnectivityMonitor:
+            (any EditLeaseConnectivityMonitoring)? = nil,
         autosaveDelay: Duration = AutosaveDebouncer.defaultDelay,
         autosaveSleep: @escaping AutosaveSleep = { duration in
             try await ContinuousClock().sleep(for: duration)
@@ -122,6 +244,11 @@ final class EditorSessionModel: ObservableObject {
         self.futureChangeNotifier = futureChangeNotifier
         self.backupStore = backupStore
         self.backupPolicyStore = backupPolicyStore
+        self.editLeaseManager = editLeaseManager
+        self.editLeaseConnectivityMonitor = editLeaseManager == nil
+            ? nil
+            : editLeaseConnectivityMonitor
+                ?? EditLeaseConnectivityMonitor()
         self.autosaveDebouncer = AutosaveDebouncer(
             delay: autosaveDelay,
             sleep: autosaveSleep
@@ -201,7 +328,84 @@ final class EditorSessionModel: ObservableObject {
     var currentText: String { textBuffer.snapshot() }
     var currentUTF16Length: Int { textBuffer.utf16Length }
     var isCurrentTextEmpty: Bool { textBuffer.isEmpty }
+    var hasUnsavedChanges: Bool {
+        dirtyGeneration > lastSavedDirtyGeneration
+    }
     var textSnapshotCreationCount: Int { textBuffer.snapshotCreationCount }
+
+    func automaticRebaseSnapshot(
+        documentID: DocumentID
+    ) -> SyncV2RebaseLocalSnapshot? {
+        guard currentDocumentID == documentID else { return nil }
+        return SyncV2RebaseLocalSnapshot(
+            content: currentText,
+            localPath: "",
+            relativePath: "",
+            localSaveGeneration: max(
+                saveGeneration,
+                dirtyGeneration
+            )
+        )
+    }
+
+    func canApplyAutomaticRebase(
+        expected: SyncV2RebaseLocalSnapshot
+    ) -> Bool {
+        guard !isComposing,
+              currentText == expected.content
+        else {
+            return false
+        }
+        let currentGeneration = max(saveGeneration, dirtyGeneration)
+        return currentGeneration <= (expected.localSaveGeneration ?? 0)
+    }
+
+    @discardableResult
+    func applyAutomaticRebase(
+        expected: SyncV2RebaseLocalSnapshot,
+        mergedContent: String
+    ) -> Bool {
+        guard canApplyAutomaticRebase(expected: expected) else {
+            return false
+        }
+        let previous = currentText
+        if previous != mergedContent {
+            autosaveDebouncer.cancel()
+            updateCursor(
+                SharedEditorTextChange.adjustedCursor(
+                    cursor,
+                    from: previous,
+                    to: mergedContent
+                )
+            )
+            guard setText(
+                mergedContent,
+                statisticsUpdate: .immediate
+            ) else {
+                return false
+            }
+            externalTextMutation = nil
+            externalVersion &+= 1
+        }
+        let generation = expected.localSaveGeneration ?? 0
+        saveGeneration = max(saveGeneration, generation)
+        dirtyGeneration = max(dirtyGeneration, generation)
+        lastSavedDirtyGeneration = dirtyGeneration
+        saveState = .saved(
+            generation: saveGeneration,
+            savedAt: Date(),
+            contentHash: SHA256ContentHasher().sha256(
+                for: Data(mergedContent.utf8)
+            )
+        )
+        if let currentDocumentID {
+            draftStore.removeIfMatching(
+                text: previous,
+                for: currentDocumentID
+            )
+        }
+        return true
+    }
 
     func selectedCharacterCount() -> Int? {
         textBuffer.selectedCharacterCount(cursor)
@@ -225,6 +429,48 @@ final class EditorSessionModel: ObservableObject {
         if let currentDocumentID {
             draftStore.removeIfMatching(text: restoredText, for: currentDocumentID)
         }
+    }
+
+    /// snapshot pull이 clean 열린 문서를 갱신할 때 사용하는 마지막 방어선이다.
+    /// dirty 또는 marked-text 조합 중이면 서버 본문을 절대 표시 버퍼에 덮지 않는다.
+    @discardableResult
+    func applyRemoteSnapshotIfClean(
+        documentID: DocumentID,
+        content: String,
+        relativePath: String? = nil
+    ) -> Bool {
+        guard currentDocumentID == documentID,
+              !isComposing,
+              !hasUnsavedChanges
+        else { return false }
+        if let relativePath {
+            selectedDisplayName = Self.displayName(
+                for: RelativeDocumentPath(rawValue: relativePath)
+            )
+        }
+        let previous = textBuffer.snapshot()
+        guard previous != content else { return true }
+        autosaveDebouncer.cancel()
+        updateCursor(
+            SharedEditorTextChange.adjustedCursor(
+                cursor,
+                from: previous,
+                to: content
+            )
+        )
+        guard setText(content, statisticsUpdate: .immediate) else {
+            return false
+        }
+        dirtyGeneration = max(dirtyGeneration, saveGeneration)
+        lastSavedDirtyGeneration = dirtyGeneration
+        externalTextMutation = nil
+        externalVersion &+= 1
+        saveState = .idle
+        draftStore.removeIfMatching(
+            text: previous,
+            for: documentID
+        )
+        return true
     }
 
     /// 같은 문서를 표시 중인 반대 패널의 변경을 표시 버전으로만 반영한다.
@@ -348,6 +594,7 @@ final class EditorSessionModel: ObservableObject {
         if !active {
             _ = await saveNow()
             _ = await persistSessionState()
+            await synchronizeEditLease(to: nil)
         }
         isSceneActive = active
         let effects = focusStateMachine.handle(
@@ -357,7 +604,15 @@ final class EditorSessionModel: ObservableObject {
         )
         focusPhase = focusStateMachine.phase
         if active {
+            if isComposing {
+                // 백그라운드 전환 중 UIKit이 marked text를 끝냈지만 콜백이
+                // 전달되지 않은 경우 현재 상태를 강제로 재확인한다.
+                compositionCommitRequest &+= 1
+            }
             await completePendingSelectionIfPossible()
+            if hasUnsavedChanges {
+                await synchronizeEditLease(to: currentDocumentID)
+            }
         }
         await apply(effects)
     }
@@ -383,11 +638,12 @@ final class EditorSessionModel: ObservableObject {
             externalTextMutation = nil
             externalVersion &+= 1
             resetSaveTracking()
+            await synchronizeEditLease(to: nil)
             return
         }
 
         if let draft = draftStore.draft(for: node.id) {
-            apply(
+            await apply(
                 documentID: node.id,
                 text: draft.text,
                 cursor: draft.cursor,
@@ -416,10 +672,14 @@ final class EditorSessionModel: ObservableObject {
                 ?? persistedCursor
                 ?? document.cursor
             guard sequence == selectionSequence else { return }
-            apply(
+            await apply(
                 documentID: document.id,
                 text: loadedText,
                 cursor: restoredCursor
+            )
+            await recoverPendingSyncHandoff(
+                for: document,
+                selectionSequence: sequence
             )
         } catch {
             guard sequence == selectionSequence else { return }
@@ -429,6 +689,7 @@ final class EditorSessionModel: ObservableObject {
             isLoading = false
             errorMessage = error.localizedDescription
             resetSaveTracking()
+            await synchronizeEditLease(to: nil)
         }
     }
 
@@ -462,6 +723,20 @@ final class EditorSessionModel: ObservableObject {
             return true
         }
         guard dirtyGeneration > lastSavedDirtyGeneration else {
+            if case let .failed(generation, _) = syncHandoffState {
+                if let document = try? await documentRepository.document(
+                    id: currentDocumentID
+                ) {
+                    let result = await documentStore.retryPendingSyncHandoff(
+                        for: document
+                    )
+                    apply(
+                        durableRecordResult: result,
+                        generation: generation,
+                        documentID: currentDocumentID
+                    )
+                }
+            }
             return await persistSessionState()
         }
         let snapshotBuffer = textBuffer
@@ -498,6 +773,13 @@ final class EditorSessionModel: ObservableObject {
                     cursor: snapshotCursor
                 )
             )
+            if let durableRecordResult = receipt.durableRecordResult {
+                apply(
+                    durableRecordResult: durableRecordResult,
+                    generation: receipt.generation,
+                    documentID: receipt.documentID
+                )
+            }
             if self.currentDocumentID == currentDocumentID,
                dirtyGeneration == snapshotDirtyGeneration {
                 lastSavedDirtyGeneration = snapshotDirtyGeneration
@@ -554,8 +836,30 @@ final class EditorSessionModel: ObservableObject {
             saveState,
             event: .edited(generation: dirtyGeneration)
         )
+        startEditLeaseAfterFirstMutationIfNeeded()
         autosaveDebouncer.schedule { [weak self] in
             _ = await self?.performSaveNow()
+        }
+    }
+
+    private func startEditLeaseAfterFirstMutationIfNeeded() {
+        guard
+            isSceneActive,
+            !isEditLeaseStartScheduled,
+            editLeaseManager != nil,
+            let documentID = currentDocumentID,
+            leaseTrackedDocumentID != documentID
+        else { return }
+        isEditLeaseStartScheduled = true
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            defer { self.isEditLeaseStartScheduled = false }
+            guard
+                self.isSceneActive,
+                self.currentDocumentID == documentID,
+                self.hasUnsavedChanges
+            else { return }
+            await self.synchronizeEditLease(to: documentID)
         }
     }
 
@@ -622,7 +926,7 @@ final class EditorSessionModel: ObservableObject {
             }
             selectedDisplayName = Self.displayName(for: document.relativePath)
             if let draft = draftStore.draft(for: documentID) {
-                apply(
+                await apply(
                     documentID: documentID,
                     text: draft.text,
                     cursor: draft.cursor,
@@ -632,7 +936,15 @@ final class EditorSessionModel: ObservableObject {
             }
             let loadedText = try await documentStore.loadText(for: document)
             guard sequence == selectionSequence else { return }
-            apply(documentID: documentID, text: loadedText, cursor: cursor)
+            await apply(
+                documentID: documentID,
+                text: loadedText,
+                cursor: cursor
+            )
+            await recoverPendingSyncHandoff(
+                for: document,
+                selectionSequence: sequence
+            )
         } catch {
             guard sequence == selectionSequence else { return }
             currentDocumentID = nil
@@ -641,6 +953,7 @@ final class EditorSessionModel: ObservableObject {
             isLoading = false
             errorMessage = error.localizedDescription
             resetSaveTracking()
+            await synchronizeEditLease(to: nil)
         }
     }
 
@@ -658,6 +971,7 @@ final class EditorSessionModel: ObservableObject {
         externalTextMutation = nil
         externalVersion &+= 1
         resetSaveTracking()
+        await synchronizeEditLease(to: nil)
         return true
     }
 
@@ -666,8 +980,12 @@ final class EditorSessionModel: ObservableObject {
         text: String,
         cursor: TextCursorState,
         isUnsavedDraft: Bool = false
-    ) {
+    ) async {
         autosaveDebouncer.cancel()
+        if leaseTrackedDocumentID != nil,
+           leaseTrackedDocumentID != documentID {
+            await synchronizeEditLease(to: nil)
+        }
         currentDocumentID = documentID
         setText(text, statisticsUpdate: .immediate)
         self.cursor = cursor
@@ -682,6 +1000,122 @@ final class EditorSessionModel: ObservableObject {
         }
     }
 
+    func releaseEditLease() async {
+        await synchronizeEditLease(to: nil)
+    }
+
+    func resumeEditLease() async {
+        guard isSceneActive, hasUnsavedChanges else { return }
+        await synchronizeEditLease(to: currentDocumentID)
+    }
+
+    private func synchronizeEditLease(to documentID: DocumentID?) async {
+        guard leaseTrackedDocumentID != documentID else { return }
+        editLeaseStateObservationTask?.cancel()
+        editLeaseStateObservationTask = nil
+        if let previous = leaseTrackedDocumentID {
+            await editLeaseManager?.endEditing(
+                documentID: previous.rawValue
+            )
+        }
+        leaseTrackedDocumentID = documentID
+        guard let documentID, let editLeaseManager else {
+            editLeaseState = .localOnly
+            return
+        }
+        editLeaseRequestSequence &+= 1
+        let requestSequence = editLeaseRequestSequence
+        editLeaseStateObservationTask = Task {
+            [weak self, editLeaseManager] in
+            let updates = await editLeaseManager.stateUpdates(
+                documentID: documentID.rawValue
+            )
+            for await state in updates {
+                guard !Task.isCancelled else { return }
+                await MainActor.run {
+                    guard let self,
+                          self.editLeaseRequestSequence == requestSequence,
+                          self.leaseTrackedDocumentID == documentID
+                    else { return }
+                    self.updateEditLeaseState(
+                        state,
+                        for: documentID
+                    )
+                }
+            }
+        }
+        let outcome = EditLeaseRequestOutcome()
+        editLeaseState = .acquiring
+        Task {
+            let state = await editLeaseManager.beginEditing(
+                documentID: documentID.rawValue
+            )
+            await outcome.resolve(state)
+        }
+        let timeoutTask = Task {
+            do {
+                try await ContinuousClock().sleep(for: .seconds(8))
+            } catch {
+                return
+            }
+            await outcome.resolve(.unavailable)
+        }
+        let state = await outcome.value()
+        timeoutTask.cancel()
+        guard editLeaseRequestSequence == requestSequence,
+              leaseTrackedDocumentID == documentID
+        else { return }
+        updateEditLeaseState(state, for: documentID)
+        startEditLeaseConnectivityMonitorIfNeeded()
+    }
+
+    private func updateEditLeaseState(
+        _ state: EditLeaseDisplayState,
+        for documentID: DocumentID
+    ) {
+        editLeaseState = state
+        _ = documentID
+    }
+
+    private func startEditLeaseConnectivityMonitorIfNeeded() {
+        guard
+            !hasStartedEditLeaseConnectivityMonitor,
+            let editLeaseConnectivityMonitor
+        else { return }
+        hasStartedEditLeaseConnectivityMonitor = true
+        editLeaseConnectivityMonitor.start { [weak self] isConnected in
+            Task { @MainActor [weak self] in
+                await self?.editLeaseConnectivityChanged(
+                    isConnected: isConnected
+                )
+            }
+        }
+    }
+
+    private func editLeaseConnectivityChanged(
+        isConnected: Bool
+    ) async {
+        guard let documentID = leaseTrackedDocumentID else { return }
+        if !isConnected {
+            if let editLeaseManager {
+                let state = await editLeaseManager
+                    .offlineDisplayState(
+                        documentID: documentID.rawValue
+                    )
+                updateEditLeaseState(state, for: documentID)
+            }
+            return
+        }
+        guard editLeaseState == .offlineEditing,
+              let editLeaseManager
+        else { return }
+        editLeaseState = .acquiring
+        let state = await editLeaseManager.refreshEditing(
+            documentID: documentID.rawValue
+        )
+        updateEditLeaseState(state, for: documentID)
+    }
+
     private func resetSaveTracking() {
         autosaveDebouncer.cancel()
         saveGeneration = 0
@@ -689,6 +1123,57 @@ final class EditorSessionModel: ObservableObject {
         lastSavedDirtyGeneration = 0
         pendingSaveAfterComposition = false
         saveState = .idle
+        syncHandoffState = currentDocumentID.flatMap {
+            syncHandoffStates[$0]
+        } ?? .idle
+    }
+
+    private func apply(
+        durableRecordResult: DurableRecordResult,
+        generation: UInt64,
+        documentID: DocumentID
+    ) {
+        let state: SyncHandoffState
+        switch durableRecordResult {
+        case .queued(let operationIDs):
+            state = .queued(
+                generation: generation,
+                operationIDs: operationIDs
+            )
+        case .notNeeded:
+            state = .upToDate(generation: generation)
+        case let .serverSizeLimitExceeded(byteCount, limit):
+            state = .serverSizeLimitExceeded(
+                generation: generation,
+                byteCount: byteCount,
+                limit: limit
+            )
+        case .localOnly:
+            state = .localOnly
+        case .localSavedButNotQueued(let reason):
+            state = .failed(generation: generation, message: reason)
+        }
+        syncHandoffStates[documentID] = state
+        if currentDocumentID == documentID {
+            syncHandoffState = state
+        }
+    }
+
+    private func recoverPendingSyncHandoff(
+        for document: DocumentNode,
+        selectionSequence: UInt64
+    ) async {
+        let result = await documentStore.retryPendingSyncHandoff(for: document)
+        guard selectionSequence == self.selectionSequence,
+              currentDocumentID == document.id
+        else { return }
+        guard result != .localOnly else { return }
+        let generation = syncHandoffState.generation ?? saveGeneration
+        apply(
+            durableRecordResult: result,
+            generation: generation,
+            documentID: document.id
+        )
     }
 
     private func rememberCurrentCursor() {
@@ -717,7 +1202,9 @@ final class EditorSessionModel: ObservableObject {
             statisticsTask?.cancel()
             statisticsGeneration &+= 1
             statisticsBurstStartedAt = nil
-            statistics = ManuscriptStatistics(text: updatedText)
+            // 새 버퍼가 초기화하며 이미 계산한 값을 재사용한다. 복원·문서 전환 때
+            // 대용량 문자열을 메인 액터에서 두 번 순회하지 않는다.
+            statistics = textBuffer.statistics
             statisticsCalculationCount &+= 1
         case .deferred:
             scheduleStatisticsUpdate(for: updatedText)
@@ -810,7 +1297,7 @@ final class EditorSessionModel: ObservableObject {
 
         if let draft = draftStore.draft(for: navigation.documentID) {
             let target = clamped(navigation.cursor, toUTF16Length: draft.buffer.utf16Length)
-            apply(
+            await apply(
                 documentID: navigation.documentID,
                 text: draft.text,
                 cursor: target,
@@ -834,7 +1321,7 @@ final class EditorSessionModel: ObservableObject {
                 navigation.cursor,
                 toUTF16Length: (loadedText as NSString).length
             )
-            apply(
+            await apply(
                 documentID: document.id,
                 text: loadedText,
                 cursor: target
@@ -848,6 +1335,7 @@ final class EditorSessionModel: ObservableObject {
             isLoading = false
             errorMessage = error.localizedDescription
             resetSaveTracking()
+            await synchronizeEditLease(to: nil)
         }
     }
 

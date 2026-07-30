@@ -1,0 +1,5 @@
+// Git에 포함되는 공통 공개 설정의 기본값이다.
+// 실제 프로젝트 URL과 publishable key는 환경별 *.local.xcconfig에만 둔다.
+
+WRITERPAD_SUPABASE_URL =
+WRITERPAD_SUPABASE_PUBLISHABLE_KEY =

@@ -93,6 +93,36 @@ final class LocalBackupStoreTests: XCTestCase {
         XCTAssertEqual(try Data(contentsOf: snapshotURL), savedData)
     }
 
+    func testSnapshotKeepsContentBeyondServerLimit() async throws {
+        let workspace = try makeWorkspace(text: "")
+        let store = LocalBackupStore(
+            workspaceLocator: FixedWorkspaceLocator(root: workspace.root)
+        )
+        let data = Data(
+            String(
+                repeating: "a",
+                count: SyncV2Store.maximumContentByteCount + 1
+            ).utf8
+        )
+        let hash = SHA256ContentHasher().sha256(for: data)
+
+        let snapshot = try await store.createSnapshot(
+            for: workspace.document(),
+            reason: .automaticSave,
+            savedContent: SavedDocumentContent(
+                utf8Data: data,
+                contentHash: hash
+            )
+        )
+
+        XCTAssertEqual(snapshot.contentHash, hash)
+        let restored = try await store.text(for: snapshot)
+        XCTAssertEqual(
+            restored.utf8.count,
+            SyncV2Store.maximumContentByteCount + 1
+        )
+    }
+
     func testCombinedSnapshotAndRetentionEnumeratesBackupDirectoryOnce() async throws {
         let workspace = try makeWorkspace(text: "첫 백업")
         let store = LocalBackupStore(
@@ -132,14 +162,81 @@ final class LocalBackupStoreTests: XCTestCase {
         XCTAssertNotEqual(result.snapshot.id, first.id)
     }
 
+    func testLargeAutomaticSnapshotIsRateLimitedButRefreshesAfterInterval() async throws {
+        let workspace = try makeWorkspace(text: "")
+        let start = Date(timeIntervalSince1970: 10_000)
+        let firstStore = LocalBackupStore(
+            workspaceLocator: FixedWorkspaceLocator(root: workspace.root),
+            clock: FixedClock(date: start)
+        )
+        let firstData = Data(
+            repeating: 0x61,
+            count: LocalBackupStore.largeAutomaticSnapshotByteCount
+        )
+        let first = try await firstStore.createSnapshotAndApplyRetention(
+            for: workspace.document(),
+            reason: .automaticSave,
+            savedContent: SavedDocumentContent(
+                utf8Data: firstData,
+                contentHash: SHA256ContentHasher().sha256(for: firstData)
+            ),
+            policy: .default
+        ).snapshot
+
+        var changedData = firstData
+        changedData[changedData.startIndex] = 0x62
+        let withinIntervalStore = LocalBackupStore(
+            workspaceLocator: FixedWorkspaceLocator(root: workspace.root),
+            clock: FixedClock(date: start.addingTimeInterval(60))
+        )
+        let rateLimited = try await withinIntervalStore.createSnapshotAndApplyRetention(
+            for: workspace.document(),
+            reason: .automaticSave,
+            savedContent: SavedDocumentContent(
+                utf8Data: changedData,
+                contentHash: SHA256ContentHasher().sha256(for: changedData)
+            ),
+            policy: .default
+        ).snapshot
+        XCTAssertEqual(rateLimited.id, first.id)
+
+        let afterIntervalStore = LocalBackupStore(
+            workspaceLocator: FixedWorkspaceLocator(root: workspace.root),
+            clock: FixedClock(
+                date: start.addingTimeInterval(
+                    LocalBackupStore.largeAutomaticSnapshotMinimumInterval
+                )
+            )
+        )
+        let refreshed = try await afterIntervalStore.createSnapshotAndApplyRetention(
+            for: workspace.document(),
+            reason: .automaticSave,
+            savedContent: SavedDocumentContent(
+                utf8Data: changedData,
+                contentHash: SHA256ContentHasher().sha256(for: changedData)
+            ),
+            policy: .default
+        ).snapshot
+
+        XCTAssertNotEqual(refreshed.id, first.id)
+        XCTAssertEqual(refreshed.contentHash, SHA256ContentHasher().sha256(for: changedData))
+    }
+
     func testRestorePreservesCurrentVersionBeforeReplacement() async throws {
         let workspace = try makeWorkspace(text: "과거본")
         let locator = FixedWorkspaceLocator(root: workspace.root)
         let backup = LocalBackupStore(workspaceLocator: locator)
         let old = try await backup.createSnapshot(for: workspace.document(), reason: .manual)
+        let recorder = ScriptedDurableChangeRecorder(
+            results: [
+                .queued(operationIDs: []),
+                .queued(operationIDs: []),
+            ]
+        )
         let documents = LocalDocumentStore(
             workspaceLocator: locator,
-            metadataUpdater: RecordingMetadataUpdater()
+            metadataUpdater: RecordingMetadataUpdater(),
+            durableChangeRecorder: recorder
         )
         let coordinator = DocumentRestoreCoordinator(documentStore: documents, backupStore: backup)
 
@@ -162,6 +259,8 @@ final class LocalBackupStoreTests: XCTestCase {
         let beforeRestore = try XCTUnwrap(snapshots.first { $0.reason == .beforeRestore })
         let preserved = try await backup.text(for: beforeRestore)
         XCTAssertEqual(preserved, "복원 직전 현재본")
+        let batches = await recorder.batches
+        XCTAssertEqual(batches.map(\.kind), [.documentSave, .backupRestore])
     }
 
     func testCorruptSnapshotIsRejectedWithoutLosingCurrentText() async throws {

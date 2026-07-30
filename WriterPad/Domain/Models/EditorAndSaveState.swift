@@ -553,6 +553,31 @@ enum SaveState: Codable, Equatable, Sendable {
     }
 }
 
+/// 로컬 저장 성공 뒤 durable queue handoff의 결과다.
+enum SyncHandoffState: Equatable, Sendable {
+    case idle
+    case localOnly
+    case queued(generation: UInt64, operationIDs: [UUID])
+    case upToDate(generation: UInt64)
+    case serverSizeLimitExceeded(
+        generation: UInt64,
+        byteCount: Int,
+        limit: Int
+    )
+    case failed(generation: UInt64, message: String)
+
+    var generation: UInt64? {
+        switch self {
+        case .idle, .localOnly:
+            nil
+        case let .queued(generation, _), let .upToDate(generation),
+             let .serverSizeLimitExceeded(generation, _, _),
+             let .failed(generation, _):
+            generation
+        }
+    }
+}
+
 private extension Double {
     func clamped(to range: ClosedRange<Double>, fallback: Double) -> Double {
         guard isFinite else { return fallback }

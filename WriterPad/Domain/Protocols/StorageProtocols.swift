@@ -34,6 +34,17 @@ protocol WorkspaceStateRepository: Sendable {
 protocol LocalDocumentStoring: Sendable {
     func loadText(for document: DocumentNode) async throws -> String
     func save(_ request: DocumentSaveRequest) async throws -> DocumentSaveReceipt
+    func retryPendingSyncHandoff(
+        for document: DocumentNode
+    ) async -> DurableRecordResult
+}
+
+extension LocalDocumentStoring {
+    func retryPendingSyncHandoff(
+        for document: DocumentNode
+    ) async -> DurableRecordResult {
+        .localOnly
+    }
 }
 
 /// 작품 ID를 실제 집필모드 루트로 바꾸는 경계다.

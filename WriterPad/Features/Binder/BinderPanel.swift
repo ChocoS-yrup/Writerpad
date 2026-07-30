@@ -64,6 +64,7 @@ struct BinderPanel: View {
     @AppStorage("writerpad.binder-font-larger") private var isBinderFontLarger = false
     let projectID: ProjectID
     let allowsKeyboardFocus: Bool
+    let refreshGeneration: UInt64
     let contentStateOverrides: [DocumentID: BinderTextContentState]
     let onSelection: (BinderNode) -> Void
     let onErrorChange: (String?) -> Void
@@ -96,6 +97,7 @@ struct BinderPanel: View {
         isOrderingMode: Binding<Bool>,
         editOperation: Binding<BinderEditOperation>,
         allowsKeyboardFocus: Bool = true,
+        refreshGeneration: UInt64 = 0,
         contentStateOverrides: [DocumentID: BinderTextContentState] = [:],
         onSelection: @escaping (BinderNode) -> Void = { _ in },
         onErrorChange: @escaping (String?) -> Void = { _ in },
@@ -104,6 +106,7 @@ struct BinderPanel: View {
     ) {
         self.projectID = projectID
         self.allowsKeyboardFocus = allowsKeyboardFocus
+        self.refreshGeneration = refreshGeneration
         self.contentStateOverrides = contentStateOverrides
         self.onSelection = onSelection
         self.onErrorChange = onErrorChange
@@ -162,7 +165,9 @@ struct BinderPanel: View {
             model.clearError()
         }
         .background(appBackground)
-        .task(id: projectID) {
+        .task(
+            id: "\(projectID.rawValue.uuidString)-\(refreshGeneration)"
+        ) {
             await model.load(projectID: projectID)
         }
         .alert(

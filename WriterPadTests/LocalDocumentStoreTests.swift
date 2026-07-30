@@ -94,6 +94,229 @@ final class LocalDocumentStoreTests: XCTestCase {
         XCTAssertEqual(generations, [1, 2])
     }
 
+    func testSuccessfulSaveHandsImmutableSnapshotToQueueAfterMetadata()
+        async throws {
+        let workspace = try LocalDocumentTestWorkspace.create()
+        defer { workspace.remove() }
+        let updater = RecordingMetadataUpdater()
+        let operationID = UUID()
+        let recorder = ScriptedDurableChangeRecorder(
+            results: [.queued(operationIDs: [operationID])],
+            metadataUpdater: updater
+        )
+        let store = makeStore(
+            workspace,
+            updater: updater,
+            durableChangeRecorder: recorder
+        )
+        let text = "확정 snapshot 한글🙂"
+
+        let receipt = try await store.save(
+            workspace.request(text: text, generation: 17)
+        )
+
+        XCTAssertEqual(
+            receipt.durableRecordResult,
+            .queued(operationIDs: [operationID])
+        )
+        let metadataReceiptCounts = await recorder.metadataReceiptCounts
+        let recordedBatches = await recorder.batches
+        XCTAssertEqual(metadataReceiptCounts, [1])
+        let batch = try XCTUnwrap(recordedBatches.first)
+        XCTAssertEqual(batch.projectID, workspace.projectID)
+        XCTAssertEqual(batch.mutations.count, 1)
+        guard case let .documentSnapshot(
+            _,
+            documentID,
+            relativePath,
+            content,
+            contentHash,
+            generation,
+            isDeleted
+        ) = batch.mutations[0] else {
+            return XCTFail("문서 snapshot이어야 합니다.")
+        }
+        XCTAssertEqual(documentID, workspace.documentID)
+        XCTAssertEqual(relativePath, workspace.relativePath)
+        XCTAssertEqual(content, text)
+        XCTAssertEqual(contentHash, receipt.contentHash)
+        XCTAssertEqual(generation, 17)
+        XCTAssertFalse(isDeleted)
+    }
+
+    func testQueueFailureKeepsLocalSaveAndRetriesSameImmutableBatch()
+        async throws {
+        let workspace = try LocalDocumentTestWorkspace.create()
+        defer { workspace.remove() }
+        let operationID = UUID()
+        let recorder = ScriptedDurableChangeRecorder(
+            results: [
+                .localSavedButNotQueued(reason: "injected queue failure"),
+                .queued(operationIDs: [operationID])
+            ]
+        )
+        let store = makeStore(
+            workspace,
+            updater: RecordingMetadataUpdater(),
+            durableChangeRecorder: recorder
+        )
+
+        let receipt = try await store.save(
+            workspace.request(text: "로컬은 성공", generation: 1)
+        )
+
+        XCTAssertEqual(
+            receipt.durableRecordResult,
+            .localSavedButNotQueued(reason: "injected queue failure")
+        )
+        XCTAssertEqual(
+            try String(contentsOf: workspace.fileURL, encoding: .utf8),
+            "로컬은 성공"
+        )
+
+        let retry = await store.retryPendingSyncHandoff(
+            for: workspace.document()
+        )
+        XCTAssertEqual(retry, .queued(operationIDs: [operationID]))
+        let attempts = await recorder.batches
+        XCTAssertEqual(attempts.count, 2)
+        XCTAssertEqual(attempts[0], attempts[1])
+    }
+
+    func testOversizedServerSnapshotStillCompletesLocalSave()
+        async throws {
+        let workspace = try LocalDocumentTestWorkspace.create()
+        defer { workspace.remove() }
+        let limit = 10 * 1_024 * 1_024
+        let text = String(repeating: "a", count: limit + 1)
+        let recorder = ScriptedDurableChangeRecorder(
+            results: [
+                .serverSizeLimitExceeded(
+                    byteCount: limit + 1,
+                    limit: limit
+                )
+            ]
+        )
+        let store = makeStore(
+            workspace,
+            updater: RecordingMetadataUpdater(),
+            durableChangeRecorder: recorder
+        )
+
+        let receipt = try await store.save(
+            workspace.request(text: text, generation: 1)
+        )
+
+        XCTAssertEqual(
+            receipt.durableRecordResult,
+            .serverSizeLimitExceeded(
+                byteCount: limit + 1,
+                limit: limit
+            )
+        )
+        XCTAssertEqual(try Data(contentsOf: workspace.fileURL).count, limit + 1)
+        let restored = try await store.loadText(for: workspace.document())
+        XCTAssertEqual(restored, text)
+
+        let reopened = makeStore(
+            workspace,
+            updater: RecordingMetadataUpdater(),
+            durableChangeRecorder: ScriptedDurableChangeRecorder(
+                results: [],
+                restoredResult: .serverSizeLimitExceeded(
+                    byteCount: limit + 1,
+                    limit: limit
+                )
+            )
+        )
+        let restoredState = await reopened.retryPendingSyncHandoff(
+            for: workspace.document()
+        )
+        XCTAssertEqual(
+            restoredState,
+            .serverSizeLimitExceeded(
+                byteCount: limit + 1,
+                limit: limit
+            )
+        )
+    }
+
+    func testNextSaveFlushesEarlierFailureBeforeNewSnapshot()
+        async throws {
+        let workspace = try LocalDocumentTestWorkspace.create()
+        defer { workspace.remove() }
+        let firstOperationID = UUID()
+        let secondOperationID = UUID()
+        let recorder = ScriptedDurableChangeRecorder(
+            results: [
+                .localSavedButNotQueued(reason: "first attempt failed"),
+                .queued(operationIDs: [firstOperationID]),
+                .queued(operationIDs: [secondOperationID])
+            ]
+        )
+        let store = makeStore(
+            workspace,
+            updater: RecordingMetadataUpdater(),
+            durableChangeRecorder: recorder
+        )
+        _ = try await store.save(
+            workspace.request(text: "첫 snapshot", generation: 1)
+        )
+
+        let second = try await store.save(
+            workspace.request(text: "둘째 snapshot", generation: 2)
+        )
+
+        XCTAssertEqual(
+            second.durableRecordResult,
+            .queued(operationIDs: [firstOperationID, secondOperationID])
+        )
+        let attempts = await recorder.batches
+        XCTAssertEqual(attempts.count, 3)
+        XCTAssertEqual(attempts[0], attempts[1])
+        XCTAssertNotEqual(attempts[1].batchID, attempts[2].batchID)
+        XCTAssertEqual(snapshotContent(in: attempts[1]), "첫 snapshot")
+        XCTAssertEqual(snapshotContent(in: attempts[2]), "둘째 snapshot")
+    }
+
+    func testQueueFailureSurvivesStoreRecreationWithSameImmutableBatch()
+        async throws {
+        let workspace = try LocalDocumentTestWorkspace.create()
+        defer { workspace.remove() }
+        let failingRecorder = ScriptedDurableChangeRecorder(
+            results: [.localSavedButNotQueued(reason: "injected")]
+        )
+        let firstStore = makeStore(
+            workspace,
+            updater: RecordingMetadataUpdater(),
+            durableChangeRecorder: failingRecorder
+        )
+        _ = try await firstStore.save(
+            workspace.request(text: "재실행 뒤에도 보존", generation: 9)
+        )
+        let failedAttempts = await failingRecorder.batches
+        let firstAttempt = try XCTUnwrap(failedAttempts.first)
+        let operationID = UUID()
+        let succeedingRecorder = ScriptedDurableChangeRecorder(
+            results: [.queued(operationIDs: [operationID])]
+        )
+        let recreatedStore = makeStore(
+            workspace,
+            updater: RecordingMetadataUpdater(),
+            durableChangeRecorder: succeedingRecorder
+        )
+
+        let result = await recreatedStore.retryPendingSyncHandoff(
+            for: workspace.document()
+        )
+
+        XCTAssertEqual(result, .queued(operationIDs: [operationID]))
+        let successfulAttempts = await succeedingRecorder.batches
+        let replay = try XCTUnwrap(successfulAttempts.first)
+        XCTAssertEqual(replay, firstAttempt)
+        XCTAssertEqual(snapshotContent(in: replay), "재실행 뒤에도 보존")
+    }
+
     func testStaleGenerationCannotOverwriteLatestText() async throws {
         let workspace = try LocalDocumentTestWorkspace.create()
         defer { workspace.remove() }
@@ -166,15 +389,27 @@ final class LocalDocumentStoreTests: XCTestCase {
     private func makeStore(
         _ workspace: LocalDocumentTestWorkspace,
         updater: any DocumentFileMetadataUpdating,
+        durableChangeRecorder: any DurableLocalChangeRecording =
+            NoOpDurableLocalChangeRecorder(),
         faultPlan: AtomicWriteFaultPlan? = nil
     ) -> LocalDocumentStore {
         LocalDocumentStore(
             workspaceLocator: FixedWorkspaceLocator(root: workspace.root),
             metadataUpdater: updater,
+            durableChangeRecorder: durableChangeRecorder,
             uuidGenerator: FixedUUIDGenerator(
                 uuid: UUID(uuidString: "00000000-0000-0000-0000-000000000001")!
             ),
             faultPlan: faultPlan
         )
+    }
+
+    private func snapshotContent(in batch: LocalMutationBatch) -> String? {
+        guard case let .documentSnapshot(
+            _, _, _, content, _, _, _
+        ) = batch.mutations.first else {
+            return nil
+        }
+        return content
     }
 }

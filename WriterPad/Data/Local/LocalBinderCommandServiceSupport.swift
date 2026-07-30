@@ -232,6 +232,7 @@ extension LocalBinderCommandService {
             journal.transactionID,
             workspaceRoot: workspaceRoot
         )
+        var localTransactionCommitted = false
         do {
             try writeJournal(journal, to: journalURL)
             try inject(.afterJournalWrite)
@@ -244,22 +245,14 @@ extension LocalBinderCommandService {
             try await saveMetadata(for: journal)
             journal.phase = .metadataSaved
             try writeJournal(journal, to: journalURL)
+            localTransactionCommitted = true
             try inject(.afterMetadataSave)
-
-            if journal.kind == .permanentDelete {
-                try removeIfExists(
-                    try validatedURL(journal.destinationPath, workspaceRoot: workspaceRoot)
-                )
-            }
-            if journal.kind == .restore || journal.kind == .permanentDelete,
-               let record = journal.trashRecord {
-                try removeIfExists(trashRecordURL(record.documentID, workspaceRoot: workspaceRoot))
-            }
-
-            try removeIfExists(journalURL)
         } catch let error as BinderCommandError {
             if case .injectedFailure(recoveryPending: true) = error {
                 throw error
+            }
+            if localTransactionCommitted {
+                return
             }
             do {
                 try await rollback(journal, workspaceRoot: workspaceRoot)
@@ -269,6 +262,9 @@ extension LocalBinderCommandService {
             }
             throw error
         } catch {
+            if localTransactionCommitted {
+                return
+            }
             do {
                 try await rollback(journal, workspaceRoot: workspaceRoot)
                 try removeIfExists(journalURL)
@@ -277,6 +273,267 @@ extension LocalBinderCommandService {
             }
             throw error
         }
+
+        do {
+            guard try await completeDurableHandoff(
+                journal: &journal,
+                journalURL: journalURL,
+                workspaceRoot: workspaceRoot
+            ) else {
+                return
+            }
+            if journal.kind == .permanentDelete {
+                try removeIfExists(
+                    try validatedURL(
+                        journal.destinationPath,
+                        workspaceRoot: workspaceRoot
+                    )
+                )
+            }
+            if journal.kind == .restore || journal.kind == .permanentDelete,
+               let record = journal.trashRecord {
+                try removeIfExists(
+                    trashRecordURL(
+                        record.documentID,
+                        workspaceRoot: workspaceRoot
+                    )
+                )
+            }
+            try removeIfExists(journalURL)
+        } catch {
+            // 로컬 transaction은 이미 완료됐다. 저널을 남겨 다음 실행에서
+            // 동일 batch/operation ID로 재등록하며 로컬 성공은 되돌리지 않는다.
+        }
+    }
+
+    func completeDurableHandoff(
+        journal: inout BinderCommandJournal,
+        journalURL: URL,
+        workspaceRoot: URL
+    ) async throws -> Bool {
+        let requirement = await durableChangeRecorder.requirement(
+            for: journal.projectID
+        )
+        guard requirement == .durableQueue else {
+            return true
+        }
+        if journal.durableBatch == nil {
+            journal.durableBatch = try await durableBatch(
+                for: journal,
+                workspaceRoot: workspaceRoot
+            )
+            try writeJournal(journal, to: journalURL)
+        }
+        guard let batch = journal.durableBatch else {
+            return true
+        }
+        switch await durableChangeRecorder.record(batch) {
+        case .queued, .notNeeded, .serverSizeLimitExceeded:
+            return true
+        case .localOnly, .localSavedButNotQueued:
+            return false
+        }
+    }
+
+    func durableBatch(
+        for journal: BinderCommandJournal,
+        workspaceRoot: URL
+    ) async throws -> LocalMutationBatch? {
+        if journal.kind == .create, journal.createdKind == .folder {
+            // 서버에는 folder entity가 없어 빈 폴더는 교차 기기 보존 대상이 아니다.
+            return nil
+        }
+
+        let batchKind: DurableLocalBatchKind
+        switch journal.kind {
+        case .create, .relocate, .reorder:
+            batchKind = .structureChange
+        case .createVolume:
+            batchKind = .volumeCreation
+        case .trash, .restore, .permanentDelete, .emptyTrash:
+            batchKind = .trashChange
+        }
+
+        var mutations: [DurableLocalMutation] = []
+        let emptyHash = hasher.sha256(for: Data())
+        switch journal.kind {
+        case .trash:
+            for node in journal.oldNodes
+                .filter({ $0.kind == .text })
+                .sorted(by: { $0.relativePath.rawValue < $1.relativePath.rawValue }) {
+                mutations.append(
+                    .documentSnapshot(
+                        operationID: uuidGenerator.makeUUID(),
+                        documentID: node.id,
+                        relativePath: node.relativePath,
+                        content: "",
+                        contentHash: emptyHash,
+                        localSaveGeneration: 0,
+                        isDeleted: true
+                    )
+                )
+            }
+        case .permanentDelete, .emptyTrash:
+            let purged = Dictionary(
+                uniqueKeysWithValues: journal.oldNodes
+                    .filter { $0.kind == .text }
+                    .map { ($0.id.rawValue.uuidString.lowercased(), 0) }
+            )
+            let content = try canonicalJSON([
+                "version": 1,
+                "purged_revisions": purged,
+                "empty_generation": journal.kind == .emptyTrash
+                    ? journal.transactionID.uuidString.lowercased()
+                    : "",
+            ])
+            mutations.append(
+                .trashPurge(
+                    operationID: uuidGenerator.makeUUID(),
+                    content: content,
+                    generation: journal.transactionID
+                )
+            )
+        case .create, .createVolume, .relocate, .restore:
+            for node in journal.newNodes
+                .filter({ $0.kind == .text })
+                .sorted(by: { $0.relativePath.rawValue < $1.relativePath.rawValue }) {
+                let url = try validatedURL(
+                    node.relativePath,
+                    workspaceRoot: workspaceRoot
+                )
+                let data = try Data(contentsOf: url)
+                guard let content = String(data: data, encoding: .utf8) else {
+                    throw LocalDocumentStoreError.invalidUTF8(url.path)
+                }
+                mutations.append(
+                    .documentSnapshot(
+                        operationID: uuidGenerator.makeUUID(),
+                        documentID: node.id,
+                        relativePath: node.relativePath,
+                        content: content,
+                        contentHash: hasher.sha256(for: data),
+                        localSaveGeneration: 0,
+                        isDeleted: false
+                    )
+                )
+            }
+        case .reorder:
+            break
+        }
+
+        if journal.kind != .permanentDelete && journal.kind != .emptyTrash {
+            let documents = try await metadataStore.binderDocuments(
+                in: journal.projectID
+            )
+            let generation = UInt64(
+                max(0, Int(clock.now().timeIntervalSince1970 * 1_000))
+            )
+            mutations.append(
+                .treeOrder(
+                    operationID: uuidGenerator.makeUUID(),
+                    content: try treeOrderContent(documents: documents),
+                    generation: generation
+                )
+            )
+        }
+        guard !mutations.isEmpty else { return nil }
+        return LocalMutationBatch(
+            batchID: uuidGenerator.makeUUID(),
+            projectID: journal.projectID,
+            localTransactionID: journal.transactionID,
+            kind: batchKind,
+            mutations: mutations
+        )
+    }
+
+    func recordEmptyTrashHandoff(
+        projectID: ProjectID,
+        deletedNodes: [DocumentNode],
+        trashPath: RelativeDocumentPath
+    ) async {
+        guard !deletedNodes.isEmpty,
+              await durableChangeRecorder.requirement(for: projectID)
+                == .durableQueue,
+              let workspaceRoot = try? await workspaceLocator.workspaceRoot(
+                for: projectID
+              )
+        else {
+            return
+        }
+        let transactionID = uuidGenerator.makeUUID()
+        var journal = BinderCommandJournal(
+            transactionID: transactionID,
+            projectID: projectID,
+            kind: .emptyTrash,
+            phase: .metadataSaved,
+            sourcePath: nil,
+            destinationPath: trashPath,
+            createdKind: nil,
+            oldNodes: deletedNodes,
+            newNodes: [],
+            trashRecord: nil
+        )
+        let journalURL = transactionJournalURL(
+            transactionID,
+            workspaceRoot: workspaceRoot
+        )
+        do {
+            journal.durableBatch = try await durableBatch(
+                for: journal,
+                workspaceRoot: workspaceRoot
+            )
+            try writeJournal(journal, to: journalURL)
+            if try await completeDurableHandoff(
+                journal: &journal,
+                journalURL: journalURL,
+                workspaceRoot: workspaceRoot
+            ) {
+                try removeIfExists(journalURL)
+            }
+        } catch {
+            // 삭제 결과는 이미 확정됐다. 표식이 만들어졌다면 복구 경로가 재시도한다.
+        }
+    }
+
+    func treeOrderContent(documents: [DocumentNode]) throws -> String {
+        let live = documents.filter {
+            if case .active = $0.deletionStatus {
+                return !isInTrash($0.relativePath)
+            }
+            return false
+        }
+        let folders = live.filter { $0.kind == .folder }
+        var order: [String: [String]] = [:]
+        for parent in folders {
+            let children = live
+                .filter { $0.parentID == parent.id }
+                .sorted {
+                    if $0.userOrder != $1.userOrder {
+                        return $0.userOrder < $1.userOrder
+                    }
+                    return $0.relativePath.rawValue < $1.relativePath.rawValue
+                }
+            guard !children.isEmpty else { continue }
+            let key = hierarchyPolicy.isTopLevelContainer(parent)
+                ? "<root>"
+                : parent.relativePath.rawValue
+            order[key] = children.map { storedName(of: $0.relativePath) }
+        }
+        return try canonicalJSON([
+            "version": 1,
+            "tree_order": order,
+        ])
+    }
+
+    func canonicalJSON(_ object: [String: Any]) throws -> String {
+        let data = try JSONSerialization.data(
+            withJSONObject: object,
+            options: [.sortedKeys]
+        )
+        guard let value = String(data: data, encoding: .utf8) else {
+            throw BinderCommandError.recoveryRequired("canonical-json")
+        }
+        return value
     }
 
     func saveMetadata(for journal: BinderCommandJournal) async throws {
@@ -327,6 +584,9 @@ extension LocalBinderCommandService {
         for journal: BinderCommandJournal,
         workspaceRoot: URL
     ) throws {
+        if journal.kind == .reorder || journal.kind == .emptyTrash {
+            return
+        }
         if journal.kind == .createVolume {
             try applyVolumeFiles(for: journal, workspaceRoot: workspaceRoot)
             return
@@ -361,6 +621,9 @@ extension LocalBinderCommandService {
         for journal: BinderCommandJournal,
         workspaceRoot: URL
     ) throws {
+        if journal.kind == .reorder || journal.kind == .emptyTrash {
+            return
+        }
         if journal.kind == .createVolume {
             try removeIfExists(
                 try validatedURL(

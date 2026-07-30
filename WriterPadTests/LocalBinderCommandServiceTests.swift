@@ -986,6 +986,397 @@ final class LocalBinderCommandServiceTests: XCTestCase {
         XCTAssertFalse(fileExists("메인/원고/41권/001001화.txt", harness: harness))
     }
 
+    func testTextCreationAndVolumeUseAtomicDurableBatches() async throws {
+        let recorder = RecordingDurableChangeRecorder()
+        let harness = try await makeHarness(durableChangeRecorder: recorder)
+        let notes = try await fixedRoot(.notes, harness: harness)
+
+        let created = try await harness.commands.create(
+            kind: .text,
+            named: "동기화 메모",
+            in: notes.id,
+            projectID: harness.project.id
+        )
+        var batches = await recorder.recordedBatches()
+        XCTAssertEqual(batches.count, 1)
+        XCTAssertEqual(batches[0].kind, .structureChange)
+        XCTAssertNotNil(batches[0].localTransactionID)
+        XCTAssertEqual(batches[0].mutations.count, 2)
+        guard case let .documentSnapshot(
+            _,
+            documentID,
+            relativePath,
+            content,
+            _,
+            _,
+            isDeleted
+        ) = batches[0].mutations[0] else {
+            return XCTFail("TXT create snapshot이 없습니다.")
+        }
+        XCTAssertEqual(documentID, created.affectedDocumentID)
+        XCTAssertEqual(relativePath, created.relativePath)
+        XCTAssertEqual(content, "")
+        XCTAssertFalse(isDeleted)
+        guard case .treeOrder = batches[0].mutations[1] else {
+            return XCTFail("tree-order가 같은 batch에 없습니다.")
+        }
+
+        await recorder.clear()
+        try await harness.commands.reorder(
+            childIDs: [created.affectedDocumentID],
+            in: notes.id,
+            projectID: harness.project.id
+        )
+        batches = await recorder.recordedBatches()
+        XCTAssertEqual(batches.count, 1)
+        XCTAssertEqual(batches[0].kind, .structureChange)
+        XCTAssertEqual(batches[0].mutations.count, 1)
+        guard case .treeOrder = batches[0].mutations[0] else {
+            return XCTFail("재정렬 tree-order가 없습니다.")
+        }
+
+        await recorder.clear()
+        _ = try await harness.commands.addNewVolume(
+            projectID: harness.project.id
+        )
+        batches = await recorder.recordedBatches()
+        XCTAssertEqual(batches.count, 1)
+        XCTAssertEqual(batches[0].kind, .volumeCreation)
+        XCTAssertEqual(
+            batches[0].mutations.filter {
+                if case .documentSnapshot = $0 { return true }
+                return false
+            }.count,
+            25
+        )
+        XCTAssertEqual(
+            batches[0].mutations.filter {
+                if case .treeOrder = $0 { return true }
+                return false
+            }.count,
+            1
+        )
+    }
+
+    func testStructureTrashRestoreAndPurgeCaptureCorrectSnapshots() async throws {
+        let recorder = RecordingDurableChangeRecorder()
+        let harness = try await makeHarness(durableChangeRecorder: recorder)
+        let notes = try await fixedRoot(.notes, harness: harness)
+        let created = try await harness.commands.create(
+            kind: .text,
+            named: "사건",
+            in: notes.id,
+            projectID: harness.project.id
+        )
+        try writeText("본문 snapshot", at: created.relativePath.rawValue, harness: harness)
+
+        await recorder.clear()
+        let renamed = try await harness.commands.rename(
+            documentID: created.affectedDocumentID,
+            to: "이름 변경",
+            projectID: harness.project.id
+        )
+        var recorded = await recorder.recordedBatches()
+        var batch = try XCTUnwrap(recorded.last)
+        XCTAssertEqual(batch.kind, .structureChange)
+        guard case let .documentSnapshot(
+            _,
+            _,
+            renamedPath,
+            renamedContent,
+            _,
+            _,
+            renamedDeleted
+        ) = batch.mutations[0] else {
+            return XCTFail("rename snapshot이 없습니다.")
+        }
+        XCTAssertEqual(renamedPath, renamed.relativePath)
+        XCTAssertEqual(renamedContent, "본문 snapshot")
+        XCTAssertFalse(renamedDeleted)
+
+        await recorder.clear()
+        _ = try await harness.commands.moveToTrash(
+            documentID: created.affectedDocumentID,
+            projectID: harness.project.id
+        )
+        recorded = await recorder.recordedBatches()
+        batch = try XCTUnwrap(recorded.last)
+        XCTAssertEqual(batch.kind, .trashChange)
+        guard case let .documentSnapshot(
+            _,
+            _,
+            tombstonePath,
+            _,
+            _,
+            _,
+            tombstoneDeleted
+        ) = batch.mutations[0] else {
+            return XCTFail("trash tombstone이 없습니다.")
+        }
+        XCTAssertEqual(tombstonePath, renamed.relativePath)
+        XCTAssertFalse(tombstonePath.rawValue.contains("/휴지통/"))
+        XCTAssertTrue(tombstoneDeleted)
+
+        await recorder.clear()
+        let restored = try await harness.commands.restoreFromTrash(
+            documentID: created.affectedDocumentID,
+            toFolderID: notes.id,
+            projectID: harness.project.id
+        )
+        recorded = await recorder.recordedBatches()
+        batch = try XCTUnwrap(recorded.last)
+        guard case let .documentSnapshot(
+            _,
+            _,
+            restorePath,
+            restoreContent,
+            _,
+            _,
+            restoreDeleted
+        ) = batch.mutations[0] else {
+            return XCTFail("restore snapshot이 없습니다.")
+        }
+        XCTAssertEqual(restorePath, restored.relativePath)
+        XCTAssertEqual(restoreContent, "본문 snapshot")
+        XCTAssertFalse(restoreDeleted)
+
+        _ = try await harness.commands.moveToTrash(
+            documentID: created.affectedDocumentID,
+            projectID: harness.project.id
+        )
+        await recorder.clear()
+        try await harness.commands.permanentlyDelete(
+            documentID: created.affectedDocumentID,
+            projectID: harness.project.id,
+            confirmsPermanentDeletion: true
+        )
+        recorded = await recorder.recordedBatches()
+        batch = try XCTUnwrap(recorded.last)
+        XCTAssertEqual(batch.mutations.count, 1)
+        guard case let .trashPurge(_, content, _) = batch.mutations[0] else {
+            return XCTFail("trash-purge snapshot이 없습니다.")
+        }
+        XCTAssertTrue(
+            content.contains(
+                created.affectedDocumentID.rawValue.uuidString.lowercased()
+            )
+        )
+
+        let first = try await harness.commands.create(
+            kind: .text,
+            named: "전체 삭제 1",
+            in: notes.id,
+            projectID: harness.project.id
+        )
+        let second = try await harness.commands.create(
+            kind: .text,
+            named: "전체 삭제 2",
+            in: notes.id,
+            projectID: harness.project.id
+        )
+        _ = try await harness.commands.moveToTrash(
+            documentID: first.affectedDocumentID,
+            projectID: harness.project.id
+        )
+        _ = try await harness.commands.moveToTrash(
+            documentID: second.affectedDocumentID,
+            projectID: harness.project.id
+        )
+        await recorder.clear()
+        let deletion = try await harness.commands.emptyTrash(
+            projectID: harness.project.id,
+            confirmsPermanentDeletion: true
+        )
+        XCTAssertEqual(Set(deletion.deletedDocumentIDs), Set([
+            first.affectedDocumentID,
+            second.affectedDocumentID,
+        ]))
+        recorded = await recorder.recordedBatches()
+        let emptyBatch = try XCTUnwrap(recorded.last)
+        guard case let .trashPurge(_, emptyContent, emptyGeneration) =
+            emptyBatch.mutations.first else {
+            return XCTFail("전체 비우기 trash-purge가 없습니다.")
+        }
+        XCTAssertTrue(emptyContent.contains(first.affectedDocumentID.rawValue.uuidString.lowercased()))
+        XCTAssertTrue(emptyContent.contains(second.affectedDocumentID.rawValue.uuidString.lowercased()))
+        XCTAssertTrue(emptyContent.contains(emptyGeneration.uuidString.lowercased()))
+    }
+
+    func testFailedDurableHandoffReplaysSameBatchFromBinderJournal() async throws {
+        let failing = RecordingDurableChangeRecorder(
+            result: .localSavedButNotQueued(reason: "injected")
+        )
+        let harness = try await makeHarness(durableChangeRecorder: failing)
+        let notes = try await fixedRoot(.notes, harness: harness)
+
+        let created = try await harness.commands.create(
+            kind: .text,
+            named: "복구 대상",
+            in: notes.id,
+            projectID: harness.project.id
+        )
+
+        XCTAssertTrue(fileExists(created.relativePath.rawValue, harness: harness))
+        XCTAssertEqual(try journalFiles(harness: harness).count, 1)
+        let failedBatches = await failing.recordedBatches()
+        let original = try XCTUnwrap(failedBatches.first)
+
+        let succeeding = RecordingDurableChangeRecorder()
+        let recovery = harness.makeCommands(
+            faultPlan: nil,
+            durableChangeRecorder: succeeding
+        )
+        try await recovery.recoverPendingTransactions(in: harness.project.id)
+
+        let replayed = await succeeding.recordedBatches()
+        XCTAssertEqual(replayed, [original])
+        XCTAssertTrue(try journalFiles(harness: harness).isEmpty)
+    }
+
+    func testBackupRestoreAsCopyKeepsCurrentDocumentAndQueuesNewSibling() async throws {
+        let recorder = RecordingDurableChangeRecorder()
+        let harness = try await makeHarness(durableChangeRecorder: recorder)
+        let notes = try await fixedRoot(.notes, harness: harness)
+        let created = try await harness.commands.create(
+            kind: .text,
+            named: "아이디어",
+            in: notes.id,
+            projectID: harness.project.id
+        )
+        let loadedOriginal = try await harness.repository.document(
+            id: created.affectedDocumentID
+        )
+        let original = try XCTUnwrap(loadedOriginal)
+        let documentStore = LocalDocumentStore(
+            workspaceLocator: harness.locator,
+            metadataUpdater: harness.repository,
+            durableChangeRecorder: recorder
+        )
+        _ = try await documentStore.save(
+            .init(
+                projectID: original.projectID,
+                documentID: original.id,
+                relativePath: original.relativePath,
+                text: "백업에 보관된 내용🙂\n",
+                generation: 1
+            )
+        )
+        let backupStore = LocalBackupStore(workspaceLocator: harness.locator)
+        let snapshot = try await backupStore.createSnapshot(
+            for: original,
+            reason: .manual
+        )
+        _ = try await documentStore.save(
+            .init(
+                projectID: original.projectID,
+                documentID: original.id,
+                relativePath: original.relativePath,
+                text: "현재 문서 내용",
+                generation: 2
+            )
+        )
+        await recorder.clear()
+
+        let coordinator = DocumentRestoreCoordinator(
+            documentStore: documentStore,
+            backupStore: backupStore,
+            documentRepository: harness.repository,
+            binderCommands: harness.commands
+        )
+        let result = try await coordinator.restoreAsCopy(
+            .init(
+                document: original,
+                snapshot: snapshot,
+                saveGeneration: 10
+            )
+        )
+
+        XCTAssertNotEqual(result.document.id, original.id)
+        XCTAssertEqual(result.document.parentID, notes.id)
+        XCTAssertEqual(
+            result.document.relativePath.rawValue,
+            "메인/메모장/아이디어 백업 사본.txt"
+        )
+        XCTAssertEqual(result.copiedText, "백업에 보관된 내용🙂\n")
+        XCTAssertEqual(
+            try String(contentsOf: fileURL(original.relativePath.rawValue, harness: harness)),
+            "현재 문서 내용"
+        )
+        XCTAssertEqual(
+            try String(contentsOf: fileURL(result.document.relativePath.rawValue, harness: harness)),
+            "백업에 보관된 내용🙂\n"
+        )
+        let batches = await recorder.recordedBatches()
+        XCTAssertEqual(batches.map(\.kind), [.structureChange, .documentSave])
+    }
+
+    func testManuscriptBackupCopyIsCreatedInNotesWithoutChangingChapter() async throws {
+        let harness = try await makeHarness()
+        let volume = try await harness.commands.addNewVolume(
+            projectID: harness.project.id
+        )
+        let loadedChapter = try await harness.repository.document(
+            id: volume.firstChapterID
+        )
+        let chapter = try XCTUnwrap(loadedChapter)
+        let notes = try await fixedRoot(.notes, harness: harness)
+        let documentStore = LocalDocumentStore(
+            workspaceLocator: harness.locator,
+            metadataUpdater: harness.repository
+        )
+        _ = try await documentStore.save(
+            .init(
+                projectID: chapter.projectID,
+                documentID: chapter.id,
+                relativePath: chapter.relativePath,
+                text: "과거 장면",
+                generation: 1
+            )
+        )
+        let backupStore = LocalBackupStore(workspaceLocator: harness.locator)
+        let snapshot = try await backupStore.createSnapshot(
+            for: chapter,
+            reason: .manual
+        )
+        _ = try await documentStore.save(
+            .init(
+                projectID: chapter.projectID,
+                documentID: chapter.id,
+                relativePath: chapter.relativePath,
+                text: "현재 장면",
+                generation: 2
+            )
+        )
+        let coordinator = DocumentRestoreCoordinator(
+            documentStore: documentStore,
+            backupStore: backupStore,
+            documentRepository: harness.repository,
+            binderCommands: harness.commands
+        )
+
+        let result = try await coordinator.restoreAsCopy(
+            .init(
+                document: chapter,
+                snapshot: snapshot,
+                saveGeneration: 10
+            )
+        )
+
+        XCTAssertEqual(result.document.parentID, notes.id)
+        XCTAssertTrue(
+            result.document.relativePath.rawValue
+                .hasPrefix("메인/메모장/001화 백업 사본")
+        )
+        XCTAssertEqual(
+            try String(contentsOf: fileURL(chapter.relativePath.rawValue, harness: harness)),
+            "현재 장면"
+        )
+        XCTAssertEqual(
+            try String(contentsOf: fileURL(result.document.relativePath.rawValue, harness: harness)),
+            "과거 장면"
+        )
+    }
+
     private struct Harness {
         let root: URL
         let repository: SwiftDataMetadataRepository
@@ -999,7 +1390,9 @@ final class LocalBinderCommandServiceTests: XCTestCase {
 
         func makeCommands(
             faultPlan: BinderCommandFaultPlan?,
-            futureChangeNotifier: any FutureChangeNotifying = NoOpFutureChangeNotifier()
+            futureChangeNotifier: any FutureChangeNotifying = NoOpFutureChangeNotifier(),
+            durableChangeRecorder: any DurableLocalChangeRecording =
+                NoOpDurableLocalChangeRecorder()
         ) -> LocalBinderCommandService {
             LocalBinderCommandService(
                 metadataStore: repository,
@@ -1008,6 +1401,7 @@ final class LocalBinderCommandServiceTests: XCTestCase {
                 pathPolicy: resolver.policy,
                 clock: clock,
                 futureChangeNotifier: futureChangeNotifier,
+                durableChangeRecorder: durableChangeRecorder,
                 faultPlan: faultPlan
             )
         }
@@ -1020,7 +1414,9 @@ final class LocalBinderCommandServiceTests: XCTestCase {
 
     private func makeHarness(
         faultPlan: BinderCommandFaultPlan? = nil,
-        futureChangeNotifier: any FutureChangeNotifying = NoOpFutureChangeNotifier()
+        futureChangeNotifier: any FutureChangeNotifying = NoOpFutureChangeNotifier(),
+        durableChangeRecorder: any DurableLocalChangeRecording =
+            NoOpDurableLocalChangeRecorder()
     ) async throws -> Harness {
         let root = FileManager.default.temporaryDirectory
             .appendingPathComponent("WriterPad-BinderCommands-\(UUID().uuidString)")
@@ -1055,6 +1451,7 @@ final class LocalBinderCommandServiceTests: XCTestCase {
             pathPolicy: resolver.policy,
             clock: clock,
             futureChangeNotifier: futureChangeNotifier,
+            durableChangeRecorder: durableChangeRecorder,
             faultPlan: faultPlan
         )
         let workspace = try resolver.standardPaths(
@@ -1146,6 +1543,34 @@ private actor RecordingFutureChangeNotifier: FutureChangeNotifying {
 
     func recordedEvents() -> [LocalChangeEvent] {
         events
+    }
+}
+
+private actor RecordingDurableChangeRecorder: DurableLocalChangeRecording {
+    private let result: DurableRecordResult
+    private var batches: [LocalMutationBatch] = []
+
+    init(result: DurableRecordResult = .queued(operationIDs: [])) {
+        self.result = result
+    }
+
+    func requirement(
+        for projectID: ProjectID
+    ) async -> DurableRecordingRequirement {
+        .durableQueue
+    }
+
+    func record(_ batch: LocalMutationBatch) async -> DurableRecordResult {
+        batches.append(batch)
+        return result
+    }
+
+    func recordedBatches() -> [LocalMutationBatch] {
+        batches
+    }
+
+    func clear() {
+        batches = []
     }
 }
 

@@ -20,6 +20,16 @@ final class AppEnvironment: ObservableObject {
     let restoreCoordinator: DocumentRestoreCoordinator
     let clock: any AppClock
     let futureChangeNotifier: any FutureChangeNotifying
+    let supabaseClientProvider: any SupabaseClientProviding
+    let authenticationService: any AuthenticationServicing
+    let deviceIdentityService: any DeviceIdentityProviding
+    let projectBindingService: any ProjectBindingServicing
+    let syncDispatcher: SyncV2Dispatcher?
+    let conflictResolutionService: (any SyncV2ConflictResolving)?
+    let snapshotPullService: SyncV2SnapshotPullService?
+    let realtimeTrigger: (any SyncV2RealtimeTriggering)?
+    let backgroundSyncCoordinator: SyncV2BackgroundSyncCoordinator?
+    let editLeaseManager: EditLeaseManager?
 
     @Published private(set) var storageStatus: LocalStorageStatus = .ready
 
@@ -39,6 +49,17 @@ final class AppEnvironment: ObservableObject {
         restoreCoordinator: DocumentRestoreCoordinator,
         clock: any AppClock,
         futureChangeNotifier: any FutureChangeNotifying,
+        supabaseClientProvider: any SupabaseClientProviding,
+        authenticationService: any AuthenticationServicing,
+        deviceIdentityService: any DeviceIdentityProviding,
+        projectBindingService: any ProjectBindingServicing,
+        syncDispatcher: SyncV2Dispatcher? = nil,
+        conflictResolutionService:
+            (any SyncV2ConflictResolving)? = nil,
+        snapshotPullService: SyncV2SnapshotPullService? = nil,
+        realtimeTrigger: (any SyncV2RealtimeTriggering)? = nil,
+        backgroundSyncCoordinator: SyncV2BackgroundSyncCoordinator? = nil,
+        editLeaseManager: EditLeaseManager? = nil,
         exporter: (any Exporting)? = nil
     ) {
         self.modelContainer = modelContainer
@@ -61,6 +82,16 @@ final class AppEnvironment: ObservableObject {
         self.restoreCoordinator = restoreCoordinator
         self.clock = clock
         self.futureChangeNotifier = futureChangeNotifier
+        self.supabaseClientProvider = supabaseClientProvider
+        self.authenticationService = authenticationService
+        self.deviceIdentityService = deviceIdentityService
+        self.projectBindingService = projectBindingService
+        self.syncDispatcher = syncDispatcher
+        self.conflictResolutionService = conflictResolutionService
+        self.snapshotPullService = snapshotPullService
+        self.realtimeTrigger = realtimeTrigger
+        self.backgroundSyncCoordinator = backgroundSyncCoordinator
+        self.editLeaseManager = editLeaseManager
     }
 
     static func live() throws -> AppEnvironment {
@@ -114,12 +145,161 @@ final class AppEnvironment: ObservableObject {
             pathPolicy: pathResolver.policy,
             clock: clock
         )
+        let syncMutationGate = SyncV2DocumentMutationGate()
+        let localSnapshotApplier = LocalSyncV2SnapshotApplier(
+            documentRepository: repository,
+            workspaceLocator: workspaceLocator
+        )
         let futureChangeNotifier = NoOpFutureChangeNotifier()
+        let supabaseClientProvider: any SupabaseClientProviding
+        if isStoredInMemoryOnly {
+            supabaseClientProvider = SupabaseClientProvider(
+                configuration: .failure(.missing)
+            )
+        } else {
+            supabaseClientProvider = SupabaseClientProvider()
+        }
+        let authenticationService = SupabaseAuthService(
+            transport: supabaseClientProvider.makeAuthTransport(),
+            sessionStore: KeychainSessionStore()
+        )
+        let projectBindingTransport =
+            supabaseClientProvider.makeProjectBindingTransport()
+        let deviceIdentityStore: any DeviceIdentityStoring
+        if isStoredInMemoryOnly {
+            deviceIdentityStore = InMemoryDeviceIdentityStore()
+        } else {
+            deviceIdentityStore = KeychainDeviceIdentityStore()
+        }
+        let deviceIdentityService = DeviceIdentityService(
+            store: deviceIdentityStore
+        )
+        let projectBindingStore: any ProjectBindingStoring
+        let durableChangeRecorder: any DurableLocalChangeRecording
+        let syncDispatcher: SyncV2Dispatcher?
+        let networkRecoveryHub: SyncV2NetworkRecoveryHub?
+        let conflictResolutionService: (any SyncV2ConflictResolving)?
+        let snapshotStateStore: (any SyncV2SnapshotStateStoring)?
+        let editLeaseManager: EditLeaseManager?
+        if isStoredInMemoryOnly {
+            projectBindingStore = InMemoryProjectBindingStore()
+            durableChangeRecorder = NoOpDurableLocalChangeRecorder()
+            syncDispatcher = nil
+            networkRecoveryHub = nil
+            conflictResolutionService = nil
+            snapshotStateStore = nil
+            editLeaseManager = nil
+        } else {
+            let dispatchWakeup = SyncV2DispatchWakeup()
+            networkRecoveryHub = SyncV2NetworkRecoveryHub()
+            let syncV2Store = LazySyncV2ProjectBindingStore(
+                databaseURL: SyncV2Store.defaultDatabaseURL(),
+                deviceIdentityProvider: deviceIdentityService,
+                dispatchWakeup: dispatchWakeup
+            )
+            projectBindingStore = syncV2Store
+            durableChangeRecorder = syncV2Store
+            conflictResolutionService = syncV2Store
+            snapshotStateStore = syncV2Store
+            editLeaseManager = supabaseClientProvider
+                .makeEditLeaseClient()
+                .map {
+                    EditLeaseManager(
+                        client: $0,
+                        revisionProvider: syncV2Store,
+                        deviceIdentityProvider: deviceIdentityService,
+                        isEnabled: {
+                            GlobalSyncPreference.isEnabled()
+                        },
+                        authenticationState: {
+                            await authenticationService.currentState()
+                        }
+                    )
+                }
+            let snapshotClient =
+                supabaseClientProvider.makeSnapshotClient()
+            syncDispatcher = supabaseClientProvider.makeSyncV2Client().map {
+                let automaticRebaser = snapshotClient.map {
+                    SyncV2AutomaticRebaser(
+                        store: syncV2Store,
+                        snapshotClient: $0,
+                        localApplier: localSnapshotApplier,
+                        openLocalProvider:
+                            SyncV2EditorSessionRegistry.shared
+                    )
+                }
+                return SyncV2Dispatcher(
+                    store: syncV2Store,
+                    client: $0,
+                    leaseManager: editLeaseManager,
+                    projectRecoveryTransport: projectBindingTransport,
+                    automaticRebaser: automaticRebaser,
+                    wakeup: dispatchWakeup,
+                    networkRecoveryHub: networkRecoveryHub
+                )
+            }
+        }
+        let initialSyncRecorder = ProjectInitialSyncRecorder(
+            documentRepository: repository,
+            workspaceLocator: workspaceLocator,
+            durableChangeRecorder: durableChangeRecorder
+        )
+        let projectBindingService = SupabaseProjectBindingService(
+            transport: projectBindingTransport,
+            bindingStore: projectBindingStore,
+            projectRepository: repository,
+            authenticationService: authenticationService,
+            initialSyncRecorder: initialSyncRecorder
+        )
         let localDocumentStore = LocalDocumentStore(
             workspaceLocator: workspaceLocator,
             metadataUpdater: repository,
-            clock: clock
+            durableChangeRecorder: durableChangeRecorder,
+            clock: clock,
+            syncMutationGate: syncMutationGate
         )
+        let snapshotPullService: SyncV2SnapshotPullService?
+        if let snapshotStateStore,
+           let snapshotClient = supabaseClientProvider.makeSnapshotClient() {
+            snapshotPullService = SyncV2SnapshotPullService(
+                client: snapshotClient,
+                stateStore: snapshotStateStore,
+                localApplier: localSnapshotApplier,
+                mergeStore: LocalSyncV2SnapshotMergeStore(
+                    workspaceLocator: workspaceLocator
+                ),
+                mutationGate: syncMutationGate
+            )
+        } else {
+            snapshotPullService = nil
+        }
+        let workspaceRealtimeTrigger =
+            supabaseClientProvider.makeRealtimeTrigger()
+        let backgroundSyncCoordinator: SyncV2BackgroundSyncCoordinator?
+        if let snapshotPullService,
+           let backgroundRealtimeTrigger =
+               supabaseClientProvider.makeRealtimeTrigger() {
+            backgroundSyncCoordinator = SyncV2BackgroundSyncCoordinator(
+                puller: snapshotPullService,
+                realtime: backgroundRealtimeTrigger,
+                projectBindingService: projectBindingService
+            )
+        } else {
+            backgroundSyncCoordinator = nil
+        }
+        if let networkRecoveryHub {
+            Task {
+                await networkRecoveryHub.install {
+                    guard GlobalSyncPreference.isEnabled() else { return }
+                    let state = await authenticationService
+                        .restoreSession()
+                    guard state.isAuthenticated else { return }
+                    await backgroundSyncCoordinator?.start()
+                    await backgroundSyncCoordinator?
+                        .appEnteredForeground()
+                }
+            }
+        }
         let searchService = LocalProjectSearchService(
             documentRepository: repository,
             documentStore: localDocumentStore
@@ -139,12 +319,6 @@ final class AppEnvironment: ObservableObject {
                 .appendingPathComponent(".writerpad-backup-policy.json"),
             legacyWorkspaceLocator: workspaceLocator
         )
-        let restoreCoordinator = DocumentRestoreCoordinator(
-            documentStore: localDocumentStore,
-            backupStore: backupStore,
-            futureChangeNotifier: futureChangeNotifier,
-            pathPolicy: pathResolver.policy
-        )
         let binderCommands = LocalBinderCommandService(
             metadataStore: repository,
             workspaceStateRepository: repository,
@@ -152,8 +326,17 @@ final class AppEnvironment: ObservableObject {
             pathPolicy: pathResolver.policy,
             clock: clock,
             futureChangeNotifier: futureChangeNotifier,
+            durableChangeRecorder: durableChangeRecorder,
             backupStore: backupStore,
             backupPolicyStore: backupPolicyStore
+        )
+        let restoreCoordinator = DocumentRestoreCoordinator(
+            documentStore: localDocumentStore,
+            backupStore: backupStore,
+            documentRepository: repository,
+            binderCommands: binderCommands,
+            futureChangeNotifier: futureChangeNotifier,
+            pathPolicy: pathResolver.policy
         )
 
         return AppEnvironment(
@@ -172,6 +355,16 @@ final class AppEnvironment: ObservableObject {
             restoreCoordinator: restoreCoordinator,
             clock: clock,
             futureChangeNotifier: futureChangeNotifier,
+            supabaseClientProvider: supabaseClientProvider,
+            authenticationService: authenticationService,
+            deviceIdentityService: deviceIdentityService,
+            projectBindingService: projectBindingService,
+            syncDispatcher: syncDispatcher,
+            conflictResolutionService: conflictResolutionService,
+            snapshotPullService: snapshotPullService,
+            realtimeTrigger: workspaceRealtimeTrigger,
+            backgroundSyncCoordinator: backgroundSyncCoordinator,
+            editLeaseManager: editLeaseManager,
             exporter: exporter
         )
     }

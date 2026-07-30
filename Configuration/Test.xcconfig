@@ -1,0 +1,2 @@
+#include "Shared.xcconfig"
+#include? "Supabase.Test.local.xcconfig"

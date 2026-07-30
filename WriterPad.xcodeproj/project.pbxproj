@@ -100,6 +100,31 @@
 		A1000000000000000000004A /* malgun.ttf in Resources */ = {isa = PBXBuildFile; fileRef = B1000000000000000000004A /* malgun.ttf */; };
 		A1000000000000000000004B /* malgunbd.ttf in Resources */ = {isa = PBXBuildFile; fileRef = B1000000000000000000004B /* malgunbd.ttf */; };
 		A1000000000000000000004C /* malgunsl.ttf in Resources */ = {isa = PBXBuildFile; fileRef = B1000000000000000000004C /* malgunsl.ttf */; };
+		A90000000000000000000001 /* SupabaseConfiguration.swift in Sources */ = {isa = PBXBuildFile; fileRef = B90000000000000000000001 /* SupabaseConfiguration.swift */; };
+		A90000000000000000000002 /* SupabaseClientProvider.swift in Sources */ = {isa = PBXBuildFile; fileRef = B90000000000000000000002 /* SupabaseClientProvider.swift */; };
+		A90000000000000000000003 /* SupabaseConfigurationTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = B90000000000000000000003 /* SupabaseConfigurationTests.swift */; };
+		A90000000000000000000004 /* Supabase in Frameworks */ = {isa = PBXBuildFile; productRef = E90000000000000000000002 /* Supabase */; };
+		A90000000000000000000005 /* KeychainSessionStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = B90000000000000000000009 /* KeychainSessionStore.swift */; };
+		A90000000000000000000006 /* SupabaseAuthService.swift in Sources */ = {isa = PBXBuildFile; fileRef = B9000000000000000000000A /* SupabaseAuthService.swift */; };
+		A90000000000000000000007 /* SupabaseAuthServiceTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = B9000000000000000000000B /* SupabaseAuthServiceTests.swift */; };
+		A90000000000000000000008 /* DeviceIdentityService.swift in Sources */ = {isa = PBXBuildFile; fileRef = B9000000000000000000000C /* DeviceIdentityService.swift */; };
+		A90000000000000000000009 /* DeviceIdentityServiceTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = B9000000000000000000000D /* DeviceIdentityServiceTests.swift */; };
+		A9000000000000000000000A /* SupabaseProjectBindingService.swift in Sources */ = {isa = PBXBuildFile; fileRef = B9000000000000000000000E /* SupabaseProjectBindingService.swift */; };
+		A9000000000000000000000B /* SupabaseProjectBindingServiceTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = B9000000000000000000000F /* SupabaseProjectBindingServiceTests.swift */; };
+		A9000000000000000000000C /* SyncV2Store.swift in Sources */ = {isa = PBXBuildFile; fileRef = B90000000000000000000010 /* SyncV2Store.swift */; };
+		A9000000000000000000000D /* SyncV2StoreTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = B90000000000000000000011 /* SyncV2StoreTests.swift */; };
+		A9000000000000000000000E /* SyncV2StoreSchemaV1.sql in Resources */ = {isa = PBXBuildFile; fileRef = B90000000000000000000012 /* SyncV2StoreSchemaV1.sql */; };
+		A9000000000000000000000F /* SyncV2Client.swift in Sources */ = {isa = PBXBuildFile; fileRef = B90000000000000000000013 /* SyncV2Client.swift */; };
+		A90000000000000000000010 /* SyncV2ClientTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = B90000000000000000000014 /* SyncV2ClientTests.swift */; };
+		A90000000000000000000011 /* SyncV2Dispatcher.swift in Sources */ = {isa = PBXBuildFile; fileRef = B90000000000000000000015 /* SyncV2Dispatcher.swift */; };
+		A90000000000000000000012 /* SyncSettingsView.swift in Sources */ = {isa = PBXBuildFile; fileRef = B90000000000000000000016 /* SyncSettingsView.swift */; };
+		A90000000000000000000014 /* EditLeaseManager.swift in Sources */ = {isa = PBXBuildFile; fileRef = B90000000000000000000018 /* EditLeaseManager.swift */; };
+		A90000000000000000000013 /* SyncSettingsModelTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = B90000000000000000000017 /* SyncSettingsModelTests.swift */; };
+		A90000000000000000000015 /* SyncV2SnapshotPull.swift in Sources */ = {isa = PBXBuildFile; fileRef = B90000000000000000000019 /* SyncV2SnapshotPull.swift */; };
+		A90000000000000000000016 /* SyncV2SnapshotPullTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = B9000000000000000000001A /* SyncV2SnapshotPullTests.swift */; };
+		A92000000000000000000001 /* ThreeWayMerge.swift in Sources */ = {isa = PBXBuildFile; fileRef = B92000000000000000000001 /* ThreeWayMerge.swift */; };
+		A92000000000000000000002 /* ThreeWayMergeTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = B92000000000000000000002 /* ThreeWayMergeTests.swift */; };
+		A92000000000000000000003 /* three_way_merge_cases.json in Resources */ = {isa = PBXBuildFile; fileRef = B92000000000000000000003 /* three_way_merge_cases.json */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXContainerItemProxy section */
@@ -218,6 +243,35 @@
 		B10000000000000000000060 /* DocumentSearchTextField.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DocumentSearchTextField.swift; sourceTree = "<group>"; };
 		B10000000000000000000061 /* EditorSessionModel.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = EditorSessionModel.swift; sourceTree = "<group>"; };
 		B10000000000000000000062 /* LocalPerformanceBaselineTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LocalPerformanceBaselineTests.swift; sourceTree = "<group>"; };
+		B90000000000000000000001 /* SupabaseConfiguration.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SupabaseConfiguration.swift; sourceTree = "<group>"; };
+		B90000000000000000000002 /* SupabaseClientProvider.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SupabaseClientProvider.swift; sourceTree = "<group>"; };
+		B90000000000000000000003 /* SupabaseConfigurationTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SupabaseConfigurationTests.swift; sourceTree = "<group>"; };
+		B90000000000000000000004 /* Shared.xcconfig */ = {isa = PBXFileReference; lastKnownFileType = text.xcconfig; path = Shared.xcconfig; sourceTree = "<group>"; };
+		B90000000000000000000005 /* Debug.xcconfig */ = {isa = PBXFileReference; lastKnownFileType = text.xcconfig; path = Debug.xcconfig; sourceTree = "<group>"; };
+		B90000000000000000000006 /* Test.xcconfig */ = {isa = PBXFileReference; lastKnownFileType = text.xcconfig; path = Test.xcconfig; sourceTree = "<group>"; };
+		B90000000000000000000007 /* Release.xcconfig */ = {isa = PBXFileReference; lastKnownFileType = text.xcconfig; path = Release.xcconfig; sourceTree = "<group>"; };
+		B90000000000000000000008 /* Supabase.local.xcconfig.example */ = {isa = PBXFileReference; lastKnownFileType = text.xcconfig; path = Supabase.local.xcconfig.example; sourceTree = "<group>"; };
+		B90000000000000000000009 /* KeychainSessionStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = KeychainSessionStore.swift; sourceTree = "<group>"; };
+		B9000000000000000000000A /* SupabaseAuthService.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SupabaseAuthService.swift; sourceTree = "<group>"; };
+		B9000000000000000000000B /* SupabaseAuthServiceTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SupabaseAuthServiceTests.swift; sourceTree = "<group>"; };
+		B9000000000000000000000C /* DeviceIdentityService.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DeviceIdentityService.swift; sourceTree = "<group>"; };
+		B9000000000000000000000D /* DeviceIdentityServiceTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DeviceIdentityServiceTests.swift; sourceTree = "<group>"; };
+		B9000000000000000000000E /* SupabaseProjectBindingService.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SupabaseProjectBindingService.swift; sourceTree = "<group>"; };
+		B9000000000000000000000F /* SupabaseProjectBindingServiceTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SupabaseProjectBindingServiceTests.swift; sourceTree = "<group>"; };
+		B90000000000000000000010 /* SyncV2Store.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SyncV2Store.swift; sourceTree = "<group>"; };
+		B90000000000000000000011 /* SyncV2StoreTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SyncV2StoreTests.swift; sourceTree = "<group>"; };
+		B90000000000000000000012 /* SyncV2StoreSchemaV1.sql */ = {isa = PBXFileReference; lastKnownFileType = text; path = Scripts/fixtures/SyncV2StoreSchemaV1.sql; sourceTree = SOURCE_ROOT; };
+		B90000000000000000000013 /* SyncV2Client.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SyncV2Client.swift; sourceTree = "<group>"; };
+		B90000000000000000000014 /* SyncV2ClientTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SyncV2ClientTests.swift; sourceTree = "<group>"; };
+		B90000000000000000000015 /* SyncV2Dispatcher.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SyncV2Dispatcher.swift; sourceTree = "<group>"; };
+		B90000000000000000000019 /* SyncV2SnapshotPull.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SyncV2SnapshotPull.swift; sourceTree = "<group>"; };
+		B9000000000000000000001A /* SyncV2SnapshotPullTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SyncV2SnapshotPullTests.swift; sourceTree = "<group>"; };
+		B90000000000000000000016 /* SyncSettingsView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SyncSettingsView.swift; sourceTree = "<group>"; };
+		B90000000000000000000018 /* EditLeaseManager.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = EditLeaseManager.swift; sourceTree = "<group>"; };
+		B90000000000000000000017 /* SyncSettingsModelTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SyncSettingsModelTests.swift; sourceTree = "<group>"; };
+		B92000000000000000000001 /* ThreeWayMerge.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ThreeWayMerge.swift; sourceTree = "<group>"; };
+		B92000000000000000000002 /* ThreeWayMergeTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ThreeWayMergeTests.swift; sourceTree = "<group>"; };
+		B92000000000000000000003 /* three_way_merge_cases.json */ = {isa = PBXFileReference; lastKnownFileType = text.json; path = three_way_merge_cases.json; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -225,6 +279,7 @@
 			isa = PBXFrameworksBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
+				A90000000000000000000004 /* Supabase in Frameworks */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -252,6 +307,7 @@
 				G10000000000000000000011 /* WriterPadTests */,
 				G10000000000000000000020 /* WriterPadUITests */,
 				G10000000000000000000012 /* Configuration */,
+				B90000000000000000000012 /* SyncV2StoreSchemaV1.sql */,
 				G10000000000000000000013 /* Products */,
 			);
 			sourceTree = "<group>";
@@ -333,6 +389,18 @@
 			isa = PBXGroup;
 			children = (
 				B10000000000000000000006 /* NoOpFutureChangeNotifier.swift */,
+				B90000000000000000000001 /* SupabaseConfiguration.swift */,
+				B90000000000000000000002 /* SupabaseClientProvider.swift */,
+				B90000000000000000000009 /* KeychainSessionStore.swift */,
+				B9000000000000000000000A /* SupabaseAuthService.swift */,
+				B9000000000000000000000C /* DeviceIdentityService.swift */,
+				B9000000000000000000000E /* SupabaseProjectBindingService.swift */,
+				B90000000000000000000010 /* SyncV2Store.swift */,
+				B90000000000000000000013 /* SyncV2Client.swift */,
+				B90000000000000000000015 /* SyncV2Dispatcher.swift */,
+				B90000000000000000000019 /* SyncV2SnapshotPull.swift */,
+				B92000000000000000000001 /* ThreeWayMerge.swift */,
+				B90000000000000000000018 /* EditLeaseManager.swift */,
 			);
 			path = Sync;
 			sourceTree = "<group>";
@@ -375,6 +443,16 @@
 			isa = PBXGroup;
 			children = (
 				B1000000000000000000000A /* AppEnvironmentTests.swift */,
+				B90000000000000000000003 /* SupabaseConfigurationTests.swift */,
+				B9000000000000000000000B /* SupabaseAuthServiceTests.swift */,
+				B9000000000000000000000D /* DeviceIdentityServiceTests.swift */,
+				B9000000000000000000000F /* SupabaseProjectBindingServiceTests.swift */,
+				B90000000000000000000011 /* SyncV2StoreTests.swift */,
+				B90000000000000000000014 /* SyncV2ClientTests.swift */,
+				B9000000000000000000001A /* SyncV2SnapshotPullTests.swift */,
+				B92000000000000000000002 /* ThreeWayMergeTests.swift */,
+				B90000000000000000000017 /* SyncSettingsModelTests.swift */,
+				G92000000000000000000001 /* Fixtures */,
 				B10000000000000000000018 /* DomainModelTests.swift */,
 				B10000000000000000000019 /* SaveStateMachineTests.swift */,
 				B10000000000000000000020 /* SwiftDataMetadataRepositoryTests.swift */,
@@ -396,10 +474,23 @@
 			path = WriterPadTests;
 			sourceTree = "<group>";
 		};
+		G92000000000000000000001 /* Fixtures */ = {
+			isa = PBXGroup;
+			children = (
+				B92000000000000000000003 /* three_way_merge_cases.json */,
+			);
+			path = Fixtures;
+			sourceTree = "<group>";
+		};
 		G10000000000000000000012 /* Configuration */ = {
 			isa = PBXGroup;
 			children = (
 				B1000000000000000000000D /* Local.xcconfig.example */,
+				B90000000000000000000004 /* Shared.xcconfig */,
+				B90000000000000000000005 /* Debug.xcconfig */,
+				B90000000000000000000006 /* Test.xcconfig */,
+				B90000000000000000000007 /* Release.xcconfig */,
+				B90000000000000000000008 /* Supabase.local.xcconfig.example */,
 				B1000000000000000000000E /* README.md */,
 			);
 			path = Configuration;
@@ -553,6 +644,7 @@
 			isa = PBXGroup;
 			children = (
 				B10000000000000000000049 /* AppearanceSettingsView.swift */,
+				B90000000000000000000016 /* SyncSettingsView.swift */,
 			);
 			path = Settings;
 			sourceTree = "<group>";
@@ -573,6 +665,9 @@
 			dependencies = (
 			);
 			name = WriterPad;
+			packageProductDependencies = (
+				E90000000000000000000002 /* Supabase */,
+			);
 			productName = WriterPad;
 			productReference = B1000000000000000000000B /* WriterPad.app */;
 			productType = "com.apple.product-type.application";
@@ -643,6 +738,9 @@
 			);
 			mainGroup = G10000000000000000000001;
 			productRefGroup = G10000000000000000000013 /* Products */;
+			packageReferences = (
+				E90000000000000000000001 /* XCRemoteSwiftPackageReference "supabase-swift" */,
+			);
 			projectDirPath = "";
 			projectRoot = "";
 			targets = (
@@ -662,6 +760,7 @@
 				A1000000000000000000004A /* malgun.ttf in Resources */,
 				A1000000000000000000004B /* malgunbd.ttf in Resources */,
 				A1000000000000000000004C /* malgunsl.ttf in Resources */,
+				A9000000000000000000000E /* SyncV2StoreSchemaV1.sql in Resources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -669,6 +768,7 @@
 			isa = PBXResourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
+				A92000000000000000000003 /* three_way_merge_cases.json in Resources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -756,6 +856,19 @@
 				A10000000000000000000026 /* RepositoryProjectWorkspaceLocator.swift in Sources */,
 				A1000000000000000000004E /* LocalProjectSearchService.swift in Sources */,
 				A10000000000000000000050 /* LocalManuscriptExporter.swift in Sources */,
+				A90000000000000000000001 /* SupabaseConfiguration.swift in Sources */,
+				A90000000000000000000002 /* SupabaseClientProvider.swift in Sources */,
+				A90000000000000000000005 /* KeychainSessionStore.swift in Sources */,
+				A90000000000000000000006 /* SupabaseAuthService.swift in Sources */,
+				A90000000000000000000008 /* DeviceIdentityService.swift in Sources */,
+				A9000000000000000000000A /* SupabaseProjectBindingService.swift in Sources */,
+				A9000000000000000000000C /* SyncV2Store.swift in Sources */,
+				A9000000000000000000000F /* SyncV2Client.swift in Sources */,
+				A90000000000000000000011 /* SyncV2Dispatcher.swift in Sources */,
+				A90000000000000000000015 /* SyncV2SnapshotPull.swift in Sources */,
+				A92000000000000000000001 /* ThreeWayMerge.swift in Sources */,
+				A90000000000000000000012 /* SyncSettingsView.swift in Sources */,
+				A90000000000000000000014 /* EditLeaseManager.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -781,6 +894,15 @@
 				A1000000000000000000004F /* ProjectSearchServiceTests.swift in Sources */,
 				A10000000000000000000051 /* LocalManuscriptExporterTests.swift in Sources */,
 				A1000000000000000000005E /* LocalPerformanceBaselineTests.swift in Sources */,
+				A90000000000000000000003 /* SupabaseConfigurationTests.swift in Sources */,
+				A90000000000000000000007 /* SupabaseAuthServiceTests.swift in Sources */,
+				A90000000000000000000009 /* DeviceIdentityServiceTests.swift in Sources */,
+				A9000000000000000000000B /* SupabaseProjectBindingServiceTests.swift in Sources */,
+				A9000000000000000000000D /* SyncV2StoreTests.swift in Sources */,
+				A90000000000000000000010 /* SyncV2ClientTests.swift in Sources */,
+				A90000000000000000000016 /* SyncV2SnapshotPullTests.swift in Sources */,
+				A92000000000000000000002 /* ThreeWayMergeTests.swift in Sources */,
+				A90000000000000000000013 /* SyncSettingsModelTests.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -848,6 +970,7 @@
 		};
 		L10000000000000000000003 /* Debug */ = {
 			isa = XCBuildConfiguration;
+			baseConfigurationReference = B90000000000000000000005 /* Debug.xcconfig */;
 			buildSettings = {
 				CODE_SIGN_STYLE = Automatic;
 				CURRENT_PROJECT_VERSION = 1;
@@ -878,6 +1001,7 @@
 		};
 		L10000000000000000000004 /* Release */ = {
 			isa = XCBuildConfiguration;
+			baseConfigurationReference = B90000000000000000000007 /* Release.xcconfig */;
 			buildSettings = {
 				CODE_SIGN_STYLE = Automatic;
 				CURRENT_PROJECT_VERSION = 1;
@@ -908,6 +1032,7 @@
 		};
 		L10000000000000000000005 /* Debug */ = {
 			isa = XCBuildConfiguration;
+			baseConfigurationReference = B90000000000000000000006 /* Test.xcconfig */;
 			buildSettings = {
 				BUNDLE_LOADER = "$(TEST_HOST)";
 				CODE_SIGN_STYLE = Automatic;
@@ -925,6 +1050,7 @@
 		};
 		L10000000000000000000006 /* Release */ = {
 			isa = XCBuildConfiguration;
+			baseConfigurationReference = B90000000000000000000006 /* Test.xcconfig */;
 			buildSettings = {
 				BUNDLE_LOADER = "$(TEST_HOST)";
 				CODE_SIGN_STYLE = Automatic;
@@ -942,6 +1068,7 @@
 		};
 		L10000000000000000000007 /* Debug */ = {
 			isa = XCBuildConfiguration;
+			baseConfigurationReference = B90000000000000000000006 /* Test.xcconfig */;
 			buildSettings = {
 				CODE_SIGN_STYLE = Automatic;
 				DEVELOPMENT_TEAM = LZZLHYSSC2;
@@ -958,6 +1085,7 @@
 		};
 		L10000000000000000000008 /* Release */ = {
 			isa = XCBuildConfiguration;
+			baseConfigurationReference = B90000000000000000000006 /* Test.xcconfig */;
 			buildSettings = {
 				CODE_SIGN_STYLE = Automatic;
 				DEVELOPMENT_TEAM = LZZLHYSSC2;
@@ -1012,6 +1140,25 @@
 			defaultConfigurationName = Release;
 		};
 /* End XCConfigurationList section */
+
+/* Begin XCRemoteSwiftPackageReference section */
+		E90000000000000000000001 /* XCRemoteSwiftPackageReference "supabase-swift" */ = {
+			isa = XCRemoteSwiftPackageReference;
+			repositoryURL = "https://github.com/supabase/supabase-swift.git";
+			requirement = {
+				kind = exactVersion;
+				version = 2.46.0;
+			};
+		};
+/* End XCRemoteSwiftPackageReference section */
+
+/* Begin XCSwiftPackageProductDependency section */
+		E90000000000000000000002 /* Supabase */ = {
+			isa = XCSwiftPackageProductDependency;
+			package = E90000000000000000000001 /* XCRemoteSwiftPackageReference "supabase-swift" */;
+			productName = Supabase;
+		};
+/* End XCSwiftPackageProductDependency section */
 	};
 	rootObject = D10000000000000000000001 /* Project object */;
 }

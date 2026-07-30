@@ -117,7 +117,7 @@ struct CompositionSessionTracker: Equatable, Sendable {
 
 /// WriterPad의 일반 텍스트 편집 표면이다. 저장과 스마트 입력 규칙은 이 타입에 넣지 않는다.
 @MainActor
-final class SmartTextView: UITextView {
+class SmartTextView: UITextView {
     private let placeholderLabel = UILabel()
     private var placeholderTopConstraint: NSLayoutConstraint?
     private var placeholderLeadingConstraint: NSLayoutConstraint?
@@ -908,6 +908,8 @@ struct iPadTextEditor: UIViewRepresentable {
 
     @MainActor
     final class Coordinator: NSObject, UITextViewDelegate, @preconcurrency NSTextStorageDelegate {
+        static let maximumSynchronousTypewriterUTF16Length = 500_000
+
         private struct TextRuleContext {
             let text: String
             let utf16Location: UInt
@@ -925,6 +927,8 @@ struct iPadTextEditor: UIViewRepresentable {
         private var isApplyingExternalState = false
         private var compositionTracker = CompositionSessionTracker()
         private var isForcingShortcutCommit = false
+        private static let maximumCompositionCommitAttempts = 4
+        private static let compositionCommitReloadInterval = 8
         private var responderResignationGeneration: UInt64 = 0
         private var typewriterPaddingGeneration: UInt64 = 0
         private var viewportRestorationGeneration: UInt64 = 0
@@ -1453,6 +1457,13 @@ struct iPadTextEditor: UIViewRepresentable {
                   parent.isActive,
                   !isUserScrolling
             else { return }
+            guard textView.textStorage.length <= Self.maximumSynchronousTypewriterUTF16Length else {
+                // 거대한 원고, 특히 줄바꿈 없는 단일 문단에서는 caretRect 계산이
+                // 문단 전체 레이아웃을 강제할 수 있다. UIKit의 기본 커서 가시성에
+                // 맡겨 입력을 우선하고 동기 타자기 스크롤은 생략한다.
+                lastTypewriterCaretMidY = nil
+                return
+            }
 
             UIView.performWithoutAnimation {
                 updateTypewriterScrollPadding(for: textView)
@@ -1562,18 +1573,91 @@ struct iPadTextEditor: UIViewRepresentable {
                       let textView,
                       request == self.lastCompositionCommitRequest
                 else { return }
-                if textView.markedTextRange != nil {
-                    textView.unmarkText()
+                self.attemptCompositionCommit(
+                    request: request,
+                    attempt: 1,
+                    in: textView
+                )
+            }
+        }
+
+        /// 실기기 한글 입력기는 빠른 연속 입력 직후 첫 `unmarkText()`를 간헐적으로
+        /// 반영하지 않는다. 조합이 실제로 끝났는지 확인하며 짧게 재시도하고, 그래도
+        /// 남으면 responder를 내려 UIKit 자체의 안전한 조합 확정 경로를 사용한다.
+        private func attemptCompositionCommit(
+            request: UInt64,
+            attempt: Int,
+            in textView: UITextView
+        ) {
+            guard request == lastCompositionCommitRequest else { return }
+            if textView.markedTextRange != nil {
+                textView.unmarkText()
+            }
+            DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(20)) {
+                [weak self, weak textView] in
+                guard let self,
+                      let textView,
+                      request == self.lastCompositionCommitRequest
+                else { return }
+                self.handleCompositionState(in: textView)
+                guard textView.markedTextRange != nil else {
+                    // UIKit의 완료 콜백과 SwiftUI Task 실행 순서가 뒤집히면 브리지는
+                    // 이미 false를 보고했다고 기억하지만 모델만 true로 남을 수 있다.
+                    // 명시적 전환 요청에는 현재 UIKit 상태를 반드시 다시 확인시킨다.
+                    self.reportCompositionState(false, force: true)
+                    return
                 }
-                // iPad 한글 입력기는 긴 입력 직후 `unmarkText()` 결과를 다음 메인
-                // 루프에서 반영할 수 있다. 확정 상태가 반영된 뒤 대기 전환을 깨운다.
-                DispatchQueue.main.async { [weak self, weak textView] in
-                    guard let self,
-                          let textView,
-                          request == self.lastCompositionCommitRequest
-                    else { return }
-                    self.handleCompositionState(in: textView)
+                guard attempt < Self.maximumCompositionCommitAttempts else {
+                    self.forceCompositionCommit(
+                        request: request,
+                        attempt: 1,
+                        in: textView
+                    )
+                    return
                 }
+                self.attemptCompositionCommit(
+                    request: request,
+                    attempt: attempt + 1,
+                    in: textView
+                )
+            }
+        }
+
+        private func forceCompositionCommit(
+            request: UInt64,
+            attempt: Int,
+            in textView: UITextView
+        ) {
+            guard request == lastCompositionCommitRequest else { return }
+            if textView.isFirstResponder {
+                _ = textView.resignFirstResponder()
+            }
+            textView.unmarkText()
+            // 드물게 입력기가 계속 marked range를 유지하더라도 메인 스레드를
+            // 빠른 타이머로 영구 점유하지 않도록, 초기 복구 뒤에는 저빈도로 확인한다.
+            let retryDelayMilliseconds = attempt < 40 ? 25 : 250
+            DispatchQueue.main.asyncAfter(
+                deadline: .now() + .milliseconds(retryDelayMilliseconds)
+            ) { [weak self, weak textView] in
+                guard let self,
+                      let textView,
+                      request == self.lastCompositionCommitRequest
+                else { return }
+                self.handleCompositionState(in: textView)
+                guard textView.markedTextRange != nil else {
+                    self.reportCompositionState(false, force: true)
+                    return
+                }
+                if attempt.isMultiple(
+                    of: Self.compositionCommitReloadInterval
+                ) {
+                    textView.reloadInputViews()
+                }
+                self.forceCompositionCommit(
+                    request: request,
+                    attempt: attempt + 1,
+                    in: textView
+                )
             }
         }
 
@@ -1684,8 +1768,11 @@ struct iPadTextEditor: UIViewRepresentable {
             }
         }
 
-        private func reportCompositionState(_ isComposing: Bool) {
-            guard isComposing != lastReportedCompositionState else { return }
+        private func reportCompositionState(
+            _ isComposing: Bool,
+            force: Bool = false
+        ) {
+            guard force || isComposing != lastReportedCompositionState else { return }
             lastReportedCompositionState = isComposing
             parent.onCompositionStateChange(isComposing)
         }

@@ -77,6 +77,83 @@ final class WriterPadShellUITests: XCTestCase {
         XCTAssertTrue(app.navigationBars["삭제 목록"].waitForExistence(timeout: 3))
     }
 
+    func testLibrarySettingsExposesServerLoginAndProjectSyncControls() throws {
+        let app = makeApp()
+        app.launch()
+
+        XCTAssertTrue(
+            element("writerpad.project-library", in: app)
+                .waitForExistence(timeout: 5)
+        )
+        let settings = app.buttons["writerpad.library-settings"]
+        XCTAssertTrue(settings.waitForExistence(timeout: 3))
+        settings.tap()
+
+        let syncSettings = app.buttons["writerpad.sync-settings"]
+        XCTAssertTrue(syncSettings.waitForExistence(timeout: 3))
+        syncSettings.tap()
+
+        XCTAssertTrue(
+            app.navigationBars["서버 동기화"].waitForExistence(timeout: 3)
+        )
+        XCTAssertTrue(
+            element("writerpad.sync-email", in: app).exists
+        )
+        XCTAssertTrue(
+            element("writerpad.sync-password", in: app).exists
+        )
+        XCTAssertTrue(
+            app.buttons["writerpad.sync-sign-in"].exists
+        )
+        XCTAssertTrue(
+            app.switches["writerpad.sync-all-projects"].exists
+        )
+    }
+
+    func testProjectEditModeRenamesProjectAndKeepsLibraryVisible() throws {
+        let app = makeApp()
+        app.launch()
+        let originalName = "UI 이름 변경 전 \(UUID().uuidString.prefix(6))"
+        let renamedName = "UI 이름 변경 후 \(UUID().uuidString.prefix(6))"
+
+        let createProject = app.buttons["새 작품"]
+        XCTAssertTrue(createProject.waitForExistence(timeout: 5))
+        createProject.tap()
+        var alert = app.alerts["새 작품"]
+        XCTAssertTrue(alert.waitForExistence(timeout: 3))
+        alert.textFields.firstMatch.typeText(originalName)
+        alert.buttons["만들기"].tap()
+
+        let projectSwitcher = app.buttons["writerpad.project-switcher"]
+        XCTAssertTrue(projectSwitcher.waitForExistence(timeout: 5))
+        projectSwitcher.tap()
+        XCTAssertTrue(
+            element("writerpad.project-library", in: app)
+                .waitForExistence(timeout: 3)
+        )
+        app.buttons["writerpad.project-edit"].tap()
+
+        let renameButton = app.buttons["‘\(originalName)’ 작품명 수정"]
+        XCTAssertTrue(renameButton.waitForExistence(timeout: 3))
+        renameButton.tap()
+        alert = app.alerts["작품 이름 변경"]
+        XCTAssertTrue(alert.waitForExistence(timeout: 3))
+        let field = alert.textFields.firstMatch
+        field.tap()
+        field.typeKey("a", modifierFlags: .command)
+        field.typeText(renamedName)
+        alert.buttons["변경"].tap()
+
+        XCTAssertTrue(
+            element("writerpad.project-library", in: app)
+                .waitForExistence(timeout: 5)
+        )
+        XCTAssertTrue(
+            app.staticTexts[renamedName].waitForExistence(timeout: 5)
+        )
+        XCTAssertFalse(app.staticTexts[originalName].exists)
+    }
+
     func testBinderReorderHandleAndRowBodyFolderMoveStaySeparated() throws {
         XCUIDevice.shared.orientation = .landscapeLeft
         defer { XCUIDevice.shared.orientation = .portrait }
@@ -892,13 +969,23 @@ final class WriterPadShellUITests: XCTestCase {
 
         let before = try scrollDiagnostic(from: editor.label)
         XCTAssertGreaterThan(before.maximumY, 100, editor.label)
-        editor.swipeUp(velocity: .slow)
-        let after = try scrollDiagnostic(from: editor.label)
-        XCTAssertGreaterThan(
-            after.offsetY,
-            before.offsetY + 20,
-            "문서 전환 후 실제 스와이프가 스크롤 위치를 바꾸지 못했습니다. before=\(before) after=\(after)"
-        )
+        if before.maximumY - before.offsetY > 20 {
+            editor.swipeUp(velocity: .slow)
+            let after = try scrollDiagnostic(from: editor.label)
+            XCTAssertGreaterThan(
+                after.offsetY,
+                before.offsetY + 20,
+                "문서 전환 후 위 스와이프가 스크롤 위치를 바꾸지 못했습니다. before=\(before) after=\(after)"
+            )
+        } else {
+            editor.swipeDown(velocity: .slow)
+            let after = try scrollDiagnostic(from: editor.label)
+            XCTAssertLessThan(
+                after.offsetY,
+                before.offsetY - 20,
+                "문서 전환 후 아래 스와이프가 스크롤 위치를 바꾸지 못했습니다. before=\(before) after=\(after)"
+            )
+        }
     }
 
     func testEmptyProjectSearchClosesWithoutBlockingWorkspace() throws {

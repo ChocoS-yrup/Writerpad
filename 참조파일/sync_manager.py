@@ -1,9 +1,10 @@
 import os
 import json
 import sys
+import unicodedata
 import uuid
 from types import SimpleNamespace
-from PyQt6.QtCore import QObject, QThread, pyqtSignal, QMutex, QMutexLocker
+from PyQt6.QtCore import QObject, QThread, pyqtSignal, QMutex, QMutexLocker, QTimer
 
 from datetime import datetime
 
@@ -14,11 +15,33 @@ from three_way_merge import three_way_merge
 
 TREE_ORDER_DOCUMENT_PATH = "__antigravity__/tree-order.json"
 TRASH_PURGE_DOCUMENT_PATH = "__antigravity__/trash-purge.json"
+LEASE_CONFLICT_RETRY_DELAYS_MS = (3000, 5000, 10000, 30000)
 
 
 def supabase_config_dir():
     """Return the directory that holds public Supabase client settings."""
     return getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__)))
+
+
+def load_or_create_device_id():
+    from runtime_profile import app_data_dir
+
+    data_dir = app_data_dir()
+    os.makedirs(data_dir, exist_ok=True)
+    device_id_path = os.path.join(data_dir, ".device_id")
+    device_id = ""
+    try:
+        with open(device_id_path, "r", encoding="utf-8") as device_file:
+            device_id = str(uuid.UUID(device_file.read().strip()))
+    except (FileNotFoundError, OSError, TypeError, ValueError):
+        device_id = str(uuid.uuid4())
+        temp_path = device_id_path + ".tmp"
+        with open(temp_path, "w", encoding="utf-8") as device_file:
+            device_file.write(device_id)
+            device_file.flush()
+            os.fsync(device_file.fileno())
+        os.replace(temp_path, device_id_path)
+    return device_id
 
 
 def is_internal_sync_path(relative_path):
@@ -330,30 +353,47 @@ class SyncManager(QObject):
         self._v2_wpm = None
         self._v2_device_id = None
         self._v2_worker = None
+        self._v2_workers = []
         self._v2_callbacks = {}
         self._v2_conflict_callbacks = {}
         self._v2_leases = {}
         self._v2_pull_worker = None
         self._v2_protected_paths_provider = None
         self._v2_active_paths_provider = None
+        self._v2_retry_timer = QTimer(self)
+        self._v2_retry_timer.setSingleShot(True)
+        self._v2_retry_timer.timeout.connect(self._run_scheduled_v2_retry)
+        self._v2_retry_context = None
+        self._v2_lease_retry_operation_id = None
+        self._v2_lease_retry_attempt = 0
         
         self.supabase = None
         self.init_supabase()
 
-    def configure_v2(self, wpm, project_name, device_id, store=None):
+    def configure_v2(
+        self,
+        wpm,
+        project_name,
+        device_id,
+        store=None,
+        project_id=None,
+        recover_local_changes=True,
+    ):
         """Attach the current Windows writing project to the durable v2 store."""
         from runtime_profile import forced_project_id
+        self._cancel_scheduled_v2_retry(reset_backoff=True)
         self._v2_store = store or self._v2_store or SyncV2Store()
         self._v2_wpm = wpm
         self._v2_device_id = str(device_id)
         local_key = self._v2_store.local_key_for(wpm.writing_root_path)
         project_was_configured = self._v2_store.get_project(local_key) is not None
+        selected_project_id = project_id or forced_project_id() or None
         self._v2_context = self._v2_store.configure_project(
-            wpm.writing_root_path, project_name, forced_project_id() or None
+            wpm.writing_root_path, project_name, selected_project_id
         )
-        deterministic_ids = bool(forced_project_id())
+        deterministic_ids = bool(forced_project_id() and not project_id)
         root = getattr(wpm, "writing_root_path", None)
-        if root and os.path.isdir(root):
+        if recover_local_changes and root and os.path.isdir(root):
             for current_root, dirs, files in os.walk(root):
                 relative_root = os.path.relpath(current_root, root).replace("\\", "/")
                 if relative_root != "." and not is_live_document_path(relative_root):
@@ -401,7 +441,8 @@ class SyncManager(QObject):
             self._v2_context["local_key"], TREE_ORDER_DOCUMENT_PATH
         )
         if (
-            project_was_configured
+            recover_local_changes
+            and project_was_configured
             and isinstance(tree_order, dict)
             and tree_order
             and tree_document is None
@@ -411,7 +452,8 @@ class SyncManager(QObject):
             "trash_purged_revisions"
         )
         if (
-            project_was_configured
+            recover_local_changes
+            and project_was_configured
             and isinstance(purge_state, dict)
             and purge_state
             and self._v2_store.get_document(
@@ -596,12 +638,52 @@ class SyncManager(QObject):
             persistent = self._v2_store.counts(self._v2_context["local_key"])["total"]
         return len(self._retry_queue) + persistent
 
+    def _current_project_server_state(self):
+        if not self.is_v2_enabled:
+            return "active"
+        return str(
+            self._v2_context.get("server_state") or "active"
+        )
+
+    def mark_project_server_state(self, project_id, state):
+        if state not in {"active", "trashed", "purged"}:
+            return False
+        if self._v2_store is not None:
+            setter = getattr(
+                self._v2_store, "set_project_server_state", None
+            )
+            if callable(setter):
+                setter(project_id, state)
+        if (
+            self._v2_context
+            and self._v2_context.get("project_id") == str(project_id)
+        ):
+            self._v2_context["server_state"] = state
+            if state in {"trashed", "purged"}:
+                # Project trash removes leases on the server. Do not issue
+                # release RPCs after access has already been revoked.
+                self._v2_leases.clear()
+                self._cancel_scheduled_v2_retry(reset_backoff=True)
+            self._publish_sync_state()
+        return True
+
     def _set_sync_state(self, state, detail=""):
         self.current_sync_state = state
         self.syncStateChanged.emit(state, detail, self.pending_retry_count)
 
     def _publish_sync_state(self):
-        if self._active_server_syncs > 0:
+        server_state = self._current_project_server_state()
+        if server_state == "trashed":
+            self._set_sync_state(
+                "project_trashed",
+                "서버 휴지통에 있는 작품입니다. 동기화를 중지하고 로컬 원고만 보존합니다.",
+            )
+        elif server_state == "purged":
+            self._set_sync_state(
+                "project_purged",
+                "서버에서 영구 삭제된 작품입니다. 기존 UUID의 동기화를 영구 중지합니다.",
+            )
+        elif self._active_server_syncs > 0:
             self._set_sync_state("syncing", "서버에 변경 내용을 올리는 중입니다.")
         elif self.is_v2_enabled and self._v2_store.counts(self._v2_context["local_key"])["conflict"]:
             count = self._v2_store.counts(self._v2_context["local_key"])["conflict"]
@@ -640,6 +722,85 @@ class SyncManager(QObject):
         )
         return any(marker in message for marker in markers)
 
+    @staticmethod
+    def _v2_follow_up_delay_ms(kind, error_message="", lease_attempt=1):
+        if kind in {"committed", "auto_merged", "conflict"}:
+            return 0
+        if kind == "retry" and "LEASE_CONFLICT" in (error_message or ""):
+            attempt_index = max(0, int(lease_attempt or 1) - 1)
+            return LEASE_CONFLICT_RETRY_DELAYS_MS[
+                min(attempt_index, len(LEASE_CONFLICT_RETRY_DELAYS_MS) - 1)
+            ]
+        return None
+
+    def _cancel_scheduled_v2_retry(self, reset_backoff=False):
+        self._v2_retry_timer.stop()
+        self._v2_retry_context = None
+        if reset_backoff:
+            self._v2_lease_retry_operation_id = None
+            self._v2_lease_retry_attempt = 0
+
+    def _next_lease_retry_attempt(self, operation_id):
+        operation_id = str(operation_id or "")
+        if operation_id != self._v2_lease_retry_operation_id:
+            self._v2_lease_retry_operation_id = operation_id
+            self._v2_lease_retry_attempt = 0
+        self._v2_lease_retry_attempt += 1
+        return self._v2_lease_retry_attempt
+
+    def _reset_lease_retry_backoff(self, operation_id=None):
+        if (
+            operation_id is not None
+            and str(operation_id) != self._v2_lease_retry_operation_id
+        ):
+            return
+        self._v2_lease_retry_operation_id = None
+        self._v2_lease_retry_attempt = 0
+
+    def _schedule_v2_retry(self, delay_ms):
+        context = self._v2_context or {}
+        local_key = context.get("local_key")
+        project_id = context.get("project_id")
+        if (
+            not local_key
+            or not project_id
+            or self._current_project_server_state() != "active"
+        ):
+            return False
+
+        retry_context = (str(local_key), str(project_id))
+        delay_ms = max(0, int(delay_ms))
+        if (
+            self._v2_retry_timer.isActive()
+            and self._v2_retry_context == retry_context
+        ):
+            remaining_ms = self._v2_retry_timer.remainingTime()
+            if 0 <= remaining_ms <= delay_ms:
+                return False
+
+        self._v2_retry_timer.stop()
+        self._v2_retry_context = retry_context
+        self._v2_retry_timer.start(delay_ms)
+        return True
+
+    def _run_scheduled_v2_retry(self):
+        expected_context = self._v2_retry_context
+        self._v2_retry_context = None
+        current_context = self._v2_context or {}
+        current_identity = (
+            str(current_context.get("local_key") or ""),
+            str(current_context.get("project_id") or ""),
+        )
+        if not expected_context or current_identity != expected_context:
+            return False
+        if (
+            self._current_project_server_state() != "active"
+            or is_forced_offline()
+            or not self.supabase
+        ):
+            return False
+        return self.retry_pending_syncs()
+
     def _queue_retry(self, key, payload, error_msg, offline=False):
         # 같은 파일은 가장 최신 내용 하나만 보관해 오래된 원고가 재전송되지 않게 한다.
         payload["_retry_error"] = error_msg or "서버 동기화에 실패했습니다."
@@ -651,6 +812,9 @@ class SyncManager(QObject):
     def retry_pending_syncs(self):
         """다른 서버 요청이 성공한 뒤 대기 중인 항목을 한 건씩 다시 전송한다."""
         if self.is_v2_enabled:
+            if self._current_project_server_state() != "active":
+                self._publish_sync_state()
+                return False
             if self._v2_worker is not None or self._active_server_syncs > 0:
                 return False
             operation = self._v2_store.next_ready_operation(self._v2_context["local_key"])
@@ -675,6 +839,70 @@ class SyncManager(QObject):
             self._publish_sync_state()
             return False
         return True
+
+    def flush_pending_syncs(self, timeout_ms=8000):
+        """Give durable Sync V2 operations a bounded chance to finish before exit."""
+        if not self.is_v2_enabled:
+            return True
+        server_state = str(
+            (getattr(self, "_v2_context", None) or {}).get(
+                "server_state", "active"
+            )
+        )
+        if server_state != "active":
+            return True
+        local_key = self._v2_context["local_key"]
+
+        def current_counts():
+            return self._v2_store.counts(local_key)
+
+        counts = current_counts()
+        if counts["conflict"]:
+            return False
+        if not counts["pending"] and not counts["inflight"]:
+            return True
+        if is_forced_offline() or not self.supabase:
+            return False
+
+        from PyQt6.QtCore import QEventLoop, QTimer
+
+        loop = QEventLoop()
+        poll_timer = QTimer()
+        poll_timer.setInterval(100)
+        timeout_timer = QTimer()
+        timeout_timer.setSingleShot(True)
+        completed = {"value": False}
+
+        def check_state():
+            counts_now = current_counts()
+            if counts_now["conflict"]:
+                loop.quit()
+                return
+            v2_worker_running = any(
+                worker.isRunning()
+                for worker in list(getattr(self, "_v2_workers", []))
+            )
+            if (
+                not counts_now["pending"]
+                and not counts_now["inflight"]
+                and not v2_worker_running
+            ):
+                completed["value"] = True
+                loop.quit()
+                return
+            if self._v2_worker is None and self._active_server_syncs == 0:
+                self.retry_pending_syncs()
+
+        poll_timer.timeout.connect(check_state)
+        timeout_timer.timeout.connect(loop.quit)
+        poll_timer.start()
+        timeout_timer.start(max(1, int(timeout_ms)))
+        check_state()
+        if not completed["value"]:
+            loop.exec()
+        poll_timer.stop()
+        timeout_timer.stop()
+        return completed["value"]
 
     def _complete_server_attempt(self, key, payload, success, error_msg, worker, is_retry):
         self._active_server_syncs = max(0, self._active_server_syncs - 1)
@@ -844,8 +1072,12 @@ class SyncManager(QObject):
     @staticmethod
     def _stable_error_code(error):
         message = str(error)
+        lowered = message.lower()
+        if "permission denied for function" in lowered:
+            return "SERVER_RPC_PERMISSION_DENIED"
         for code in (
             "AUTH_REQUIRED", "FORBIDDEN", "INVALID_ARGUMENT",
+            "PROJECT_TRASHED", "PROJECT_PURGED", "PROJECT_NOT_FOUND",
             "DOCUMENT_NOT_FOUND", "DOCUMENT_ALREADY_EXISTS",
             "REVISION_CONFLICT", "OPERATION_ID_REUSED", "LEASE_REQUIRED",
             "LEASE_CONFLICT", "LEASE_EXPIRED", "PATH_CONFLICT",
@@ -857,9 +1089,60 @@ class SyncManager(QObject):
     def _ensure_remote_project(self, client):
         response = client.rpc("ensure_project", {
             "p_project_id": self._v2_context["project_id"],
-            "p_name": self._v2_context["project_name"],
+            "p_name": (
+                self._v2_context.get("server_name")
+                or self._v2_context["project_name"]
+            ),
         }).execute()
         return self._response_data(response)
+
+    def _fetch_v2_project_status(self, require_connection=False):
+        if not self.is_v2_enabled or is_forced_offline() or not self.supabase:
+            if require_connection:
+                raise RuntimeError("NETWORK_UNAVAILABLE")
+            return self._current_project_server_state()
+        project_id = self._v2_context["project_id"]
+        try:
+            response = self.supabase.rpc(
+                "get_project_status",
+                {"p_project_id": project_id},
+            ).execute()
+            data = self._response_data(response) or {}
+        except Exception:
+            # Compatibility path for a server that has the project-trash
+            # migration but has not deployed get_project_status yet.
+            trashed_response = self.supabase.rpc(
+                "list_trashed_projects", {}
+            ).execute()
+            trashed_rows = getattr(trashed_response, "data", None)
+            if not isinstance(trashed_rows, list):
+                raise RuntimeError("INVALID_RESPONSE") from None
+            if any(
+                str(row.get("project_id") or "") == project_id
+                for row in trashed_rows if isinstance(row, dict)
+            ):
+                data = {"state": "trashed"}
+            else:
+                active_response = (
+                    self.supabase.table("projects")
+                    .select("project_id")
+                    .eq("project_id", project_id)
+                    .limit(1)
+                    .execute()
+                )
+                active_rows = getattr(active_response, "data", None)
+                if not isinstance(active_rows, list):
+                    raise RuntimeError("INVALID_RESPONSE") from None
+                data = {
+                    "state": "active" if active_rows else "purged"
+                }
+        state = str(data.get("state") or "")
+        if state not in {"active", "trashed", "purged"}:
+            raise RuntimeError("INVALID_RESPONSE")
+        self.mark_project_server_state(
+            self._v2_context["project_id"], state
+        )
+        return state
 
     def _acquire_v2_lease(self, document_id, client=None):
         client = client or self.supabase
@@ -949,9 +1232,21 @@ class SyncManager(QObject):
         if must_release:
             self._release_v2_lease(document_id)
 
-    def _fetch_v2_project_documents(self):
+    def _fetch_v2_project_documents(
+        self, require_connection=False, check_project_status=True
+    ):
         if not self.is_v2_enabled or is_forced_offline() or not self.supabase:
+            if require_connection:
+                raise RuntimeError("NETWORK_UNAVAILABLE")
             return []
+        if check_project_status:
+            state = self._fetch_v2_project_status(
+                require_connection=require_connection
+            )
+            if state == "trashed":
+                raise RuntimeError("PROJECT_TRASHED")
+            if state == "purged":
+                raise RuntimeError("PROJECT_PURGED")
         response = (
             self.supabase.table("documents")
             .select(
@@ -960,11 +1255,20 @@ class SyncManager(QObject):
             .eq("project_id", self._v2_context["project_id"])
             .execute()
         )
-        return getattr(response, "data", None) or []
+        data = getattr(response, "data", None)
+        if data is None:
+            if require_connection:
+                raise RuntimeError("INVALID_RESPONSE")
+            return []
+        if not isinstance(data, list):
+            raise RuntimeError("INVALID_RESPONSE")
+        return data
 
     @staticmethod
     def _safe_relative_path(path):
-        normalized = (path or "").replace("\\", "/").strip("/")
+        normalized = unicodedata.normalize(
+            "NFC", (path or "").replace("\\", "/").strip("/")
+        )
         parts = [part for part in normalized.split("/") if part]
         if not parts or any(part in {".", ".."} for part in parts):
             raise ValueError("INVALID_REMOTE_PATH")
@@ -1088,7 +1392,7 @@ class SyncManager(QObject):
             "is_deleted": False,
         }
 
-    def _apply_v2_remote_documents(self, remote_documents):
+    def _apply_v2_remote_documents(self, remote_documents, strict=False):
         if not self.is_v2_enabled or not self._v2_wpm:
             return []
         try:
@@ -1097,7 +1401,11 @@ class SyncManager(QObject):
             )
         except Exception:
             protected = set()
-        protected = {path.replace("\\", "/") for path in protected if path}
+        protected = {
+            unicodedata.normalize("NFC", path.replace("\\", "/"))
+            for path in protected
+            if path
+        }
         changes = []
         root = os.path.abspath(self._v2_wpm.writing_root_path)
 
@@ -1145,6 +1453,16 @@ class SyncManager(QObject):
                     continue
                 document = self._v2_store.get_document_by_id(document_id)
                 old_path = document.get("local_path") if document else None
+                canonical_old_path = (
+                    self._safe_relative_path(old_path) if old_path else None
+                )
+                repair_unicode_path = bool(
+                    document
+                    and not is_deleted
+                    and old_path != remote_path
+                    and canonical_old_path == remote_path
+                    and revision == int(document.get("revision") or 0)
+                )
                 purged_revision = self._normalized_trash_purges(
                     self._v2_wpm.project_settings.get(
                         "trash_purged_revisions", {}
@@ -1213,17 +1531,25 @@ class SyncManager(QObject):
                     and revision <= document["revision"]
                     and not repair_tombstone_location
                     and not repair_live_copy
+                    and not repair_unicode_path
                 ):
+                    if strict and revision <= 0:
+                        raise ValueError("INVALID_REMOTE_REVISION")
                     continue
                 if self._v2_store.has_active_operations(document_id):
+                    if strict:
+                        raise RuntimeError("REMOTE_DOCUMENT_HAS_LOCAL_OPERATIONS")
                     continue
                 if remote_path in protected or (old_path and old_path in protected):
+                    if strict:
+                        raise RuntimeError("REMOTE_DOCUMENT_PATH_IS_PROTECTED")
                     continue
 
                 local_path = old_path or remote_path
                 renamed_from = None
                 renamed_to = None
                 created_tombstone_path = None
+                duplicate_unicode_path = None
 
                 if is_deleted:
                     if repair_tombstone_location:
@@ -1256,6 +1582,8 @@ class SyncManager(QObject):
                             )
                             created_tombstone_path = local_path
                         elif not self._v2_wpm.write_text_file(local_path, content):
+                            if strict:
+                                raise OSError("REMOTE_DOCUMENT_WRITE_FAILED")
                             continue
                     else:
                         local_path = self._v2_wpm.materialize_remote_tombstone(
@@ -1265,6 +1593,8 @@ class SyncManager(QObject):
                     if not self._v2_wpm.write_text_file(local_path, content):
                         if created_tombstone_path:
                             self._v2_wpm.delete_from_trash(created_tombstone_path)
+                        if strict:
+                            raise OSError("REMOTE_DOCUMENT_WRITE_FAILED")
                         continue
                 else:
                     local_path = remote_path
@@ -1272,16 +1602,52 @@ class SyncManager(QObject):
                     new_full = full_path(local_path)
                     if old_path and old_path != local_path and old_full and os.path.exists(old_full):
                         if os.path.exists(new_full):
+                            if not repair_unicode_path:
+                                if strict:
+                                    raise FileExistsError("REMOTE_PATH_CONFLICT")
+                                continue
+                            try:
+                                with open(old_full, "r", encoding="utf-8") as source:
+                                    old_content = source.read()
+                                with open(new_full, "r", encoding="utf-8") as source:
+                                    new_content = source.read()
+                            except OSError:
+                                if strict:
+                                    raise
+                                continue
+                            if old_content != content or new_content != content:
+                                if strict:
+                                    raise FileExistsError("REMOTE_PATH_CONFLICT")
+                                continue
+                            duplicate_unicode_path = old_path
+                        else:
+                            os.makedirs(os.path.dirname(new_full), exist_ok=True)
+                            os.rename(old_full, new_full)
+                            renamed_from, renamed_to = old_path, local_path
+                    elif repair_unicode_path and os.path.exists(new_full):
+                        try:
+                            with open(new_full, "r", encoding="utf-8") as source:
+                                new_content = source.read()
+                        except OSError:
+                            if strict:
+                                raise
                             continue
-                        os.makedirs(os.path.dirname(new_full), exist_ok=True)
-                        os.rename(old_full, new_full)
-                        renamed_from, renamed_to = old_path, local_path
+                        if new_content != content:
+                            if strict:
+                                raise FileExistsError("REMOTE_PATH_CONFLICT")
+                            continue
                     elif not old_path and os.path.exists(new_full):
                         try:
                             with open(new_full, "r", encoding="utf-8") as source:
                                 if source.read() != content:
+                                    if strict:
+                                        raise FileExistsError(
+                                            "REMOTE_PATH_CONFLICT"
+                                        )
                                     continue
                         except OSError:
+                            if strict:
+                                raise
                             continue
 
                     if not self._v2_wpm.write_text_file(local_path, content):
@@ -1290,9 +1656,15 @@ class SyncManager(QObject):
                                 os.rename(full_path(renamed_to), full_path(renamed_from))
                             except OSError:
                                 pass
+                        if strict:
+                            raise OSError("REMOTE_DOCUMENT_WRITE_FAILED")
                         continue
 
-                if repair_live_copy:
+                if repair_unicode_path:
+                    applied = self._v2_store.repair_clean_document_path(
+                        document_id, local_path, remote_path
+                    )
+                elif repair_live_copy:
                     applied = {
                         "applied": True,
                         "reason": "restored_missing_local_copy",
@@ -1325,7 +1697,21 @@ class SyncManager(QObject):
                             os.rename(full_path(renamed_to), full_path(renamed_from))
                         except OSError:
                             pass
+                    if strict:
+                        raise RuntimeError(
+                            "REMOTE_SNAPSHOT_APPLY_FAILED:"
+                            + str(applied.get("reason") or "unknown")
+                        )
                     continue
+                if duplicate_unicode_path:
+                    try:
+                        os.remove(full_path(duplicate_unicode_path))
+                    except OSError:
+                        pass
+                if repair_unicode_path:
+                    self._prune_empty_unicode_path_parents(
+                        root, full_path(old_path)
+                    )
                 if is_deleted:
                     self._v2_wpm.update_trash_metadata(
                         local_path, deleted_at, document_id
@@ -1340,8 +1726,24 @@ class SyncManager(QObject):
                     "is_deleted": is_deleted,
                 })
             except Exception as error:
+                if strict:
+                    raise
                 print(f"Failed to apply remote v2 document: {error}")
         return changes
+
+    @staticmethod
+    def _prune_empty_unicode_path_parents(root, old_file_path):
+        """Remove only empty legacy NFD directories left by a path repair."""
+        root = os.path.abspath(root)
+        current = os.path.dirname(os.path.abspath(old_file_path))
+        while current != root:
+            try:
+                if os.path.commonpath([root, current]) != root:
+                    break
+                os.rmdir(current)
+            except OSError:
+                break
+            current = os.path.dirname(current)
 
     def pull_remote_changes_async(self):
         if not self.is_v2_enabled or is_forced_offline() or not self.supabase:
@@ -1362,6 +1764,15 @@ class SyncManager(QObject):
                 if changes:
                     self.remoteDocumentsApplied.emit(changes)
             else:
+                code = self._stable_error_code(payload)
+                if code == "PROJECT_TRASHED":
+                    self.mark_project_server_state(
+                        self._v2_context["project_id"], "trashed"
+                    )
+                elif code in {"PROJECT_PURGED", "PROJECT_NOT_FOUND"}:
+                    self.mark_project_server_state(
+                        self._v2_context["project_id"], "purged"
+                    )
                 print(f"Failed to pull v2 documents: {payload}")
 
         def handle_finished():
@@ -1411,6 +1822,21 @@ class SyncManager(QObject):
             return {"kind": "committed", "result": result, "operation": operation}
         except Exception as error:
             code = self._stable_error_code(error)
+            if code in {
+                "PROJECT_TRASHED", "PROJECT_PURGED", "PROJECT_NOT_FOUND"
+            }:
+                state = (
+                    "trashed" if code == "PROJECT_TRASHED" else "purged"
+                )
+                self.mark_project_server_state(
+                    operation["project_id"], state
+                )
+                self._v2_store.mark_retry(operation_id, code)
+                return {
+                    "kind": "project_disabled",
+                    "error": code,
+                    "operation": operation,
+                }
             if code in {"REVISION_CONFLICT", "DOCUMENT_ALREADY_EXISTS"}:
                 remote = self._fetch_remote_document(operation["document_id"], client)
                 if not remote:
@@ -1542,9 +1968,14 @@ class SyncManager(QObject):
             return {"kind": "retry", "error": message, "operation": operation}
 
     def _launch_v2_operation(self, operation):
+        # A manual retry or another successful operation may start before a
+        # scheduled lease retry fires. Cancel that reservation so only one
+        # retry chain can exist at a time.
+        self._cancel_scheduled_v2_retry(reset_backoff=False)
         self._v2_store.mark_attempt(operation["operation_id"])
         worker = V2QueueWorker(self, operation["operation_id"])
         self._v2_worker = worker
+        self._v2_workers.append(worker)
         self._active_server_syncs += 1
         self._publish_sync_state()
 
@@ -1580,6 +2011,15 @@ class SyncManager(QObject):
                     conflict_callback(payload)
                 if callback:
                     callback(False, "REVISION_CONFLICT", original["local_path"], None)
+            elif kind == "project_disabled":
+                self._last_sync_error = payload.get("error", "")
+                if callback:
+                    callback(
+                        False,
+                        self._last_sync_error,
+                        original["local_path"],
+                        None,
+                    )
             else:
                 self._last_sync_error = error_message or payload.get("error", "")
                 self._last_failure_offline = self._is_connectivity_error(self._last_sync_error)
@@ -1589,14 +2029,30 @@ class SyncManager(QObject):
 
             self._finalize_v2_operation_lease(kind, original)
             self._publish_sync_state()
-            if kind in {"committed", "auto_merged", "conflict"}:
-                from PyQt6.QtCore import QTimer
-                QTimer.singleShot(0, self.retry_pending_syncs)
+            operation_id = original.get("operation_id") or operation["operation_id"]
+            if kind == "retry" and "LEASE_CONFLICT" in self._last_sync_error:
+                lease_attempt = self._next_lease_retry_attempt(operation_id)
+            else:
+                self._reset_lease_retry_backoff(operation_id)
+                lease_attempt = 1
+            follow_up_delay = self._v2_follow_up_delay_ms(
+                kind,
+                self._last_sync_error,
+                lease_attempt,
+            )
+            if follow_up_delay is not None:
+                self._schedule_v2_retry(follow_up_delay)
 
         # resultReady can arrive just before QThread.run() returns. Keep the worker
         # alive until QThread's native finished signal confirms the thread stopped.
         worker.resultReady.connect(handle_finished)
-        worker.finished.connect(worker.deleteLater)
+
+        def cleanup_worker():
+            if worker in self._v2_workers:
+                self._v2_workers.remove(worker)
+            worker.deleteLater()
+
+        worker.finished.connect(cleanup_worker)
         self._start_worker(worker)
         return worker
 
@@ -1607,6 +2063,12 @@ class SyncManager(QObject):
         Returns: (success(bool), message(str))
         """
         if self.is_v2_enabled:
+            server_state = self._current_project_server_state()
+            if server_state in {"trashed", "purged"}:
+                return (
+                    True,
+                    "서버 동기화가 중지된 작품입니다. 변경 내용은 로컬에만 저장됩니다.",
+                )
             if not is_live_document_path(relative_path):
                 return False, "휴지통 문서는 읽기 전용입니다. 복원한 뒤 편집해주세요."
             if not self.can_save_path(relative_path):
@@ -1628,6 +2090,12 @@ class SyncManager(QObject):
                 code = self._stable_error_code(error)
                 if code == "LEASE_CONFLICT":
                     return False, "다른 기기에서 이미 편집 중인 문서입니다."
+                if code == "SERVER_RPC_PERMISSION_DENIED":
+                    return (
+                        False,
+                        "서버 동기화 권한 설정이 완료되지 않았습니다. "
+                        "Supabase V2 RPC 권한을 적용한 뒤 문서를 다시 열어주세요.",
+                    )
                 if self._is_connectivity_error(str(error)):
                     return True, "오프라인 상태로 편집합니다. 저장 내용은 재시도 큐에 보관됩니다."
                 return False, code or str(error)
@@ -2221,7 +2689,8 @@ class SyncManager(QObject):
             getattr(self, '_autosave_workers', []),
             getattr(self, '_retention_workers', []),
             getattr(self, '_rename_workers', []),
-            getattr(self, '_lock_workers', [])
+            getattr(self, '_lock_workers', []),
+            getattr(self, '_v2_workers', []),
         ]
         for worker_list in lists:
             for worker in list(worker_list):

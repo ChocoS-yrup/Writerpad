@@ -83,6 +83,38 @@ final class AppEnvironmentTests: XCTestCase {
     }
 
     @MainActor
+    func testProjectListModelWaitsForBindingBeforeOpeningNewWorkspace()
+        async throws {
+        let previous = GlobalSyncPreference.isEnabled()
+        GlobalSyncPreference.setEnabled(true)
+        defer { GlobalSyncPreference.setEnabled(previous) }
+        let environment = try AppEnvironment.testing()
+        let binding = DelayedNewProjectBindingService()
+        let model = ProjectListModel(
+            projectManager: environment.projectManager,
+            projectImporter: environment.projectImporter,
+            authenticationService: AlwaysAuthenticatedService(),
+            projectBindingService: binding
+        )
+        await model.load(opensLastProject: false)
+
+        let creation = Task { @MainActor in
+            await model.create(named: "binding 대기 작품")
+        }
+        await binding.waitUntilCreateStarts()
+
+        XCTAssertNil(
+            model.selectedProjectID,
+            "서버 binding 중에는 작업 화면을 먼저 열면 안 됩니다."
+        )
+        await binding.releaseCreate()
+        await creation.value
+
+        XCTAssertNotNil(model.selectedProjectID)
+        XCTAssertEqual(model.selectedProject?.name, "binding 대기 작품")
+    }
+
+    @MainActor
     func testProjectListModelMovesToDeletedListThenPermanentlyDeletes() async throws {
         let environment = try AppEnvironment.testing()
         let doomed = try await environment.projectManager.createProject(named: "삭제할 작품")
@@ -123,6 +155,45 @@ final class AppEnvironmentTests: XCTestCase {
         XCTAssertTrue(model.deletedProjects.isEmpty)
         XCTAssertNil(model.selectedProjectID)
         XCTAssertNil(deletedMetadata)
+    }
+
+    @MainActor
+    func testProjectListRenameStaysInLibraryAndPreservesNameOnCollision()
+        async throws {
+        let environment = try AppEnvironment.testing()
+        let first = try await environment.projectManager.createProject(
+            named: "이름 변경 전"
+        )
+        let second = try await environment.projectManager.createProject(
+            named: "이미 있는 작품"
+        )
+        let model = ProjectListModel(
+            projectManager: environment.projectManager,
+            projectImporter: environment.projectImporter
+        )
+        await model.load(opensLastProject: false)
+        let firstRow = try XCTUnwrap(
+            model.libraryProjects.first { $0.id == first.id }
+        )
+
+        await model.rename(firstRow, to: "이름 변경 후")
+
+        XCTAssertNil(model.selectedProjectID)
+        XCTAssertEqual(
+            model.libraryProjects.first { $0.id == first.id }?.name,
+            "이름 변경 후"
+        )
+        let renamedRow = try XCTUnwrap(
+            model.libraryProjects.first { $0.id == first.id }
+        )
+        await model.rename(renamedRow, to: second.name)
+
+        XCTAssertNil(model.selectedProjectID)
+        XCTAssertNotNil(model.errorMessage)
+        XCTAssertEqual(
+            model.libraryProjects.first { $0.id == first.id }?.name,
+            "이름 변경 후"
+        )
     }
 
     @MainActor
@@ -461,6 +532,184 @@ final class AppEnvironmentTests: XCTestCase {
         XCTAssertNil(textView.markedTextRange)
         XCTAssertTrue(textView.text.hasSuffix("네목"))
         XCTAssertEqual(compositionStates.last, false)
+    }
+
+    @MainActor
+    func testCompositionCommitRequestRetriesWhenKoreanIMEIgnoresInitialCommits() async {
+        final class DelayedCompositionCommitTextView: SmartTextView {
+            var ignoredCommitCount = 1
+            private(set) var commitAttemptCount = 0
+
+            override func unmarkText() {
+                commitAttemptCount += 1
+                guard ignoredCommitCount == 0 else {
+                    ignoredCommitCount -= 1
+                    return
+                }
+                super.unmarkText()
+            }
+        }
+
+        let documentID = DocumentID(rawValue: UUID())
+        var text = "전환 직전 입력 "
+        var selection = TextCursorState(
+            location: UInt(text.utf16.count),
+            selectionLength: 0
+        )
+        var compositionStates: [Bool] = []
+
+        func editor(commitRequest: UInt64) -> iPadTextEditor {
+            iPadTextEditor(
+                text: Binding(get: { text }, set: { text = $0 }),
+                documentID: documentID,
+                externalVersion: 0,
+                selection: Binding(get: { selection }, set: { selection = $0 }),
+                focusRequest: 0,
+                compositionCommitRequest: commitRequest,
+                onCompositionStateChange: { compositionStates.append($0) }
+            )
+        }
+
+        let coordinator = editor(commitRequest: 0).makeCoordinator()
+        let textView = DelayedCompositionCommitTextView()
+        textView.delegate = coordinator
+        coordinator.applyExternalState(to: textView)
+        textView.setMarkedText("한글", selectedRange: NSRange(location: 2, length: 0))
+        coordinator.textViewDidChange(textView)
+        XCTAssertNotNil(textView.markedTextRange)
+        XCTAssertEqual(compositionStates.last, true)
+
+        coordinator.parent = editor(commitRequest: 1)
+        coordinator.applyExternalState(to: textView)
+        let committed = expectation(description: "무시된 한글 조합 확정 재시도")
+        DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(150)) {
+            committed.fulfill()
+        }
+        await fulfillment(of: [committed], timeout: 1)
+
+        XCTAssertGreaterThanOrEqual(textView.commitAttemptCount, 2)
+        XCTAssertNil(textView.markedTextRange)
+        XCTAssertTrue(textView.text.hasSuffix("한글"))
+        XCTAssertEqual(compositionStates.last, false)
+    }
+
+    @MainActor
+    func testCompositionCommitRequestRetriesPersistentlyDelayedMarkedText()
+        async {
+        final class DelayedCompositionTextView: SmartTextView {
+            private(set) var commitAttemptCount = 0
+            var ignoredCommitCount = 12
+
+            override func unmarkText() {
+                commitAttemptCount += 1
+                guard ignoredCommitCount == 0 else {
+                    ignoredCommitCount -= 1
+                    return
+                }
+                super.unmarkText()
+            }
+        }
+
+        let documentID = DocumentID(rawValue: UUID())
+        var text = "전환 직전 "
+        var selection = TextCursorState(
+            location: UInt(text.utf16.count),
+            selectionLength: 0
+        )
+        var compositionStates: [Bool] = []
+
+        func editor(commitRequest: UInt64) -> iPadTextEditor {
+            iPadTextEditor(
+                text: Binding(get: { text }, set: { text = $0 }),
+                documentID: documentID,
+                externalVersion: 0,
+                selection: Binding(
+                    get: { selection },
+                    set: { selection = $0 }
+                ),
+                focusRequest: 0,
+                compositionCommitRequest: commitRequest,
+                onCompositionStateChange: {
+                    compositionStates.append($0)
+                }
+            )
+        }
+
+        let coordinator = editor(commitRequest: 0).makeCoordinator()
+        let textView = DelayedCompositionTextView()
+        textView.delegate = coordinator
+        coordinator.applyExternalState(to: textView)
+        textView.setMarkedText(
+            "한글",
+            selectedRange: NSRange(location: 2, length: 0)
+        )
+        coordinator.textViewDidChange(textView)
+        XCTAssertNotNil(textView.markedTextRange)
+
+        coordinator.parent = editor(commitRequest: 1)
+        coordinator.applyExternalState(to: textView)
+        let committed = expectation(
+            description: "오래 지연된 marked text 안전 해제"
+        )
+        DispatchQueue.main.asyncAfter(
+            deadline: .now() + .milliseconds(500)
+        ) {
+            committed.fulfill()
+        }
+        await fulfillment(of: [committed], timeout: 1)
+
+        XCTAssertGreaterThanOrEqual(textView.commitAttemptCount, 13)
+        XCTAssertNil(textView.markedTextRange)
+        XCTAssertTrue(textView.text.hasSuffix("한글"))
+        XCTAssertEqual(text, textView.text)
+        XCTAssertEqual(compositionStates.last, false)
+    }
+
+    @MainActor
+    func testExplicitCompositionCommitReacknowledgesAlreadyUnmarkedIMEState() async {
+        let documentID = DocumentID(rawValue: UUID())
+        var text = "조합 완료 신호 순서"
+        var selection = TextCursorState(
+            location: UInt(text.utf16.count),
+            selectionLength: 0
+        )
+        var compositionStates: [Bool] = []
+
+        func editor(commitRequest: UInt64) -> iPadTextEditor {
+            iPadTextEditor(
+                text: Binding(get: { text }, set: { text = $0 }),
+                documentID: documentID,
+                externalVersion: 0,
+                selection: Binding(get: { selection }, set: { selection = $0 }),
+                focusRequest: 0,
+                compositionCommitRequest: commitRequest,
+                onCompositionStateChange: { compositionStates.append($0) }
+            )
+        }
+
+        let coordinator = editor(commitRequest: 0).makeCoordinator()
+        let textView = SmartTextView()
+        textView.delegate = coordinator
+        coordinator.applyExternalState(to: textView)
+        textView.setMarkedText("확정", selectedRange: NSRange(location: 2, length: 0))
+        coordinator.textViewDidChange(textView)
+        textView.unmarkText()
+        coordinator.textViewDidChangeSelection(textView)
+        XCTAssertEqual(compositionStates, [true, false])
+
+        // false 완료 Task보다 앞선 true Task가 나중에 모델을 덮었다고 가정한다.
+        // 브리지는 이미 false라고 기억하더라도 명시적 커밋에는 다시 응답해야 한다.
+        compositionStates.removeAll()
+        coordinator.parent = editor(commitRequest: 1)
+        coordinator.applyExternalState(to: textView)
+        let acknowledged = expectation(description: "현재 조합 완료 상태 재확인")
+        DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(60)) {
+            acknowledged.fulfill()
+        }
+        await fulfillment(of: [acknowledged], timeout: 1)
+
+        XCTAssertEqual(compositionStates, [false])
+        XCTAssertNil(textView.markedTextRange)
     }
 
     @MainActor
@@ -1251,6 +1500,52 @@ final class AppEnvironmentTests: XCTestCase {
 
         XCTAssertEqual(coordinator.typewriterSynchronousLayoutCount, previousCount + 1)
         XCTAssertEqual(textView.text, text)
+    }
+
+    @MainActor
+    func testLargeManuscriptTypingSkipsSynchronousTypewriterLayout() {
+        let textView = SmartTextView()
+        textView.text = String(
+            repeating: "가",
+            count: iPadTextEditor.Coordinator.maximumSynchronousTypewriterUTF16Length + 1
+        )
+        let editor = iPadTextEditor(
+            text: .constant(""),
+            documentID: DocumentID(rawValue: UUID()),
+            externalVersion: 1,
+            selection: .constant(.start),
+            focusRequest: 0,
+            appearance: EditorAppearanceSettings(
+                fontFamily: .system,
+                fontSize: 18,
+                lineSpacing: 6,
+                horizontalInset: 20,
+                verticalInset: 18,
+                typewriterScrolling: true
+            )
+        )
+        let coordinator = editor.makeCoordinator()
+        let previousCount = coordinator.typewriterSynchronousLayoutCount
+
+        coordinator.textViewDidChange(textView)
+
+        XCTAssertEqual(coordinator.typewriterSynchronousLayoutCount, previousCount)
+    }
+
+    func testLargeBackupPreviewBoundsRenderedTextAndDisablesDetailedDiff() {
+        let source = String(
+            repeating: "가",
+            count: BackupPreviewContent.maximumDiffUTF16Length + 1
+        )
+
+        let preview = BackupPreviewContent(backup: source)
+
+        XCTAssertFalse(preview.allowsDetailedDiff)
+        XCTAssertLessThan(
+            (preview.preview as NSString).length,
+            BackupPreviewContent.maximumPreviewUTF16Length + 32
+        )
+        XCTAssertTrue(preview.preview.hasSuffix("… (일부 미리보기)"))
     }
 
     @MainActor
@@ -2826,6 +3121,236 @@ final class AppEnvironmentTests: XCTestCase {
     }
 
     @MainActor
+    func testEditorSessionDefersDurableHandoffUntilIMECompositionEnds()
+        async throws {
+        let environment = try AppEnvironment.testing()
+        let project = try await environment.projectManager.createProject(
+            named: "IME queue 경계"
+        )
+        _ = try await environment.binderRepository.rootNodes(in: project.id)
+        let volume = try await environment.binderCommands.addNewVolume(
+            projectID: project.id
+        )
+        let loadedDocument = try await environment.documentRepository.document(
+            id: volume.documentToOpenID
+        )
+        let document = try XCTUnwrap(loadedDocument)
+        let operationID = UUID()
+        let store = ScriptedSyncHandoffDocumentStore(
+            underlying: environment.localDocumentStore,
+            saveResult: .queued(operationIDs: [operationID])
+        )
+        let model = EditorSessionModel(
+            documentRepository: environment.documentRepository,
+            documentStore: store,
+            workspaceStateRepository: environment.workspaceStateRepository,
+            autosaveDelay: .seconds(60)
+        )
+        let node = BinderNode(
+            id: document.id,
+            projectID: document.projectID,
+            kind: .text,
+            relativePath: document.relativePath,
+            displayName: "001화",
+            fixedCategory: nil,
+            userOrder: document.userOrder,
+            contentState: .empty,
+            isExpanded: false
+        )
+        await model.select(node)
+        await model.updateCompositionState(true)
+        model.updateText("조합 중간 본문")
+
+        let deferred = await model.saveNow()
+
+        XCTAssertTrue(deferred)
+        let saveCountDuringComposition = await store.saveCount()
+        XCTAssertEqual(saveCountDuringComposition, 0)
+        await model.updateCompositionState(false)
+        let saveCountAfterComposition = await store.saveCount()
+        XCTAssertEqual(saveCountAfterComposition, 1)
+        guard case let .queued(_, operationIDs) = model.syncHandoffState else {
+            return XCTFail("조합 확정 뒤 queue 기록 상태여야 합니다.")
+        }
+        XCTAssertEqual(operationIDs, [operationID])
+    }
+
+    @MainActor
+    func testEditorSessionKeepsLocalSuccessOnQueueFailureAndRetries()
+        async throws {
+        let environment = try AppEnvironment.testing()
+        let project = try await environment.projectManager.createProject(
+            named: "queue 실패 분리"
+        )
+        _ = try await environment.binderRepository.rootNodes(in: project.id)
+        let volume = try await environment.binderCommands.addNewVolume(
+            projectID: project.id
+        )
+        let loadedDocument = try await environment.documentRepository.document(
+            id: volume.documentToOpenID
+        )
+        let document = try XCTUnwrap(loadedDocument)
+        let operationID = UUID()
+        let store = ScriptedSyncHandoffDocumentStore(
+            underlying: environment.localDocumentStore,
+            saveResult: .localSavedButNotQueued(reason: "injected"),
+            retryResults: [.queued(operationIDs: [operationID])]
+        )
+        let model = EditorSessionModel(
+            documentRepository: environment.documentRepository,
+            documentStore: store,
+            workspaceStateRepository: environment.workspaceStateRepository,
+            autosaveDelay: .seconds(60)
+        )
+        let node = BinderNode(
+            id: document.id,
+            projectID: document.projectID,
+            kind: .text,
+            relativePath: document.relativePath,
+            displayName: "001화",
+            fixedCategory: nil,
+            userOrder: document.userOrder,
+            contentState: .empty,
+            isExpanded: false
+        )
+        await model.select(node)
+        model.updateText("queue 실패와 무관하게 보존될 원고🙂")
+
+        let savedLocally = await model.saveNow()
+
+        XCTAssertTrue(savedLocally)
+        guard case .saved = model.saveState else {
+            return XCTFail("로컬 저장은 성공 상태여야 합니다.")
+        }
+        guard case .failed = model.syncHandoffState else {
+            return XCTFail("queue 기록 실패는 별도 상태여야 합니다.")
+        }
+        let diskText = try await environment.localDocumentStore.loadText(
+            for: document
+        )
+        XCTAssertEqual(diskText, "queue 실패와 무관하게 보존될 원고🙂")
+
+        let retried = await model.saveNow()
+
+        XCTAssertTrue(retried)
+        let retryCount = await store.retryCount()
+        XCTAssertEqual(retryCount, 1)
+        guard case let .queued(_, operationIDs) = model.syncHandoffState else {
+            return XCTFail("동일 원고의 queue 재기록이 성공해야 합니다.")
+        }
+        XCTAssertEqual(operationIDs, [operationID])
+    }
+
+    @MainActor
+    func testEditorSessionKeepsOversizedServerResultSeparateFromLocalSave()
+        async throws {
+        let environment = try AppEnvironment.testing()
+        let project = try await environment.projectManager.createProject(
+            named: "서버 크기 제한"
+        )
+        _ = try await environment.binderRepository.rootNodes(in: project.id)
+        let volume = try await environment.binderCommands.addNewVolume(
+            projectID: project.id
+        )
+        let loadedDocument = try await environment.documentRepository.document(
+            id: volume.documentToOpenID
+        )
+        let document = try XCTUnwrap(loadedDocument)
+        let store = ScriptedSyncHandoffDocumentStore(
+            underlying: environment.localDocumentStore,
+            saveResult: .serverSizeLimitExceeded(
+                byteCount: 10_485_761,
+                limit: 10_485_760
+            )
+        )
+        let model = EditorSessionModel(
+            documentRepository: environment.documentRepository,
+            documentStore: store,
+            workspaceStateRepository: environment.workspaceStateRepository,
+            autosaveDelay: .seconds(60)
+        )
+        await model.select(
+            BinderNode(
+                id: document.id,
+                projectID: document.projectID,
+                kind: .text,
+                relativePath: document.relativePath,
+                displayName: "001화",
+                fixedCategory: nil,
+                userOrder: document.userOrder,
+                contentState: .empty,
+                isExpanded: false
+            )
+        )
+        model.updateText("로컬에는 저장되는 본문")
+
+        let saved = await model.saveNow()
+        XCTAssertTrue(saved)
+        guard case .saved = model.saveState else {
+            return XCTFail("서버 제한은 로컬 저장 실패가 아니어야 합니다.")
+        }
+        guard case let .serverSizeLimitExceeded(
+            generation,
+            byteCount,
+            limit
+        ) = model.syncHandoffState else {
+            return XCTFail("서버 크기 제한 상태여야 합니다.")
+        }
+        XCTAssertGreaterThan(generation, 0)
+        XCTAssertEqual(byteCount, 10_485_761)
+        XCTAssertEqual(limit, 10_485_760)
+    }
+
+    @MainActor
+    func testEditorSessionReplaysPendingHandoffWhenDocumentOpens()
+        async throws {
+        let environment = try AppEnvironment.testing()
+        let project = try await environment.projectManager.createProject(
+            named: "재실행 handoff"
+        )
+        _ = try await environment.binderRepository.rootNodes(in: project.id)
+        let volume = try await environment.binderCommands.addNewVolume(
+            projectID: project.id
+        )
+        let loadedDocument = try await environment.documentRepository.document(
+            id: volume.documentToOpenID
+        )
+        let document = try XCTUnwrap(loadedDocument)
+        let operationID = UUID()
+        let store = ScriptedSyncHandoffDocumentStore(
+            underlying: environment.localDocumentStore,
+            saveResult: .localOnly,
+            retryResults: [.queued(operationIDs: [operationID])],
+            hasPendingHandoff: true
+        )
+        let model = EditorSessionModel(
+            documentRepository: environment.documentRepository,
+            documentStore: store,
+            workspaceStateRepository: environment.workspaceStateRepository
+        )
+        let node = BinderNode(
+            id: document.id,
+            projectID: document.projectID,
+            kind: .text,
+            relativePath: document.relativePath,
+            displayName: "001화",
+            fixedCategory: nil,
+            userOrder: document.userOrder,
+            contentState: .empty,
+            isExpanded: false
+        )
+
+        await model.select(node)
+
+        let retryCount = await store.retryCount()
+        XCTAssertEqual(retryCount, 1)
+        guard case let .queued(_, operationIDs) = model.syncHandoffState else {
+            return XCTFail("문서를 열 때 남은 handoff를 queue에 복구해야 합니다.")
+        }
+        XCTAssertEqual(operationIDs, [operationID])
+    }
+
+    @MainActor
     func testEditorSessionDebouncesAutosaveAndFlushesBeforeChapterTransition() async throws {
         let environment = try AppEnvironment.testing()
         let project = try await environment.projectManager.createProject(named: "자동 저장")
@@ -3138,6 +3663,131 @@ final class AppEnvironmentTests: XCTestCase {
     }
 
     @MainActor
+    func testRemoteSnapshotUpdatesOnlyCleanNonComposingEditor()
+        async throws {
+        let environment = try AppEnvironment.testing()
+        let project = try await environment.projectManager.createProject(
+            named: "snapshot editor"
+        )
+        _ = try await environment.binderRepository.rootNodes(in: project.id)
+        let volume = try await environment.binderCommands.addNewVolume(
+            projectID: project.id
+        )
+        let loaded = try await environment.documentRepository.document(
+            id: volume.documentToOpenID
+        )
+        let document = try XCTUnwrap(loaded)
+        let node = BinderNode(
+            id: document.id,
+            projectID: project.id,
+            kind: .text,
+            relativePath: document.relativePath,
+            displayName: "001화",
+            fixedCategory: nil,
+            userOrder: document.userOrder,
+            contentState: .empty,
+            isExpanded: false
+        )
+        let model = EditorSessionModel(
+            documentRepository: environment.documentRepository,
+            documentStore: environment.localDocumentStore,
+            workspaceStateRepository: environment.workspaceStateRepository
+        )
+        await model.select(node)
+
+        XCTAssertTrue(
+            model.applyRemoteSnapshotIfClean(
+                documentID: document.id,
+                content: "서버 clean",
+                relativePath: "메인/원고/서버 제목.txt"
+            )
+        )
+        XCTAssertEqual(model.currentText, "서버 clean")
+        XCTAssertEqual(model.selectedDisplayName, "서버 제목")
+        XCTAssertFalse(model.hasUnsavedChanges)
+
+        model.updateText("로컬 dirty")
+        XCTAssertFalse(
+            model.applyRemoteSnapshotIfClean(
+                documentID: document.id,
+                content: "덮어쓰면 안 됨"
+            )
+        )
+        XCTAssertEqual(model.currentText, "로컬 dirty")
+
+        let saved = await model.saveNow()
+        XCTAssertTrue(saved)
+        await model.updateCompositionState(true)
+        XCTAssertFalse(
+            model.applyRemoteSnapshotIfClean(
+                documentID: document.id,
+                content: "조합 중 덮어쓰면 안 됨"
+            )
+        )
+        XCTAssertEqual(model.currentText, "로컬 dirty")
+        await model.updateCompositionState(false)
+    }
+
+    @MainActor
+    func testAutomaticRebaseAppliesOnlyMatchingEditorGeneration()
+        async throws {
+        let environment = try AppEnvironment.testing()
+        let project = try await environment.projectManager.createProject(
+            named: "automatic rebase editor"
+        )
+        _ = try await environment.binderRepository.rootNodes(in: project.id)
+        let volume = try await environment.binderCommands.addNewVolume(
+            projectID: project.id
+        )
+        let loaded = try await environment.documentRepository.document(
+            id: volume.documentToOpenID
+        )
+        let document = try XCTUnwrap(loaded)
+        let node = BinderNode(
+            id: document.id,
+            projectID: project.id,
+            kind: .text,
+            relativePath: document.relativePath,
+            displayName: "001화",
+            fixedCategory: nil,
+            userOrder: document.userOrder,
+            contentState: .empty,
+            isExpanded: false
+        )
+        let model = EditorSessionModel(
+            documentRepository: environment.documentRepository,
+            documentStore: environment.localDocumentStore,
+            workspaceStateRepository: environment.workspaceStateRepository
+        )
+        await model.select(node)
+        model.updateText("로컬 최신\n")
+        let expected = try XCTUnwrap(
+            model.automaticRebaseSnapshot(documentID: document.id)
+        )
+
+        XCTAssertTrue(
+            model.applyAutomaticRebase(
+                expected: expected,
+                mergedContent: "로컬 최신\n서버 비겹침\n"
+            )
+        )
+        XCTAssertEqual(
+            model.currentText,
+            "로컬 최신\n서버 비겹침\n"
+        )
+        XCTAssertFalse(model.hasUnsavedChanges)
+
+        model.updateText("병합 중 추가 입력\n")
+        XCTAssertFalse(
+            model.applyAutomaticRebase(
+                expected: expected,
+                mergedContent: "오래된 병합 결과\n"
+            )
+        )
+        XCTAssertEqual(model.currentText, "병합 중 추가 입력\n")
+    }
+
+    @MainActor
     func testEditorSessionKeepsLatestSelectionPendingUntilCompositionEnds() async throws {
         let environment = try AppEnvironment.testing()
         let project = try await environment.projectManager.createProject(named: "IME 전환")
@@ -3194,6 +3844,16 @@ final class AppEnvironmentTests: XCTestCase {
         await model.updateSceneActivity(true)
         XCTAssertGreaterThan(model.focusRequest, focusRequestBeforeBackground)
         XCTAssertEqual(model.focusPhase, .restoring)
+
+        await model.updateCompositionState(true)
+        await model.updateSceneActivity(false)
+        let foregroundCommitRequest = model.compositionCommitRequest
+        await model.updateSceneActivity(true)
+        XCTAssertGreaterThan(
+            model.compositionCommitRequest,
+            foregroundCommitRequest
+        )
+        await model.updateCompositionState(false)
 
         await model.updateCompositionState(true)
         await model.updateSceneActivity(false)
@@ -3324,6 +3984,101 @@ final class AppEnvironmentTests: XCTestCase {
     }
 }
 
+private actor AlwaysAuthenticatedService: AuthenticationServicing {
+    private let state = AuthenticationState.authenticated(
+        AuthenticatedAccount(
+            userID: UUID(),
+            maskedEmail: "u***@example.com"
+        )
+    )
+
+    func currentState() -> AuthenticationState { state }
+    func restoreSession() -> AuthenticationState { state }
+    func signIn(
+        email: String,
+        password: String
+    ) -> AuthenticationState {
+        state
+    }
+    func signOut() -> AuthenticationState { .signedOut(.userInitiated) }
+}
+
+private actor DelayedNewProjectBindingService: ProjectBindingServicing {
+    private var createContinuation:
+        CheckedContinuation<ProjectBindingResult, Never>?
+    private var startWaiters: [CheckedContinuation<Void, Never>] = []
+    private var binding: ProjectSyncBinding?
+    private var pendingProjectID: ProjectID?
+
+    func currentBinding(
+        for localProjectID: ProjectID
+    ) -> ProjectSyncBinding? {
+        guard binding?.localProjectID == localProjectID else { return nil }
+        return binding
+    }
+
+    func createServerProject(
+        for localProjectID: ProjectID
+    ) async -> ProjectBindingResult {
+        await withCheckedContinuation { continuation in
+            pendingProjectID = localProjectID
+            createContinuation = continuation
+            let waiters = startWaiters
+            startWaiters.removeAll()
+            waiters.forEach { $0.resume() }
+        }
+    }
+
+    func waitUntilCreateStarts() async {
+        guard createContinuation == nil else { return }
+        await withCheckedContinuation { continuation in
+            startWaiters.append(continuation)
+        }
+    }
+
+    func releaseCreate() {
+        guard let continuation = createContinuation,
+              let projectID = pendingProjectID else { return }
+        let connected = ProjectSyncBinding.connected(
+            localProjectID: projectID,
+            serverProjectID: projectID.rawValue,
+            kind: .newServerProject,
+            projectName: "binding 대기 작품",
+            ownerSubject: UUID()
+        )
+        binding = connected
+        createContinuation = nil
+        pendingProjectID = nil
+        continuation.resume(returning: .connected(connected))
+    }
+
+    func connectExistingProject(
+        localProjectID: ProjectID,
+        confirmation: ConfirmedServerProjectID
+    ) -> ProjectBindingResult {
+        .failed(.serverRejected)
+    }
+
+    func connectWindowsProject(
+        localProjectID: ProjectID,
+        confirmation: ConfirmedServerProjectID
+    ) -> ProjectBindingResult {
+        .failed(.serverRejected)
+    }
+
+    func refreshServerName(
+        for localProjectID: ProjectID
+    ) -> ProjectBindingResult {
+        .failed(.serverRejected)
+    }
+
+    func disconnect(
+        localProjectID: ProjectID
+    ) -> ProjectBindingResult {
+        .failed(.serverRejected)
+    }
+}
+
 private actor AutosaveSleepProbe {
     private var delays: [Duration] = []
 
@@ -3407,5 +4162,63 @@ private actor FirstSaveDelayingDocumentStore: LocalDocumentStoring {
 
     func saveCount() -> Int {
         submittedSaveCount
+    }
+}
+
+private actor ScriptedSyncHandoffDocumentStore: LocalDocumentStoring {
+    private let underlying: any LocalDocumentStoring
+    private let saveResult: DurableRecordResult
+    private var retryResults: [DurableRecordResult]
+    private var submittedSaveCount = 0
+    private var submittedRetryCount = 0
+    private var hasPendingHandoff = false
+
+    init(
+        underlying: any LocalDocumentStoring,
+        saveResult: DurableRecordResult,
+        retryResults: [DurableRecordResult] = [],
+        hasPendingHandoff: Bool = false
+    ) {
+        self.underlying = underlying
+        self.saveResult = saveResult
+        self.retryResults = retryResults
+        self.hasPendingHandoff = hasPendingHandoff
+    }
+
+    func loadText(for document: DocumentNode) async throws -> String {
+        try await underlying.loadText(for: document)
+    }
+
+    func save(_ request: DocumentSaveRequest) async throws -> DocumentSaveReceipt {
+        submittedSaveCount += 1
+        let receipt = try await underlying.save(request)
+        if case .localSavedButNotQueued = saveResult {
+            hasPendingHandoff = true
+        }
+        return receipt.recording(saveResult)
+    }
+
+    func retryPendingSyncHandoff(
+        for document: DocumentNode
+    ) async -> DurableRecordResult {
+        _ = document
+        guard hasPendingHandoff else { return .localOnly }
+        submittedRetryCount += 1
+        guard !retryResults.isEmpty else {
+            return .localSavedButNotQueued(reason: "retry exhausted")
+        }
+        let result = retryResults.removeFirst()
+        if case .queued = result {
+            hasPendingHandoff = false
+        }
+        return result
+    }
+
+    func saveCount() -> Int {
+        submittedSaveCount
+    }
+
+    func retryCount() -> Int {
+        submittedRetryCount
     }
 }

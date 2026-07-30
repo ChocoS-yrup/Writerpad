@@ -1,0 +1,93 @@
+{
+  "version": 3,
+  "cases": [
+    {
+      "id": "non_overlapping",
+      "base": "첫 줄\n둘째 줄\n셋째 줄\n",
+      "local": "첫 줄 수정\n둘째 줄\n셋째 줄\n",
+      "remote": "첫 줄\n둘째 줄\n셋째 줄 수정\n",
+      "expectedContent": "첫 줄 수정\n둘째 줄\n셋째 줄 수정\n",
+      "expectedHasConflicts": false,
+      "expectedConflictCount": 0
+    },
+    {
+      "id": "adjacent_insertion",
+      "base": "이름 변경 테스트\nA가 파일 이름을 바꿉니다.\nB가 이 줄을 수정합니다.\n",
+      "local": "이름 변경 테스트\nA가 파일 이름을 바꿉니다.\nB가 이 줄을 수정합니다.\n강제 종료 후에도 남아야 하는 문장",
+      "remote": "이름 변경 테스트\nA가 파일 이름을 바꿉니다.\nB가 이름변경과 동시에 수정했습니다.",
+      "expectedContent": "이름 변경 테스트\nA가 파일 이름을 바꿉니다.\nB가 이름변경과 동시에 수정했습니다.\n강제 종료 후에도 남아야 하는 문장\n",
+      "expectedHasConflicts": false,
+      "expectedConflictCount": 0
+    },
+    {
+      "id": "line_deletion",
+      "base": "첫 줄\n삭제할 줄\n유지할 줄\n마지막 줄\n",
+      "local": "첫 줄\n유지할 줄\n마지막 줄\n",
+      "remote": "첫 줄\n삭제할 줄\n유지할 줄 수정\n마지막 줄\n",
+      "expectedContent": "첫 줄\n유지할 줄 수정\n마지막 줄\n",
+      "expectedHasConflicts": false,
+      "expectedConflictCount": 0
+    },
+    {
+      "id": "final_newline",
+      "base": "첫 줄\n둘째 줄\n",
+      "local": "첫 줄\n둘째 줄",
+      "remote": "첫 줄\n둘째 줄 수정\n",
+      "expectedContent": "첫 줄\n둘째 줄 수정\n",
+      "expectedHasConflicts": false,
+      "expectedConflictCount": 0
+    },
+    {
+      "id": "empty_document",
+      "base": "",
+      "local": "로컬에서 시작",
+      "remote": "",
+      "expectedContent": "로컬에서 시작",
+      "expectedHasConflicts": false,
+      "expectedConflictCount": 0
+    },
+    {
+      "id": "korean_emoji",
+      "base": "주인공은 문을 열었다. 🚪\n고양이가 기다렸다. 🐈\n끝\n",
+      "local": "주인공은 조심스럽게 문을 열었다. 🚪\n고양이가 기다렸다. 🐈\n끝\n",
+      "remote": "주인공은 문을 열었다. 🚪\n고양이가 반갑게 기다렸다. 🐈‍⬛\n끝\n",
+      "expectedContent": "주인공은 조심스럽게 문을 열었다. 🚪\n고양이가 반갑게 기다렸다. 🐈‍⬛\n끝\n",
+      "expectedHasConflicts": false,
+      "expectedConflictCount": 0
+    },
+    {
+      "id": "same_line_conflict",
+      "base": "문장\n",
+      "local": "내 문장\n",
+      "remote": "서버 문장\n",
+      "expectedContent": "=========\n\n바꾸기 전 원본\n\n문장\n\n=========\n\n로컬 편집본\n\n내 문장\n\n=========\n\n서버 최신본\n\n서버 문장\n\n=========\n\n로컬과 서버 차이점\n\n로컬 : 내\n서버 : 서버\n\n=========\n",
+      "expectedHasConflicts": true,
+      "expectedConflictCount": 1
+    }
+  ],
+  "generatedCases": [
+    {
+      "id": "large_document",
+      "generator": {
+        "kind": "numberedLines",
+        "lineCount": 5000,
+        "localReplacements": [
+          {
+            "index": 17,
+            "value": "로컬 변경 00017 ✍️\n"
+          }
+        ],
+        "remoteReplacements": [
+          {
+            "index": 4982,
+            "value": "서버 변경 04982 ☁️\n"
+          }
+        ]
+      },
+      "expectedContentSHA256": "adce9a0f5aabe54aa0968eecfb3dc78a3e57a3888e01a7726a236f327331e145",
+      "expectedUTF8ByteCount": 90018,
+      "expectedHasConflicts": false,
+      "expectedConflictCount": 0
+    }
+  ]
+}

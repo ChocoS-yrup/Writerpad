@@ -155,6 +155,10 @@ class WritingTreeMixin:
             except Exception:
                 pass
 
+        # Saved orders from older builds and newly discovered custom roots may
+        # otherwise leave items below trash. Repair the invariant on every load.
+        self.binder_tree.ensure_trash_at_bottom()
+
         if "expanded_folders" not in self.wpm.project_settings:
             for i in range(self.binder_tree.topLevelItemCount()):
                 item = self.binder_tree.topLevelItem(i)
@@ -163,6 +167,9 @@ class WritingTreeMixin:
         else:
             self.restore_tree_state()
 
+        # This creates a scrollable blank area after the last root item, making
+        # it easy to right-click there without targeting an existing item.
+        self.binder_tree.add_bottom_spacer()
         self.binder_tree.blockSignals(False)
 
     def _get_emoji_icon(self, emoji_text):
@@ -413,6 +420,8 @@ class WritingTreeMixin:
                     self._processing = False
 
         item = self.binder_tree.itemAt(pos)
+        if self.binder_tree.is_bottom_spacer(item):
+            item = None
         menu = QMenu(self.window())
 
         if not item:
@@ -420,11 +429,6 @@ class WritingTreeMixin:
             add_folder_action.triggered.connect(lambda: self.start_create_root_item(is_folder=True))
             menu.addAction(add_folder_action)
             callbacks['F'] = lambda: self.start_create_root_item(is_folder=True)
-
-            add_file_action = QAction("새 문서", self)
-            add_file_action.triggered.connect(lambda: self.start_create_root_item(is_folder=False))
-            menu.addAction(add_file_action)
-            callbacks['N'] = lambda: self.start_create_root_item(is_folder=False)
         elif item.text(0) == "📚 원고":
             add_volume_action = QAction("권 추가", self)
             add_volume_action.triggered.connect(self.add_volume)
@@ -694,6 +698,8 @@ class WritingTreeMixin:
 
     def save_tree_order(self):
         tree_order = {}
+        self.binder_tree.ensure_trash_at_bottom()
+
         def traverse(item):
             rel_path = item.data(0, Qt.ItemDataRole.UserRole)
             if rel_path:
@@ -712,6 +718,8 @@ class WritingTreeMixin:
         root_names = []
         for i in range(self.binder_tree.topLevelItemCount()):
             item = self.binder_tree.topLevelItem(i)
+            if self.binder_tree.is_bottom_spacer(item):
+                continue
             root_names.append(item.text(0))
             traverse(item)
 
@@ -729,7 +737,8 @@ class WritingTreeMixin:
         if not new_name: return
 
         self.binder_tree.blockSignals(True)
-        new_item = QTreeWidgetItem(self.binder_tree)
+        new_item = QTreeWidgetItem()
+        self.binder_tree.insert_root_item(new_item)
         display_name = new_name[:-4] if not is_folder else new_name
         new_item.setText(0, display_name)
         editable_flags = Qt.ItemFlag.ItemIsSelectable | Qt.ItemFlag.ItemIsEditable | Qt.ItemFlag.ItemIsDragEnabled | Qt.ItemFlag.ItemIsDropEnabled | Qt.ItemFlag.ItemIsEnabled
@@ -1067,6 +1076,7 @@ class WritingTreeMixin:
 
         QMessageBox.information(self, "권 추가", f"{new_vol_name}이 생성되고 25화 분량 파일이 만들어졌습니다.")
         self.load_tree_data()
+        self._open_new_volume_chapters(new_vol_name)
 
         # 새 권수 아이템 포커스 강제
         def _set_active():
@@ -1083,6 +1093,28 @@ class WritingTreeMixin:
                     break
         from PyQt6.QtCore import QTimer
         QTimer.singleShot(10, _set_active)
+
+    def _open_new_volume_chapters(self, volume_name):
+        """Open the first new chapter, and its successor when split view is on."""
+        match = re.fullmatch(r"(\d+)권", volume_name)
+        if not match:
+            return
+
+        first_chapter_number = (int(match.group(1)) - 1) * 25 + 1
+        first_chapter = f"메인/원고/{volume_name}/{first_chapter_number:03d}화.txt"
+
+        self.set_active_editor(self.left_editor)
+        self._open_file_by_path(first_chapter)
+
+        if self.btn_toggle_split.isChecked() and self.right_editor_container.isVisible():
+            next_chapter = (
+                f"메인/원고/{volume_name}/{first_chapter_number + 1:03d}화.txt"
+            )
+            self.set_active_editor(self.right_editor)
+            self._open_file_by_path(next_chapter)
+
+        # The newly-created volume always leaves the main (left) editor active.
+        self.set_active_editor(self.left_editor)
 
     def on_tree_current_item_changed(self, current, previous):
         if not current:
