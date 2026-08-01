@@ -1,0 +1,178 @@
+============================================
+WriterPad 한글 조합 종료 대기 결함 — 디버깅 메모
+============================================
+
+작성일
+- 2026-08-01
+
+목적
+- 동기화 v2 영구 스피너 수정 계획이 끝난 뒤 별도 작업으로 디버깅한다.
+- 동기화 수정과 원인·변경 범위를 섞지 않는다.
+
+
+--------------------------------------------
+[1] 실기기에서 관찰한 증상
+--------------------------------------------
+
+- iPad의 작품 편집 화면에서 한글을 입력한 뒤 다른 화를 선택했다.
+- 화면 하단에 다음 안내가 나타났다.
+
+    "한글 조합 완료 후 ‘<화 이름>’(으)로 전환합니다."
+
+- 한글 자모 입력이 이미 끝난 것처럼 보여도 안내가 사라지지 않았다.
+- 선택한 다른 화로 넘어가지 못하고 전환 대기 상태가 계속됐다.
+- 2026-08-01 동기화 v2 1번(구조적 로깅) 실기기 검증 중 재현됐다.
+
+주의
+- 현재까지 확인한 것은 UI에서 보이는 현상이다.
+- UIKit의 markedTextRange가 실제로 남았는지, 모델의 isComposing만 true로
+  남았는지, 두 상태가 모두 남았는지는 아직 계측하지 않았다.
+- 동기화 영구 스피너와 같은 원인이라는 증거는 없다.
+
+
+--------------------------------------------
+[2] 예상 재현 절차
+--------------------------------------------
+
+1. iPad 실기기에서 WriterPad를 실행한다.
+2. 작품을 열고 한 화의 편집기에 포커스를 둔다.
+3. 한글 키보드로 자모를 연속 입력한다.
+4. 마지막 글자가 화면에 표시된 직후 바인더에서 다른 화를 선택한다.
+5. 위 안내가 나타나는지 확인한다.
+6. 키보드의 완료, 공백, 줄바꿈 등을 눌러 조합을 끝낸 뒤에도 전환되는지 본다.
+7. 5초 이상 기다려도 안내가 남고 화가 바뀌지 않으면 재현으로 판정한다.
+
+추가로 나눠서 확인할 조건
+- 천지인/두벌식 등 한글 키보드 종류
+- 빠른 연속 입력 직후 전환과 1초 이상 기다린 뒤 전환
+- 빈 문서와 본문이 있는 문서
+- 왼쪽/오른쪽 분할 편집기
+- 하드웨어 키보드 연결 여부
+- 마지막 입력이 자모, 완성 글자, 공백, 줄바꿈인 경우
+- 앱을 background로 보냈다가 복귀한 뒤 대기가 풀리는지
+
+
+--------------------------------------------
+[3] 관련 코드와 상태 흐름
+--------------------------------------------
+
+주요 파일
+- WriterPad/Features/Editor/EditorSessionModel.swift
+- WriterPad/Features/Projects/WritingWorkspaceView.swift
+- WriterPad/Platform/UIKitTextViewBridge.swift
+- WriterPadTests/AppEnvironmentTests.swift
+
+현재 의도된 흐름
+
+1. EditorSessionModel.requestSelection(_:)
+   - isComposing이 true이면 pendingSelection과 pendingDisplayName을 저장한다.
+   - compositionCommitRequest를 증가시키고 즉시 화를 바꾸지 않는다.
+
+2. WritingWorkspaceView
+   - pendingDisplayName이 있으면
+     "한글 조합 완료 후 … 전환합니다." 안내를 표시한다.
+   - 브리지의 onCompositionStateChange를 EditorSessionModel에 전달한다.
+
+3. UIKitTextViewBridge.Coordinator.commitCompositionIfRequested(in:)
+   - compositionCommitRequest 증가를 감지한다.
+   - attemptCompositionCommit에서 unmarkText()를 호출하고 marked text 종료를
+     재확인한다.
+   - 짧은 재시도 후에도 남으면 forceCompositionCommit으로 responder를 내리고
+     저빈도 재시도를 계속한다.
+
+4. EditorSessionModel.finishCompositionStateUpdate(_:generation:)
+   - isComposing이 false로 확정되면 completePendingTransition을 적용한다.
+   - 그 결과 pendingSelection의 화로 전환되어야 한다.
+
+
+--------------------------------------------
+[4] 조사할 가설 — 아직 원인으로 확정하지 말 것
+--------------------------------------------
+
+A. UIKit 상태와 모델 상태 불일치
+- markedTextRange는 없어졌지만 isComposing이 true로 남았을 수 있다.
+- false 강제 보고가 generation 검사 또는 콜백 순서 때문에 무시될 수 있다.
+
+B. markedTextRange 잔류
+- 실기기 한글 입력기가 unmarkText()와 resignFirstResponder() 뒤에도 길이가 있는
+  marked range를 유지할 수 있다.
+- forceCompositionCommit 재시도가 계속되며 pendingSelection이 영구 대기할 수 있다.
+
+C. 요청/Coordinator 교체 경쟁
+- compositionCommitRequest를 받은 Coordinator와 현재 화면의 Coordinator가
+  달라졌거나, SwiftUI 갱신 중 lastCompositionCommitRequest 비교에서 요청이
+  소실될 수 있다.
+
+D. 조합 완료 후처리 generation 경쟁
+- recordCompositionState(false) 뒤 새 상태 콜백이 먼저 들어오면
+  finishCompositionStateUpdate의 generation guard가 실패할 수 있다.
+- 이 경우 completePendingTransition이 실행되지 않는지 확인해야 한다.
+
+E. 길이 0 marked range 판정과 실제 입력기 상태의 차이
+- hasActiveMarkedText는 marked range 길이가 0이면 false로 본다.
+- 이 판정 뒤 false 보고가 모델까지 도달하는지, 반대로 길이가 잘못 양수로
+  계산되어 계속 true가 되는지 실기기에서 확인해야 한다.
+
+
+--------------------------------------------
+[5] 디버깅 시 먼저 추가할 임시 계측
+--------------------------------------------
+
+하나의 전환 correlation ID를 만들어 아래 순서를 같은 ID로 기록한다.
+
+- requestSelection
+  - sourceDocumentID, targetDocumentID, isComposing
+  - compositionCommitRequest, compositionStateGeneration
+- commitCompositionIfRequested / attemptCompositionCommit / forceCompositionCommit
+  - request, attempt, isFirstResponder
+  - markedTextRange 존재 여부와 UTF-16 길이(본문 원문은 기록하지 않음)
+- reportCompositionState
+  - 보고 값, force 여부, 마지막 보고 값
+- recordCompositionState / finishCompositionStateUpdate
+  - composing, generation, 현재 generation, guard 통과 여부
+- completePendingTransition
+  - pendingSelection 존재 여부와 실제 전환 완료 여부
+
+개인정보 및 원고 보호
+- 입력한 글자와 원고 본문은 로그에 남기지 않는다.
+- documentID가 필요하면 UUID 앞 8자리만 사용한다.
+
+
+--------------------------------------------
+[6] 회귀 테스트 후보
+--------------------------------------------
+
+- 첫 unmarkText()를 입력기가 무시해도 재시도 후 pendingSelection이 완료된다.
+- markedTextRange가 사라졌는데 모델만 composing인 경우 false 재확인으로 풀린다.
+- 길이 0 marked range는 영구 대기를 만들지 않는다.
+- false 콜백과 SwiftUI Task 순서가 뒤집혀도 pendingSelection이 한 번만 완료된다.
+- 오래된 compositionCommitRequest/Coordinator가 새 요청을 완료하거나 취소하지 않는다.
+- 두 화를 빠르게 연속 선택하면 마지막 선택만 적용된다.
+- 조합 종료 과정에서 최신 원고가 유실되거나 다른 화에 저장되지 않는다.
+- 분할 편집기에서 한쪽의 조합 상태가 다른 쪽 화 전환을 잘못 막지 않는다.
+
+유닛 테스트만으로 충분하지 않은 항목
+- 실제 iPadOS 한글 입력기의 marked-text 콜백 순서
+- unmarkText(), resignFirstResponder(), reloadInputViews()의 실기기 동작
+- 소프트웨어 키보드 종류별 차이
+
+
+--------------------------------------------
+[7] 완료 기준
+--------------------------------------------
+
+- 위 실기기 재현 절차에서 화 전환이 유한 시간 안에 완료된다.
+- 안내가 전환 완료와 함께 사라진다.
+- 마지막 조합 글자와 직전 원고가 유실되지 않는다.
+- 잘못된 화에 본문이 저장되지 않는다.
+- 자동화 회귀 테스트가 통과한다.
+- iPad 실기기에서 키보드 종류와 빠른 입력 조건을 포함해 반복 검증한다.
+
+
+--------------------------------------------
+[8] 현재 작업 상태
+--------------------------------------------
+
+- 기록만 완료했다.
+- 원인 확정 및 코드 수정은 하지 않았다.
+- 동기화 v2 수정 계획 완료 후 별도 디버깅 작업으로 진행한다.

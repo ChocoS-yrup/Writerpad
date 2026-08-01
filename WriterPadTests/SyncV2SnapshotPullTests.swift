@@ -970,7 +970,7 @@ final class SyncV2SnapshotPullTests: XCTestCase {
     }
 
     @MainActor
-    func testWorkspaceInitialPullDoesNotWaitForRealtimeSubscription()
+    func testWorkspaceInitialPullShowsSuccessBeforeRealtimeSubscription()
         async throws {
         let previous = GlobalSyncPreference.isEnabled()
         GlobalSyncPreference.setEnabled(true)
@@ -1008,8 +1008,142 @@ final class SyncV2SnapshotPullTests: XCTestCase {
         if case .synced = model.serverState {
             // expected
         } else {
+            XCTFail(
+                "Expected synced after successful pull, got \(model.serverState)"
+            )
+        }
+        await model.stop()
+    }
+
+    @MainActor
+    func testWorkspaceObservesLogoutAndLoginWithoutSceneRoundTrip() async {
+        let previous = GlobalSyncPreference.isEnabled()
+        GlobalSyncPreference.setEnabled(true)
+        defer { GlobalSyncPreference.setEnabled(previous) }
+        let localProjectID = ProjectID(rawValue: UUID())
+        let account = AuthenticatedAccount(
+            userID: UUID(),
+            maskedEmail: "u***@example.com"
+        )
+        let authentication = ObservableWorkspaceAuthenticationStub(
+            state: .authenticated(account)
+        )
+        let puller = WorkspacePullerStub()
+        let model = SyncV2WorkspaceSyncModel(
+            localProjectID: localProjectID,
+            puller: puller,
+            realtime: nil,
+            authenticationService: authentication,
+            projectBindingService: WorkspaceBindingStub(
+                binding: .connected(
+                    localProjectID: localProjectID,
+                    serverProjectID: UUID(),
+                    kind: .existingServerProject,
+                    projectName: "auth updates",
+                    ownerSubject: UUID()
+                )
+            ),
+            periodicDelay: .seconds(600)
+        )
+
+        await model.start(editingGuards: { [:] }) { _ in }
+        for _ in 0..<500 where await authentication.observerCount() < 1 {
+            await Task.yield()
+        }
+        let observerCount = await authentication.observerCount()
+        XCTAssertEqual(observerCount, 1)
+        guard observerCount == 1 else {
+            await model.stop()
+            return
+        }
+
+        await authentication.setState(.signedOut(.userInitiated))
+        for _ in 0..<500 where model.serverState != .authenticationRequired {
+            await Task.yield()
+        }
+        XCTAssertEqual(model.serverState, .authenticationRequired)
+
+        let pullsBeforeLogin = await puller.count()
+        await authentication.setState(.authenticated(account))
+        for _ in 0..<500 {
+            if await puller.count() > pullsBeforeLogin,
+               case .synced = model.serverState {
+                break
+            }
+            await Task.yield()
+        }
+
+        let pullsAfterLogin = await puller.count()
+        XCTAssertGreaterThan(pullsAfterLogin, pullsBeforeLogin)
+        if case .synced = model.serverState {
+            // expected
+        } else {
             XCTFail("Expected synced, got \(model.serverState)")
         }
+        await model.stop()
+    }
+
+    @MainActor
+    func testWorkspaceRealtimeSubscriptionWatchdogCancelsHungStart()
+        async throws {
+        let previous = GlobalSyncPreference.isEnabled()
+        GlobalSyncPreference.setEnabled(true)
+        defer { GlobalSyncPreference.setEnabled(previous) }
+        let realtime = HangingWorkspaceRealtimeStub()
+        let model = makeLifecycleModel(
+            puller: WorkspacePullerStub(),
+            realtime: realtime,
+            realtimeSubscriptionTimeout: .milliseconds(20),
+            realtimeTimeoutSleep: { duration in
+                try await ContinuousClock().sleep(for: duration)
+            },
+            recoverySleep: { _ in
+                try await ContinuousClock().sleep(for: .seconds(60))
+            }
+        )
+
+        await model.start(editingGuards: { [:] }) { _ in }
+        for _ in 0..<100 where await realtime.stopCount() == 0 {
+            try await Task.sleep(for: .milliseconds(5))
+        }
+
+        let stopCount = await realtime.stopCount()
+        XCTAssertGreaterThanOrEqual(stopCount, 1)
+        XCTAssertEqual(model.serverState, .reconnecting)
+        await model.stop()
+    }
+
+    @MainActor
+    func testWorkspaceFailedInitialSubscriptionStaysReconnectingDuringRetry()
+        async throws {
+        let previous = GlobalSyncPreference.isEnabled()
+        GlobalSyncPreference.setEnabled(true)
+        defer { GlobalSyncPreference.setEnabled(previous) }
+        let realtime = WorkspaceRealtimeStub()
+        let model = makeLifecycleModel(
+            puller: WorkspacePullerStub(),
+            realtime: realtime,
+            recoverySleep: { _ in }
+        )
+
+        await model.start(editingGuards: { [:] }) { _ in }
+        for _ in 0..<100 where await realtime.startCount() == 0 {
+            await Task.yield()
+        }
+        let initialStartCount = await realtime.startCount()
+        XCTAssertGreaterThan(initialStartCount, 0)
+        await realtime.emitStatus(.channelError)
+        for _ in 0..<100
+            where await realtime.startCount() <= initialStartCount {
+            await Task.yield()
+        }
+        let retryStartCount = await realtime.startCount()
+        XCTAssertGreaterThan(retryStartCount, initialStartCount)
+
+        await realtime.emitStatus(.subscribing)
+        for _ in 0..<10 { await Task.yield() }
+
+        XCTAssertEqual(model.serverState, .reconnecting)
         await model.stop()
     }
 
@@ -1213,6 +1347,71 @@ final class SyncV2SnapshotPullTests: XCTestCase {
         XCTAssertTrue(gate.receiveSubscribed())
     }
 
+    func testRealtimeConnectGateSerializesSharedClientSubscriptions()
+        async throws {
+        let gate = SyncV2RealtimeConnectGate()
+        let probe = RealtimeConnectGateProbe()
+        let first = Task {
+            try await gate.withSubscription {
+                await probe.enterAndWait()
+                await probe.leave()
+            }
+        }
+        await probe.waitUntilStarted(1)
+        let second = Task {
+            try await gate.withSubscription {
+                await probe.enterAndWait()
+                await probe.leave()
+            }
+        }
+        for _ in 0..<20 { await Task.yield() }
+
+        let startedCount = await probe.startedCount()
+        XCTAssertEqual(startedCount, 1)
+        await probe.releaseOne()
+        try await first.value
+        await probe.waitUntilStarted(2)
+        let maximumWhileWaiting = await probe.maximumConcurrentCount()
+        XCTAssertEqual(maximumWhileWaiting, 1)
+
+        await probe.releaseOne()
+        try await second.value
+        let maximumAfterCompletion = await probe.maximumConcurrentCount()
+        XCTAssertEqual(maximumAfterCompletion, 1)
+    }
+
+    func testBackgroundRealtimeWatchdogReleasesHungSubscription()
+        async throws {
+        let previous = GlobalSyncPreference.isEnabled()
+        GlobalSyncPreference.setEnabled(true)
+        defer { GlobalSyncPreference.setEnabled(previous) }
+        let realtime = HangingAllRealtimeStub()
+        let coordinator = SyncV2BackgroundSyncCoordinator(
+            puller: BackgroundPullerStub(),
+            realtime: realtime,
+            projectBindingService: BackgroundBindingStub(bindings: []),
+            periodicDelay: .seconds(600),
+            realtimeSubscriptionTimeout: .milliseconds(20),
+            realtimeTimeoutSleep: { duration in
+                try await ContinuousClock().sleep(for: duration)
+            },
+            sleep: { _ in
+                try await ContinuousClock().sleep(for: .seconds(60))
+            }
+        )
+
+        await coordinator.start()
+        for _ in 0..<100 where await realtime.stopCount() == 0 {
+            try await Task.sleep(for: .milliseconds(5))
+        }
+
+        let startCount = await realtime.startCount()
+        let stopCount = await realtime.stopCount()
+        XCTAssertEqual(startCount, 1)
+        XCTAssertGreaterThanOrEqual(stopCount, 1)
+        await coordinator.stop()
+    }
+
     func testBackgroundSyncKeepsInactiveProjectsLiveAndSkipsOpenProject()
         async throws {
         let previous = GlobalSyncPreference.isEnabled()
@@ -1277,6 +1476,33 @@ final class SyncV2SnapshotPullTests: XCTestCase {
         completed = await puller.completedProjectIDs()
         await coordinator.stop()
         XCTAssertTrue(completed.contains(openProjectID))
+    }
+
+    func testBackgroundForegroundEntryDoesNotRestartInitialSubscription()
+        async throws {
+        let previous = GlobalSyncPreference.isEnabled()
+        GlobalSyncPreference.setEnabled(true)
+        defer { GlobalSyncPreference.setEnabled(previous) }
+        let realtime = WorkspaceRealtimeStub()
+        let coordinator = SyncV2BackgroundSyncCoordinator(
+            puller: BackgroundPullerStub(),
+            realtime: realtime,
+            projectBindingService: BackgroundBindingStub(bindings: []),
+            periodicDelay: .seconds(600)
+        )
+
+        await coordinator.start()
+        for _ in 0..<100 where await realtime.startCount() < 1 {
+            await Task.yield()
+        }
+        await coordinator.appEnteredForeground()
+        for _ in 0..<20 { await Task.yield() }
+
+        let startCount = await realtime.startCount()
+        let stopCount = await realtime.stopCount()
+        XCTAssertEqual(startCount, 1)
+        XCTAssertEqual(stopCount, 0)
+        await coordinator.stop()
     }
 
     func testBackgroundProjectPullsAreIndependent() async throws {
@@ -1676,6 +1902,646 @@ final class SyncV2SnapshotPullTests: XCTestCase {
         }
         await model.stop()
     }
+
+    @MainActor
+    func testSnapshotAuthFailureRefreshesAndRetriesOriginalRequest()
+        async throws {
+        let previous = GlobalSyncPreference.isEnabled()
+        GlobalSyncPreference.setEnabled(true)
+        defer { GlobalSyncPreference.setEnabled(previous) }
+        let puller = SequencedWorkspacePuller(
+            outcomes: [
+                .failure(
+                    SyncV2ClientError.remote(
+                        code: .authRequired,
+                        detail: nil
+                    )
+                ),
+                .success(
+                    SyncV2SnapshotPullReport(
+                        outcomes: [],
+                        appliedSnapshots: []
+                    )
+                ),
+            ]
+        )
+        let authentication = RefreshCountingAuthenticationStub()
+        let model = makeLifecycleModel(
+            puller: puller,
+            realtime: nil,
+            authentication: authentication
+        )
+
+        await model.start(editingGuards: { [:] }) { _ in }
+        for _ in 0..<100 where await puller.count() < 2 {
+            try await Task.sleep(for: .milliseconds(5))
+        }
+
+        let pullCount = await puller.count()
+        let refreshCount = await authentication.refreshCount()
+        XCTAssertEqual(pullCount, 2)
+        XCTAssertEqual(refreshCount, 1)
+        if case .synced = model.serverState {
+            // expected
+        } else {
+            XCTFail("Expected synced, got \(model.serverState)")
+        }
+        await model.stop()
+    }
+
+    @MainActor
+    func testRealtimeTerminalStatesReconnectAndPullImmediately()
+        async throws {
+        let previous = GlobalSyncPreference.isEnabled()
+        GlobalSyncPreference.setEnabled(true)
+        defer { GlobalSyncPreference.setEnabled(previous) }
+        let puller = WorkspacePullerStub()
+        let realtime = WorkspaceRealtimeStub()
+        let model = makeLifecycleModel(
+            puller: puller,
+            realtime: realtime,
+            recoverySleep: { _ in }
+        )
+
+        await model.start(editingGuards: { [:] }) { _ in }
+        await realtime.emitStatus(.subscribed)
+        for _ in 0..<100 where await puller.count() < 2 {
+            await Task.yield()
+        }
+
+        for terminal in [
+            SyncV2RealtimeConnectionStatus.closed,
+            .channelError,
+            .timedOut,
+        ] {
+            let oldIndex = max(0, await realtime.startCount() - 1)
+            await realtime.emitStatus(terminal)
+            for _ in 0..<100
+                where await realtime.startCount() <= oldIndex + 1 {
+                await Task.yield()
+            }
+            XCTAssertEqual(model.serverState, .reconnecting)
+
+            let beforeStale = await puller.count()
+            await realtime.emitStatus(.subscribed, at: oldIndex)
+            for _ in 0..<10 { await Task.yield() }
+            let afterStale = await puller.count()
+            XCTAssertEqual(afterStale, beforeStale)
+
+            await realtime.emitStatus(.subscribed)
+            for _ in 0..<100 where await puller.count() <= beforeStale {
+                await Task.yield()
+            }
+        }
+
+        let realtimeStartCount = await realtime.startCount()
+        XCTAssertGreaterThanOrEqual(realtimeStartCount, 4)
+        await model.stop()
+    }
+
+    @MainActor
+    func testPullWatchdogReleasesHungRequestAndRetrySucceeds()
+        async throws {
+        let previous = GlobalSyncPreference.isEnabled()
+        GlobalSyncPreference.setEnabled(true)
+        defer { GlobalSyncPreference.setEnabled(previous) }
+        let puller = FirstPullHangsWorkspacePuller()
+        let model = makeLifecycleModel(
+            puller: puller,
+            realtime: nil,
+            pullTimeout: .milliseconds(20),
+            retryDelays: [.milliseconds(1)],
+            recoverySleep: { duration in
+                try await ContinuousClock().sleep(for: duration)
+            }
+        )
+
+        await model.start(editingGuards: { [:] }) { _ in }
+        for _ in 0..<100 where await puller.count() < 2 {
+            try await Task.sleep(for: .milliseconds(5))
+        }
+
+        let pullCount = await puller.count()
+        XCTAssertEqual(pullCount, 2)
+        if case .synced = model.serverState {
+            // expected
+        } else {
+            XCTFail("Expected synced after watchdog retry")
+        }
+        await model.stop()
+    }
+
+    @MainActor
+    func testEventsDuringPullCoalesceIntoOneFollowUp() async throws {
+        let previous = GlobalSyncPreference.isEnabled()
+        GlobalSyncPreference.setEnabled(true)
+        defer { GlobalSyncPreference.setEnabled(previous) }
+        let puller = ControlledFirstWorkspacePuller()
+        let model = makeLifecycleModel(
+            puller: puller,
+            realtime: nil,
+            debounceDelay: .milliseconds(5)
+        )
+
+        await model.start(editingGuards: { [:] }) { _ in }
+        await puller.waitUntilFirstStarted()
+        model.realtimeChanged()
+        model.realtimeChanged()
+        model.realtimeChanged()
+        try await Task.sleep(for: .milliseconds(20))
+        await puller.finishFirst()
+        for _ in 0..<100 where await puller.count() < 2 {
+            await Task.yield()
+        }
+        try await Task.sleep(for: .milliseconds(30))
+
+        let pullCount = await puller.count()
+        XCTAssertEqual(pullCount, 2)
+        await model.stop()
+    }
+
+    @MainActor
+    func testPeriodicSafetyPullRecoversMissedRealtimeEvent()
+        async throws {
+        let previous = GlobalSyncPreference.isEnabled()
+        GlobalSyncPreference.setEnabled(true)
+        defer { GlobalSyncPreference.setEnabled(previous) }
+        let puller = WorkspacePullerStub()
+        let model = makeLifecycleModel(
+            puller: puller,
+            realtime: nil,
+            periodicDelay: .milliseconds(25)
+        )
+
+        await model.start(editingGuards: { [:] }) { _ in }
+        for _ in 0..<100 where await puller.count() < 2 {
+            try await Task.sleep(for: .milliseconds(5))
+        }
+
+        let pullCount = await puller.count()
+        XCTAssertGreaterThanOrEqual(pullCount, 2)
+        await model.stop()
+    }
+
+    @MainActor
+    func testSyncedStatusBecomesReconnectStatusAfterConnectionCloses()
+        async throws {
+        let previous = GlobalSyncPreference.isEnabled()
+        GlobalSyncPreference.setEnabled(true)
+        defer { GlobalSyncPreference.setEnabled(previous) }
+        let realtime = WorkspaceRealtimeStub()
+        let model = makeLifecycleModel(
+            puller: WorkspacePullerStub(),
+            realtime: realtime,
+            retryDelays: [.seconds(60)]
+        )
+
+        await model.start(editingGuards: { [:] }) { _ in }
+        await realtime.emitStatus(.subscribed)
+        for _ in 0..<100 {
+            if case .synced = model.serverState { break }
+            await Task.yield()
+        }
+        await realtime.emitStatus(.closed)
+
+        XCTAssertEqual(model.serverState, .reconnecting)
+        let presentation = WorkspaceSyncStatusReducer.presentation(
+            saveState: .idle,
+            handoffState: .idle,
+            serverState: model.serverState,
+            leaseState: .localOnly
+        )
+        XCTAssertEqual(presentation.label, "서버 재연결 중")
+        await model.stop()
+    }
+
+    @MainActor
+    func testBindingChangeAllowsPullRetryAndRealtimeReconnectToReschedule()
+        async {
+        let previous = GlobalSyncPreference.isEnabled()
+        GlobalSyncPreference.setEnabled(true)
+        defer { GlobalSyncPreference.setEnabled(previous) }
+        let localProjectID = ProjectID(rawValue: UUID())
+        let binding = WorkspaceBindingStub(
+            binding: .connected(
+                localProjectID: localProjectID,
+                serverProjectID: UUID(),
+                kind: .existingServerProject,
+                projectName: "first binding",
+                ownerSubject: UUID()
+            )
+        )
+        let puller = SequencedWorkspacePuller(
+            outcomes: [
+                .failure(.networkUnavailable),
+                .failure(.networkUnavailable),
+            ]
+        )
+        let realtime = WorkspaceRealtimeStub()
+        let recoverySleep = ManualWorkspaceSleep()
+        let model = SyncV2WorkspaceSyncModel(
+            localProjectID: localProjectID,
+            puller: puller,
+            realtime: realtime,
+            authenticationService: WorkspaceAuthenticationStub(
+                state: .authenticated(
+                    AuthenticatedAccount(
+                        userID: UUID(),
+                        maskedEmail: "u***@example.com"
+                    )
+                )
+            ),
+            projectBindingService: binding,
+            periodicDelay: .seconds(600),
+            retryDelays: [.seconds(1)],
+            recoverySleep: { duration in
+                try await recoverySleep.sleep(duration)
+            }
+        )
+
+        await model.start(editingGuards: { [:] }) { _ in }
+        for _ in 0..<500 {
+            let pullCount = await puller.count()
+            let realtimeStartCount = await realtime.startCount()
+            let sleepCount = await recoverySleep.callCount()
+            let isReady = pullCount >= 1
+                && realtimeStartCount >= 1
+                && sleepCount >= 1
+            if isReady { break }
+            await Task.yield()
+        }
+        await realtime.emitStatus(.channelError)
+        for _ in 0..<500 where await recoverySleep.callCount() < 2 {
+            await Task.yield()
+        }
+
+        await binding.setBinding(
+            .connected(
+                localProjectID: localProjectID,
+                serverProjectID: UUID(),
+                kind: .existingServerProject,
+                projectName: "second binding",
+                ownerSubject: UUID()
+            )
+        )
+        for _ in 0..<500 {
+            let pullCount = await puller.count()
+            let realtimeStartCount = await realtime.startCount()
+            let sleepCount = await recoverySleep.callCount()
+            let isReady = pullCount >= 2
+                && realtimeStartCount >= 2
+                && sleepCount >= 3
+            if isReady { break }
+            await Task.yield()
+        }
+        await realtime.emitStatus(.channelError)
+        for _ in 0..<500 where await recoverySleep.callCount() < 4 {
+            await Task.yield()
+        }
+
+        let pullCount = await puller.count()
+        let realtimeStartCount = await realtime.startCount()
+        let recoverySleepCount = await recoverySleep.callCount()
+        XCTAssertEqual(pullCount, 2)
+        XCTAssertGreaterThanOrEqual(realtimeStartCount, 2)
+        XCTAssertGreaterThanOrEqual(recoverySleepCount, 4)
+        await model.stop()
+    }
+
+    @MainActor
+    func testCancelledReconnectDelayReleasesRetrySentinel() async {
+        let previous = GlobalSyncPreference.isEnabled()
+        GlobalSyncPreference.setEnabled(true)
+        defer { GlobalSyncPreference.setEnabled(previous) }
+        let realtime = WorkspaceRealtimeStub()
+        let recoverySleep = ManualWorkspaceSleep()
+        let model = makeLifecycleModel(
+            puller: WorkspacePullerStub(),
+            realtime: realtime,
+            retryDelays: [.seconds(1)],
+            recoverySleep: { duration in
+                try await recoverySleep.sleep(duration)
+            }
+        )
+
+        await model.start(editingGuards: { [:] }) { _ in }
+        for _ in 0..<500 where await realtime.startCount() < 1 {
+            await Task.yield()
+        }
+        await realtime.emitStatus(.channelError)
+        for _ in 0..<500 where await recoverySleep.callCount() < 1 {
+            await Task.yield()
+        }
+        await recoverySleep.cancelNext()
+        for _ in 0..<500 where await recoverySleep.callCount() < 2 {
+            await realtime.emitStatus(.channelError)
+            await Task.yield()
+        }
+
+        let recoverySleepCount = await recoverySleep.callCount()
+        XCTAssertEqual(recoverySleepCount, 2)
+        await model.stop()
+    }
+
+    @MainActor
+    func testImmediateDisconnectsAccumulateRealtimeReconnectBackoff()
+        async {
+        let previous = GlobalSyncPreference.isEnabled()
+        GlobalSyncPreference.setEnabled(true)
+        defer { GlobalSyncPreference.setEnabled(previous) }
+        let puller = WorkspacePullerStub()
+        let realtime = WorkspaceRealtimeStub()
+        let recoverySleep = ManualWorkspaceSleep()
+        let model = makeLifecycleModel(
+            puller: puller,
+            realtime: realtime,
+            retryDelays: [
+                .seconds(1), .seconds(2), .seconds(5),
+            ],
+            recoverySleep: { duration in
+                try await recoverySleep.sleep(duration)
+            }
+        )
+
+        await model.start(editingGuards: { [:] }) { _ in }
+        for attempt in 0..<3 {
+            for _ in 0..<500
+                where await realtime.startCount() <= attempt {
+                await Task.yield()
+            }
+            let pullCount = await puller.count()
+            await realtime.emitStatus(.subscribed)
+            for _ in 0..<500 where await puller.count() <= pullCount {
+                await Task.yield()
+            }
+            await realtime.emitStatus(.closed)
+            for _ in 0..<500
+                where await recoverySleep.callCount() <= attempt {
+                await Task.yield()
+            }
+            await recoverySleep.resumeNext()
+        }
+
+        for _ in 0..<500 where await realtime.startCount() < 4 {
+            await Task.yield()
+        }
+        let recordedDurations = await recoverySleep.recordedDurations()
+        XCTAssertEqual(
+            recordedDurations,
+            [.seconds(1), .seconds(2), .seconds(5)]
+        )
+        await model.stop()
+    }
+
+    @MainActor
+    func testSuccessfulPullShowsSyncedWhileRealtimeIsUnhealthy() async {
+        let previous = GlobalSyncPreference.isEnabled()
+        GlobalSyncPreference.setEnabled(true)
+        defer { GlobalSyncPreference.setEnabled(previous) }
+        let puller = WorkspacePullerStub()
+        let realtime = WorkspaceRealtimeStub()
+        let model = makeLifecycleModel(
+            puller: puller,
+            realtime: realtime
+        )
+
+        await model.start(editingGuards: { [:] }) { _ in }
+        for _ in 0..<500 {
+            if case .synced = model.serverState { break }
+            await Task.yield()
+        }
+
+        let pullCount = await puller.count()
+        XCTAssertEqual(pullCount, 1)
+        if case .synced = model.serverState {
+            // expected
+        } else {
+            XCTFail("Expected synced, got \(model.serverState)")
+        }
+        await model.stop()
+    }
+
+    @MainActor
+    func testHungAuthenticationRefreshReleasesPullBeforeTimeoutRetry()
+        async {
+        let previous = GlobalSyncPreference.isEnabled()
+        GlobalSyncPreference.setEnabled(true)
+        defer { GlobalSyncPreference.setEnabled(previous) }
+        let puller = SequencedWorkspacePuller(
+            outcomes: [
+                .failure(
+                    .remote(code: .authRequired, detail: nil)
+                ),
+                .success(
+                    SyncV2SnapshotPullReport(
+                        outcomes: [],
+                        appliedSnapshots: []
+                    )
+                ),
+            ]
+        )
+        let authentication = HangingRefreshAuthenticationStub()
+        let pullTimeoutSleep = ManualWorkspaceSleep()
+        let model = makeLifecycleModel(
+            puller: puller,
+            realtime: nil,
+            authentication: authentication,
+            pullTimeout: .seconds(15),
+            pullTimeoutSleep: { duration in
+                try await pullTimeoutSleep.sleep(duration)
+            },
+            recoverySleep: { _ in
+                throw CancellationError()
+            }
+        )
+
+        await model.start(editingGuards: { [:] }) { _ in }
+        for _ in 0..<500 {
+            let refreshCount = await authentication.refreshCount()
+            let timeoutCount = await pullTimeoutSleep.callCount()
+            let isReady = refreshCount >= 1 && timeoutCount >= 2
+            if isReady { break }
+            await Task.yield()
+        }
+        await pullTimeoutSleep.resumeLast()
+        for _ in 0..<500 {
+            if case .authenticationRequired = model.serverState { break }
+            await Task.yield()
+        }
+
+        await model.retry()
+        for _ in 0..<500 where await puller.count() < 2 {
+            await Task.yield()
+        }
+
+        let pullCount = await puller.count()
+        XCTAssertEqual(pullCount, 2)
+        if case .synced = model.serverState {
+            // expected
+        } else {
+            XCTFail("Expected retry to start after refresh timeout")
+        }
+        await authentication.releaseRefresh()
+        await model.stop()
+    }
+
+    @MainActor
+    func testInvalidatedPullDoesNotLeavePendingFollowUp() async {
+        let previous = GlobalSyncPreference.isEnabled()
+        GlobalSyncPreference.setEnabled(true)
+        defer { GlobalSyncPreference.setEnabled(previous) }
+        let puller = ControlledFirstWorkspacePuller()
+        let model = makeLifecycleModel(
+            puller: puller,
+            realtime: nil
+        )
+
+        await model.start(editingGuards: { [:] }) { _ in }
+        await puller.waitUntilFirstStarted()
+        await model.retry()
+        await model.updateSceneActivity(false)
+        await puller.finishFirst()
+        for _ in 0..<100 { await Task.yield() }
+        XCTAssertEqual(model.serverState, .idle)
+        await model.updateSceneActivity(true)
+        for _ in 0..<500 where await puller.count() < 2 {
+            await Task.yield()
+        }
+        for _ in 0..<100 { await Task.yield() }
+
+        let pullCount = await puller.count()
+        XCTAssertEqual(
+            pullCount,
+            2,
+            "무효화된 pull의 pending 요청이 scene 재개 pull 뒤 남으면 안 됩니다."
+        )
+        if case .synced = model.serverState {
+            // expected
+        } else {
+            XCTFail("Expected resumed generation to settle as synced")
+        }
+        await model.stop()
+    }
+
+    func testRealtimeConnectGateTimesOutHungOperationAndReleasesWaiter()
+        async {
+        let gate = SyncV2RealtimeConnectGate()
+        let operation = SequencedRealtimeGateOperation()
+        let timeoutSleep = ManualWorkspaceSleep()
+        let first = Task { () -> SyncV2RealtimeTriggerError? in
+            do {
+                try await gate.withSubscription(
+                    timeout: .seconds(20),
+                    timeoutSleep: { duration in
+                        try await timeoutSleep.sleep(duration)
+                    }
+                ) {
+                    await operation.run()
+                }
+                return nil
+            } catch let error as SyncV2RealtimeTriggerError {
+                return error
+            } catch {
+                return nil
+            }
+        }
+        await operation.waitUntilStarted(1)
+        let second = Task { () -> Bool in
+            do {
+                try await gate.withSubscription(
+                    timeout: .seconds(20),
+                    timeoutSleep: { duration in
+                        try await timeoutSleep.sleep(duration)
+                    }
+                ) {
+                    await operation.run()
+                }
+                return true
+            } catch {
+                return false
+            }
+        }
+        for _ in 0..<100 { await Task.yield() }
+        let startCountWhileHeld = await operation.startCount()
+        XCTAssertEqual(startCountWhileHeld, 1)
+        await timeoutSleep.waitUntilCalled(1)
+        await timeoutSleep.resumeNext()
+        let emergencyRelease = Task {
+            for _ in 0..<50_000 { await Task.yield() }
+            return await operation.releaseHungIfSecondDidNotStart()
+        }
+        await operation.waitUntilStarted(2)
+        let startCountAfterTimeout = await operation.startCount()
+        XCTAssertEqual(startCountAfterTimeout, 2)
+        let requiredEmergencyRelease = await emergencyRelease.value
+        XCTAssertFalse(requiredEmergencyRelease)
+        let firstError = await first.value
+        switch firstError {
+        case .subscriptionTimedOut?:
+            break
+        default:
+            XCTFail("Expected subscriptionTimedOut")
+        }
+        let secondCompleted = await second.value
+        XCTAssertTrue(secondCompleted)
+        await operation.releaseHungOperation()
+    }
+
+    @MainActor
+    private func makeLifecycleModel(
+        puller: any SyncV2SnapshotPulling,
+        realtime: (any SyncV2RealtimeTriggering)?,
+        authentication: any AuthenticationServicing =
+            WorkspaceAuthenticationStub(
+                state: .authenticated(
+                    AuthenticatedAccount(
+                        userID: UUID(),
+                        maskedEmail: "u***@example.com"
+                    )
+                )
+            ),
+        debounceDelay: Duration = .milliseconds(5),
+        periodicDelay: Duration = .seconds(600),
+        realtimeSubscriptionTimeout: Duration = .seconds(12),
+        pullTimeout: Duration = .seconds(15),
+        retryDelays: [Duration] = [.seconds(1), .seconds(2)],
+        realtimeTimeoutSleep:
+            @escaping SyncV2WorkspaceSleep = { duration in
+                try await ContinuousClock().sleep(for: duration)
+            },
+        pullTimeoutSleep:
+            @escaping SyncV2WorkspaceSleep = { duration in
+                try await ContinuousClock().sleep(for: duration)
+            },
+        recoverySleep: @escaping SyncV2WorkspaceSleep = { duration in
+            try await ContinuousClock().sleep(for: duration)
+        }
+    ) -> SyncV2WorkspaceSyncModel {
+        let localProjectID = ProjectID(rawValue: UUID())
+        return SyncV2WorkspaceSyncModel(
+            localProjectID: localProjectID,
+            puller: puller,
+            realtime: realtime,
+            authenticationService: authentication,
+            projectBindingService: WorkspaceBindingStub(
+                binding: .connected(
+                    localProjectID: localProjectID,
+                    serverProjectID: UUID(),
+                    kind: .existingServerProject,
+                    projectName: "lifecycle",
+                    ownerSubject: UUID()
+                )
+            ),
+            debounceDelay: debounceDelay,
+            periodicDelay: periodicDelay,
+            realtimeSubscriptionTimeout: realtimeSubscriptionTimeout,
+            pullTimeout: pullTimeout,
+            retryDelays: retryDelays,
+            realtimeTimeoutSleep: realtimeTimeoutSleep,
+            pullTimeoutSleep: pullTimeoutSleep,
+            recoverySleep: recoverySleep
+        )
+    }
 }
 
 private func makeSnapshot(
@@ -1972,6 +2838,108 @@ private actor WorkspacePullerStub: SyncV2SnapshotPulling {
     func count() -> Int { pulls }
 }
 
+private enum SequencedWorkspacePullOutcome: Sendable {
+    case success(SyncV2SnapshotPullReport)
+    case failure(SyncV2ClientError)
+}
+
+private actor SequencedWorkspacePuller: SyncV2SnapshotPulling {
+    private var outcomes: [SequencedWorkspacePullOutcome]
+    private var pulls = 0
+
+    init(outcomes: [SequencedWorkspacePullOutcome]) {
+        self.outcomes = outcomes
+    }
+
+    func pull(
+        localProjectID: ProjectID,
+        serverProjectID: UUID,
+        editingGuards: [UUID: SyncV2EditingGuard]
+    ) async throws -> SyncV2SnapshotPullReport {
+        _ = (localProjectID, serverProjectID, editingGuards)
+        pulls += 1
+        guard !outcomes.isEmpty else {
+            return SyncV2SnapshotPullReport(
+                outcomes: [],
+                appliedSnapshots: []
+            )
+        }
+        switch outcomes.removeFirst() {
+        case .success(let report):
+            return report
+        case .failure(let error):
+            throw error
+        }
+    }
+
+    func count() -> Int { pulls }
+}
+
+private actor FirstPullHangsWorkspacePuller: SyncV2SnapshotPulling {
+    private var pulls = 0
+
+    func pull(
+        localProjectID: ProjectID,
+        serverProjectID: UUID,
+        editingGuards: [UUID: SyncV2EditingGuard]
+    ) async throws -> SyncV2SnapshotPullReport {
+        _ = (localProjectID, serverProjectID, editingGuards)
+        pulls += 1
+        if pulls == 1 {
+            try await ContinuousClock().sleep(for: .seconds(60))
+        }
+        return SyncV2SnapshotPullReport(
+            outcomes: [],
+            appliedSnapshots: []
+        )
+    }
+
+    func count() -> Int { pulls }
+}
+
+private actor ControlledFirstWorkspacePuller: SyncV2SnapshotPulling {
+    private var pulls = 0
+    private var firstStarted = false
+    private var startWaiters: [CheckedContinuation<Void, Never>] = []
+    private var finishContinuation: CheckedContinuation<Void, Never>?
+
+    func pull(
+        localProjectID: ProjectID,
+        serverProjectID: UUID,
+        editingGuards: [UUID: SyncV2EditingGuard]
+    ) async throws -> SyncV2SnapshotPullReport {
+        _ = (localProjectID, serverProjectID, editingGuards)
+        pulls += 1
+        if pulls == 1 {
+            firstStarted = true
+            let waiters = startWaiters
+            startWaiters.removeAll()
+            waiters.forEach { $0.resume() }
+            await withCheckedContinuation { continuation in
+                finishContinuation = continuation
+            }
+        }
+        return SyncV2SnapshotPullReport(
+            outcomes: [],
+            appliedSnapshots: []
+        )
+    }
+
+    func waitUntilFirstStarted() async {
+        guard !firstStarted else { return }
+        await withCheckedContinuation { continuation in
+            startWaiters.append(continuation)
+        }
+    }
+
+    func finishFirst() {
+        finishContinuation?.resume()
+        finishContinuation = nil
+    }
+
+    func count() -> Int { pulls }
+}
+
 private actor CancellationIgnoringWorkspacePuller:
     SyncV2SnapshotPulling {
     private let report: SyncV2SnapshotPullReport
@@ -2016,6 +2984,9 @@ private actor CancellationIgnoringWorkspacePuller:
 private actor WorkspaceRealtimeStub: SyncV2RealtimeTriggering {
     private var change: (@Sendable () -> Void)?
     private var subscribed: (@Sendable () -> Void)?
+    private var statuses: [
+        @Sendable (SyncV2RealtimeConnectionStatus) -> Void
+    ] = []
     private var stops = 0
 
     func start(
@@ -2035,6 +3006,26 @@ private actor WorkspaceRealtimeStub: SyncV2RealtimeTriggering {
         subscribed = onSubscribed
     }
 
+    func start(
+        projectID: UUID,
+        onChange: @escaping @Sendable () -> Void,
+        onStatus: @escaping @Sendable
+            (SyncV2RealtimeConnectionStatus) -> Void
+    ) async throws {
+        _ = projectID
+        change = onChange
+        statuses.append(onStatus)
+    }
+
+    func startAll(
+        onChange: @escaping @Sendable () -> Void,
+        onStatus: @escaping @Sendable
+            (SyncV2RealtimeConnectionStatus) -> Void
+    ) async throws {
+        change = onChange
+        statuses.append(onStatus)
+    }
+
     func stop() async {
         stops += 1
         change = nil
@@ -2046,14 +3037,31 @@ private actor WorkspaceRealtimeStub: SyncV2RealtimeTriggering {
     }
 
     func emitSubscribed() {
-        subscribed?()
+        if let status = statuses.last {
+            status(.subscribed)
+        } else {
+            subscribed?()
+        }
+    }
+
+    func emitStatus(
+        _ value: SyncV2RealtimeConnectionStatus,
+        at index: Int? = nil
+    ) {
+        guard !statuses.isEmpty else { return }
+        let resolved = index ?? statuses.index(before: statuses.endIndex)
+        guard statuses.indices.contains(resolved) else { return }
+        statuses[resolved](value)
     }
 
     func stopCount() -> Int { stops }
+    func startCount() -> Int { statuses.count }
 }
 
 private actor HangingWorkspaceRealtimeStub:
     SyncV2RealtimeTriggering {
+    private var stops = 0
+
     func start(
         projectID: UUID,
         onChange: @escaping @Sendable () -> Void,
@@ -2062,7 +3070,191 @@ private actor HangingWorkspaceRealtimeStub:
         try await ContinuousClock().sleep(for: .seconds(60))
     }
 
-    func stop() async {}
+    func stop() async {
+        stops += 1
+    }
+
+    func stopCount() -> Int { stops }
+}
+
+private actor HangingAllRealtimeStub: SyncV2RealtimeTriggering {
+    private var starts = 0
+    private var stops = 0
+
+    func start(
+        projectID: UUID,
+        onChange: @escaping @Sendable () -> Void,
+        onSubscribed: @escaping @Sendable () -> Void
+    ) async throws {
+        _ = (projectID, onChange, onSubscribed)
+        try await ContinuousClock().sleep(for: .seconds(60))
+    }
+
+    func startAll(
+        onChange: @escaping @Sendable () -> Void,
+        onSubscribed: @escaping @Sendable () -> Void
+    ) async throws {
+        _ = (onChange, onSubscribed)
+        starts += 1
+        try await ContinuousClock().sleep(for: .seconds(60))
+    }
+
+    func stop() async {
+        stops += 1
+    }
+
+    func startCount() -> Int { starts }
+    func stopCount() -> Int { stops }
+}
+
+private actor RealtimeConnectGateProbe {
+    private var active = 0
+    private var maximumConcurrent = 0
+    private var started = 0
+    private var blockers: [CheckedContinuation<Void, Never>] = []
+    private var startWaiters:
+        [(target: Int, continuation: CheckedContinuation<Void, Never>)] = []
+
+    func enterAndWait() async {
+        active += 1
+        maximumConcurrent = max(maximumConcurrent, active)
+        started += 1
+        let ready = startWaiters.filter { started >= $0.target }
+        startWaiters.removeAll { started >= $0.target }
+        ready.forEach { $0.continuation.resume() }
+        await withCheckedContinuation { continuation in
+            blockers.append(continuation)
+        }
+    }
+
+    func leave() {
+        active -= 1
+    }
+
+    func releaseOne() {
+        guard !blockers.isEmpty else { return }
+        blockers.removeFirst().resume()
+    }
+
+    func waitUntilStarted(_ target: Int) async {
+        guard started < target else { return }
+        await withCheckedContinuation { continuation in
+            startWaiters.append((target, continuation))
+        }
+    }
+
+    func startedCount() -> Int { started }
+    func maximumConcurrentCount() -> Int { maximumConcurrent }
+}
+
+private actor ManualWorkspaceSleep {
+    private struct Waiter {
+        let id: UUID
+        let continuation: CheckedContinuation<Void, any Error>
+    }
+
+    private var durations: [Duration] = []
+    private var waiters: [Waiter] = []
+    private var callWaiters: [
+        (target: Int, continuation: CheckedContinuation<Void, Never>)
+    ] = []
+
+    func sleep(_ duration: Duration) async throws {
+        let id = UUID()
+        try Task.checkCancellation()
+        try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { continuation in
+                durations.append(duration)
+                waiters.append(
+                    Waiter(id: id, continuation: continuation)
+                )
+                let ready = callWaiters.filter {
+                    durations.count >= $0.target
+                }
+                callWaiters.removeAll {
+                    durations.count >= $0.target
+                }
+                ready.forEach { $0.continuation.resume() }
+            }
+        } onCancel: {
+            Task { await self.cancel(id) }
+        }
+    }
+
+    func resumeNext() {
+        guard !waiters.isEmpty else { return }
+        waiters.removeFirst().continuation.resume()
+    }
+
+    func resumeLast() {
+        guard !waiters.isEmpty else { return }
+        waiters.removeLast().continuation.resume()
+    }
+
+    func cancelNext() {
+        guard !waiters.isEmpty else { return }
+        waiters.removeFirst().continuation.resume(
+            throwing: CancellationError()
+        )
+    }
+
+    private func cancel(_ id: UUID) {
+        guard let index = waiters.firstIndex(where: { $0.id == id }) else {
+            return
+        }
+        waiters.remove(at: index).continuation.resume(
+            throwing: CancellationError()
+        )
+    }
+
+    func waitUntilCalled(_ target: Int) async {
+        guard durations.count < target else { return }
+        await withCheckedContinuation { continuation in
+            callWaiters.append((target, continuation))
+        }
+    }
+
+    func callCount() -> Int { durations.count }
+    func recordedDurations() -> [Duration] { durations }
+}
+
+private actor SequencedRealtimeGateOperation {
+    private var starts = 0
+    private var hungContinuation: CheckedContinuation<Void, Never>?
+    private var startWaiters: [
+        (target: Int, continuation: CheckedContinuation<Void, Never>)
+    ] = []
+
+    func run() async {
+        starts += 1
+        let ready = startWaiters.filter { starts >= $0.target }
+        startWaiters.removeAll { starts >= $0.target }
+        ready.forEach { $0.continuation.resume() }
+        guard starts == 1 else { return }
+        await withCheckedContinuation { continuation in
+            hungContinuation = continuation
+        }
+    }
+
+    func startCount() -> Int { starts }
+
+    func waitUntilStarted(_ target: Int) async {
+        guard starts < target else { return }
+        await withCheckedContinuation { continuation in
+            startWaiters.append((target, continuation))
+        }
+    }
+
+    func releaseHungOperation() {
+        hungContinuation?.resume()
+        hungContinuation = nil
+    }
+
+    func releaseHungIfSecondDidNotStart() -> Bool {
+        guard starts < 2 else { return false }
+        releaseHungOperation()
+        return true
+    }
 }
 
 private actor WorkspaceAuthenticationStub: AuthenticationServicing {
@@ -2096,6 +3288,134 @@ private actor WorkspaceAuthenticationStub: AuthenticationServicing {
         let waiters = restoreWaiters
         restoreWaiters.removeAll()
         waiters.forEach { $0.resume(returning: state) }
+    }
+}
+
+private actor ObservableWorkspaceAuthenticationStub:
+    AuthenticationServicing {
+    private var state: AuthenticationState
+    private var observers: [
+        UUID: AsyncStream<AuthenticationState>.Continuation
+    ] = [:]
+
+    init(state: AuthenticationState) {
+        self.state = state
+    }
+
+    func currentState() -> AuthenticationState { state }
+    func restoreSession() -> AuthenticationState { state }
+
+    func signIn(
+        email: String,
+        password: String
+    ) -> AuthenticationState {
+        _ = (email, password)
+        return state
+    }
+
+    func signOut() -> AuthenticationState {
+        state = .signedOut(.userInitiated)
+        publish(state)
+        return state
+    }
+
+    func stateUpdates() -> AsyncStream<AuthenticationState> {
+        let observerID = UUID()
+        return AsyncStream { continuation in
+            observers[observerID] = continuation
+            continuation.onTermination = { [weak self] _ in
+                Task { await self?.removeObserver(observerID) }
+            }
+        }
+    }
+
+    func setState(_ state: AuthenticationState) {
+        self.state = state
+        publish(state)
+    }
+
+    func observerCount() -> Int { observers.count }
+
+    private func publish(_ state: AuthenticationState) {
+        observers.values.forEach { $0.yield(state) }
+    }
+
+    private func removeObserver(_ observerID: UUID) {
+        observers[observerID] = nil
+    }
+}
+
+private actor RefreshCountingAuthenticationStub:
+    AuthenticationServicing {
+    private let authenticated = AuthenticationState.authenticated(
+        AuthenticatedAccount(
+            userID: UUID(),
+            maskedEmail: "u***@example.com"
+        )
+    )
+    private var refreshes = 0
+
+    func currentState() -> AuthenticationState { authenticated }
+    func restoreSession() -> AuthenticationState { authenticated }
+    func refreshSession(force: Bool) -> AuthenticationState {
+        _ = force
+        refreshes += 1
+        return authenticated
+    }
+    func signIn(
+        email: String,
+        password: String
+    ) -> AuthenticationState {
+        _ = (email, password)
+        return authenticated
+    }
+    func signOut() -> AuthenticationState {
+        .signedOut(.userInitiated)
+    }
+    func refreshCount() -> Int { refreshes }
+}
+
+private actor HangingRefreshAuthenticationStub:
+    AuthenticationServicing {
+    private let authenticated = AuthenticationState.authenticated(
+        AuthenticatedAccount(
+            userID: UUID(),
+            maskedEmail: "u***@example.com"
+        )
+    )
+    private var refreshes = 0
+    private var refreshContinuation:
+        CheckedContinuation<Void, Never>?
+
+    func currentState() -> AuthenticationState { authenticated }
+    func restoreSession() -> AuthenticationState { authenticated }
+
+    func refreshSession(force: Bool) async -> AuthenticationState {
+        _ = force
+        refreshes += 1
+        await withCheckedContinuation { continuation in
+            refreshContinuation = continuation
+        }
+        return authenticated
+    }
+
+    func signIn(
+        email: String,
+        password: String
+    ) -> AuthenticationState {
+        _ = (email, password)
+        return authenticated
+    }
+
+    func signOut() -> AuthenticationState {
+        .signedOut(.userInitiated)
+    }
+
+    func refreshCount() -> Int { refreshes }
+
+    func releaseRefresh() {
+        refreshContinuation?.resume()
+        refreshContinuation = nil
     }
 }
 

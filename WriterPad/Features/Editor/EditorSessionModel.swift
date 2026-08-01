@@ -208,6 +208,7 @@ final class EditorSessionModel: ObservableObject {
     private var dirtyGeneration: UInt64 = 0
     private var lastSavedDirtyGeneration: UInt64 = 0
     private var pendingSaveAfterComposition = false
+    private var compositionStateGeneration: UInt64 = 0
     private var syncHandoffStates: [DocumentID: SyncHandoffState] = [:]
     private var statisticsGeneration: UInt64 = 0
     private var statisticsTask: Task<Void, Never>?
@@ -526,17 +527,50 @@ final class EditorSessionModel: ObservableObject {
     }
 
     func updateCompositionState(_ composing: Bool) async {
-        guard composing != isComposing else { return }
+        guard let generation = recordCompositionState(composing) else {
+            return
+        }
+        _ = await finishCompositionStateUpdate(
+            composing,
+            generation: generation
+        )
+    }
+
+    /// UIKit의 marked-text 콜백 순서를 그대로 보존하도록 조합 여부는 콜백
+    /// 순간에 동기 반영한다. 문서 전환·저장처럼 await가 필요한 후처리만
+    /// generation으로 보호해 별도 Task에서 이어간다.
+    @discardableResult
+    func recordCompositionState(_ composing: Bool) -> UInt64? {
+        guard composing != isComposing else { return nil }
+        compositionStateGeneration &+= 1
+        let generation = compositionStateGeneration
         isComposing = composing
-        let effects = focusStateMachine.handle(
+        _ = focusStateMachine.handle(
             composing ? .compositionStarted : .compositionEnded
         )
         focusPhase = focusStateMachine.phase
-        await apply(effects)
+        return generation
+    }
+
+    @discardableResult
+    func finishCompositionStateUpdate(
+        _ composing: Bool,
+        generation: UInt64
+    ) async -> Bool {
+        guard generation == compositionStateGeneration,
+              isComposing == composing
+        else { return false }
+        if !composing {
+            await apply([.completePendingTransition])
+        }
+        guard generation == compositionStateGeneration,
+              isComposing == composing
+        else { return false }
         if !composing, pendingSaveAfterComposition {
             pendingSaveAfterComposition = false
             _ = await saveNow()
         }
+        return true
     }
 
     func updateFocusState(_ hasFocus: Bool) {
@@ -982,10 +1016,13 @@ final class EditorSessionModel: ObservableObject {
         isUnsavedDraft: Bool = false
     ) async {
         autosaveDebouncer.cancel()
-        if leaseTrackedDocumentID != nil,
-           leaseTrackedDocumentID != documentID {
-            await synchronizeEditLease(to: nil)
-        }
+        let shouldReleasePreviousLease =
+            leaseTrackedDocumentID != nil
+            && leaseTrackedDocumentID != documentID
+
+        // 문서 본문 전환은 이전 문서의 네트워크 잠금 정리보다 먼저 끝낸다.
+        // 특히 대상이 빈 draft일 때 잠금 해제를 기다리면 제목만 새 화로
+        // 바뀐 채 이전 UITextView와 본문이 화면에 남을 수 있다.
         currentDocumentID = documentID
         setText(text, statisticsUpdate: .immediate)
         self.cursor = cursor
@@ -997,6 +1034,9 @@ final class EditorSessionModel: ObservableObject {
         resetSaveTracking()
         if isUnsavedDraft {
             markDirtyAndScheduleAutosave()
+        }
+        if shouldReleasePreviousLease {
+            await synchronizeEditLease(to: nil)
         }
     }
 
@@ -1011,20 +1051,28 @@ final class EditorSessionModel: ObservableObject {
 
     private func synchronizeEditLease(to documentID: DocumentID?) async {
         guard leaseTrackedDocumentID != documentID else { return }
+        editLeaseRequestSequence &+= 1
+        let requestSequence = editLeaseRequestSequence
         editLeaseStateObservationTask?.cancel()
         editLeaseStateObservationTask = nil
-        if let previous = leaseTrackedDocumentID {
+        let previousDocumentID = leaseTrackedDocumentID
+        leaseTrackedDocumentID = documentID
+        if documentID == nil || editLeaseManager == nil {
+            editLeaseState = .localOnly
+        } else {
+            editLeaseState = .acquiring
+        }
+        if let previous = previousDocumentID {
             await editLeaseManager?.endEditing(
                 documentID: previous.rawValue
             )
         }
-        leaseTrackedDocumentID = documentID
+        guard editLeaseRequestSequence == requestSequence,
+              leaseTrackedDocumentID == documentID
+        else { return }
         guard let documentID, let editLeaseManager else {
-            editLeaseState = .localOnly
             return
         }
-        editLeaseRequestSequence &+= 1
-        let requestSequence = editLeaseRequestSequence
         editLeaseStateObservationTask = Task {
             [weak self, editLeaseManager] in
             let updates = await editLeaseManager.stateUpdates(
@@ -1045,7 +1093,6 @@ final class EditorSessionModel: ObservableObject {
             }
         }
         let outcome = EditLeaseRequestOutcome()
-        editLeaseState = .acquiring
         Task {
             let state = await editLeaseManager.beginEditing(
                 documentID: documentID.rawValue

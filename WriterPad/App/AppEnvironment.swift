@@ -273,6 +273,8 @@ final class AppEnvironment: ObservableObject {
         } else {
             snapshotPullService = nil
         }
+        // 두 trigger는 같은 SupabaseClientProvider가 보유한 subscription gate를
+        // 공유해 workspace/background 채널의 동시 subscribe를 직렬화한다.
         let workspaceRealtimeTrigger =
             supabaseClientProvider.makeRealtimeTrigger()
         let backgroundSyncCoordinator: SyncV2BackgroundSyncCoordinator?
@@ -282,7 +284,8 @@ final class AppEnvironment: ObservableObject {
             backgroundSyncCoordinator = SyncV2BackgroundSyncCoordinator(
                 puller: snapshotPullService,
                 realtime: backgroundRealtimeTrigger,
-                projectBindingService: projectBindingService
+                projectBindingService: projectBindingService,
+                authenticationService: authenticationService
             )
         } else {
             backgroundSyncCoordinator = nil

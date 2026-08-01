@@ -46,6 +46,8 @@ final class EphemeralAuthLocalStorage: AuthLocalStorage, @unchecked Sendable {
 final class SupabaseClientProvider: SupabaseClientProviding {
     let configurationState: SupabaseConfigurationState
     private let client: SupabaseClient?
+    private let realtimeSubscriptionGate =
+        SyncV2RealtimeConnectGate()
 
     var isConfigured: Bool {
         client != nil
@@ -76,7 +78,12 @@ final class SupabaseClientProvider: SupabaseClientProviding {
     }
 
     func makeRealtimeTrigger() -> (any SyncV2RealtimeTriggering)? {
-        client.map(LiveSyncV2RealtimeTrigger.init(client:))
+        client.map {
+            LiveSyncV2RealtimeTrigger(
+                client: $0,
+                subscriptionGate: realtimeSubscriptionGate
+            )
+        }
     }
 
     func makeEditLeaseClient() -> EditLeaseClient? {
@@ -111,7 +118,7 @@ final class SupabaseClientProvider: SupabaseClientProviding {
                     auth: .init(
                         storage: EphemeralAuthLocalStorage(),
                         autoRefreshToken: false,
-                        emitLocalSessionAsInitialSession: false
+                        emitLocalSessionAsInitialSession: true
                     )
                 )
             )

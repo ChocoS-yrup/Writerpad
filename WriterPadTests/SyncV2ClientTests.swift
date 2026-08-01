@@ -528,6 +528,182 @@ final class EditLeaseManagerTests: XCTestCase {
         XCTAssertEqual(acquireCount, 1)
     }
 
+    @MainActor
+    func testHeldByOtherDocumentTransitionKeepsChapterContentsIsolated()
+        async throws {
+        let environment = try AppEnvironment.testing()
+        let project = try await environment.projectManager.createProject(
+            named: "잠금 충돌 문서 전환"
+        )
+        _ = try await environment.binderRepository.rootNodes(in: project.id)
+        _ = try await environment.binderCommands.addNewVolume(
+            projectID: project.id
+        )
+        let documents = try await environment.documentRepository
+            .documents(in: project.id)
+            .filter {
+                $0.kind == .text
+                    && $0.relativePath.rawValue.contains("/원고/")
+            }
+            .sorted { $0.userOrder < $1.userOrder }
+        let chapters = Array(documents.prefix(3))
+        XCTAssertEqual(chapters.count, 3)
+        let initialContents = ["", "", ""]
+        for (index, document) in chapters.enumerated() {
+            _ = try await environment.localDocumentStore.save(
+                DocumentSaveRequest(
+                    projectID: project.id,
+                    documentID: document.id,
+                    relativePath: document.relativePath,
+                    text: initialContents[index],
+                    generation: 1
+                )
+            )
+        }
+        func node(
+            _ document: DocumentNode,
+            displayName: String
+        ) -> BinderNode {
+            BinderNode(
+                id: document.id,
+                projectID: document.projectID,
+                kind: .text,
+                relativePath: document.relativePath,
+                displayName: displayName,
+                fixedCategory: nil,
+                userOrder: document.userOrder,
+                contentState: .written,
+                isExpanded: false
+            )
+        }
+        let client = EditLeaseClientStub(
+            acquireError: .remote(
+                code: .leaseConflict,
+                detail: #"{"expires_at":"2030-01-02T03:04:05Z"}"#
+            )
+        )
+        let manager = EditLeaseManager(
+            client: client,
+            revisionProvider: FixedRevisionProvider(revision: 2),
+            deviceIdentityProvider: FixedDeviceIdentityProvider(
+                identifier: DeviceIdentifier(uuid: UUID())
+            )
+        )
+        let model = EditorSessionModel(
+            documentRepository: environment.documentRepository,
+            documentStore: environment.localDocumentStore,
+            workspaceStateRepository:
+                environment.workspaceStateRepository,
+            editLeaseManager: manager,
+            editLeaseConnectivityMonitor:
+                EditLeaseConnectivityMonitorStub(),
+            autosaveDelay: .seconds(60)
+        )
+
+        await model.select(node(chapters[0], displayName: "6화"))
+        model.updateText("아아")
+        await waitForLeaseState(model) {
+            if case .heldByOther = $0 {
+                return true
+            }
+            return false
+        }
+
+        await model.select(node(chapters[1], displayName: "7화"))
+        XCTAssertEqual(model.currentDocumentID, chapters[1].id)
+        XCTAssertEqual(model.currentText, "")
+        XCTAssertEqual(model.text, "")
+        XCTAssertEqual(model.selectedDisplayName, "7화")
+
+        await model.select(node(chapters[2], displayName: "8화"))
+        XCTAssertEqual(model.currentDocumentID, chapters[2].id)
+        XCTAssertEqual(model.currentText, "")
+        XCTAssertEqual(model.text, "")
+        XCTAssertEqual(model.selectedDisplayName, "8화")
+
+        var storedContents: [String] = []
+        for chapter in chapters {
+            storedContents.append(
+                try await environment.localDocumentStore.loadText(
+                    for: chapter
+                )
+            )
+        }
+        XCTAssertEqual(storedContents, ["아아", "", ""])
+    }
+
+    @MainActor
+    func testHeldByOtherEmptyDraftAppearsBeforePreviousLeaseCleanupFinishes()
+        async throws {
+        let environment = try AppEnvironment.testing()
+        let project = try await environment.projectManager.createProject(
+            named: "잠금 정리 중 빈 문서 전환"
+        )
+        _ = try await environment.binderRepository.rootNodes(in: project.id)
+        _ = try await environment.binderCommands.addNewVolume(
+            projectID: project.id
+        )
+        let documents = try await environment.documentRepository
+            .documents(in: project.id)
+            .filter {
+                $0.kind == .text
+                    && $0.relativePath.rawValue.contains("/원고/")
+            }
+            .sorted { $0.userOrder < $1.userOrder }
+        let chapters = Array(documents.prefix(2))
+        XCTAssertEqual(chapters.count, 2)
+        func node(_ document: DocumentNode, name: String) -> BinderNode {
+            BinderNode(
+                id: document.id,
+                projectID: document.projectID,
+                kind: .text,
+                relativePath: document.relativePath,
+                displayName: name,
+                fixedCategory: nil,
+                userOrder: document.userOrder,
+                contentState: .empty,
+                isExpanded: false
+            )
+        }
+        let drafts = EditorDraftStore()
+        drafts.store(
+            EditorDraftStore.Draft(text: "", cursor: .start),
+            for: chapters[1].id
+        )
+        let leaseManager = BlockingLeaseCleanupManager()
+        let model = EditorSessionModel(
+            documentRepository: environment.documentRepository,
+            documentStore: environment.localDocumentStore,
+            workspaceStateRepository:
+                environment.workspaceStateRepository,
+            draftStore: drafts,
+            editLeaseManager: leaseManager,
+            editLeaseConnectivityMonitor:
+                EditLeaseConnectivityMonitorStub(),
+            autosaveDelay: .seconds(60)
+        )
+
+        await model.select(node(chapters[0], name: "6화"))
+        model.updateText("아아")
+        await waitForLeaseState(model) {
+            if case .heldByOther = $0 { return true }
+            return false
+        }
+
+        let transition = Task { @MainActor in
+            await model.select(node(chapters[1], name: "7화"))
+        }
+        await leaseManager.waitUntilCleanupStarts()
+
+        XCTAssertEqual(model.currentDocumentID, chapters[1].id)
+        XCTAssertEqual(model.selectedDisplayName, "7화")
+        XCTAssertEqual(model.currentText, "")
+        XCTAssertEqual(model.text, "")
+
+        await leaseManager.finishCleanup()
+        await transition.value
+    }
+
     func testSessionRestoreNeverStartsLeaseRPCAndCommitAcquiresAfterAuth()
         async throws {
         let documentID = UUID()
@@ -2732,6 +2908,92 @@ private actor LeaseReleaseGate {
         let pending = waiters
         waiters.removeAll()
         pending.forEach { $0.resume() }
+    }
+}
+
+private actor BlockingLeaseCleanupManager: EditLeaseManaging {
+    private var cleanupStarted = false
+    private var cleanupCanFinish = false
+    private var cleanupStartWaiters:
+        [CheckedContinuation<Void, Never>] = []
+    private var cleanupFinishWaiters:
+        [CheckedContinuation<Void, Never>] = []
+
+    func stateUpdates(
+        documentID: UUID
+    ) -> AsyncStream<EditLeaseDisplayState> {
+        _ = documentID
+        return AsyncStream { _ in }
+    }
+
+    func beginEditing(documentID: UUID) -> EditLeaseDisplayState {
+        _ = documentID
+        return .heldByOther(expiresAt: nil)
+    }
+
+    func refreshEditing(documentID: UUID) -> EditLeaseDisplayState {
+        _ = documentID
+        return .heldByOther(expiresAt: nil)
+    }
+
+    func offlineDisplayState(
+        documentID: UUID
+    ) -> EditLeaseDisplayState {
+        _ = documentID
+        return .offlineEditing
+    }
+
+    func endEditing(documentID: UUID) async {
+        _ = documentID
+        cleanupStarted = true
+        let startWaiters = cleanupStartWaiters
+        cleanupStartWaiters.removeAll()
+        startWaiters.forEach { $0.resume() }
+        guard !cleanupCanFinish else { return }
+        await withCheckedContinuation { continuation in
+            cleanupFinishWaiters.append(continuation)
+        }
+    }
+
+    func leaseTokenForCommit(
+        documentID: UUID,
+        deviceID: UUID,
+        baseRevision: Int64
+    ) throws -> UUID? {
+        _ = (documentID, deviceID, baseRevision)
+        return nil
+    }
+
+    func commitSucceeded(
+        documentID: UUID,
+        deviceID: UUID,
+        isDeleted: Bool
+    ) {
+        _ = (documentID, deviceID, isDeleted)
+    }
+
+    func commitFailed(
+        documentID: UUID,
+        deviceID: UUID,
+        error: SyncV2ClientError
+    ) {
+        _ = (documentID, deviceID, error)
+    }
+
+    func releaseAll() {}
+
+    func waitUntilCleanupStarts() async {
+        guard !cleanupStarted else { return }
+        await withCheckedContinuation { continuation in
+            cleanupStartWaiters.append(continuation)
+        }
+    }
+
+    func finishCleanup() {
+        cleanupCanFinish = true
+        let finishWaiters = cleanupFinishWaiters
+        cleanupFinishWaiters.removeAll()
+        finishWaiters.forEach { $0.resume() }
     }
 }
 

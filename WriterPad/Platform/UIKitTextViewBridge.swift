@@ -881,9 +881,14 @@ struct iPadTextEditor: UIViewRepresentable {
     var textRuleSettings: TextRuleSettings = .enabled
     /// 정상 입력은 전체 문자열 없이 mutation만 전달한다. TextKit이 단일 변경 범위를
     /// 제공하지 못한 예외 경로에서만 첫 번째 인자에 전체 복구 스냅샷이 들어온다.
-    var onTextChange: (String?, SharedEditorTextChange.Mutation?) -> Void = { _, _ in }
+    /// 변경이 실제로 발생한 UITextView의 문서 ID를 함께 전달한다. SwiftUI 모델이
+    /// 먼저 다음 문서로 전환된 뒤 이전 UITextView의 지연 callback이 도착하더라도,
+    /// 호출자가 이전 원고를 새 문서에 적용하지 않도록 문서 경계를 보존한다.
+    var onTextChange:
+        (DocumentID, String?, SharedEditorTextChange.Mutation?) -> Void =
+            { _, _, _ in }
     var onEditorCommand: (WriterPadEditorCommand) -> Void = { _ in }
-    var onCompositionStateChange: (Bool) -> Void = { _ in }
+    var onCompositionStateChange: (DocumentID, Bool) -> Void = { _, _ in }
     var onFocusChange: (Bool) -> Void = { _ in }
 
     func makeCoordinator() -> Coordinator {
@@ -957,7 +962,7 @@ struct iPadTextEditor: UIViewRepresentable {
             let previousSnapshot = tracker.appliedSnapshot
             let decision = tracker.decision(
                 for: incoming,
-                isComposing: textView.markedTextRange != nil
+                isComposing: Self.hasActiveMarkedText(in: textView)
             )
 
             switch decision {
@@ -1052,7 +1057,7 @@ struct iPadTextEditor: UIViewRepresentable {
         }
 
         private func applyEditCommandsIfNeeded(to textView: SmartTextView) {
-            guard textView.markedTextRange == nil else { return }
+            guard !Self.hasActiveMarkedText(in: textView) else { return }
             if parent.undoRequest != lastUndoRequest {
                 lastUndoRequest = parent.undoRequest
                 textView.performUndo()
@@ -1065,6 +1070,8 @@ struct iPadTextEditor: UIViewRepresentable {
 
         func textViewDidChange(_ textView: UITextView) {
             guard !isApplyingExternalState else { return }
+            guard let sourceDocumentID = tracker.appliedSnapshot?.documentID
+            else { return }
             let resultingLength = textView.textStorage.length
             let processed = processedTextMutations
             processedTextMutations.removeAll(keepingCapacity: true)
@@ -1086,12 +1093,11 @@ struct iPadTextEditor: UIViewRepresentable {
             }
             lastKnownUTF16Length = resultingLength
             if let mutation {
-                parent.onTextChange(nil, mutation)
+                parent.onTextChange(sourceDocumentID, nil, mutation)
             } else {
                 // 드문 다중 편집·예상 밖 IME 콜백에서만 전체 스냅샷으로 복구한다.
                 let snapshot = textView.textStorage.string
-                parent.text = snapshot
-                parent.onTextChange(snapshot, nil)
+                parent.onTextChange(sourceDocumentID, snapshot, nil)
             }
             if let smartTextView = textView as? SmartTextView {
                 smartTextView.refreshPlaceholderVisibility()
@@ -1161,7 +1167,7 @@ struct iPadTextEditor: UIViewRepresentable {
         private func normalizeTrailingEllipsisIfNeeded(in textView: SmartTextView) {
             guard parent.textRuleSettings.ellipsisConversionEnabled,
                   !textView.isPerformingPlainTextPaste,
-                  textView.markedTextRange == nil,
+                  !Self.hasActiveMarkedText(in: textView),
                   textView.selectedRange.length == 0,
                   textView.selectedRange.location >= 3
             else { return }
@@ -1197,7 +1203,7 @@ struct iPadTextEditor: UIViewRepresentable {
                 replacementText: replacement
             )
             guard let smartTextView = textView as? SmartTextView else { return true }
-            let isComposing = textView.markedTextRange != nil
+            let isComposing = Self.hasActiveMarkedText(in: textView)
             let isPaste = smartTextView.isPerformingPlainTextPaste
             guard parent.textRuleSettings.hasEnabledRule, !isComposing, !isPaste else {
                 return true
@@ -1252,7 +1258,7 @@ struct iPadTextEditor: UIViewRepresentable {
                   parent.appearance.typewriterScrolling,
                   parent.isActive,
                   !isUserScrolling,
-                  textView.markedTextRange == nil,
+                  !Self.hasActiveMarkedText(in: textView),
                   textView.selectedRange.length == 0,
                   let selection = textView.selectedTextRange
             else { return }
@@ -1590,7 +1596,7 @@ struct iPadTextEditor: UIViewRepresentable {
             in textView: UITextView
         ) {
             guard request == lastCompositionCommitRequest else { return }
-            if textView.markedTextRange != nil {
+            if Self.hasActiveMarkedText(in: textView) {
                 textView.unmarkText()
             }
             DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(20)) {
@@ -1600,7 +1606,7 @@ struct iPadTextEditor: UIViewRepresentable {
                       request == self.lastCompositionCommitRequest
                 else { return }
                 self.handleCompositionState(in: textView)
-                guard textView.markedTextRange != nil else {
+                guard Self.hasActiveMarkedText(in: textView) else {
                     // UIKit의 완료 콜백과 SwiftUI Task 실행 순서가 뒤집히면 브리지는
                     // 이미 false를 보고했다고 기억하지만 모델만 true로 남을 수 있다.
                     // 명시적 전환 요청에는 현재 UIKit 상태를 반드시 다시 확인시킨다.
@@ -1644,7 +1650,7 @@ struct iPadTextEditor: UIViewRepresentable {
                       request == self.lastCompositionCommitRequest
                 else { return }
                 self.handleCompositionState(in: textView)
-                guard textView.markedTextRange != nil else {
+                guard Self.hasActiveMarkedText(in: textView) else {
                     self.reportCompositionState(false, force: true)
                     return
                 }
@@ -1672,7 +1678,7 @@ struct iPadTextEditor: UIViewRepresentable {
                       let textView,
                       generation == self.responderResignationGeneration,
                       !self.parent.isActive,
-                      textView.markedTextRange == nil,
+                      !Self.hasActiveMarkedText(in: textView),
                       textView.isFirstResponder
                 else { return }
                 textView.resignFirstResponder()
@@ -1774,7 +1780,13 @@ struct iPadTextEditor: UIViewRepresentable {
         ) {
             guard force || isComposing != lastReportedCompositionState else { return }
             lastReportedCompositionState = isComposing
-            parent.onCompositionStateChange(isComposing)
+            let sourceDocumentID =
+                tracker.appliedSnapshot?.documentID
+                ?? parent.documentID
+            parent.onCompositionStateChange(
+                sourceDocumentID,
+                isComposing
+            )
         }
 
         private static func cursor(from range: NSRange) -> TextCursorState {
@@ -1836,11 +1848,18 @@ struct iPadTextEditor: UIViewRepresentable {
                 to: markedTextRange.start
             )
             let length = textView.offset(from: markedTextRange.start, to: markedTextRange.end)
-            guard location >= 0, length >= 0 else { return nil }
+            // iPad 한글 입력기는 포커스 직후나 빈 문서에서 실제 조합 글자 없이
+            // 길이 0의 marked range만 남길 수 있다. 이를 조합 중으로 취급하면
+            // 문서 전환이 영구 대기하고 `unmarkText()` 재시도가 끝나지 않는다.
+            guard location >= 0, length > 0 else { return nil }
             return TextCursorState(
                 location: UInt(location),
                 selectionLength: UInt(length)
             )
+        }
+
+        private static func hasActiveMarkedText(in textView: UITextView) -> Bool {
+            markedCursor(in: textView) != nil
         }
     }
 }

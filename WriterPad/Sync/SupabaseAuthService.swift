@@ -6,6 +6,21 @@ struct ValidatedAuthSession: Equatable, Sendable {
     let email: String?
     let accessToken: String
     let refreshToken: String
+    let expiresAt: Date?
+
+    init(
+        userID: UUID,
+        email: String?,
+        accessToken: String,
+        refreshToken: String,
+        expiresAt: Date? = nil
+    ) {
+        self.userID = userID
+        self.email = email
+        self.accessToken = accessToken
+        self.refreshToken = refreshToken
+        self.expiresAt = expiresAt
+    }
 }
 
 enum SupabaseAuthTransportError: Error, Equatable, Sendable {
@@ -22,7 +37,17 @@ protocol SupabaseAuthTransporting: Sendable {
         -> ValidatedAuthSession
     func restore(tokens: StoredSessionTokens) async throws
         -> ValidatedAuthSession
+    func refresh(tokens: StoredSessionTokens) async throws
+        -> ValidatedAuthSession
     func signOut() async throws
+}
+
+extension SupabaseAuthTransporting {
+    func refresh(
+        tokens: StoredSessionTokens
+    ) async throws -> ValidatedAuthSession {
+        try await restore(tokens: tokens)
+    }
 }
 
 actor LiveSupabaseAuthTransport: SupabaseAuthTransporting {
@@ -62,6 +87,20 @@ actor LiveSupabaseAuthTransport: SupabaseAuthTransporting {
         }
     }
 
+    func refresh(
+        tokens: StoredSessionTokens
+    ) async throws -> ValidatedAuthSession {
+        do {
+            return validated(
+                try await client.auth.refreshSession(
+                    refreshToken: tokens.refreshToken
+                )
+            )
+        } catch {
+            throw map(error, isRestore: true)
+        }
+    }
+
     func signOut() async throws {
         do {
             try await client.auth.signOut()
@@ -75,7 +114,8 @@ actor LiveSupabaseAuthTransport: SupabaseAuthTransporting {
             userID: session.user.id,
             email: session.user.email,
             accessToken: session.accessToken,
-            refreshToken: session.refreshToken
+            refreshToken: session.refreshToken,
+            expiresAt: Date(timeIntervalSince1970: session.expiresAt)
         )
     }
 
@@ -147,16 +187,31 @@ enum AuthenticationState: Equatable, Sendable {
 
 protocol AuthenticationServicing: Sendable {
     func currentState() async -> AuthenticationState
+    func stateUpdates() async -> AsyncStream<AuthenticationState>
     @discardableResult
     func restoreSession() async -> AuthenticationState
+    @discardableResult
+    func refreshSession(force: Bool) async -> AuthenticationState
     @discardableResult
     func signIn(email: String, password: String) async -> AuthenticationState
     @discardableResult
     func signOut() async -> AuthenticationState
 }
 
+extension AuthenticationServicing {
+    func stateUpdates() async -> AsyncStream<AuthenticationState> {
+        AsyncStream { $0.finish() }
+    }
+
+    func refreshSession(force: Bool) async -> AuthenticationState {
+        _ = force
+        return await restoreSession()
+    }
+}
+
 typealias AuthenticationSleep =
     @Sendable (Duration) async throws -> Void
+typealias AuthenticationNow = @Sendable () -> Date
 
 actor SupabaseAuthService: AuthenticationServicing {
     private struct ActiveRestore {
@@ -167,15 +222,35 @@ actor SupabaseAuthService: AuthenticationServicing {
     private let transport: (any SupabaseAuthTransporting)?
     private let sessionStore: any SessionTokenStoring
     private let restoreTimeout: Duration
+    private let refreshMargin: TimeInterval
     private let sleep: AuthenticationSleep
-    private var state: AuthenticationState = .localOnly
+    private let now: AuthenticationNow
+    private var stateObservers: [
+        UUID: AsyncStream<AuthenticationState>.Continuation
+    ] = [:]
+    private var state: AuthenticationState = .localOnly {
+        didSet {
+            guard oldValue != state else { return }
+            stateObservers.values.forEach { $0.yield(state) }
+        }
+    }
     private var activeOperationID: UUID?
     private var activeRestore: ActiveRestore?
+    private var activeRefresh: ActiveRestore?
+    private var automaticRefreshTask: Task<Void, Never>?
+    private var refreshRetryTask: Task<Void, Never>?
+    private var sessionExpiresAt: Date?
+#if DEBUG
+    private var restoreCompletionProbe:
+        (@Sendable () async -> Void)?
+#endif
 
     init(
         transport: (any SupabaseAuthTransporting)?,
         sessionStore: any SessionTokenStoring,
         restoreTimeout: Duration = .seconds(12),
+        refreshMargin: TimeInterval = 5 * 60,
+        now: @escaping AuthenticationNow = Date.init,
         sleep: @escaping AuthenticationSleep = {
             try await ContinuousClock().sleep(for: $0)
         }
@@ -183,6 +258,8 @@ actor SupabaseAuthService: AuthenticationServicing {
         self.transport = transport
         self.sessionStore = sessionStore
         self.restoreTimeout = restoreTimeout
+        self.refreshMargin = refreshMargin
+        self.now = now
         self.sleep = sleep
     }
 
@@ -190,13 +267,32 @@ actor SupabaseAuthService: AuthenticationServicing {
         state
     }
 
+    func stateUpdates() async -> AsyncStream<AuthenticationState> {
+        let observerID = UUID()
+        return AsyncStream { continuation in
+            stateObservers[observerID] = continuation
+            continuation.onTermination = { [weak self] _ in
+                Task { await self?.removeStateObserver(observerID) }
+            }
+        }
+    }
+
+    private func removeStateObserver(_ observerID: UUID) {
+        stateObservers[observerID] = nil
+    }
+
     @discardableResult
     func restoreSession() async -> AuthenticationState {
         if state.isAuthenticated {
-            return state
+            return await refreshSession(force: false)
         }
         if let activeRestore {
             return await activeRestore.task.value
+        }
+        // beginOperation은 단일 activeOperationID를 덮어쓰므로 진행 중인
+        // refresh와 겹치면 성공한 refresh 결과가 stale로 폐기될 수 있다.
+        if let activeRefresh {
+            return await activeRefresh.task.value
         }
         guard let transport else {
             state = .unavailable(.configurationUnavailable)
@@ -221,10 +317,125 @@ actor SupabaseAuthService: AuthenticationServicing {
             task: task
         )
         let result = await task.value
+#if DEBUG
+        let completionProbe = restoreCompletionProbe
+        restoreCompletionProbe = nil
+        await completionProbe?()
+#endif
         if activeRestore?.operationID == operationID {
             activeRestore = nil
         }
         return result
+    }
+
+#if DEBUG
+    func installRestoreCompletionProbe(
+        _ probe: @escaping @Sendable () async -> Void
+    ) {
+        restoreCompletionProbe = probe
+    }
+#endif
+
+    @discardableResult
+    func refreshSession(force: Bool) async -> AuthenticationState {
+        if let activeRefresh {
+            return await activeRefresh.task.value
+        }
+        guard state.isAuthenticated else {
+            return await restoreSession()
+        }
+        // beginOperation은 단일 activeOperationID를 덮어쓰므로 진행 중인
+        // restore와 겹치면 성공한 restore 결과가 stale로 폐기될 수 있다.
+        if let activeRestore {
+            return await activeRestore.task.value
+        }
+        if !force {
+            guard let sessionExpiresAt else { return state }
+            if sessionExpiresAt.timeIntervalSince(now()) > refreshMargin {
+                return state
+            }
+        }
+        guard let transport else {
+            state = .unavailable(.configurationUnavailable)
+            return state
+        }
+
+        let operationID = beginOperation()
+        let task = Task { [weak self] in
+            guard let self else {
+                return AuthenticationState.unavailable(.serverRejected)
+            }
+            return await self.performRefresh(
+                transport: transport,
+                operationID: operationID
+            )
+        }
+        activeRefresh = ActiveRestore(
+            operationID: operationID,
+            task: task
+        )
+        let result = await task.value
+        if activeRefresh?.operationID == operationID {
+            activeRefresh = nil
+        }
+        return result
+    }
+
+    private func performRefresh(
+        transport: any SupabaseAuthTransporting,
+        operationID: UUID
+    ) async -> AuthenticationState {
+        let storedTokens: StoredSessionTokens
+        do {
+            guard let tokens = try await sessionStore.load() else {
+                guard isCurrent(operationID) else { return state }
+                state = .signedOut(.noStoredSession)
+                return state
+            }
+            storedTokens = tokens
+        } catch {
+            guard isCurrent(operationID) else { return state }
+            state = .unavailable(.keychainAccess)
+            return state
+        }
+
+        let outcome = AuthenticationRestoreOutcome()
+        let transportTask = Task {
+            do {
+                let session = try await transport.refresh(tokens: storedTokens)
+                await outcome.resolve(.success(session))
+            } catch let error as SupabaseAuthTransportError {
+                await outcome.resolve(.failure(error))
+            } catch {
+                await outcome.resolve(.failure(.serverRejected))
+            }
+        }
+        let timeoutTask = Task {
+            do {
+                try await sleep(restoreTimeout)
+                await outcome.resolve(.failure(.networkUnavailable))
+            } catch {
+                // 갱신 또는 다른 인증 작업이 먼저 끝났다.
+            }
+        }
+        let result = await outcome.value()
+        transportTask.cancel()
+        timeoutTask.cancel()
+
+        guard isCurrent(operationID) else { return state }
+        switch result {
+        case .success(let session):
+            return await accept(session, operationID: operationID)
+        case .failure(.networkUnavailable):
+            state = .unavailable(.networkUnavailable)
+            scheduleRefreshRetry()
+            return state
+        case .failure(let error):
+            return await handleRestoreFailure(
+                error,
+                operationID: operationID
+            )
+        }
     }
 
     private func performRestore(
@@ -291,7 +502,7 @@ actor SupabaseAuthService: AuthenticationServicing {
         email: String,
         password: String
     ) async -> AuthenticationState {
-        cancelActiveRestore()
+        cancelActiveAuthenticationTasks()
         guard let transport else {
             state = .unavailable(.configurationUnavailable)
             return state
@@ -325,13 +536,14 @@ actor SupabaseAuthService: AuthenticationServicing {
 
     @discardableResult
     func signOut() async -> AuthenticationState {
-        cancelActiveRestore()
+        cancelActiveAuthenticationTasks()
         let operationID = beginOperation()
         state = .signedOut(.userInitiated)
         do {
             try await sessionStore.delete()
             guard isCurrent(operationID) else { return state }
             state = .signedOut(.userInitiated)
+            sessionExpiresAt = nil
         } catch {
             guard isCurrent(operationID) else { return state }
             state = .unavailable(.keychainAccess)
@@ -350,7 +562,8 @@ actor SupabaseAuthService: AuthenticationServicing {
             try await sessionStore.save(
                 StoredSessionTokens(
                     accessToken: session.accessToken,
-                    refreshToken: session.refreshToken
+                    refreshToken: session.refreshToken,
+                    expiresAt: session.expiresAt
                 )
             )
         } catch {
@@ -369,6 +582,10 @@ actor SupabaseAuthService: AuthenticationServicing {
                 maskedEmail: Self.masked(session.email)
             )
         )
+        sessionExpiresAt = session.expiresAt
+        refreshRetryTask?.cancel()
+        refreshRetryTask = nil
+        scheduleAutomaticRefresh()
         return state
     }
 
@@ -399,6 +616,11 @@ actor SupabaseAuthService: AuthenticationServicing {
             try await sessionStore.delete()
             guard isCurrent(operationID) else { return state }
             state = .signedOut(reason)
+            sessionExpiresAt = nil
+            automaticRefreshTask?.cancel()
+            automaticRefreshTask = nil
+            refreshRetryTask?.cancel()
+            refreshRetryTask = nil
         } catch {
             guard isCurrent(operationID) else { return state }
             state = .unavailable(.keychainAccess)
@@ -439,13 +661,65 @@ actor SupabaseAuthService: AuthenticationServicing {
         return operationID
     }
 
-    private func cancelActiveRestore() {
+    private func scheduleAutomaticRefresh() {
+        automaticRefreshTask?.cancel()
+        guard let sessionExpiresAt else { return }
+        let delay = max(
+            0,
+            sessionExpiresAt.timeIntervalSince(now()) - refreshMargin
+        )
+        let sleep = self.sleep
+        automaticRefreshTask = Task { [weak self] in
+            do {
+                try await sleep(.seconds(delay))
+                try Task.checkCancellation()
+            } catch {
+                return
+            }
+            _ = await self?.refreshSession(force: true)
+        }
+    }
+
+    private func scheduleRefreshRetry() {
+        guard refreshRetryTask == nil else { return }
+        let sleep = self.sleep
+        refreshRetryTask = Task { [weak self] in
+            do {
+                try await sleep(.seconds(30))
+                try Task.checkCancellation()
+            } catch {
+                return
+            }
+            guard let self else { return }
+            await self.clearRefreshRetryTask()
+            _ = await self.restoreSession()
+        }
+    }
+
+    private func clearRefreshRetryTask() {
+        refreshRetryTask = nil
+    }
+
+    private func cancelActiveAuthenticationTasks() {
         activeRestore?.task.cancel()
         activeRestore = nil
+        activeRefresh?.task.cancel()
+        activeRefresh = nil
+        automaticRefreshTask?.cancel()
+        automaticRefreshTask = nil
+        refreshRetryTask?.cancel()
+        refreshRetryTask = nil
     }
 
     private func isCurrent(_ operationID: UUID) -> Bool {
-        activeOperationID == operationID
+        let isCurrent = activeOperationID == operationID
+        if !isCurrent {
+            SyncV2Diagnostics.supersededAuthOperation(
+                operationID: operationID,
+                activeOperationID: activeOperationID
+            )
+        }
+        return isCurrent
     }
 }
 

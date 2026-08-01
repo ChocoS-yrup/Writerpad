@@ -1248,44 +1248,19 @@ class WritingModeWidget(WritingTreeMixin, WritingExtractionMixin, QWidget):
                 save_config("writing_last_right_file", self.pm.global_config.get("writing_last_right_file"))
                 return
             
-            # 락 획득 전까지 임시로 읽기 전용 처리
-            editor.setReadOnly(True)
-            editor.setPlaceholderText("로딩 중 (서버 락 확인)...")
-            
-            # 비동기 락 검사 (컨트롤러에 위임)
-            def on_lock_acquired(success, msg, server_updated_at):
-                # 콜백 도중 사용자가 이미 다른 탭으로 이동했는지 검증
-                is_still_viewing = False
-                if editor == self.left_editor and getattr(self, 'current_loaded_file_left', None) == rel_path:
-                    is_still_viewing = True
-                elif editor == self.right_editor and getattr(self, 'current_loaded_file_right', None) == rel_path:
-                    is_still_viewing = True
-                    
-                if not is_still_viewing:
-                    # 탭을 이동했다면 불필요하게 획득한 락 즉시 반환
-                    if success:
-                        self.controller.release_lock(rel_path)
-                    return
-                    
-                if not success:
-                    QMessageBox.warning(self, "편집 불가", msg)
-                    editor.setReadOnly(True)
-                    editor.setPlaceholderText("텍스트 입력 (읽기 전용)")
-                else:
-                    self.loaded_versions[rel_path] = server_updated_at
-                    editor.setReadOnly(False)
-                    editor.setPlaceholderText("텍스트 입력")
+            # 파일을 여는 것만으로는 lease를 획득하지 않는다. 첫 실제
+            # textChanged에서 WritingController가 비동기로 획득한다.
+            editor.setReadOnly(False)
+            editor.setPlaceholderText("텍스트 입력")
 
-                    from PyQt6.QtWidgets import QAbstractItemView
-                    if (
-                        editor is self.active_editor
-                        and self.isVisible()
-                        and self.binder_tree.state() != QAbstractItemView.State.EditingState
-                    ):
-                        editor.activate_input_method()
-                    if msg == "Lock acquired.":
-                        QTimer.singleShot(0, self.sync_manager.retry_pending_syncs)
-            self.controller.acquire_lock_async(rel_path, on_lock_acquired)
+            from PyQt6.QtWidgets import QAbstractItemView
+            if (
+                editor is self.active_editor
+                and self.isVisible()
+                and self.binder_tree.state()
+                    != QAbstractItemView.State.EditingState
+            ):
+                editor.activate_input_method()
             
             if editor == self.left_editor:
                 self.lbl_current_doc.setText(os.path.basename(rel_path))
@@ -1354,7 +1329,12 @@ class WritingModeWidget(WritingTreeMixin, WritingExtractionMixin, QWidget):
             self.binder_tree.blockSignals(False)
 
     def on_editor_text_changed(self):
-        editor = self.sender() if self.sender() else self.active_editor
+        editor = self.sender()
+        # 앱 시작의 load_saved_files()는 통계 갱신을 위해 이 메서드를 직접
+        # 호출한다. Qt textChanged 신호가 아닌 직접 호출은 편집으로 보지 않는다.
+        if editor is None:
+            self.update_editor_statistics()
+            return
         if editor == self.left_editor and getattr(self, 'current_loaded_file_left', None) and not editor.isReadOnly():
             self.is_dirty_left = True
             has_content = len(editor.toPlainText().strip()) > 0

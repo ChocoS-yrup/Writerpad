@@ -1,0 +1,1067 @@
+================================================================================
+WriterPad 동기화 v2 — 영구 스피너 버그 수정 계획
+단계별 실행 프롬프트 + 아이패드 실기기 테스트 절차
+================================================================================
+
+작성 기준
+  - 대상 커밋   : 2178af4 "feat: 동기화 v2 및 실기기 복구 구현" + 워킹 트리 변경분
+  - 분석 범위   : WriterPad/Sync/, WriterPad/App/AppEnvironment.swift
+  - 증상        : 서버 동기화 진행 상태에서 영구 정지, 에러 표시 없음,
+                  재로그인 시 일시 정상화 후 유휴 시간 지나면 재발,
+                  앱 재시작으로 풀리기도 하고 안 풀리기도 함
+
+
+--------------------------------------------------------------------------------
+[0] 이 문서 사용법
+--------------------------------------------------------------------------------
+
+각 단계는 "###" 로 감싼 블록을 그대로 복사해 AI 에이전트에게 주면 실행되도록
+작성했습니다. 블록 바깥의 설명은 사람이 읽는 용도입니다.
+
+★ 중요 1 — 줄 번호
+  본문에 나오는 줄 번호는 현재 워킹 트리 기준입니다. 앞 단계를 적용하면 전부
+  밀립니다. 각 단계는 줄 번호가 아니라 반드시 "심볼 이름"으로 다시 찾아서
+  작업하세요.
+
+★ 중요 2 — 순서
+  1~7번은 순서대로 진행하세요. 8번 이후는 이번 버그와 무관한 리팩터링이므로,
+  버그가 잡히기 전에 손대면 원인 추적이 어려워집니다.
+
+★ 중요 3 — 실기기
+  이 버그의 재현 조건은 시뮬레이터에 존재하지 않습니다. 아래 표 참조.
+
+      조건                                  시뮬레이터    실기기
+      ------------------------------------  -----------  -----------------
+      WebSocket 유휴 끊김(NAT/서버 타임아웃)  발생 안 함    핵심 재현 조건
+      앱 실제 서스펜션(타이머 정지)           거의 안 됨    발생
+      Keychain AfterFirstUnlockThisDeviceOnly 동작이 다름  실제 정책 적용
+      Wi-Fi <-> 셀룰러 전환 / NWPathMonitor  Mac 공유      실제 이벤트
+      액세스 토큰 1시간 만료 후 401           장시간 필요   실환경 필요
+
+  따라서 1~6번이 고치는 결함 6개는 전부 "유휴 -> 소켓 끊김 -> 토큰 만료 -> 401"
+  경로에 몰려 있고, 그 경로는 실기기에서 실제 시간을 보내야만 진입합니다.
+  유닛 테스트는 로직이 맞는지만 증명하지, 실제로 그 상황에 진입하는지는
+  증명하지 못합니다.
+
+
+--------------------------------------------------------------------------------
+[0-1] 실기기 테스트 필요 여부 요약
+--------------------------------------------------------------------------------
+
+  단계   내용                                   실기기
+  -----  -------------------------------------  --------------------------
+   1     관측 가능성(로깅) 추가                  필수  <- 세션 A
+   2     bindingChanged sentinel 누락 수정       필수  <- 세션 A
+   3     재연결 hot loop + 성공 미표시 수정      필수  <- 세션 B
+   4     pullTask 미종료 + pullPending 유실 수정 필수  <- 세션 B
+   5     RealtimeConnectGate 영구 잠금 수정      필수  <- 세션 B
+   6     Auth operationID 충돌 수정              필수  <- 세션 B
+   7     회귀 테스트 추가                        불필요 (세션 B 에 포함)
+   8     SingleFlightTask 추상화                 불필요
+   9     게이트/레이스 프리미티브 정리           스모크만
+  10     프로토콜 기본 구현 제거                 불필요
+  11     파일 분리                               불필요
+  12     serverState 3축 분리                    필수  <- 세션 C
+  13     타이밍 상수 통합                        불필요
+  14     테스트 플레이크 제거                    불필요
+  15     AppEnvironment 분해                     스모크만
+
+  실기기 세션은 총 3회 + 스모크 2회면 충분합니다.
+  단계마다 기기를 꺼낼 필요는 없습니다.
+
+
+================================================================================
+1번 — 가장 먼저 해야 됨
+    진단 인프라 없이는 나머지 수정의 효과를 검증할 수 없음
+================================================================================
+
+###
+WriterPad 동기화 계층에 구조적 로깅을 추가해줘.
+
+[배경]
+프로덕션 37,509줄 전체에서 Logger 인스턴스가 LocalBinderCommandService.swift:82
+단 한 곳뿐이다. watchdog 4종, generation 카운터 4종, backoff 2벌, pullPending
+병합이 전부 있는데 아무 흔적도 남기지 않아서 실기기 버그를 코드 정독으로만
+찾아야 한다.
+
+[해야 할 것]
+1. WriterPad/Sync/ 에 공용 Logger 를 하나 만든다.
+   subsystem: "com.chocos.writerpad", category: "sync-v2"
+2. 아래 축만 찍는다. 그 외에는 추가하지 마라.
+   a) SyncV2WorkspaceSyncModel.serverState 에 didSet 을 걸어 상태 전이 전/후를
+      기록 (localProjectID 포함)
+   b) generation / realtimeGeneration / pullRequestID /
+      authenticationCheckGeneration 이 증가하는 모든 지점에서
+      "누가 왜 올렸는지" 기록
+   c) pullTask / reconnectTask / pullRetryTask / realtimeStartTask /
+      debounceTask / periodicTask 의 생성 · 취소 · nil 대입 지점
+   d) SyncV2WorkspacePullRace, SyncV2RealtimeStartRace 가 .timedOut 으로
+      resolve 될 때
+   e) SyncV2RealtimeConnectGate.acquire / release 에서 isHeld 와 waiters.count
+   f) SyncV2DocumentMutationGate.acquire / release 에서 documentID 와
+      대기열 길이
+   g) SupabaseAuthService.isCurrent() 가 false 를 반환할 때
+      (operationID 탈취 감지)
+3. 액세스 토큰, 리프레시 토큰, 이메일 원문은 절대 찍지 마라.
+   userID 는 UUID 앞 8자리만, 이메일은 기존 masked() 형식만 사용한다.
+
+[하지 말 것]
+- 로직 변경 금지. 순수하게 관측 코드만 추가한다.
+- print / NSLog 사용 금지 (현재 0개인 상태를 유지한다).
+- 새 파일을 여러 개 만들지 마라. Logger 정의 파일 1개면 충분하다.
+
+[완료 기준]
+- 빌드 통과, 기존 테스트 전부 통과
+- 앱을 켜고 작품을 연 뒤 Console.app 에서 subsystem 필터로
+  "pullNow start -> finishPull" 짝과 serverState 전이 시퀀스가 눈으로 읽힐 것
+###
+
+  ▶ 실기기 테스트: 필수 — 세션 A 에서 2번과 함께 확인 (아래 [세션 A] 참조)
+
+
+================================================================================
+2번 — 두 번째로 해야 됨
+    확정 원인 중 diff 가 가장 작고 영향이 가장 큼
+================================================================================
+
+###
+WriterPad/Sync/SyncV2SnapshotPull.swift 의 SyncV2WorkspaceSyncModel.bindingChanged
+에서 취소한 Task ivar 를 nil 로 되돌리지 않는 버그를 고쳐줘.
+
+[확정된 결함]
+bindingChanged 의 두 분기 모두 reconnectTask?.cancel() / pullRetryTask?.cancel()
+만 하고 nil 대입을 빠뜨렸다. updateSceneActivity(false) 와 stop() 은 둘 다
+nil 을 대입하는데 bindingChanged 만 누락이다.
+
+두 스케줄러는 sentinel 기반 단일 실행이다:
+  scheduleRealtimeReconnect()  : guard reconnectTask == nil
+  schedulePullRetry()          : guard pullRetryTask == nil
+
+취소된 task 본문은 catch { return } 로 빠져나가며 ivar 를 비우지 않는다
+(self.reconnectTask = nil 은 sleep 성공 이후에만 실행된다).
+따라서 binding 변경 이후 재연결과 pull 재시도가 프로세스 수명 동안 영구
+봉쇄된다. 재로그인 시 rebinding 이 일어나므로 "재로그인하면 잠깐 정상,
+이후 재발" 증상과 일치한다.
+
+[해야 할 것]
+1. bindingChanged 의 serverProjectID == nil 분기에서 cancel 한 모든 task
+   (debounceTask, periodicTask, realtimeStartTask, reconnectTask,
+   pullRetryTask)에 nil 을 대입한다.
+2. bindingChanged 의 serverProjectID 변경 분기에서도 동일하게
+   realtimeStartTask, reconnectTask, pullRetryTask 에 nil 을 대입한다.
+3. schedulePullRetry() 와 scheduleRealtimeReconnect() 의 Task 본문을 재구성해
+   모든 종료 경로에서 sentinel 이 해제되게 한다. 예:
+
+       xTask = Task { [weak self] in
+           let didSleep: Bool
+           do {
+               try await sleep(delay)
+               try Task.checkCancellation()
+               didSleep = true
+           } catch {
+               didSleep = false
+           }
+           guard let self else { return }
+           self.xTask = nil
+           guard didSleep, self.isActive else { return }
+           await self.<다음 동작>()
+       }
+
+4. scheduleRealtimeReconnect() 안의
+   authenticationService.refreshSession(force: false) 호출을
+   취소 확인(Task.checkCancellation) 뒤로 옮긴다.
+   지금은 이미 취소된 재연결도 refresh 를 한 번 수행한다.
+
+[하지 말 것]
+- pullTask 에는 nil 을 대입하지 마라. finishPull 의 pullRequestID 대조가
+  성립해야 in-flight 결과가 새 pull 을 덮어쓰지 않는다.
+  15초 watchdog 이 스스로 정리한다.
+- 전체 재작성 금지. 최소 수정만.
+
+[완료 기준]
+- 빌드 통과, 기존 테스트 전부 통과
+- 1번에서 넣은 로그로 "blocked by stale sentinel" 이 더는 반복되지 않을 것
+###
+
+  ▶ 실기기 테스트: 필수 — 세션 A
+
+
+--------------------------------------------------------------------------------
+[세션 A] 1~2번 적용 후 실기기 테스트 — 원인 판별
+--------------------------------------------------------------------------------
+
+목적: 아직 고치는 게 아니라 "무엇이 실제로 일어나는지" 확인하는 단계입니다.
+      이 세션 결과가 3~6번의 우선순위를 다시 정해줍니다.
+
+준비물
+  - 아이패드 실기기 (시뮬레이터로는 재현 불가)
+  - Mac 에 USB 연결 또는 동일 네트워크
+  - Console.app 실행, 기기 선택, 검색창에 subsystem:com.chocos.writerpad 입력
+
+절차
+  1. 앱 실행 -> 작품 열기 -> Console.app 로그 흐르는지 확인
+  2. 앱을 포그라운드에 둔 채 1시간 이상 유휴 방치
+     (화면 자동 잠금은 꺼두고, 아이패드를 그냥 놔둘 것)
+  3. 스피너가 뜨면 "라벨을 먼저" 확인한다. 이게 원인 분기점이다.
+
+       "서버 동기화 중"                  -> C4 경로  (4번 단계가 대상)
+       "서버 재연결 중" / "서버 연결 확인 중" -> C1+C3 경로 (2·3번 단계가 대상)
+       "로그인 확인 중"                   -> C7 경로  (6번 단계가 대상)
+
+  4. 로그에서 아래 4가지를 확인하고 기록한다.
+
+       (1) "pullNow start reqID=N" 과 "finishPull reqID=N" 짝이 맞는가?
+           start 만 있고 finish 가 없으면 -> C4 확정 (4번 단계 필요)
+           짝이 맞으면                    -> C4 배제 (4번 단계 후순위 가능)
+
+       (2) reconnectAttempt 값이 0->1->0 으로 왕복하는가?
+           왕복하면 -> C2 확정 (3번 단계 필요)
+
+       (3) gate acquire 와 release 개수가 균형인가? waiters.count 가
+           단조 증가하는가?
+           증가하면 -> C6 확정 (5번 단계 필요)
+
+       (4) "blocked by stale sentinel" 이 반복되는가?
+           반복되면 -> C1 확정 (2번 수정이 효과 있음을 역으로 확인)
+
+       (5) "operation superseded" 가 찍히는가?
+           찍히면 -> C7 확정 (6번 단계 필요)
+
+  5. 로그아웃 -> 재로그인 -> 잠깐 정상 -> 다시 유휴 -> 재발하는지 확인
+     2번 수정 후에도 재발하면 원인이 C1 만은 아니라는 뜻이다.
+
+기록할 것
+  - 스피너 라벨 (정확한 문구 그대로)
+  - 정지까지 걸린 시간
+  - 위 (1)~(5) 각각의 관찰 결과
+  - Console 로그를 파일로 저장 (Console.app 에서 선택 후 저장)
+
+★ 이 세션을 건너뛰고 1~6번을 한꺼번에 적용하면, 무엇이 실제로 효과가
+  있었는지 영영 알 수 없게 됩니다. 반드시 하세요.
+
+
+================================================================================
+3번 — 세 번째로 해야 됨
+    사용자가 실제로 보는 "에러 없는 무한 스피너"의 직접 원인
+================================================================================
+
+###
+WriterPad/Sync/SyncV2SnapshotPull.swift 의 재연결 hot loop 와
+"pull 성공이 화면에 안 보이는" 문제를 고쳐줘. 두 결함은 같은 증상으로 합쳐진다.
+
+[확정된 결함 A — backoff hot loop]
+LiveSyncV2RealtimeTrigger.startChannel 은 subscribeWithError() 가 정상 반환하면
+항상 .subscribed 를 합성해 올려보낸다.
+SyncV2WorkspaceSyncModel.receivedRealtimeStatus 의 .subscribed 분기는 그걸 받아
+reconnectAttempt = 0 으로 리셋하고 pullNow(forceVisibleProgress: true) 를 건다.
+
+따라서 "join 은 성공하지만 곧 끊기는" 채널(유휴 후 서버/NAT 가 socket 을 끊은
+상태)에서:
+    subscribe 성공 -> reconnectAttempt = 0 -> pullNow -> serverState = .syncing
+    -> 곧 .channelError -> .reconnecting -> 1초 후 재시도 -> 반복
+backoff 가 1초에 고정되고, .syncing 과 .reconnecting 둘 다 progress 상태라
+에러가 절대 표시되지 않는다.
+
+[확정된 결함 B — 성공이 표시되지 않음]
+complete(_ report:) 마지막 분기가
+    } else if realtime != nil && !realtimeHealthy {
+        serverState = realtimeProgressState
+    } else {
+        serverState = .synced(at: Date())
+    }
+이라서, realtimeHealthy 가 false 로 굳으면 snapshot pull 이 매번 성공해도
+화면은 영원히 "서버 연결 확인 중" / "서버 재연결 중" 이다.
+
+[해야 할 것]
+1. 결함 A: reconnectAttempt 리셋 조건을 "구독이 실제로 유지된 경우"로 바꾼다.
+   - lastSubscribedAt: ContinuousClock.Instant? 프로퍼티를 추가
+   - .subscribed 분기: reconnectAttempt = 0 을 제거하고 lastSubscribedAt 만 기록
+   - .closed / .channelError / .timedOut 분기: 직전 구독이 30초 이상 유지됐을
+     때만 reconnectAttempt = 0 으로 리셋하고, lastSubscribedAt 은 nil 로 되돌린다
+2. 결함 B: complete(_ report:) 에서
+   `else if realtime != nil && !realtimeHealthy` 분기를 제거해 성공한 pull 이
+   항상 .synced(at:) 를 표시하게 한다. realtime 연결 상태 표시는
+   receivedRealtimeStatus 가 계속 담당한다
+   (.synced 는 preservesHigherPriorityServerState 에 없으므로 다음 콜백이 덮는다).
+
+[트레이드오프 — 그대로 수용할 것]
+결함 B 수정 후 재연결 중에도 "서버 동기화됨" 이 잠깐 보일 수 있다.
+성공이 영원히 안 보이는 것보다 낫다는 판단이므로 되돌리지 마라.
+
+[하지 말 것]
+- serverState 열거형 구조 자체는 건드리지 마라. 그건 12번 단계에서 한다.
+- 전체 재작성 금지. 최소 수정만.
+
+[완료 기준]
+- 빌드 통과, 기존 테스트 전부 통과
+- 1번 로그에서 reconnectAttempt 가 0->1->0 으로 왕복하지 않고 실제로 누적될 것
+- pull 이 성공하면 "서버 동기화됨" 이 뜰 것
+###
+
+  ▶ 실기기 테스트: 필수 — 세션 B 에서 4~6번과 함께 확인
+
+
+================================================================================
+4번 — 네 번째로 해야 됨
+    .syncing 영구 고착의 유일한 미해결 경로
+================================================================================
+
+###
+WriterPad/Sync/SyncV2SnapshotPull.swift 의 SyncV2WorkspaceSyncModel 에서
+pullTask 가 영구히 non-nil 로 남을 수 있는 경로와
+pullPending 드레인 주체가 죽는 경로를 막아줘.
+
+[확정된 결함 A — watchdog 밖의 await]
+performPullWithAuthenticationRetry 안의
+    let state = await authenticationService.refreshSession(force: true)
+가 pullTask 본문에서 유일하게 시간 상한이 없는 await 다.
+performWatchdogPull 은 15초 상한이 있고, race.value() 는 취소 불가지만
+watchdog Task 가 비구조적 Task 라 취소를 상속하지 않아 반드시 발화한다.
+즉 pullTask 는 "본문이 종료되기만 하면" 반드시 nil 로 돌아온다.
+종료 보장이 없는 곳이 위 한 줄뿐이다.
+여기가 막히면 이후 모든 pullNow 가 pullPending = true 로만 병합되고
+serverState 가 .syncing 에 영구 고정된다.
+이 경로는 토큰 만료(=유휴) 후에만 진입한다.
+
+[확정된 결함 B — 드레인 주체 사망]
+finishPull 의 구조가
+    guard pullRequestID == requestID else { return }        // (1) 드레인 안 함
+    pullTask = nil
+    guard generation == requestGeneration, isActive else { return } // (2) 안 함
+    ...
+    if pullPending { pullPending = false; await pullNow() }  // 드레인은 여기뿐
+라서, (2)에 걸리면 pullPending 이 true 로 남고 아무도 소비하지 않는다.
+같은 경로에서 serverState 도 .syncing 인 채 방치된다.
+
+[해야 할 것]
+1. 결함 A: refreshSession(force: true) 를 watchdog 으로 감싼다.
+   파일에 이미 있는 private actor SyncV2WorkspaceAuthenticationOutcome 을
+   재사용해 private func refreshWithTimeout() async -> AuthenticationState 를
+   추가하고, pullTimeout / pullTimeoutSleep 을 상한으로 쓴다.
+   타임아웃 시 .unavailable(.networkUnavailable) 를 반환하고
+   refresh Task 는 cancel 한다.
+2. 결함 B: finishPull 의 두 번째 guard 를 else 블록으로 바꿔
+   pullPending = false 로 비우고, serverState 가 .syncing 이면 .idle 로
+   되돌린 뒤 return 한다.
+   (scene 재개 경로가 반드시 새 pullNow 를 돌리므로 상태만 비우면 된다.)
+
+[하지 말 것]
+- 첫 번째 guard(pullRequestID 대조)의 위치나 의미는 바꾸지 마라.
+  현재 로직이 맞다.
+- 새로운 race/outcome actor 타입을 추가하지 마라. 기존 타입을 재사용한다.
+
+[완료 기준]
+- 빌드 통과, 기존 테스트 전부 통과
+- 1번 로그에서 "pullNow start reqID=N" 과 "finishPull reqID=N" 의 짝이
+  어떤 상황에서도 15초 안에 맞을 것
+###
+
+  ▶ 실기기 테스트: 필수 — 세션 B
+
+
+================================================================================
+5번 — 다섯 번째로 해야 됨
+    프로세스 전역 영구 잠금, 구조적 위험
+================================================================================
+
+###
+WriterPad/Sync/SyncV2SnapshotPull.swift 의 SyncV2RealtimeConnectGate 가
+영구히 잠길 수 있는 구조를 고쳐줘.
+
+[확정된 결함]
+    await acquire()
+    defer { release() }
+    try Task.checkCancellation()
+    try await operation()          // <- channel.subscribeWithError()
+release() 는 operation() 이 반환해야만 실행된다. 그런데 이 게이트를 도입한
+주석이 직접 밝히듯 Supabase SDK 2.46.0 의 subscribeWithError 는 phx_join 에서
+영구 대기할 수 있고, 취소를 무시할 수 있다. 그러면 isHeld = true 가 영구
+고정되고, acquire() 의 withCheckedContinuation 은 취소 불가라 이후 모든 구독이
+영원히 대기한다.
+
+게다가 AppEnvironment.swift 에서 workspace trigger 와 background trigger 가
+SupabaseClientProvider 의 동일한 realtimeSubscriptionGate 인스턴스를 공유한다
+(SupabaseClientProvider.makeRealtimeTrigger 가 저장 프로퍼티를 넘긴다).
+즉 채널 하나의 hang 이 앱 전체 realtime 을 영구 정지시킨다.
+
+[해야 할 것]
+1. withSubscription 에 보유 시간 상한(기본 20초)을 넣어, operation() 이
+   반환하지 않아도 게이트가 반드시 풀리게 한다. operation 을 별도 Task 로
+   띄우고 timeout Task 와 race 시킨 뒤, 어느 쪽이 이기든 release() 한다.
+   방치된 join 은 상위 stop() 이 정리한다.
+   race 는 파일에 이미 있는 SyncV2RealtimeStartRace 를 재사용해도 된다.
+2. 타임아웃으로 풀린 경우 호출측이 구분할 수 있도록
+   SyncV2RealtimeTriggerError 에 전용 case(예: subscriptionTimedOut)를 추가해
+   throw 한다. globalSubscriptionUnsupported 를 재사용하지 마라 —
+   로그 판독이 불가능해진다.
+3. AppEnvironment.swift 에서 두 trigger 가 같은 gate 를 공유한다는 사실을
+   주석으로 명시한다. 지금은 우연처럼 보인다.
+
+[하지 말 것]
+- 게이트를 없애지 마라. 동시 subscribe 직렬화는 실제 SDK 버그 우회이며
+  필요하다.
+- acquire() 쪽에 타임아웃을 넣는 대안은 쓰지 마라. 그러면 두 채널이 동시에
+  subscribe 해버려 게이트의 존재 이유가 사라진다.
+
+[완료 기준]
+- 빌드 통과, 기존 테스트 전부 통과
+- 1번 로그에서 gate acquire 와 release 의 개수가 장시간 구동 후에도 균형을
+  유지할 것
+- waiters.count 가 단조 증가하지 않을 것
+###
+
+  ▶ 실기기 테스트: 필수 — 세션 B
+
+
+================================================================================
+6번 — 여섯 번째로 해야 됨
+    stale 인증 상태 고착
+================================================================================
+
+###
+WriterPad/Sync/SupabaseAuthService.swift 에서 restore 와 refresh 가
+단일 activeOperationID 를 공유해 서로의 결과를 무효화하는 문제를 고쳐줘.
+
+[확정된 결함]
+beginOperation() 은 하나의 activeOperationID 만 관리하는데
+restoreSession() 과 refreshSession(force:) 가 둘 다 이걸 호출한다.
+
+state 가 .authenticated 인 타이밍에 refresh 가 들어오면 진행 중인 restore 의
+operationID 를 탈취한다. 그러면 performRestore 의
+    guard isCurrent(operationID) else { return state }
+가 실패해 "성공한 restore 결과를 버리고 stale state 를 그대로 반환" 한다.
+state 가 .restoring 인 채로 남으면 SyncV2WorkspaceSyncModel.activate() 가
+.checkingAuthentication 분기로 빠져 "로그인 확인 중" 스피너가 계속된다.
+
+[확인된 비-결함 — 건드리지 마라]
+- activeRefresh / activeRestore 캐시는 누수가 없다. 생성자가
+  await task.value 직후 항상 정리하고, Task<_, Never>.value 는 취소로
+  중단되지 않는다.
+- refreshSession -> restoreSession -> refreshSession 상호 재귀는 데드락이
+  아니다. 같은 actor 내부 직접 호출이라 그 사이에 서스펜션 창이 없어
+  state 가 뒤바뀔 수 없다.
+따라서 "실패한 task 가 캐시에 남는다"거나 "재진입 데드락"이라는 가설로
+수정하지 마라. 실제 결함은 operationID 네임스페이스 공유로 인한 결과 폐기다.
+
+[해야 할 것]
+1. refreshSession(force:) 에서 activeRefresh 확인 직후,
+   state.isAuthenticated 가드 뒤에 activeRestore 확인을 추가해 진행 중인
+   restore 가 있으면 그 결과를 그대로 반환한다.
+   (새 operation 을 시작하지 않는다.)
+2. restoreSession() 에도 대칭으로 activeRefresh 확인을 추가한다.
+   refreshSession 이 activeRefresh 설정 시 먼저 반환하므로 루프가 생기지 않는다.
+3. 두 곳 모두 "왜 이 확인이 필요한지"(beginOperation 이 단일 ID 를 덮어쓴다)를
+   주석으로 남긴다.
+
+[선택 — 판단해서 보고만 해줘]
+scheduleAutomaticRefresh 의 delay 계산이
+    max(0, sessionExpiresAt.timeIntervalSince(now()) - refreshMargin)
+이라, 발급 시점에 이미 만료 5분 이내인 토큰이면 delay 가 0 이 되고
+accept() 가 다시 scheduleAutomaticRefresh() 를 불러 즉시 재갱신 루프가 된다.
+정상 1시간 토큰에서는 발생하지 않지만 기기 시계 오차나 짧은 토큰에서는
+성립한다. 최소 하한(예: 30초)을 두는 게 맞는지 판단해서 알려줘.
+임의로 적용하지는 마라.
+
+[완료 기준]
+- 빌드 통과, 기존 테스트 전부 통과
+- 1번 로그에서 "operation superseded" 가 더는 찍히지 않을 것
+###
+
+  ▶ 실기기 테스트: 필수 — 세션 B
+
+
+================================================================================
+7번 — 일곱 번째로 해야 됨
+    여기까지가 "버그 수정 완료" 지점
+================================================================================
+
+###
+2~6번에서 고친 6개 결함에 대한 회귀 테스트를 추가해줘.
+
+[배경]
+WriterPadTests 는 이미 23,771줄(프로덕션 대비 63%)이고, sleep / clock / now 가
+전부 주입 가능하다. 그 인프라를 써서 결정적 테스트를 작성하라.
+
+[추가할 테스트]
+1. bindingChanged 이후에도 scheduleRealtimeReconnect / schedulePullRetry 가
+   다시 스케줄링되는지 (2번)
+2. 취소된 재시도 task 가 sentinel 을 해제하는지 (2번)
+3. subscribe 직후 즉시 끊기는 채널을 반복해도 reconnectAttempt 가 누적되는지 (3번)
+4. pull 성공 시 realtimeHealthy 가 false 여도 .synced 가 나오는지 (3번)
+5. refreshSession 이 응답하지 않을 때 pullTask 가 pullTimeout 안에 해제되는지 (4번)
+6. generation 불일치로 finishPull 이 조기 반환해도 pullPending 이 남지 않는지 (4번)
+7. operation 이 영원히 반환하지 않아도 SyncV2RealtimeConnectGate 가 풀리는지 (5번)
+8. restore 진행 중 refresh 가 들어와도 restore 결과가 버려지지 않는지 (6번)
+
+[제약]
+- 실제 대기(Task.sleep / ContinuousClock().sleep)를 새로 추가하지 마라.
+  주입된 sleep 클로저와 상태 폴링 헬퍼로 결정적으로 작성한다.
+- 기존 테스트 파일 구조와 명명 관례를 따른다 (XCTest, 파일당 대상 타입 1개).
+- 테스트를 통과시키려고 프로덕션 코드를 완화하지 마라.
+  실패하면 프로덕션 수정이 잘못된 것이므로 보고해라.
+
+[완료 기준]
+- 8개 테스트 전부 통과
+- 각 테스트에 대해, 해당 수정을 되돌리면 그 테스트가 실패하는지 확인하고
+  결과를 보고
+###
+
+  ▶ 실기기 테스트: 불필요 (유닛 테스트). 단, 7번 완료 후 곧바로 세션 B 실시.
+
+
+--------------------------------------------------------------------------------
+[세션 B] 3~7번 적용 후 실기기 테스트 — 수정 검증
+--------------------------------------------------------------------------------
+
+목적: 가장 중요한 세션입니다. 여기를 통과하면 버그 수정이 끝난 것입니다.
+
+준비물
+  - 아이패드 실기기
+  - Console.app (세션 A 와 동일 설정)
+  - Windows 앱 (양방향 동기화 확인용)
+  - 셀룰러 모델이면 셀룰러 회선, 아니면 다른 Wi-Fi AP 하나 더
+
+판정 기준 (모든 시나리오 공통)
+  각 시나리오의 최종 상태가 "서버 동기화됨" 으로 수렴해야 한다.
+  progress 상태(서버 동기화 중 / 서버 재연결 중 / 서버 연결 확인 중 /
+  로그인 확인 중)에서 5분 이상 머물면 실패다.
+
+시나리오 (전부 수행)
+  B-1. 장시간 유휴 (토큰 만료 경로)
+       앱 포그라운드 유지 -> 1시간 이상 방치 -> 상태 확인
+       ▶ 4번(refresh watchdog), 3번(hot loop) 검증
+
+  B-2. 백그라운드 장시간
+       앱을 홈으로 내림 -> 30분 이상 -> 복귀 -> 상태 확인
+       ▶ updateSceneActivity 경로, generation 카운터 검증
+
+  B-3. 기기 잠금 장시간 (Keychain 경로)
+       전원 버튼으로 잠금 -> 30분 이상 -> 잠금 해제 -> 앱 복귀
+       ▶ 6번(auth), AfterFirstUnlockThisDeviceOnly 정책 검증
+       ※ 시뮬레이터에서 재현 불가한 항목
+
+  B-4. 네트워크 단절/복구
+       비행기 모드 ON -> 1분 대기 -> OFF -> 상태 확인
+       ▶ networkRecovered, 5번(gate) 검증
+
+  B-5. 네트워크 경로 전환
+       Wi-Fi -> 셀룰러 -> Wi-Fi 전환 (또는 AP 변경)
+       ▶ NWPathMonitor, 재구독 경로 검증
+       ※ 시뮬레이터에서 재현 불가한 항목
+
+  B-6. 멀티태스킹
+       Split View 로 다른 앱과 함께 띄운 뒤 20분 이상 유휴
+       ▶ scene lifecycle, 백그라운드 coordinator 검증
+
+  B-7. 재로그인
+       로그아웃 -> 재로그인 -> 즉시 상태 확인 -> 30분 유휴 -> 재확인
+       ▶ 2번(bindingChanged sentinel) 검증. 세션 A 에서 재발했던 시나리오.
+
+  B-8. 양방향 동기화
+       Windows 앱에서 같은 원고 수정 -> iPad 에 반영되는지
+       iPad 에서 수정 -> Windows 에 반영되는지
+       ▶ 기능 회귀 확인
+
+  B-9. 한글 조합 보호
+       iPad 에서 한글 입력 중(조합 미완료 상태) Windows 에서 같은 문서 수정
+       -> iPad 입력이 깨지지 않고 조합 완료 후 반영되는지
+       ▶ SyncV2EditingGuard 회귀 확인
+       ※ 실제 IME 동작이라 시뮬레이터 신뢰 불가
+
+로그에서 확인할 것 (세션 A 와 대조)
+  - "pullNow start reqID=N" / "finishPull reqID=N" 짝이 항상 15초 안에 맞는가
+  - reconnectAttempt 가 1 -> 2 -> 5 -> 10 -> 30 으로 실제 누적되는가
+  - gate acquire / release 개수가 균형인가, waiters.count 가 증가하지 않는가
+  - "blocked by stale sentinel" 이 사라졌는가
+  - "operation superseded" 가 사라졌는가
+
+실패 시
+  세션 A 로그와 나란히 놓고 비교하세요. 어떤 지표가 개선되고 어떤 지표가
+  그대로인지가 남은 원인을 가리킵니다.
+
+★ B-1 ~ B-9 를 전부 통과하면 1~7번 작업은 완료입니다.
+  여기서 배포하고, 8번 이후는 여유 있을 때 진행하세요.
+
+
+================================================================================
+8번 — 여덟 번째로 해야 됨
+    2번 버그의 재발 자체를 불가능하게 만듦
+================================================================================
+
+###
+Task ivar sentinel 패턴을 값 타입으로 봉인해 2번에서 고친 결함 클래스가
+재발할 수 없게 만들어줘.
+
+[문제]
+    guard xTask == nil else { return }      // 단일 실행 보장
+    xTask = Task { ... ; self.xTask = nil } // 해제는 본문 안쪽 한 지점
+이 패턴이 SyncV2WorkspaceSyncModel 의 8개 필드
+(pullTask, reconnectTask, pullRetryTask, realtimeStartTask, debounceTask,
+ periodicTask, authenticationCheckTask, bindingUpdateTask)에 각각 손으로
+구현돼 있고, 취소 지점은 updateSceneActivity / stop / bindingChanged /
+각 스케줄러 4곳에 흩어져 있다. 곱하면 32개 조합이고, 2번 버그는 그중
+2칸이 비어서 났다. 주의력으로 막을 수 없는 구조다.
+
+[해야 할 것]
+1. @MainActor 값 타입을 하나 만든다. cancel() 이 nil 대입을 강제하는 것이
+   핵심이다.
+
+       @MainActor
+       struct SingleFlightTask {
+           private var task: Task<Void, Never>?
+           var isScheduled: Bool { task != nil }
+           mutating func cancel() { task?.cancel(); task = nil }
+           mutating func schedule(...) { guard task == nil else { return }; ... }
+       }
+
+2. SyncV2WorkspaceSyncModel 의 8개 필드를 순차적으로 이 타입으로 교체한다.
+   한 번에 하나씩, 각 교체마다 빌드와 테스트를 돌린다.
+3. SyncV2BackgroundSyncCoordinator 의 realtimeTask / reconnectTask /
+   debounceTask / periodicTask 에도 같은 타입을 적용한다
+   (actor 격리라 별도 변형이 필요하면 만들어라).
+   특히 performRealtimeReconnect 의 catch { return } 경로가 reconnectTask 를
+   비우지 않는 것도 같은 결함 클래스다.
+
+[하지 말 것]
+- pullTask 는 finishPull 의 pullRequestID 대조와 얽혀 있으니 마지막에 손대고,
+  의미가 바뀌면 교체하지 말고 그대로 둔 채 보고해라.
+- 동작 변경 금지. 순수 리팩터링이며 7번 테스트가 전부 통과해야 한다.
+
+[완료 기준]
+- 8개 + 4개 필드 교체 완료, 기존 테스트 및 7번 테스트 전부 통과
+- "cancel 했는데 nil 을 안 넣는" 코드를 작성하는 것이 타입 수준에서
+  불가능해질 것
+###
+
+  ▶ 실기기 테스트: 불필요 (동작 변경 없는 리팩터링, 7번 테스트가 보증)
+
+
+================================================================================
+9번 — 아홉 번째로 해야 됨
+    5번 버그의 재발 방지
+================================================================================
+
+###
+취소 불가 동기화 프리미티브 5벌을 정리해서, 어느 쪽이 "취소 불가가 정상"이고
+어느 쪽이 "반드시 상한이 필요"한지 코드에서 구분되게 해줘.
+
+[현황 — 전부 withCheckedContinuation 기반이라 모양이 똑같다]
+  SyncV2RealtimeConnectGate      (SyncV2SnapshotPull.swift)  <- 게이트: 상한 필수
+  SyncV2DocumentMutationGate     (SyncV2SnapshotPull.swift)  <- 게이트: 상한 필수
+  SyncV2WorkspacePullRace        (SyncV2SnapshotPull.swift)  <- 레이스: 취소불가 정상
+  SyncV2RealtimeStartRace        (SyncV2SnapshotPull.swift)  <- 레이스: 취소불가 정상
+  AuthenticationRestoreOutcome   (SupabaseAuthService.swift) <- 레이스: 취소불가 정상
+
+레이스 3종은 watchdog 이 해소하므로 취소 불가가 의도된 설계다.
+게이트 2종은 취소 불가가 곧 영구 잠금이다. 그런데 모양이 같아서 리뷰에서
+구분이 안 된다.
+
+[해야 할 것]
+1. 레이스 3종의 중복 구현을 제네릭 하나로 합친다.
+   (resolve 1회 고정 + value() 대기, 동작은 완전히 동일하므로 순수 통합이다.)
+   이름에 Race 를 유지해 "취소 불가가 정상"임을 드러내고, 그 이유를 타입
+   주석에 남긴다.
+2. 게이트 2종에 "보유 시간 상한"을 공통 기능으로 넣는다.
+   5번에서 SyncV2RealtimeConnectGate 에 넣은 것을 SyncV2DocumentMutationGate
+   에도 적용한다. SyncV2DocumentMutationGate.acquire 도 취소 불가
+   continuation 이라, 한 문서 락이 오래 잡히면 뒤에 줄선 pull 이 전부 대기한다.
+3. 게이트 타입 주석에 "이 안의 operation 이 반환하지 않으면 프로세스 전역이
+   멈춘다"를 명시한다.
+
+[참고 — 확인은 했지만 확정 결함은 아님]
+SyncV2DocumentMutationGate 는 withCriticalSection 이 throw 경로에서도
+release 하므로 락 자체는 균형이 맞다. 문제는 acquire 대기가 취소 불가라서,
+watchdog 에 버려진 orphan task 들이 문서별 FIFO 큐 앞에 쌓일 수 있다는 점이다.
+AppEnvironment 에서 workspace 모델과 background coordinator 가 같은
+SyncV2SnapshotPullService / syncMutationGate 인스턴스를 공유하므로 이 축적이
+실제로 가능하다. 1번 로그의 대기열 길이로 실제 발생 여부를 먼저 확인하고,
+발생하지 않으면 상한만 넣고 끝내라.
+
+[완료 기준]
+- 빌드 통과, 기존 테스트 및 7번 테스트 전부 통과
+- 게이트와 레이스가 이름과 주석만으로 구분될 것
+###
+
+  ▶ 실기기 테스트: 스모크만 — 아래 [스모크 절차] 참조
+
+
+================================================================================
+10번 — 열 번째로 해야 됨
+    조용히 의미를 바꾸는 계약, 작은 diff
+================================================================================
+
+###
+WriterPad/Sync/SupabaseAuthService.swift 의 프로토콜 기본 구현이
+호출자 의도를 조용히 바꾸는 문제를 정리해줘.
+
+[문제]
+    extension AuthenticationServicing {
+        func refreshSession(force: Bool) async -> AuthenticationState {
+            _ = force                       // force 를 버림
+            return await restoreSession()   // 다른 동작으로 대체
+        }
+    }
+    extension SupabaseAuthTransporting {
+        func refresh(tokens:) async throws -> ValidatedAuthSession {
+            try await restore(tokens: tokens)
+        }
+    }
+
+SyncV2SnapshotPull.swift 의 401 재시도 경로는 refreshSession(force: true) 로
+"강제 갱신"을 기대하는데, 이 기본 구현을 쓰는 타입에서는 조용히
+restoreSession() 이 실행된다. 401 재시도가 같은 만료 토큰으로 나갈 수 있다.
+테스트 더블 편의를 위해 프로덕션 계약을 약화시킨 자리다.
+
+[해야 할 것]
+1. 두 기본 구현을 제거하고, 프로토콜 준수 타입이 명시적으로 구현하게 한다.
+2. 제거로 컴파일이 깨지는 테스트 더블에는 각각 올바른 구현을 넣는다.
+   더블이 "refresh 와 restore 를 구분하지 않는다"면 그 사실을 더블 안에
+   명시적으로 쓴다.
+3. 제거가 과도하다고 판단되면 최소한 이름을 의미대로 바꿔라
+   (예: refreshSessionOrRestore). 단 그 경우 왜 제거하지 않았는지 보고해라.
+
+[완료 기준]
+- 빌드 통과, 기존 테스트 및 7번 테스트 전부 통과
+- refreshSession(force: true) 호출부가 실제로 refresh 를 수행함이 코드에서
+  보일 것
+###
+
+  ▶ 실기기 테스트: 불필요 (컴파일 + 유닛 테스트로 충분)
+
+
+================================================================================
+11번 — 열한 번째로 해야 됨
+    여기부터는 급하지 않은 구조 개선
+================================================================================
+
+###
+비대해진 파일을 책임 단위로 분리해줘. 동작 변경은 일절 없다.
+
+[현황]
+  SyncV2Store.swift            5,897줄 / 최상위 타입 49개
+  SyncV2SnapshotPull.swift     2,973줄 / 최상위 타입 38개
+  WritingWorkspaceView.swift   2,808줄
+  UIKitTextViewBridge.swift    1,868줄
+
+SyncV2SnapshotPull.swift 하나에 전송 계층 · 클라이언트 · 풀 서비스 ·
+뮤테이션 게이트 · 리얼타임 트리거 · 연결 게이트 · 백그라운드 코디네이터 ·
+워크스페이스 뷰모델 · UI 상태 리듀서 · 로컬 적용기가 전부 들어 있다.
+파일명이 내용의 1/5도 설명하지 못한다.
+
+[해야 할 것 — SyncV2SnapshotPull.swift 부터, 한 번에 한 파일씩]
+1. 아래로 쪼갠다. 타입 정의를 그대로 옮기기만 하고 내용은 수정하지 마라.
+   - SyncV2SnapshotTransport.swift
+       LiveSyncV2SnapshotTransport, SyncV2SnapshotClient
+   - SyncV2SnapshotModels.swift
+       Snapshot / LocalState / EditingGuard / MergeCandidate / PullReport
+   - SyncV2SnapshotPullService.swift
+       SyncV2DocumentMutationGate, SyncV2SnapshotPullService
+   - SyncV2RealtimeTrigger.swift
+       SyncV2RealtimeConnectGate, LiveSyncV2RealtimeTrigger, 상태 enum
+   - SyncV2BackgroundSyncCoordinator.swift
+   - SyncV2WorkspaceSyncModel.swift
+       모델 + private race actor 들
+   - SyncV2LocalSnapshotApply.swift
+       LocalSyncV2SnapshotMergeStore, LocalSyncV2SnapshotApplier
+
+2. WorkspaceSyncStatusReducer 와 WorkspaceSyncStatusPresentation 은
+   Sync 계층이 아니라 Features 계층으로 옮긴다.
+   순수 UI 프레젠테이션 로직(21개 if case 캐스케이드)이 Sync 한복판에 있는 건
+   파일 분리 문제가 아니라 계층 배치 오류다.
+
+3. private 접근 제어 때문에 옮기지 못하는 타입이 있으면 억지로 internal 로
+   열지 말고, 해당 타입만 원래 파일에 남기고 이유를 보고해라.
+
+[하지 말 것]
+- 이번 단계에서 로직 수정 금지. 순수 이동만이다.
+- SyncV2Store.swift(5,897줄)와 뷰 파일들은 이번에 건드리지 마라.
+  별도 단계로 남긴다.
+
+[완료 기준]
+- 빌드 통과, 기존 테스트 및 7번 테스트 전부 통과
+- git diff 가 사실상 파일 이동으로만 구성될 것
+###
+
+  ▶ 실기기 테스트: 불필요 (순수 파일 이동)
+
+
+================================================================================
+12번 — 열두 번째로 해야 됨
+    3번 버그를 구조적으로 없앰
+================================================================================
+
+###
+SyncV2WorkspaceServerState 에 세 개의 축이 섞여 있는 것을 분리해줘.
+
+[문제]
+현재 하나의 enum 에 독립적인 세 가지가 들어 있다.
+  진행 상태 : .syncing, .checkingAuthentication
+  연결 건강 : .connectionChecking, .reconnecting, .offlineSaved
+  결과      : .synced, .waiting, .conflictRequired, .structuralConflict,
+              .automaticallyMerged, .failed
+
+축이 섞여서 서로 덮어쓴다. 그래서 preservesHigherPriorityServerState 라는
+우선순위 예외 규칙이 필요해졌고, complete() 에서 "pull 은 성공했는데 realtime 이
+아프니 진행 상태를 표시" 하는 축 혼선이 생겼다.
+3번 단계에서 고친 결함 B 가 바로 이 설계에서 나온 것이다.
+
+[해야 할 것]
+1. 세 필드로 분리한다.
+
+       struct SyncV2WorkspaceState {
+           var progress: Progress      // idle / pulling / checkingAuthentication
+           var connection: Connection  // unknown / healthy / reconnecting / offline
+           var lastResult: Result      // synced(at:) / waiting / conflict... / failed
+       }
+
+2. preservesHigherPriorityServerState 를 제거한다. 축이 분리되면 우선순위
+   예외가 필요 없어야 한다. 여전히 필요하다면 분리가 잘못된 것이므로 보고해라.
+3. WorkspaceSyncStatusReducer 의 21개 if case 캐스케이드를 세 축 조합으로
+   다시 쓴다. 사용자에게 보이는 라벨과 문구는 한 글자도 바꾸지 마라.
+   특히 실패 경로의 "로컬 TXT 는 보존되어 있습니다" 계열 문구는 그대로 유지한다.
+
+[하지 말 것]
+- 라벨 / 문구 / 아이콘 / severity 변경 금지. 순수 내부 구조 변경이다.
+- 이 단계는 3번보다 뒤여야 한다. 3번 수정이 이미 적용된 상태에서 시작해라.
+
+[완료 기준]
+- 빌드 통과, 기존 테스트 및 7번 테스트 전부 통과
+- WorkspaceSyncStatusReducer 의 분기 수가 눈에 띄게 줄어들 것
+- 기존 UI 스냅샷/문구 테스트가 수정 없이 통과할 것
+###
+
+  ▶ 실기기 테스트: 필수 — 세션 C
+
+
+--------------------------------------------------------------------------------
+[세션 C] 12번 적용 후 실기기 테스트 — UI 회귀
+--------------------------------------------------------------------------------
+
+목적: 로직이 아니라 눈으로 봅니다. 상태 표시 코드를 전부 다시 썼기 때문에
+      사용자에게 보이는 모든 문구가 이 경로를 지나갑니다.
+
+절차
+  C-1. 상태별 표시 확인 (각 상태를 인위적으로 만들어 스크린샷)
+       - 정상 동기화됨          "서버 동기화됨" + 마지막 확인 시각
+       - 동기화 중              "서버 동기화 중"
+       - 연결 확인 중           "서버 연결 확인 중"
+       - 재연결 중              "서버 재연결 중"
+       - 오프라인 (비행기 모드)  "오프라인 저장됨"
+       - 인증 필요 (로그아웃)    "인증 필요"
+       - 로컬 전용              "로컬 저장됨" 계열
+       - 편집 중 / 로컬 저장 중  각 문구
+       ▶ 12번 적용 전 스크린샷과 한 글자도 다르지 않아야 한다
+
+  C-2. 충돌 계열 문구 확인 (가장 중요)
+       Windows 와 iPad 에서 같은 문서의 같은 문단을 동시에 수정 -> 충돌 유발
+       - "충돌 해결 필요"
+       - "제목·경로 확인 필요"
+       - "동기화 대기"
+       ▶ 실패 문구의 "로컬 TXT 는 보존되어 있습니다" / "로컬 TXT 는
+         덮어쓰지 않았습니다" 계열이 그대로인지 반드시 확인.
+         작가에게 원고 유실 공포보다 큰 건 없다.
+
+  C-3. 아이패드 레이아웃
+       - 세로 / 가로 회전
+       - Split View (1/2, 1/3 분할)
+       - Slide Over
+       - Stage Manager (지원 기기면)
+       ▶ 상태 표시가 잘리거나 줄바꿈이 깨지지 않는지
+
+  C-4. 아이콘 / 색상
+       severity 별 색상(neutral / success / warning / failure)과
+       SF Symbol 이 이전과 동일한지
+
+실패 시
+  라벨 문구가 하나라도 바뀌었으면 12번 수정을 되돌리고 다시 하세요.
+  "내부 구조만 바꾸고 표시는 그대로"가 이 단계의 유일한 성공 조건입니다.
+
+
+================================================================================
+13번 — 열세 번째로 해야 됨
+================================================================================
+
+###
+흩어진 타임아웃/마진 상수를 한곳에 모아 정합성이 보이게 해줘.
+
+[현황 — 각 타입의 init 기본값으로 흩어져 있음]
+  12초   auth restoreTimeout           (SupabaseAuthService)
+  12초   realtimeSubscriptionTimeout   (WorkspaceSyncModel, BackgroundCoordinator)
+  15초   pullTimeout                   (동상)
+  12초   authenticationTimeout         (SyncV2WorkspaceSyncModel)
+  3초    authenticationRetryDelay
+  90초   periodicDelay
+  450ms  debounceDelay
+  5분    refreshMargin                 (SupabaseAuthService)
+  30초   refreshRetry
+  [1,2,5,10,30]초  backoff             (두 벌 중복 정의)
+  20초   gate hold timeout             (5번에서 추가)
+
+전부 주입 가능한 건 훌륭하다. 문제는 "이 값들이 서로 정합적인가"를 한눈에
+볼 수 없다는 것이다. pull watchdog 15초와 auth restore 12초의 관계,
+backoff 최대 30초와 periodic 90초의 관계는 우연이 아니라 설계일 텐데
+코드에 드러나지 않는다.
+
+[해야 할 것]
+1. SyncV2Timing 값 타입 하나로 모은다. 기본값은 현재 값을 그대로 유지한다.
+2. 값들 사이의 제약을 주석으로 명시한다. 예:
+   - pullTimeout > authRestoreTimeout 이어야 401 재시도가 watchdog 안에 들어온다
+   - backoff 최대값 < periodicDelay 여야 안전망이 backoff 를 앞지르지 않는다
+3. 가능하면 그 제약을 테스트로 못박는다 (단순 부등식 assert 로 충분).
+4. backoff 배열 중복 정의(SyncV2WorkspaceSyncModel 과
+   SyncV2BackgroundSyncCoordinator)를 하나로 합친다.
+
+[하지 말 것]
+- 값 자체를 바꾸지 마라. 순수 이동 및 통합이다.
+- 주입 가능성을 없애지 마라. 테스트가 개별 값을 오버라이드할 수 있어야 한다.
+
+[완료 기준]
+- 빌드 통과, 기존 테스트 및 7번 테스트 전부 통과
+- 타이밍 값 전체를 파일 하나에서 읽을 수 있을 것
+###
+
+  ▶ 실기기 테스트: 불필요 (값 불변, 순수 이동)
+
+
+================================================================================
+14번 — 열네 번째로 해야 됨
+================================================================================
+
+###
+테스트의 벽시계 대기를 제거해 CI 플레이크 위험을 없애줘.
+
+[현황]
+sleep / clock / now 주입 지점이 77곳이나 되는데도, 테스트에 실제 대기가
+58곳 남아 있다.
+  .milliseconds(10) x 8,  .milliseconds(80) x 5,  .milliseconds(5) x 5,
+  .milliseconds(2) x 3,   .milliseconds(350) x 2,  Task.sleep(nanoseconds:) x 5 ...
+대부분 "actor task 가 인터리브할 틈을 준다"는 용도로 보이는데,
+부하 걸린 CI 머신에서는 2ms 가 부족하다. 주입 인프라는 이미 다 만들어져 있으니
+마무리만 하면 된다.
+
+[해야 할 것]
+1. 상태 폴링 헬퍼를 만든다.
+       func waitUntil(_ condition: @MainActor () -> Bool,
+                      timeout: Duration = .seconds(2),
+                      file: StaticString = #filePath,
+                      line: UInt = #line) async throws
+   내부는 Task.yield() 반복 + 실패 시 명확한 메시지로 XCTFail.
+2. "틈을 주는" 용도의 짧은 sleep(2~100ms)을 waitUntil 또는 Task.yield()
+   반복으로 교체한다.
+3. 남겨야 하는 sleep 은 남기되, 왜 실제 시간이 필요한지 주석을 단다.
+   LocalPerformanceBaselineTests 의 16ms 처럼 성능 측정이 목적이면 정당하다.
+4. 교체 후 테스트 스위트를 최소 20회 반복 실행해 플레이크가 없는지 확인한다.
+
+[하지 말 것]
+- 테스트의 검증 내용을 약화시키지 마라. 대기 방식만 바꾼다.
+- 타임아웃을 늘려서 통과시키는 방식 금지. 그건 플레이크를 숨기는 것이다.
+
+[완료 기준]
+- 테스트 내 Task.sleep / ContinuousClock().sleep 사용처가 정당한 것만 남을 것
+- 20회 연속 전체 통과
+###
+
+  ▶ 실기기 테스트: 불필요 (테스트 코드만 변경)
+
+
+================================================================================
+15번 — 마지막
+================================================================================
+
+###
+AppEnvironment 의 조립 책임을 기능별로 분해해줘.
+
+[현황]
+AppEnvironment.swift 가 전 계층을 혼자 조립한다.
+AppEnvironmentTests.swift 가 4,520줄로 테스트 파일 중 가장 큰데,
+이 조립 경로 분기를 전부 검증하기 때문으로 보인다.
+
+[해야 할 것]
+1. 기능별 팩토리로 쪼갠다.
+   - SyncComposition          auth service, binding service, snapshot pull
+                              service, realtime trigger, background coordinator,
+                              dispatcher
+   - LocalStorageComposition  SwiftData 스택, repository 들, document store
+   - BackupComposition        backup store, trash
+2. AppEnvironment 는 이 팩토리들을 호출해 조립만 담당하게 한다.
+3. AppEnvironmentTests 에서 각 팩토리 단위로 테스트 가능한 부분을 분리한다.
+   테스트 총량을 억지로 줄이지는 마라. 표면을 나누는 것이 목적이다.
+4. 조립 중 발견되는 "공유 인스턴스"에 의도를 주석으로 명시한다.
+   특히 snapshotPullService 와 syncMutationGate 를 workspace 모델과
+   background coordinator 가 공유하는 부분(문서 단위 락이라 정합성은 맞지만
+   한쪽의 지연이 다른 쪽 대기열에 쌓인다)은 반드시 명시한다.
+   9번에서 이미 주석을 달았다면 중복하지 말고 참조만 남겨라.
+
+[하지 말 것]
+- 의존성 주입 구조 자체를 바꾸지 마라. 프로토콜 50개 기반 구조는 잘 되어 있다.
+- 동작 변경 금지.
+
+[완료 기준]
+- 빌드 통과, 기존 테스트 및 7번 테스트 전부 통과
+- AppEnvironment.swift 가 "무엇을 조립하는지"만 읽어도 파악될 것
+###
+
+  ▶ 실기기 테스트: 스모크만 — 앱 부팅 경로를 건드리므로 실행 확인 필수
+
+
+--------------------------------------------------------------------------------
+[스모크 절차] 9번 · 15번 적용 후
+--------------------------------------------------------------------------------
+
+5분이면 충분합니다.
+
+  1. 앱 실행 -> 크래시 없이 뜨는지
+  2. 작품 목록 -> 작품 열기
+  3. 본문 편집 -> 로컬 저장 확인
+  4. 상태가 "서버 동기화됨" 까지 도달하는지
+  5. Console 로그에 에러/경고가 새로 생기지 않았는지
+
+이 5개가 통과하면 넘어가세요. 세션 A/B/C 같은 장시간 테스트는 불필요합니다.
+
+
+================================================================================
+[진행 요령 및 중단 가능 지점]
+================================================================================
+
+  구간    목표                          실기기        중단 가능 여부
+  ------  ----------------------------  ------------  ----------------------
+  1~2     진단 가능 + 최대 원인 제거     세션 A        배포 후 관찰 권장
+  3~6     나머지 확정 원인 제거          (세션 B 대기)  7번까지 진행 권장
+  7       회귀 방지 확정                 세션 B        ★ 버그 수정 완료 지점
+  8~9     결함 클래스 재발 불가화        스모크(9)      여기서 멈춰도 무방
+  10~13   구조 개선                     세션 C(12)     급하지 않음
+  14~15   마감                          스모크(15)     여유 있을 때
+
+권장 흐름
+  1. 1~2번 적용 -> 커밋 -> 실기기 배포 -> [세션 A] -> 로그 분석
+  2. 세션 A 결과로 3~6번 우선순위 재조정 (필요 없는 단계는 뒤로 미룸)
+  3. 3~7번 적용 -> 커밋 -> 실기기 배포 -> [세션 B]
+  4. B-1 ~ B-9 전부 통과하면 여기서 릴리즈
+  5. 이후 8번부터는 여유 있을 때
+
+브랜치 전략
+  각 단계는 별도 브랜치 + 개별 커밋을 권합니다.
+  특히 11~13번은 diff 가 커서 문제가 생겼을 때 되돌릴 단위가 필요합니다.
+
+
+================================================================================
+[부록] 확정 원인 대조표
+================================================================================
+
+  ID   결함                                          수정 단계   실기기 시나리오
+  ---  --------------------------------------------  ---------  ---------------
+  C1   bindingChanged 가 sentinel 을 nil 로 안 되돌림   2번        B-7 (재로그인)
+  C2   재연결 backoff 가 매 사이클 0 으로 리셋          3번        B-1 (장시간유휴)
+  C3   pull 성공해도 .synced 가 표시되지 않음           3번        B-1, B-8
+  C4   refreshSession 이 watchdog 밖에 있음             4번        B-1 (토큰만료)
+  C5   finishPull 에서 pullPending 드레인 주체 사망     4번        B-2 (백그라운드)
+  C6   RealtimeConnectGate 가 프로세스 전역 영구 잠금   5번        B-4, B-5 (네트워크)
+  C7   restore/refresh 가 operationID 를 공유해 충돌    6번        B-3 (기기 잠금)
+
+  S1   refreshSession 의 실제 hang 여부 (추측)         세션 A 로그로 판정
+  S2   DocumentMutationGate 대기열 적체 (추측)         세션 A 로그로 판정
+  S3   scheduleAutomaticRefresh delay 0 루프 (추측)    6번 [선택] 항목
+
+================================================================================
+문서 끝
+================================================================================

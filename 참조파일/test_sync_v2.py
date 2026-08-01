@@ -20,6 +20,7 @@ from sync_manager import (
 )
 from sync_v2_store import SyncV2Store
 from three_way_merge import three_way_merge
+from writing_controller import WritingController
 from writing_tree import WritingTreeMixin
 
 
@@ -433,6 +434,78 @@ class SyncV2RpcTestCase(unittest.TestCase):
                 manager._v2_active_paths_provider,
             ) = previous
             manager._v2_leases = previous_leases
+
+    def test_active_new_document_acquires_lease_after_create_commit(self):
+        manager = SyncManager()
+        previous = (
+            manager.supabase,
+            manager._v2_device_id,
+            dict(manager._v2_leases),
+            manager._v2_active_paths_provider,
+        )
+        document_id = str(uuid.uuid4())
+        active_path = "메인/원고/1권/새문서.txt"
+        client = _FakeClient()
+        try:
+            manager.supabase = client
+            manager._v2_device_id = str(uuid.uuid4())
+            manager._v2_leases = {}
+            manager.set_active_document_paths_provider(
+                lambda: [active_path]
+            )
+
+            manager._finalize_v2_operation_lease("committed", {
+                "document_id": document_id,
+                "local_path": active_path,
+                "is_deleted": False,
+            })
+
+            self.assertIn(document_id, manager._v2_leases)
+            self.assertEqual(
+                client.calls[0][0],
+                "acquire_edit_lease",
+            )
+        finally:
+            (
+                manager.supabase,
+                manager._v2_device_id,
+                previous_leases,
+                manager._v2_active_paths_provider,
+            ) = previous
+            manager._v2_leases = previous_leases
+
+    def test_viewing_does_not_acquire_until_first_text_change(self):
+        controller = WritingController(
+            MagicMock(),
+            MagicMock(),
+            SimpleNamespace(current_project="열람 정책 작품"),
+            "device-a",
+            lambda: [],
+            lambda _path: "",
+        )
+        controller.acquire_lock_async = MagicMock()
+        path = "메인/원고/1권/열람중.txt"
+
+        controller.notify_file_opened(path, "")
+        controller.acquire_lock_async.assert_not_called()
+
+        controller.notify_text_changed(path)
+        controller.acquire_lock_async.assert_called_once()
+        controller.idle_timer.stop()
+
+    def test_startup_statistics_refresh_is_not_a_text_edit(self):
+        panel = SimpleNamespace(
+            sender=lambda: None,
+            update_editor_statistics=MagicMock(),
+            controller=SimpleNamespace(
+                notify_text_changed=MagicMock()
+            ),
+        )
+
+        WritingModeWidget.on_editor_text_changed(panel)
+
+        panel.controller.notify_text_changed.assert_not_called()
+        panel.update_editor_statistics.assert_called_once()
 
     def test_unchanged_synced_content_does_not_create_another_revision(self):
         with tempfile.TemporaryDirectory() as temp_dir:

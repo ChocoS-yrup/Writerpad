@@ -1221,13 +1221,30 @@ class SyncManager(QObject):
         if not operation or kind == "auto_merged":
             return
         document_id = operation.get("document_id")
-        if not document_id or document_id not in self._v2_leases:
+        if not document_id:
             return
         local_path = str(operation.get("local_path") or "").replace("\\", "/")
+        is_active = local_path in self._active_v2_paths()
+        # 새 문서 생성은 계약상 lease_token 없이 commit한다. 생성 직후에도
+        # 사용자가 그 문서를 편집 중이면 즉시 lease를 획득해야 기존 문서와
+        # 동일하게 heartbeat가 유지되고 다른 기기의 덮어쓰기를 막을 수 있다.
+        if (
+            kind == "committed"
+            and not operation.get("is_deleted")
+            and is_active
+            and document_id not in self._v2_leases
+        ):
+            try:
+                self._acquire_v2_lease(document_id)
+            except Exception as error:
+                print(f"Failed to retain v2 edit lease after create: {error}")
+            return
+        if document_id not in self._v2_leases:
+            return
         must_release = (
             kind == "conflict"
             or bool(operation.get("is_deleted"))
-            or local_path not in self._active_v2_paths()
+            or not is_active
         )
         if must_release:
             self._release_v2_lease(document_id)

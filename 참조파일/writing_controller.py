@@ -32,6 +32,7 @@ class WritingController(QObject):
         self.pending_autosave_paths = set()
         self.last_snapshot_contents = {}
         self.locked_paths = set()
+        self.locking_paths = set()
         
         # 1.5초 유휴 타이머 (자동저장)
         self.idle_timer = QTimer(self)
@@ -73,12 +74,34 @@ class WritingController(QObject):
         if not self.pm.current_project or not path: 
             callback(False, "Invalid path", None)
             return
+        if path in self.locked_paths:
+            callback(True, "Lock acquired.", None)
+            return
+        if path in self.locking_paths:
+            return
+        self.locking_paths.add(path)
 
         from sync_manager import LockWorker
         worker = LockWorker(self.sync_manager, self.pm.current_project, path, self.session_id)
         
         def on_finished(success, msg, server_updated_at):
+            self.locking_paths.discard(path)
             if success:
+                active_paths = set(self.get_active_paths() or [])
+                if path not in active_paths:
+                    # 첫 입력 직후 다른 문서로 이동했다면 늦게 얻은 lease를
+                    # 열린 문서의 잠금으로 남기지 않는다.
+                    self.sync_manager.release_lock(
+                        self.pm.current_project,
+                        path,
+                        self.session_id,
+                    )
+                    callback(
+                        True,
+                        "Inactive document lease released.",
+                        server_updated_at,
+                    )
+                    return
                 self.locked_paths.add(path)
             callback(success, msg, server_updated_at)
             
@@ -139,8 +162,27 @@ class WritingController(QObject):
     def notify_text_changed(self, path):
         """에디터 내용이 변경될 때 UI에서 호출하여 유휴 타이머를 재시작합니다."""
         if not path: return
+        # 단순 열람은 다른 기기의 편집을 막지 않는다. 실제 첫 입력이 발생한
+        # 시점에만 lease를 요청하고, 결과를 기다리는 동안에도 로컬 입력과
+        # 자동저장 대기열은 그대로 보존한다.
+        if path not in self.locked_paths and path not in self.locking_paths:
+            self.acquire_lock_async(
+                path,
+                lambda success, message, _revision: self._edit_lease_checked(
+                    path,
+                    success,
+                    message,
+                ),
+            )
         self.pending_autosave_paths.add(path)
         self.idle_timer.start()
+
+    def _edit_lease_checked(self, path, success, message):
+        if success:
+            return
+        # 서버 queue가 같은 operation으로 계속 재시도하며, lease가 풀리기
+        # 전에는 commit_document가 서버 본문을 덮어쓰지 못한다.
+        print(f"편집 lease 대기 ({path}): {message}")
         
     def rename_path(self, old_path, new_path):
         """파일 이름이 변경되었을 때 내부 관리 중인 경로들을 업데이트합니다."""
@@ -152,6 +194,7 @@ class WritingController(QObject):
             return path
 
         self.locked_paths = {moved(path) for path in self.locked_paths}
+        self.locking_paths = {moved(path) for path in self.locking_paths}
         self.pending_autosave_paths = {moved(path) for path in self.pending_autosave_paths}
         self.last_snapshot_contents = {
             moved(path): content for path, content in self.last_snapshot_contents.items()
@@ -165,6 +208,9 @@ class WritingController(QObject):
             )
 
         self.locked_paths = {path for path in self.locked_paths if remains(path)}
+        self.locking_paths = {
+            path for path in self.locking_paths if remains(path)
+        }
         self.pending_autosave_paths = {
             path for path in self.pending_autosave_paths if remains(path)
         }

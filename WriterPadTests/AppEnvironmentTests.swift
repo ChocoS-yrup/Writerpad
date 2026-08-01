@@ -491,6 +491,132 @@ final class AppEnvironmentTests: XCTestCase {
     }
 
     @MainActor
+    func testZeroLengthMarkedRangeDoesNotBlockDocumentChange() {
+        final class ZeroLengthMarkedTextView: SmartTextView {
+            var exposesZeroLengthMarkedRange = false
+
+            override var markedTextRange: UITextRange? {
+                guard exposesZeroLengthMarkedRange,
+                      let position = selectedTextRange?.end
+                else { return super.markedTextRange }
+                return textRange(from: position, to: position)
+            }
+        }
+
+        let firstDocumentID = DocumentID(rawValue: UUID())
+        let secondDocumentID = DocumentID(rawValue: UUID())
+        var text = "내용이 있는 기존 문서"
+        var selection = TextCursorState(
+            location: UInt(text.utf16.count),
+            selectionLength: 0
+        )
+        var compositionStates: [Bool] = []
+
+        func editor(
+            documentID: DocumentID,
+            version: UInt64
+        ) -> iPadTextEditor {
+            iPadTextEditor(
+                text: Binding(get: { text }, set: { text = $0 }),
+                documentID: documentID,
+                externalVersion: version,
+                selection: Binding(
+                    get: { selection },
+                    set: { selection = $0 }
+                ),
+                focusRequest: 0,
+                onCompositionStateChange: {
+                    _, isComposing in
+                    compositionStates.append(isComposing)
+                }
+            )
+        }
+
+        let coordinator = editor(
+            documentID: firstDocumentID,
+            version: 0
+        ).makeCoordinator()
+        let textView = ZeroLengthMarkedTextView()
+        textView.delegate = coordinator
+        coordinator.applyExternalState(to: textView)
+
+        textView.exposesZeroLengthMarkedRange = true
+        coordinator.textViewDidChangeSelection(textView)
+        XCTAssertNotNil(textView.markedTextRange)
+        XCTAssertEqual(
+            textView.offset(
+                from: textView.markedTextRange!.start,
+                to: textView.markedTextRange!.end
+            ),
+            0
+        )
+        XCTAssertTrue(compositionStates.isEmpty)
+
+        text = "다음 문서 본문"
+        selection = .start
+        coordinator.parent = editor(
+            documentID: secondDocumentID,
+            version: 0
+        )
+        coordinator.applyExternalState(to: textView)
+
+        XCTAssertEqual(textView.text, "다음 문서 본문")
+        XCTAssertTrue(compositionStates.isEmpty)
+    }
+
+    @MainActor
+    func testCompositionStateEndsWhenMarkedRangeShrinksToZero() {
+        final class ShrinkingMarkedTextView: SmartTextView {
+            var exposesZeroLengthMarkedRange = false
+
+            override var markedTextRange: UITextRange? {
+                guard exposesZeroLengthMarkedRange,
+                      let position = selectedTextRange?.end
+                else { return super.markedTextRange }
+                return textRange(from: position, to: position)
+            }
+        }
+
+        let documentID = DocumentID(rawValue: UUID())
+        var text = "내용이 있는 문서 "
+        var selection = TextCursorState(
+            location: UInt(text.utf16.count),
+            selectionLength: 0
+        )
+        var compositionStates: [Bool] = []
+        let editor = iPadTextEditor(
+            text: Binding(get: { text }, set: { text = $0 }),
+            documentID: documentID,
+            externalVersion: 0,
+            selection: Binding(
+                get: { selection },
+                set: { selection = $0 }
+            ),
+            focusRequest: 0,
+            onCompositionStateChange: {
+                _, isComposing in
+                compositionStates.append(isComposing)
+            }
+        )
+        let coordinator = editor.makeCoordinator()
+        let textView = ShrinkingMarkedTextView()
+        textView.delegate = coordinator
+        coordinator.applyExternalState(to: textView)
+
+        textView.setMarkedText(
+            "한",
+            selectedRange: NSRange(location: 1, length: 0)
+        )
+        coordinator.textViewDidChange(textView)
+        XCTAssertEqual(compositionStates, [true])
+
+        textView.exposesZeroLengthMarkedRange = true
+        coordinator.textViewDidChangeSelection(textView)
+
+        XCTAssertEqual(compositionStates, [true, false])
+    }
+
+    @MainActor
     func testCompositionCommitRequestUnmarksTextAndReportsCompletion() async {
         let documentID = DocumentID(rawValue: UUID())
         var text = String(repeating: "ㅇ\n", count: 2_000)
@@ -508,7 +634,10 @@ final class AppEnvironmentTests: XCTestCase {
                 selection: Binding(get: { selection }, set: { selection = $0 }),
                 focusRequest: 0,
                 compositionCommitRequest: commitRequest,
-                onCompositionStateChange: { compositionStates.append($0) }
+                onCompositionStateChange: {
+                    _, isComposing in
+                    compositionStates.append(isComposing)
+                }
             )
         }
 
@@ -566,7 +695,10 @@ final class AppEnvironmentTests: XCTestCase {
                 selection: Binding(get: { selection }, set: { selection = $0 }),
                 focusRequest: 0,
                 compositionCommitRequest: commitRequest,
-                onCompositionStateChange: { compositionStates.append($0) }
+                onCompositionStateChange: {
+                    _, isComposing in
+                    compositionStates.append(isComposing)
+                }
             )
         }
 
@@ -629,8 +761,15 @@ final class AppEnvironmentTests: XCTestCase {
                 ),
                 focusRequest: 0,
                 compositionCommitRequest: commitRequest,
+                onTextChange: { sourceDocumentID, snapshot, _ in
+                    guard sourceDocumentID == documentID,
+                          let snapshot
+                    else { return }
+                    text = snapshot
+                },
                 onCompositionStateChange: {
-                    compositionStates.append($0)
+                    _, isComposing in
+                    compositionStates.append(isComposing)
                 }
             )
         }
@@ -683,7 +822,10 @@ final class AppEnvironmentTests: XCTestCase {
                 selection: Binding(get: { selection }, set: { selection = $0 }),
                 focusRequest: 0,
                 compositionCommitRequest: commitRequest,
-                onCompositionStateChange: { compositionStates.append($0) }
+                onCompositionStateChange: {
+                    _, isComposing in
+                    compositionStates.append(isComposing)
+                }
             )
         }
 
@@ -710,6 +852,85 @@ final class AppEnvironmentTests: XCTestCase {
 
         XCTAssertEqual(compositionStates, [false])
         XCTAssertNil(textView.markedTextRange)
+    }
+
+    @MainActor
+    func testCompositionStateRecordingCannotBeReversedByAsyncCompletion()
+        async throws {
+        let environment = try AppEnvironment.testing()
+        let model = EditorSessionModel(
+            documentRepository: environment.documentRepository,
+            documentStore: environment.localDocumentStore,
+            workspaceStateRepository:
+                environment.workspaceStateRepository
+        )
+
+        let composingGeneration = try XCTUnwrap(
+            model.recordCompositionState(true)
+        )
+        let completedGeneration = try XCTUnwrap(
+            model.recordCompositionState(false)
+        )
+
+        XCTAssertFalse(model.isComposing)
+        let staleCompletionWasApplied =
+            await model.finishCompositionStateUpdate(
+                true,
+                generation: composingGeneration
+            )
+        XCTAssertFalse(staleCompletionWasApplied)
+        let latestCompletionWasApplied =
+            await model.finishCompositionStateUpdate(
+                false,
+                generation: completedGeneration
+            )
+        XCTAssertTrue(latestCompletionWasApplied)
+        XCTAssertFalse(model.isComposing)
+    }
+
+    @MainActor
+    func testCompositionCallbackKeepsDisplayedDocumentIdentity() {
+        let displayedDocumentID = DocumentID(rawValue: UUID())
+        let incomingDocumentID = DocumentID(rawValue: UUID())
+        var text = ""
+        var selection = TextCursorState.start
+        var updates: [(DocumentID, Bool)] = []
+        func editor(documentID: DocumentID) -> iPadTextEditor {
+            iPadTextEditor(
+                text: Binding(get: { text }, set: { text = $0 }),
+                documentID: documentID,
+                externalVersion: 0,
+                selection: Binding(
+                    get: { selection },
+                    set: { selection = $0 }
+                ),
+                focusRequest: 0,
+                onCompositionStateChange: {
+                    updates.append(($0, $1))
+                }
+            )
+        }
+        let coordinator = editor(
+            documentID: displayedDocumentID
+        ).makeCoordinator()
+        let textView = SmartTextView()
+        textView.delegate = coordinator
+        coordinator.applyExternalState(to: textView)
+        textView.setMarkedText(
+            "한글",
+            selectedRange: NSRange(location: 2, length: 0)
+        )
+        coordinator.textViewDidChange(textView)
+
+        coordinator.parent = editor(documentID: incomingDocumentID)
+        textView.unmarkText()
+        coordinator.textViewDidChangeSelection(textView)
+
+        XCTAssertEqual(updates.map(\.0), [
+            displayedDocumentID,
+            displayedDocumentID,
+        ])
+        XCTAssertEqual(updates.map(\.1), [true, false])
     }
 
     @MainActor
@@ -812,7 +1033,7 @@ final class AppEnvironmentTests: XCTestCase {
             selection: Binding(get: { selection }, set: { selection = $0 }),
             focusRequest: 0,
             textRuleSettings: .disabled,
-            onTextChange: { _, mutation in reportedMutation = mutation }
+            onTextChange: { _, _, mutation in reportedMutation = mutation }
         )
         let coordinator = editor.makeCoordinator()
         let textView = SmartTextView()
@@ -838,6 +1059,81 @@ final class AppEnvironmentTests: XCTestCase {
     }
 
     @MainActor
+    func testNativeEditorAttributesDelayedCallbackToDisplayedDocument()
+        throws {
+        let displayedDocumentID = DocumentID(rawValue: UUID())
+        let incomingDocumentID = DocumentID(rawValue: UUID())
+        var displayedText = "6화 원문"
+        var incomingText = "7화 원문"
+        var selection = TextCursorState(
+            location: UInt(displayedText.utf16.count),
+            selectionLength: 0
+        )
+        var reportedDocumentID: DocumentID?
+        var reportedRecoverySnapshot: String?
+        let displayedEditor = iPadTextEditor(
+            text: Binding(
+                get: { displayedText },
+                set: { displayedText = $0 }
+            ),
+            documentID: displayedDocumentID,
+            externalVersion: 0,
+            selection: Binding(
+                get: { selection },
+                set: { selection = $0 }
+            ),
+            focusRequest: 0,
+            textRuleSettings: .disabled
+        )
+        let coordinator = displayedEditor.makeCoordinator()
+        let textView = SmartTextView()
+        textView.delegate = coordinator
+        coordinator.applyExternalState(to: textView)
+
+        // SwiftUI 모델은 다음 문서로 이동했지만 기존 UITextView가 한글 조합
+        // callback을 늦게 전달하는 전환 경계를 재현한다.
+        coordinator.parent = iPadTextEditor(
+            text: Binding(
+                get: { incomingText },
+                set: { incomingText = $0 }
+            ),
+            documentID: incomingDocumentID,
+            externalVersion: 1,
+            selection: Binding(
+                get: { selection },
+                set: { selection = $0 }
+            ),
+            focusRequest: 0,
+            textRuleSettings: .disabled,
+            onTextChange: { sourceDocumentID, snapshot, _ in
+                reportedDocumentID = sourceDocumentID
+                reportedRecoverySnapshot = snapshot
+            }
+        )
+        var insertionRange = NSRange(
+            location: textView.textStorage.length,
+            length: 0
+        )
+        // 두 번의 text-storage 변경을 한 callback으로 합쳐 IME의 전체
+        // 복구 스냅샷 경로도 함께 통과시킨다.
+        textView.textStorage.replaceCharacters(
+            in: insertionRange,
+            with: "아"
+        )
+        insertionRange.location = textView.textStorage.length
+        textView.textStorage.replaceCharacters(
+            in: insertionRange,
+            with: "아"
+        )
+        coordinator.textViewDidChange(textView)
+
+        XCTAssertEqual(reportedDocumentID, displayedDocumentID)
+        XCTAssertNotEqual(reportedDocumentID, incomingDocumentID)
+        XCTAssertEqual(reportedRecoverySnapshot, "6화 원문아아")
+        XCTAssertEqual(incomingText, "7화 원문")
+    }
+
+    @MainActor
     func testNativeEditorDoesNotCreateFullSnapshotForOrdinaryInput() throws {
         let original = String(repeating: "긴 원고🙂\n", count: 50_000)
         var boundText = original
@@ -854,7 +1150,7 @@ final class AppEnvironmentTests: XCTestCase {
             selection: Binding(get: { selection }, set: { selection = $0 }),
             focusRequest: 0,
             textRuleSettings: .disabled,
-            onTextChange: { snapshot, mutation in
+            onTextChange: { _, snapshot, mutation in
                 recoverySnapshotWasReported = snapshot != nil
                 reportedMutation = mutation
             }

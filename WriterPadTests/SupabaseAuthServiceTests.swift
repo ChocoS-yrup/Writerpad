@@ -149,6 +149,184 @@ final class SupabaseAuthServiceTests: XCTestCase {
         XCTAssertEqual(restoreCallCount, 1)
     }
 
+    func testAutomaticallyRefreshesBeforeExpiryAndStoresRotatedTokens()
+        async {
+        let now = Date(timeIntervalSince1970: 1_800_000_000)
+        let sleepRecorder = AuthenticationSleepRecorder(
+            immediatelyCompleting: .seconds(300)
+        )
+        let initial = session(
+            email: "writer@example.com",
+            accessToken: "initial-access",
+            refreshToken: "initial-refresh",
+            expiresAt: now.addingTimeInterval(600)
+        )
+        let rotated = session(
+            email: "writer@example.com",
+            accessToken: "rotated-access",
+            refreshToken: "rotated-refresh",
+            expiresAt: now.addingTimeInterval(1_200)
+        )
+        let store = SessionStoreStub()
+        let transport = AuthTransportStub(
+            signInResult: .success(initial),
+            refreshResult: .success(rotated)
+        )
+        let service = SupabaseAuthService(
+            transport: transport,
+            sessionStore: store,
+            refreshMargin: 300,
+            now: { now },
+            sleep: { duration in
+                try await sleepRecorder.sleep(duration)
+            }
+        )
+
+        _ = await service.signIn(
+            email: "writer@example.com",
+            password: "password"
+        )
+        for _ in 0..<200 where await transport.refreshCallCount() == 0 {
+            try? await Task.sleep(for: .milliseconds(2))
+        }
+
+        let refreshCallCount = await transport.refreshCallCount()
+        let storedTokens = await store.storedTokens()
+        let recordedDurations = await sleepRecorder.recordedDurations()
+        XCTAssertEqual(refreshCallCount, 1)
+        XCTAssertEqual(
+            storedTokens,
+            StoredSessionTokens(
+                accessToken: rotated.accessToken,
+                refreshToken: rotated.refreshToken,
+                expiresAt: rotated.expiresAt
+            )
+        )
+        XCTAssertTrue(recordedDurations.contains(.seconds(300)))
+    }
+
+    func testConcurrentForcedRefreshUsesSingleFlight() async {
+        let now = Date(timeIntervalSince1970: 1_800_000_000)
+        let gate = AuthRestoreGate()
+        let initial = session(
+            email: "writer@example.com",
+            expiresAt: now.addingTimeInterval(3_600)
+        )
+        let rotated = session(
+            email: "writer@example.com",
+            accessToken: "single-rotated-access",
+            refreshToken: "single-rotated-refresh",
+            expiresAt: now.addingTimeInterval(7_200)
+        )
+        let transport = AuthTransportStub(
+            signInResult: .success(initial),
+            refreshResult: .success(rotated),
+            refreshGate: gate
+        )
+        let service = SupabaseAuthService(
+            transport: transport,
+            sessionStore: SessionStoreStub(),
+            now: { now }
+        )
+        _ = await service.signIn(email: "writer@example.com", password: "pw")
+
+        async let first = service.refreshSession(force: true)
+        for _ in 0..<100 where await transport.refreshCallCount() == 0 {
+            await Task.yield()
+        }
+        async let second = service.refreshSession(force: true)
+        await gate.open()
+        let states = await [first, second]
+
+        let refreshCallCount = await transport.refreshCallCount()
+        XCTAssertEqual(refreshCallCount, 1)
+        XCTAssertEqual(states[0], states[1])
+        XCTAssertTrue(states[0].isAuthenticated)
+    }
+
+    func testRefreshDuringRestoreReturnsTheInFlightRestoreResult()
+        async {
+        let completionGate = AuthOperationCompletionGate()
+        let restored = session(
+            email: "writer@example.com"
+        )
+        let transport = AuthTransportStub(
+            restoreResult: .success(restored),
+            refreshResult: .failure(.serverRejected)
+        )
+        let service = SupabaseAuthService(
+            transport: transport,
+            sessionStore: SessionStoreStub(
+                tokens: StoredSessionTokens(
+                    accessToken: "stored-access",
+                    refreshToken: "stored-refresh"
+                )
+            )
+        )
+        await service.installRestoreCompletionProbe {
+            await completionGate.pause()
+        }
+
+        async let restoreState = service.restoreSession()
+        await completionGate.waitUntilPaused()
+        let refreshState = await service.refreshSession(force: true)
+        await completionGate.open()
+        let restoredState = await restoreState
+
+        let refreshCallCount = await transport.refreshCallCount()
+        XCTAssertEqual(refreshState, restoredState)
+        XCTAssertTrue(restoredState.isAuthenticated)
+        XCTAssertEqual(refreshCallCount, 0)
+    }
+
+    func testRotatedRefreshTokenRestoresAfterServiceRecreation() async {
+        let rotated = session(
+            email: "writer@example.com",
+            accessToken: "persisted-access",
+            refreshToken: "persisted-refresh",
+            expiresAt: Date().addingTimeInterval(3_600)
+        )
+        let store = SessionStoreStub(
+            tokens: StoredSessionTokens(
+                accessToken: "old-access",
+                refreshToken: "old-refresh"
+            )
+        )
+        let firstTransport = AuthTransportStub(
+            restoreResult: .success(
+                session(email: "writer@example.com")
+            ),
+            refreshResult: .success(rotated)
+        )
+        let firstService = SupabaseAuthService(
+            transport: firstTransport,
+            sessionStore: store
+        )
+        _ = await firstService.restoreSession()
+        _ = await firstService.refreshSession(force: true)
+
+        let recreatedTransport = AuthTransportStub(
+            restoreResult: .success(rotated)
+        )
+        let recreatedService = SupabaseAuthService(
+            transport: recreatedTransport,
+            sessionStore: store
+        )
+        let state = await recreatedService.restoreSession()
+
+        XCTAssertTrue(state.isAuthenticated)
+        let receivedTokens =
+            await recreatedTransport.receivedRestoreTokens()
+        XCTAssertEqual(
+            receivedTokens,
+            StoredSessionTokens(
+                accessToken: rotated.accessToken,
+                refreshToken: rotated.refreshToken,
+                expiresAt: rotated.expiresAt
+            )
+        )
+    }
+
     func testNetworkFailureKeepsTokensButNeverShowsAuthenticated() async {
         let tokens = StoredSessionTokens(
             accessToken: "access",
@@ -269,6 +447,43 @@ final class SupabaseAuthServiceTests: XCTestCase {
         XCTAssertEqual(signOutCallCount, 1)
     }
 
+    func testStateUpdatesPublishesLoginAndLogoutTransitions() async {
+        let serverSession = session(email: "writer@example.com")
+        let service = SupabaseAuthService(
+            transport: AuthTransportStub(
+                signInResult: .success(serverSession)
+            ),
+            sessionStore: SessionStoreStub()
+        )
+        let updates = await service.stateUpdates()
+        let observedStates = Task {
+            var iterator = updates.makeAsyncIterator()
+            return (
+                await iterator.next(),
+                await iterator.next()
+            )
+        }
+        await Task.yield()
+
+        _ = await service.signIn(
+            email: "writer@example.com",
+            password: "password"
+        )
+        _ = await service.signOut()
+        let (loggedIn, loggedOut) = await observedStates.value
+
+        XCTAssertEqual(
+            loggedIn,
+            .authenticated(
+                AuthenticatedAccount(
+                    userID: serverSession.userID,
+                    maskedEmail: "w***@example.com"
+                )
+            )
+        )
+        XCTAssertEqual(loggedOut, .signedOut(.userInitiated))
+    }
+
     func testMissingConfigurationPreservesStoredTokensAndLocalMode() async {
         let tokens = StoredSessionTokens(
             accessToken: "access",
@@ -348,7 +563,8 @@ final class SupabaseAuthServiceTests: XCTestCase {
     private func session(
         email: String?,
         accessToken: String = "new-access",
-        refreshToken: String = "new-refresh"
+        refreshToken: String = "new-refresh",
+        expiresAt: Date? = nil
     ) -> ValidatedAuthSession {
         ValidatedAuthSession(
             userID: UUID(
@@ -356,7 +572,8 @@ final class SupabaseAuthServiceTests: XCTestCase {
             )!,
             email: email,
             accessToken: accessToken,
-            refreshToken: refreshToken
+            refreshToken: refreshToken,
+            expiresAt: expiresAt
         )
     }
 }
@@ -402,12 +619,18 @@ private actor AuthTransportStub: SupabaseAuthTransporting {
         ValidatedAuthSession,
         SupabaseAuthTransportError
     >
+    private let refreshResult: Result<
+        ValidatedAuthSession,
+        SupabaseAuthTransportError
+    >
     private let signOutError: SupabaseAuthTransportError?
     private let restoreDelay: Duration?
     private let restoreGate: AuthRestoreGate?
+    private let refreshGate: AuthRestoreGate?
     private var signInCalls = 0
     private var signOutCalls = 0
     private var restoreCalls = 0
+    private var refreshCalls = 0
     private var restoreTokens: StoredSessionTokens?
 
     init(
@@ -419,15 +642,22 @@ private actor AuthTransportStub: SupabaseAuthTransporting {
             ValidatedAuthSession,
             SupabaseAuthTransportError
         > = .failure(.serverRejected),
+        refreshResult: Result<
+            ValidatedAuthSession,
+            SupabaseAuthTransportError
+        >? = nil,
         signOutError: SupabaseAuthTransportError? = nil,
         restoreDelay: Duration? = nil,
-        restoreGate: AuthRestoreGate? = nil
+        restoreGate: AuthRestoreGate? = nil,
+        refreshGate: AuthRestoreGate? = nil
     ) {
         self.signInResult = signInResult
         self.restoreResult = restoreResult
+        self.refreshResult = refreshResult ?? restoreResult
         self.signOutError = signOutError
         self.restoreDelay = restoreDelay
         self.restoreGate = restoreGate
+        self.refreshGate = refreshGate
     }
 
     func signIn(
@@ -450,6 +680,15 @@ private actor AuthTransportStub: SupabaseAuthTransporting {
         return try restoreResult.get()
     }
 
+    func refresh(
+        tokens: StoredSessionTokens
+    ) async throws -> ValidatedAuthSession {
+        _ = tokens
+        refreshCalls += 1
+        await refreshGate?.wait()
+        return try refreshResult.get()
+    }
+
     func signOut() throws {
         signOutCalls += 1
         if let signOutError {
@@ -469,8 +708,31 @@ private actor AuthTransportStub: SupabaseAuthTransporting {
         restoreCalls
     }
 
+    func refreshCallCount() -> Int {
+        refreshCalls
+    }
+
     func receivedRestoreTokens() -> StoredSessionTokens? {
         restoreTokens
+    }
+}
+
+private actor AuthenticationSleepRecorder {
+    private let immediatelyCompleting: Duration
+    private var durations: [Duration] = []
+
+    init(immediatelyCompleting: Duration) {
+        self.immediatelyCompleting = immediatelyCompleting
+    }
+
+    func sleep(_ duration: Duration) async throws {
+        durations.append(duration)
+        if duration == immediatelyCompleting { return }
+        try await ContinuousClock().sleep(for: duration)
+    }
+
+    func recordedDurations() -> [Duration] {
+        durations
     }
 }
 
@@ -490,5 +752,34 @@ private actor AuthRestoreGate {
         let pending = waiters
         waiters.removeAll()
         pending.forEach { $0.resume() }
+    }
+}
+
+private actor AuthOperationCompletionGate {
+    private var isPaused = false
+    private var pauseWaiters: [CheckedContinuation<Void, Never>] = []
+    private var completionContinuation:
+        CheckedContinuation<Void, Never>?
+
+    func pause() async {
+        isPaused = true
+        let pending = pauseWaiters
+        pauseWaiters.removeAll()
+        pending.forEach { $0.resume() }
+        await withCheckedContinuation { continuation in
+            completionContinuation = continuation
+        }
+    }
+
+    func waitUntilPaused() async {
+        guard !isPaused else { return }
+        await withCheckedContinuation { continuation in
+            pauseWaiters.append(continuation)
+        }
+    }
+
+    func open() {
+        completionContinuation?.resume()
+        completionContinuation = nil
     }
 }

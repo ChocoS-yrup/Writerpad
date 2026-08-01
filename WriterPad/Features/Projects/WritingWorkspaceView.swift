@@ -543,7 +543,12 @@ struct WritingWorkspaceShell: View {
                         specialQuotationShortcutsEnabled: smartQuotationShortcutsEnabled,
                         sceneBreakEnabled: smartSceneBreakEnabled
                     ),
-                    onTextChange: { recoverySnapshot, mutation in
+                    onTextChange: {
+                        sourceDocumentID,
+                        recoverySnapshot,
+                        mutation in
+                        guard model.currentDocumentID == sourceDocumentID
+                        else { return }
                         if let mutation,
                            model.applyTextMutation(mutation) {
                             updateBinderContentState(for: model)
@@ -561,10 +566,20 @@ struct WritingWorkspaceShell: View {
                         }
                     },
                     onEditorCommand: handleEditorCommand,
-                    onCompositionStateChange: { isComposing in
+                    onCompositionStateChange: {
+                        sourceDocumentID,
+                        isComposing in
+                        guard model.currentDocumentID == sourceDocumentID,
+                              let generation =
+                                model.recordCompositionState(isComposing)
+                        else { return }
                         Task {
-                            await model.updateCompositionState(isComposing)
-                            if !isComposing {
+                            let didFinish =
+                                await model.finishCompositionStateUpdate(
+                                    isComposing,
+                                    generation: generation
+                                )
+                            if didFinish, !isComposing {
                                 completePendingDocumentSearch(for: pane)
                                 await persistWorkspaceState()
                             }
@@ -577,6 +592,9 @@ struct WritingWorkspaceShell: View {
                         }
                     }
                 )
+                // 문서 전환 때 UITextView와 coordinator도 함께 교체한다. 이전 문서의
+                // 한글 조합·delegate callback·Undo 상태가 다음 문서에 잔류하지 않는다.
+                .id(documentID)
                 .background(editorSurface)
             } else {
                 ContentUnavailableView(

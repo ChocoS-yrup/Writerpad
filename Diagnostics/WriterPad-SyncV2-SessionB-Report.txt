@@ -1,0 +1,172 @@
+WriterPad 동기화 v2 — 실기기 세션 B 기록
+===========================================
+
+기기: ChoCo / iPad Pro 11-inch (M4) / iPad16,3
+앱: 1~7번 수정 적용 Debug 실기기 빌드
+로그: /private/tmp/WriterPad-SessionB-console-3.log
+
+[초기 기준선]
+- 2026-08-01 17:10:48 KST: 최신 빌드 실행 및 로그 수집 시작
+- 최초 실행 직후 workspace가 scene-inactive로 전환되어 "로그인 확인 중" 표시가 남음
+- 진단: workspaceSyncModel.start()가 실제 scenePhase 확인 전에 active=true로
+  인증 확인을 시작하고, 직후 inactive 처리에서 Task만 취소한 채 progress 상태를
+  idle로 되돌리지 않아 checkingAuthentication 문구가 stale로 남은 경로
+- 정상 의도: 실제 인증 복원 중의 짧은 "로그인 확인 중" 표시는 허용되지만,
+  인증 Task 취소 후에도 계속 표시되는 것은 의도된 동작이 아님
+- 홈 화면 전환 후 재진입하자 scene-active 경로가 정상 재실행됨
+- 2026-08-01 17:12:30 KST: pullRequestID 1, 2 모두 finishPull로 종료
+- serverState: checkingAuthentication -> connectionChecking -> syncing -> synced
+- realtime gate: acquire -> release-handoff -> release, 최종 isHeld=false / waiters=0
+- operation superseded 관찰 없음
+
+[B-1 장시간 유휴]
+- 시작: 2026-08-01 17:12:55 KST
+- 시작 상태: 서버 동기화됨
+- 조건: 작품 편집 화면 foreground 유지, 자동 잠금 안 함
+- 17:20 중간 확인: 화면은 "서버 동기화됨", 마지막 확인 시각이
+  17:12, 17:14, 17:16, 17:18, 17:20 순서로 계속 갱신됨
+- 로그 대조: pullRequestID 3~7이 약 90초 간격으로 생성됐고 모두
+  0.13~0.30초 안에 finishPull로 종료, 매번 syncing -> synced 수렴
+- realtime gate는 17:12 초기 구독 뒤 isHeld=false / waiters=0 유지
+- reconnect 생성, race timeout, operation superseded 관찰 없음
+- 18:13 종료 확인: "서버 동기화됨", 마지막 확인 18:13
+- 전체 pullRequestID 1~42와 finishPull이 42:42로 일치
+- 유휴 1시간 동안 reconnect 생성, race timeout, operation superseded 없음
+- 최종 gate isHeld=false / waiters=0
+- 결과: 통과
+
+[B-2 백그라운드 장시간]
+- 18:18:36 앱이 실제 scene-inactive로 전환됨
+- generation=4, realtimeGeneration=3으로 증가하고 관련 task 취소·해제 확인
+- 백그라운드 진입 직후 기존 프로세스(PID 2832)가 SIGKILL(9)로 종료됨
+- 18:50경 복귀 시 새 프로세스(PID 2919)로 콜드 재실행됨
+- 복귀 후 3초 안에 "서버 동기화됨"으로 수렴함
+- 결과: 통과(콜드 재실행 복구 경로)
+- 참고: 동일 프로세스가 서스펜션에서 복귀하는 경로는 이번 실행에서 관찰되지 않음
+
+[B-3 기기 잠금 장시간]
+- 18:51:28 로그 재연결을 위해 WriterPad를 강제 재실행함(PID 3024)
+- 인증 확인과 pull 2회는 18:51:31.881까지 모두 synced로 수렴했고 gate도 해제됨
+- 그러나 사용자 화면은 검은 화면에 고착됨. 잠금 절차 시작 전 테스트 중단
+- 현재 분류: 동기화 상태는 정상이며 UI 복원/표시 계층의 별도 이상 또는 강제 재실행 영향
+- 18:53:56 홈 이동 후 18:54:01 같은 프로세스(PID 3024)로 복귀하자 정상 화면 복원
+- 복귀 pullRequestID 4, 5가 각각 정상 종료했고 18:54:02.248 synced 수렴
+- gate 최종 isHeld=false, waiters=0
+- 18:54:36 기기 잠금으로 실제 scene-inactive 전환 확인
+- generation=4, realtimeGeneration=4로 증가하고 관련 task 취소·해제 확인
+- 19:25:05 잠금 해제 후 같은 프로세스(PID 3024)로 scene-active 복귀
+- 사용자 화면은 약 1초 안에 "서버 동기화됨" 표시
+- pullRequestID 6은 0.49초, 7은 0.38초 만에 finishPull 완료
+- 최종 19:25:07.947 synced, gate isHeld=false, waiters=0
+- operation superseded 및 race timeout 없음
+- 결과: 통과
+
+[B-4 네트워크 단절/복구]
+- 19:25:54 비행기 모드 전환을 위한 Control Center 진입으로 scene-inactive 확인
+- 19:26경 비행기 모드 ON, 네트워크 단절 시작
+- 19:27:06 네트워크 복구와 함께 scene-active
+- pullRequestID 8: 19:27:06.245 시작 -> 19:27:06.691 finishPull/synced
+- realtime subscribed 콜백 뒤 pullRequestID 9: 19:27:06.863 시작 -> 19:27:07.023 finishPull/synced
+- 사용자 화면은 약 1초 안에 최종 "서버 동기화됨"으로 수렴
+- 첫 synced 뒤 connectionChecking(지구본) -> syncing -> synced가 한 차례 더 보여 두 번 깜빡임 관찰
+- gate 최종 isHeld=false, waiters=0. stale sentinel, operation superseded, race timeout 없음
+- 판정: 기능 통과. 깜빡임은 3번 수정에서 수용한 표시상 트레이드오프이며 12번 상태 3축 분리 대상
+- 사용자 요청으로 후속 UI-only 수정 적용:
+  - 모델의 serverState 및 pull/realtime 실행 순서는 변경하지 않음
+  - SaveStatusBadge가 .synced 표시만 250ms 보류하고 상태 변경 시 자동 취소
+  - 중간 synced 유지 시간 139ms이므로 숨겨지고 최종 synced만 표시될 예정
+  - 전체 WriterPadTests 470 통과, 1 제외, 실패 0
+- 새 실기기 빌드 19:36 설치 완료. 시각적 재검증 대기
+- 재검증 중 "서버 재연결 중 -> 서버 연결 확인 중(지구본)" 진행 상태 깜빡임 추가 관찰
+- UI-only 보완 적용:
+  - connectionChecking/reconnecting/syncing을 하나의 표시 진행 구간으로 취급
+  - 구간 진입 때 처음 보인 진행 문구·아이콘을 성공 또는 오류까지 유지
+  - 내부 serverState 전이, pull, realtime 로직은 변경하지 않음
+  - SyncV2SnapshotPullTests 50개 전부 통과
+- 보완된 실기기 빌드 19:41 설치 완료. 최종 시각적 재검증 대기
+- 19:41 빌드 재설치 후 앱이 "로그인 확인 중"에 고착되는 현상 재발(PID 3223 생존)
+- Console.app가 해당 앱 시작 당시 스트리밍 OFF여서 최초 전이 로그는 현재 세션에 미수집
+- 이전 동일 증상 로그와 일치하는 유력 원인:
+  - start()가 실제 scenePhase와 무관하게 updateSceneActivity(true)를 호출
+  - 직후 실제 scene-inactive가 오면 인증 task는 취소되지만 checkingAuthentication 상태는 초기화되지 않음
+- UI 배지 안정화 코드는 serverState를 읽기만 하므로 모델 고착 원인은 아님
+- 현재 발생 건은 Console 스트리밍 ON 상태에서 background -> active 복구 로그로 추가 확인 예정
+- 사용자가 Home 3초 -> 같은 앱 복귀 직후 인증 고착이 즉시 해제됨
+- 이후 synced -> reconnecting/connectionChecking -> synced를 거쳐 최종 정상 수렴
+- 인증 고착 원인 판정: 초기 scene 활성화 레이스 확정
+- 추가 표시 관찰: 250ms synced 보류는 공유 realtime gate의 순차 구독 간격이 250ms를 넘으면 중간 성공을 숨기지 못함
+- 이전 실기기 로그에서도 첫 finishPull/synced 뒤 workspace subscribed까지 약 1.5초 간격이 관찰됨
+- 결론: 임의의 짧은 UI 타이머만으로 "최종 확인 완료"를 정확히 판별할 수 없으며, 모델이 최종 verification 완료 신호를 제공해야 함
+- 후속 정리: 위 UI 안정화와 scene lifecycle 실험은 연결 고착을
+  악화시켜 모두 되돌림. 현재 빌드에는 1~7번 핵심 수정과 B-7 인증
+  상태 알림 수정만 남아 있음
+
+[B-5 네트워크 경로 전환]
+- Wi-Fi -> 다른 경로 전환 후 약 4초 만에 "서버 동기화됨" 수렴
+- 원래 경로로 복귀 후 약 3초 안에 "서버 동기화됨" 수렴
+- 결과: 통과
+
+[B-6 멀티태스킹]
+- Split View에서 다른 앱과 함께 사용하는 동안 동기화 상태가 계속 유지됨
+- 결과: 통과
+
+[B-7 재로그인]
+- 최초 실기기 결과:
+  - 로그아웃 후에도 열린 workspace는 stale "서버 동기화됨" 유지
+  - Home 왕복 후에야 "인증 필요"로 변경
+  - 재로그인 후에도 Home 왕복 전까지 realtime 갱신 안 됨
+- 원인: AuthenticationServicing에 상태 변경 stream이 없어 열린
+  SyncV2WorkspaceSyncModel이 scene activation/network 이벤트가 오기 전까지
+  로그아웃·로그인을 알 수 없었음
+- 수정:
+  - SupabaseAuthService가 인증 상태 전이를 AsyncStream으로 발행
+  - workspace가 active 동안 stream을 구독
+  - 로그아웃/인증 실패 즉시 cloud task를 정리하고 "인증 필요"를 표시
+  - 재로그인 즉시 workspace를 재활성화하여 pull/realtime 재개
+- 회귀 검증:
+  - B-7 전용 서비스/작업공간 테스트 2개 통과
+  - SupabaseAuthServiceTests + SyncV2SnapshotPullTests 68개 전부 통과
+  - 전체 병렬 실행의 기존 타이밍 플레이크 2개는 단독 재실행 통과
+- 2026-08-01 21:37 KST 수정 빌드 실기기 설치
+- Home 왕복 없이 로그아웃·재로그인 상태와 동기화가 즉시 반영됨을
+  사용자가 실기기에서 확인
+- 2026-08-02 02:07 KST: 재로그인 수정 빌드로 4시간 이상 경과한 뒤에도
+  iPad 임대 해제 후 Windows 대기 변경이 5~10초 안에 정상 동기화됨
+- 결과: 즉시 재인증·동기 재개와 30분 이상 경과 후 동기 모두 통과
+
+[B-8 양방향 동기화]
+- 18:13:24 Windows 문서 변경 realtime 이벤트 수신
+- 18:13:25 pullRequestID 42 시작, 약 0.13초 뒤 finishPull 및 synced 수렴
+- Windows -> iPad 문서 반영을 사용자가 화면에서 확인
+- 18:16경 iPad에서 동기화 저장 후 약 2초 만에 Windows 반영을 사용자가 확인
+- 결과: 양방향 모두 통과
+
+[B-9 한글 조합 보호]
+- 실기기 관찰:
+  - iPad에서 `ㅎ` 자음 하나를 입력한 결과 Windows까지 동기화됨
+  - 따라서 해당 키보드에서 자음 하나는 autosave를 막는 장기
+    marked-text 조합 상태로 유지되지 않음
+  - iPad에서 문서를 열기만 하고 수정하지 않으면 Windows 수정이
+    정상 동기화됨
+  - iPad에서 첫 수정을 하면 edit lease를 획득하여 Windows는
+    로컬 저장/편집 잠금 상태로 대기함
+  - Windows에서 먼저 수정했을 때도 iPad가 대기하는 동일한 동작을
+    확인함
+  - iPad가 다른 화로 이동해 edit lease를 해제하자 Windows의 로컬
+    대기 변경이 5~10초 후 서버에 정상 동기화됨
+  - 최종 iPad 화면에 `윈도우 베이스`, `윈도우-b9-2139`,
+    `아이패드 베이스하`, `아이패드-B9`이 모두 표시됨
+  - iPad의 한글 `하`가 깨지거나 유실되지 않았고 Windows/iPad
+    변경이 하나의 최종 문서로 수렴함
+- 판정:
+  - 편집 임대가 양방향으로 정상 작동함
+  - 정상 UI 경로에서는 한 기기의 첫 수정이 edit lease를 잡으므로
+    "iPad marked-text 조합 중 Windows의 같은 문서 변경이 서버에
+    commit되어 iPad에 도착"하는 원래 B-9 조건은 만들 수 없음
+  - SyncV2EditingGuard의 markedTextComposition 분기는 결정적 유닛 테스트로
+    검증되었지만, 실기기 2개 앱을 이용한 해당 정확 시나리오는
+    edit lease에 의해 실행 불가
+- 결과: 편집 임대 양방향·임대 해제·대기 작업 복구·최종
+  양쪽 변경 보존 통과.
+  원래 B-9의 "조합 중 원격 snapshot 도착" 조건은 편집 임대로
+  정상 차단되어 적용 불가

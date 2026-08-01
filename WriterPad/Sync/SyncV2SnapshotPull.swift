@@ -519,10 +519,20 @@ actor SyncV2DocumentMutationGate {
     private func acquire(_ documentID: UUID) async {
         guard lockedDocumentIDs.contains(documentID) else {
             lockedDocumentIDs.insert(documentID)
+            SyncV2Diagnostics.documentMutationGate(
+                action: "acquire",
+                documentID: documentID,
+                waiters: waiters[documentID]?.count ?? 0
+            )
             return
         }
         await withCheckedContinuation { continuation in
             waiters[documentID, default: []].append(continuation)
+            SyncV2Diagnostics.documentMutationGate(
+                action: "acquire-wait",
+                documentID: documentID,
+                waiters: waiters[documentID]?.count ?? 0
+            )
         }
     }
 
@@ -530,10 +540,20 @@ actor SyncV2DocumentMutationGate {
         guard var pending = waiters[documentID], !pending.isEmpty else {
             waiters[documentID] = nil
             lockedDocumentIDs.remove(documentID)
+            SyncV2Diagnostics.documentMutationGate(
+                action: "release",
+                documentID: documentID,
+                waiters: 0
+            )
             return
         }
         let next = pending.removeFirst()
         waiters[documentID] = pending.isEmpty ? nil : pending
+        SyncV2Diagnostics.documentMutationGate(
+            action: "release-handoff",
+            documentID: documentID,
+            waiters: pending.count
+        )
         next.resume()
     }
 }
@@ -783,6 +803,8 @@ enum SyncV2WorkspaceServerState: Equatable, Sendable {
     case localOnly
     case idle
     case checkingAuthentication
+    case connectionChecking
+    case reconnecting
     case syncing
     case synced(at: Date)
     case offlineSaved
@@ -874,6 +896,21 @@ enum WorkspaceSyncStatusReducer {
                 "로그인 확인 중",
                 "person.crop.circle.badge.clock",
                 "저장된 로그인 세션을 복원하고 있습니다."
+            )
+        }
+        if case .connectionChecking = serverState {
+            return value(
+                "서버 연결 확인 중",
+                "network",
+                "Realtime 연결과 최신 서버 snapshot을 확인하고 있습니다."
+            )
+        }
+        if case .reconnecting = serverState {
+            return value(
+                "서버 재연결 중",
+                "arrow.triangle.2.circlepath.icloud",
+                "연결을 복구한 뒤 누락된 변경을 즉시 다시 확인합니다.",
+                severity: .warning
             )
         }
         if case .offlineSaved = serverState {
@@ -1017,11 +1054,119 @@ protocol SyncV2RealtimeTriggering: Sendable {
         onChange: @escaping @Sendable () -> Void,
         onSubscribed: @escaping @Sendable () -> Void
     ) async throws
+    func start(
+        projectID: UUID,
+        onChange: @escaping @Sendable () -> Void,
+        onStatus: @escaping @Sendable
+            (SyncV2RealtimeConnectionStatus) -> Void
+    ) async throws
+    func startAll(
+        onChange: @escaping @Sendable () -> Void,
+        onStatus: @escaping @Sendable
+            (SyncV2RealtimeConnectionStatus) -> Void
+    ) async throws
     func stop() async
+}
+
+actor SyncV2RealtimeConnectGate {
+    private var isHeld = false
+    private var waiters: [CheckedContinuation<Void, Never>] = []
+
+    func withSubscription(
+        timeout: Duration = .seconds(20),
+        timeoutSleep: @escaping @Sendable (Duration) async throws -> Void = {
+            duration in
+            try await ContinuousClock().sleep(for: duration)
+        },
+        _ operation: @escaping @Sendable () async throws -> Void
+    ) async throws {
+        await acquire()
+        do {
+            try Task.checkCancellation()
+        } catch {
+            release()
+            throw error
+        }
+        let race = SyncV2RealtimeStartRace()
+        let operationTask = Task {
+            do {
+                try await operation()
+                await race.resolve(.completed)
+            } catch {
+                await race.resolve(.failed)
+                throw error
+            }
+        }
+        let timeoutTask = Task {
+            do {
+                try await timeoutSleep(timeout)
+                await race.resolve(.timedOut)
+            } catch {
+                // 구독 완료 또는 상위 stop이 먼저 끝났다.
+            }
+        }
+        let outcome = await race.value()
+        operationTask.cancel()
+        timeoutTask.cancel()
+        release()
+        switch outcome {
+        case .completed, .failed:
+            try await operationTask.value
+        case .timedOut:
+            throw SyncV2RealtimeTriggerError.subscriptionTimedOut
+        }
+    }
+
+    private func acquire() async {
+        guard isHeld else {
+            isHeld = true
+            SyncV2Diagnostics.realtimeConnectGate(
+                action: "acquire",
+                isHeld: isHeld,
+                waiters: waiters.count
+            )
+            return
+        }
+        await withCheckedContinuation { continuation in
+            waiters.append(continuation)
+            SyncV2Diagnostics.realtimeConnectGate(
+                action: "acquire-wait",
+                isHeld: isHeld,
+                waiters: waiters.count
+            )
+        }
+    }
+
+    private func release() {
+        guard !waiters.isEmpty else {
+            isHeld = false
+            SyncV2Diagnostics.realtimeConnectGate(
+                action: "release",
+                isHeld: isHeld,
+                waiters: waiters.count
+            )
+            return
+        }
+        waiters.removeFirst().resume()
+        SyncV2Diagnostics.realtimeConnectGate(
+            action: "release-handoff",
+            isHeld: isHeld,
+            waiters: waiters.count
+        )
+    }
+}
+
+enum SyncV2RealtimeConnectionStatus: Equatable, Sendable {
+    case subscribing
+    case subscribed
+    case closed
+    case channelError
+    case timedOut
 }
 
 enum SyncV2RealtimeTriggerError: Error {
     case globalSubscriptionUnsupported
+    case subscriptionTimedOut
 }
 
 extension SyncV2RealtimeTriggering {
@@ -1031,6 +1176,30 @@ extension SyncV2RealtimeTriggering {
     ) async throws {
         _ = (onChange, onSubscribed)
         throw SyncV2RealtimeTriggerError.globalSubscriptionUnsupported
+    }
+
+    func start(
+        projectID: UUID,
+        onChange: @escaping @Sendable () -> Void,
+        onStatus: @escaping @Sendable
+            (SyncV2RealtimeConnectionStatus) -> Void
+    ) async throws {
+        try await start(
+            projectID: projectID,
+            onChange: onChange,
+            onSubscribed: { onStatus(.subscribed) }
+        )
+    }
+
+    func startAll(
+        onChange: @escaping @Sendable () -> Void,
+        onStatus: @escaping @Sendable
+            (SyncV2RealtimeConnectionStatus) -> Void
+    ) async throws {
+        try await startAll(
+            onChange: onChange,
+            onSubscribed: { onStatus(.subscribed) }
+        )
     }
 }
 
@@ -1048,14 +1217,21 @@ struct SyncV2RealtimeSubscriptionGate {
 
 actor LiveSyncV2RealtimeTrigger: SyncV2RealtimeTriggering {
     private let client: SupabaseClient
+    private let subscriptionGate: SyncV2RealtimeConnectGate
     private var channel: RealtimeChannelV2?
     private var changeSubscription: RealtimeSubscription?
     private var statusSubscription: RealtimeSubscription?
     private var channelGeneration: UUID?
-    private var subscriptionGate = SyncV2RealtimeSubscriptionGate()
+    private var hasObservedSubscribing = false
+    private var hasSubscribed = false
 
-    init(client: SupabaseClient) {
+    init(
+        client: SupabaseClient,
+        subscriptionGate: SyncV2RealtimeConnectGate =
+            SyncV2RealtimeConnectGate()
+    ) {
         self.client = client
+        self.subscriptionGate = subscriptionGate
     }
 
     func start(
@@ -1063,10 +1239,14 @@ actor LiveSyncV2RealtimeTrigger: SyncV2RealtimeTriggering {
         onChange: @escaping @Sendable () -> Void,
         onSubscribed: @escaping @Sendable () -> Void
     ) async throws {
-        try await startChannel(
+        try await start(
             projectID: projectID,
             onChange: onChange,
-            onSubscribed: onSubscribed
+            onStatus: { status in
+                if status == .subscribed {
+                    onSubscribed()
+                }
+            }
         )
     }
 
@@ -1074,22 +1254,52 @@ actor LiveSyncV2RealtimeTrigger: SyncV2RealtimeTriggering {
         onChange: @escaping @Sendable () -> Void,
         onSubscribed: @escaping @Sendable () -> Void
     ) async throws {
+        try await startAll(
+            onChange: onChange,
+            onStatus: { status in
+                if status == .subscribed {
+                    onSubscribed()
+                }
+            }
+        )
+    }
+
+    func start(
+        projectID: UUID,
+        onChange: @escaping @Sendable () -> Void,
+        onStatus: @escaping @Sendable
+            (SyncV2RealtimeConnectionStatus) -> Void
+    ) async throws {
+        try await startChannel(
+            projectID: projectID,
+            onChange: onChange,
+            onStatus: onStatus
+        )
+    }
+
+    func startAll(
+        onChange: @escaping @Sendable () -> Void,
+        onStatus: @escaping @Sendable
+            (SyncV2RealtimeConnectionStatus) -> Void
+    ) async throws {
         try await startChannel(
             projectID: nil,
             onChange: onChange,
-            onSubscribed: onSubscribed
+            onStatus: onStatus
         )
     }
 
     private func startChannel(
         projectID: UUID?,
         onChange: @escaping @Sendable () -> Void,
-        onSubscribed: @escaping @Sendable () -> Void
+        onStatus: @escaping @Sendable
+            (SyncV2RealtimeConnectionStatus) -> Void
     ) async throws {
         await stop()
         let generation = UUID()
         channelGeneration = generation
-        subscriptionGate = SyncV2RealtimeSubscriptionGate()
+        hasObservedSubscribing = false
+        hasSubscribed = false
         let channel = client.channel(
             projectID.map {
                 "writerpad-documents-\($0.uuidString.lowercased())"
@@ -1103,7 +1313,12 @@ actor LiveSyncV2RealtimeTrigger: SyncV2RealtimeTriggering {
                 filter:
                     "project_id=eq.\(projectID.uuidString.lowercased())"
             ) { _ in
-                onChange()
+                Task {
+                    await self.receivedChange(
+                        generation: generation,
+                        callback: onChange
+                    )
+                }
             }
         } else {
             changeSubscription = channel.onPostgresChange(
@@ -1111,22 +1326,58 @@ actor LiveSyncV2RealtimeTrigger: SyncV2RealtimeTriggering {
                 schema: "public",
                 table: "documents"
             ) { _ in
-                onChange()
-            }
-        }
-        statusSubscription = channel.onStatusChange {
-            [weak self] status in
-            if case .subscribed = status {
                 Task {
-                    await self?.receivedSubscribed(
+                    await self.receivedChange(
                         generation: generation,
-                        callback: onSubscribed
+                        callback: onChange
                     )
                 }
             }
         }
+        statusSubscription = channel.onStatusChange {
+            [weak self] status in
+            Task {
+                await self?.receivedStatus(
+                    status,
+                    generation: generation,
+                    callback: onStatus
+                )
+            }
+        }
         self.channel = channel
-        try await channel.subscribeWithError()
+        do {
+            // 같은 SupabaseClient를 쓰는 전체-작품 채널과 현재-작품 채널이
+            // 동시에 최초 connect/subscribe에 진입하면 SDK 2.46.0에서 한
+            // phx_join이 영구 대기할 수 있다. 공유 gate로 socket 구독을
+            // 직렬화하고, 완료된 채널은 즉시 다음 채널에 차례를 넘긴다.
+            try await subscriptionGate.withSubscription {
+                try await channel.subscribeWithError()
+            }
+            // subscribeWithError의 정상 반환은 채널 구독이 완료됐다는
+            // authoritative 신호다. 일부 장시간 실행·재연결 경로에서는
+            // onStatusChange(.subscribed)가 replay되지 않을 수 있으므로,
+            // callback 누락 여부와 무관하게 정확히 한 번 확정한다.
+            receivedStatus(
+                .subscribed,
+                generation: generation,
+                callback: onStatus
+            )
+        } catch {
+            guard channelGeneration == generation else { throw error }
+            let status: SyncV2RealtimeConnectionStatus
+            switch error {
+            case SyncV2RealtimeTriggerError.subscriptionTimedOut:
+                status = .timedOut
+            default:
+                let detail = error.localizedDescription.lowercased()
+                status = detail.contains("timeout")
+                    || detail.contains("retry")
+                    ? .timedOut
+                    : .channelError
+            }
+            onStatus(status)
+            throw error
+        }
     }
 
     func stop() async {
@@ -1135,24 +1386,77 @@ actor LiveSyncV2RealtimeTrigger: SyncV2RealtimeTriggering {
         changeSubscription = nil
         statusSubscription = nil
         if let channel {
+            // Supabase 2.46.0의 removeChannel은 이미 subscribed인 채널만
+            // unsubscribe한다. subscribing 중 remove하면 내부 phx_join Task가
+            // 고아로 남아 같은 topic의 다음 채널 응답을 가로막을 수 있으므로,
+            // 상태와 관계없이 먼저 state machine을 unsubscribed까지 보낸다.
+            await channel.unsubscribe()
             await client.removeChannel(channel)
         }
         channel = nil
         channelGeneration = nil
-        subscriptionGate = SyncV2RealtimeSubscriptionGate()
+        hasObservedSubscribing = false
+        hasSubscribed = false
     }
 
-    private func receivedSubscribed(
+    private func receivedChange(
         generation: UUID,
         callback: @escaping @Sendable () -> Void
     ) {
         guard channelGeneration == generation else { return }
-        guard subscriptionGate.receiveSubscribed() else {
-            // foreground activation already performs an immediate snapshot.
-            // The first subscription is therefore not a second trigger.
-            return
-        }
         callback()
+    }
+
+    private func receivedStatus(
+        _ status: RealtimeChannelStatus,
+        generation: UUID,
+        callback: @escaping @Sendable
+            (SyncV2RealtimeConnectionStatus) -> Void
+    ) {
+        guard channelGeneration == generation else { return }
+        switch status {
+        case .subscribing:
+            // actor가 status callback Task를 처리하기 전에 채널이 이미
+            // subscribed로 진행했다면 오래된 subscribing으로 회귀하지 않는다.
+            guard !hasSubscribed,
+                  let currentStatus = channel?.status,
+                  Self.sameStatus(status, currentStatus)
+            else { return }
+            hasObservedSubscribing = true
+            callback(.subscribing)
+        case .subscribed:
+            // subscribed는 callback 시점의 channel.status 비교로 버리지 않는다.
+            // subscribeWithError 정상 반환도 같은 경로를 사용하므로 generation당
+            // 한 번만 상위 수명주기 모델에 전달된다.
+            guard !hasSubscribed else { return }
+            hasSubscribed = true
+            callback(.subscribed)
+        case .unsubscribed:
+            // onStatusChange는 등록 직후 초기 unsubscribed를 replay한다.
+            // 실제 subscribe가 시작되기 전의 값은 종료 신호가 아니다.
+            guard hasObservedSubscribing || hasSubscribed,
+                  let currentStatus = channel?.status,
+                  Self.sameStatus(status, currentStatus)
+            else { return }
+            callback(.closed)
+        case .unsubscribing:
+            break
+        }
+    }
+
+    private static func sameStatus(
+        _ lhs: RealtimeChannelStatus,
+        _ rhs: RealtimeChannelStatus
+    ) -> Bool {
+        switch (lhs, rhs) {
+        case (.unsubscribed, .unsubscribed),
+             (.subscribing, .subscribing),
+             (.subscribed, .subscribed),
+             (.unsubscribing, .unsubscribing):
+            true
+        default:
+            false
+        }
     }
 }
 
@@ -1163,22 +1467,57 @@ actor SyncV2BackgroundSyncCoordinator {
     private let puller: any SyncV2SnapshotPulling
     private let realtime: any SyncV2RealtimeTriggering
     private let projectBindingService: any ProjectBindingServicing
+    private let authenticationService: (any AuthenticationServicing)?
     private let debounceDelay: Duration
     private let periodicDelay: Duration
+    private let realtimeSubscriptionTimeout: Duration
+    private let pullTimeout: Duration
     private let sleep: SyncV2WorkspaceSleep
+    private let realtimeTimeoutSleep: SyncV2WorkspaceSleep
+    private let pullTimeoutSleep: SyncV2WorkspaceSleep
 
     private var isStarted = false
     private var activeLocalProjectID: ProjectID?
     private var pullTasks: [ProjectID: Task<Void, Never>] = [:]
+    private var pullGenerations: [ProjectID: UInt64] = [:]
+    private var pendingProjects = Set<ProjectID>()
     private var debounceTask: Task<Void, Never>?
     private var periodicTask: Task<Void, Never>?
+    private var realtimeTask: Task<Void, Never>?
+    private var reconnectTask: Task<Void, Never>?
+    private var realtimeGeneration: UInt64 = 0
+    private var reconnectAttempt = 0
+
+    private func logTask(
+        _ name: String,
+        action: String,
+        reason: String
+    ) {
+        SyncV2Diagnostics.task(
+            scope: "background",
+            name: name,
+            action: action,
+            reason: reason
+        )
+    }
 
     init(
         puller: any SyncV2SnapshotPulling,
         realtime: any SyncV2RealtimeTriggering,
         projectBindingService: any ProjectBindingServicing,
+        authenticationService: (any AuthenticationServicing)? = nil,
         debounceDelay: Duration = .milliseconds(450),
         periodicDelay: Duration = .seconds(90),
+        realtimeSubscriptionTimeout: Duration = .seconds(12),
+        pullTimeout: Duration = .seconds(15),
+        realtimeTimeoutSleep:
+            @escaping SyncV2WorkspaceSleep = { duration in
+                try await ContinuousClock().sleep(for: duration)
+            },
+        pullTimeoutSleep:
+            @escaping SyncV2WorkspaceSleep = { duration in
+                try await ContinuousClock().sleep(for: duration)
+            },
         sleep: @escaping SyncV2WorkspaceSleep = { duration in
             try await ContinuousClock().sleep(for: duration)
         }
@@ -1186,38 +1525,51 @@ actor SyncV2BackgroundSyncCoordinator {
         self.puller = puller
         self.realtime = realtime
         self.projectBindingService = projectBindingService
+        self.authenticationService = authenticationService
         self.debounceDelay = debounceDelay
         self.periodicDelay = periodicDelay
+        self.realtimeSubscriptionTimeout = realtimeSubscriptionTimeout
+        self.pullTimeout = pullTimeout
+        self.realtimeTimeoutSleep = realtimeTimeoutSleep
+        self.pullTimeoutSleep = pullTimeoutSleep
         self.sleep = sleep
     }
 
     func start() async {
         guard !isStarted, GlobalSyncPreference.isEnabled() else { return }
         isStarted = true
-        do {
-            try await realtime.startAll(
-                onChange: { [weak self] in
-                    Task { await self?.realtimeChanged() }
-                },
-                onSubscribed: { [weak self] in
-                    Task { await self?.realtimeChanged() }
-                }
-            )
-        } catch {
-            // Realtime 실패 시에도 주기 snapshot pull로 복구한다.
-        }
+        startRealtime()
         startPeriodicPull()
         await pullInactiveProjects()
     }
 
     func stop() async {
         isStarted = false
+        logTask("debounceTask", action: "cancel", reason: "stop")
         debounceTask?.cancel()
+        logTask("periodicTask", action: "cancel", reason: "stop")
         periodicTask?.cancel()
+        realtimeTask?.cancel()
+        logTask("reconnectTask", action: "cancel", reason: "stop")
+        reconnectTask?.cancel()
         pullTasks.values.forEach { $0.cancel() }
+        logTask("debounceTask", action: "clear", reason: "stop")
         debounceTask = nil
+        logTask("periodicTask", action: "clear", reason: "stop")
         periodicTask = nil
+        realtimeTask = nil
+        logTask("reconnectTask", action: "clear", reason: "stop")
+        reconnectTask = nil
         pullTasks.removeAll()
+        pullGenerations.removeAll()
+        pendingProjects.removeAll()
+        realtimeGeneration &+= 1
+        SyncV2Diagnostics.generation(
+            scope: "background",
+            counter: "realtimeGeneration",
+            value: realtimeGeneration,
+            reason: "stop"
+        )
         await realtime.stop()
     }
 
@@ -1229,6 +1581,7 @@ actor SyncV2BackgroundSyncCoordinator {
                forKey: localProjectID
            ) {
             activePull.cancel()
+            pullGenerations[localProjectID, default: 0] &+= 1
         }
         guard isStarted, previous != localProjectID else { return }
         await pullInactiveProjects()
@@ -1236,14 +1589,184 @@ actor SyncV2BackgroundSyncCoordinator {
 
     func appEnteredForeground() async {
         guard isStarted else { return }
+        // 앱 최초 active 진입에서는 `start()`와 이 호출이 연달아 온다.
+        // 진행 중인 phx_join을 stop/start하면 SDK 내부에 같은 topic의
+        // 고아 join이 남아 이후 응답까지 가로막을 수 있다. scene inactive는
+        // coordinator 자체를 stop하므로, 이미 시작된 foreground 경로에서는
+        // 현재 구독 또는 재연결 task를 그대로 유지한다.
+        if realtimeTask == nil, reconnectTask == nil {
+            startRealtime()
+        }
         await pullInactiveProjects()
+    }
+
+    private func startRealtime() {
+        guard isStarted else { return }
+        realtimeTask?.cancel()
+        realtimeGeneration &+= 1
+        SyncV2Diagnostics.generation(
+            scope: "background",
+            counter: "realtimeGeneration",
+            value: realtimeGeneration,
+            reason: "startRealtime"
+        )
+        let generation = realtimeGeneration
+        realtimeTask = Task { [weak self] in
+            guard let self else { return }
+            let race = SyncV2RealtimeStartRace()
+            let operation = Task {
+                do {
+                    try await self.realtime.startAll(
+                        onChange: { [weak self] in
+                            Task { await self?.realtimeChanged() }
+                        },
+                        onStatus: { [weak self] status in
+                            Task {
+                                await self?.receivedRealtimeStatus(
+                                    status,
+                                    generation: generation
+                                )
+                            }
+                        }
+                    )
+                    await race.resolve(.completed)
+                } catch {
+                    await race.resolve(.failed)
+                }
+            }
+            let timeout = self.realtimeSubscriptionTimeout
+            let timeoutSleep = self.realtimeTimeoutSleep
+            let watchdog = Task {
+                do {
+                    try await timeoutSleep(timeout)
+                    await race.resolve(.timedOut)
+                } catch {
+                    // 정상 구독 또는 coordinator 종료가 먼저 끝났다.
+                }
+            }
+            let outcome = await race.value()
+            operation.cancel()
+            watchdog.cancel()
+            await self.realtimeStartFinished(
+                outcome,
+                generation: generation
+            )
+        }
+    }
+
+    private func realtimeStartFinished(
+        _ outcome: SyncV2RealtimeStartOutcome,
+        generation: UInt64
+    ) async {
+        guard isStarted,
+              realtimeGeneration == generation
+        else { return }
+        switch outcome {
+        case .completed:
+            // 완료된 Task 참조는 foreground 중복 start를 막는 생존 표식이다.
+            break
+        case .failed:
+            realtimeTask = nil
+            await receivedRealtimeStatus(
+                .channelError,
+                generation: generation
+            )
+        case .timedOut:
+            realtimeTask = nil
+            await realtime.stop()
+            guard isStarted,
+                  realtimeGeneration == generation
+            else { return }
+            await receivedRealtimeStatus(
+                .timedOut,
+                generation: generation
+            )
+        }
+    }
+
+    private func receivedRealtimeStatus(
+        _ status: SyncV2RealtimeConnectionStatus,
+        generation: UInt64
+    ) async {
+        guard isStarted, realtimeGeneration == generation else { return }
+        switch status {
+        case .subscribed:
+            reconnectAttempt = 0
+            logTask(
+                "reconnectTask",
+                action: "cancel",
+                reason: "realtime-subscribed"
+            )
+            reconnectTask?.cancel()
+            logTask(
+                "reconnectTask",
+                action: "clear",
+                reason: "realtime-subscribed"
+            )
+            reconnectTask = nil
+            // 재구독 직후에는 debounce 없이 누락 구간을 바로 확인한다.
+            await pullInactiveProjects()
+        case .closed, .channelError, .timedOut:
+            scheduleRealtimeReconnect()
+        case .subscribing:
+            break
+        }
+    }
+
+    private func scheduleRealtimeReconnect() {
+        guard reconnectTask == nil, isStarted else { return }
+        let delays: [Duration] = [
+            .seconds(1), .seconds(2), .seconds(5),
+            .seconds(10), .seconds(30),
+        ]
+        let delay = delays[min(reconnectAttempt, delays.count - 1)]
+        reconnectAttempt += 1
+        logTask(
+            "reconnectTask",
+            action: "create",
+            reason: "scheduleRealtimeReconnect"
+        )
+        reconnectTask = Task { [weak self] in
+            await self?.performRealtimeReconnect(after: delay)
+        }
+    }
+
+    private func performRealtimeReconnect(after delay: Duration) async {
+        if let authenticationService {
+            _ = await authenticationService.refreshSession(force: false)
+        }
+        do {
+            try await sleep(delay)
+            try Task.checkCancellation()
+        } catch {
+            return
+        }
+        guard isStarted else { return }
+        logTask(
+            "reconnectTask",
+            action: "clear",
+            reason: "performRealtimeReconnect"
+        )
+        reconnectTask = nil
+        await realtime.stop()
+        startRealtime()
     }
 
     private func realtimeChanged() {
         guard isStarted else { return }
+        logTask(
+            "debounceTask",
+            action: "cancel",
+            reason: "realtimeChanged"
+        )
         debounceTask?.cancel()
         let delay = debounceDelay
         let sleep = self.sleep
+        logTask(
+            "debounceTask",
+            action: "create",
+            reason: "realtimeChanged"
+        )
         debounceTask = Task { [weak self] in
             do {
                 try await sleep(delay)
@@ -1256,9 +1779,19 @@ actor SyncV2BackgroundSyncCoordinator {
     }
 
     private func startPeriodicPull() {
+        logTask(
+            "periodicTask",
+            action: "cancel",
+            reason: "startPeriodicPull"
+        )
         periodicTask?.cancel()
         let delay = periodicDelay
         let sleep = self.sleep
+        logTask(
+            "periodicTask",
+            action: "create",
+            reason: "startPeriodicPull"
+        )
         periodicTask = Task { [weak self] in
             while !Task.isCancelled {
                 do {
@@ -1276,26 +1809,82 @@ actor SyncV2BackgroundSyncCoordinator {
         guard isStarted else { return }
         let bindings = await projectBindingService.connectedBindings()
         for binding in bindings {
-            guard
-                binding.localProjectID != activeLocalProjectID,
-                let serverProjectID = binding.serverProjectID,
-                pullTasks[binding.localProjectID] == nil
+            guard binding.localProjectID != activeLocalProjectID,
+                  let serverProjectID = binding.serverProjectID
             else { continue }
             let localProjectID = binding.localProjectID
-            let puller = self.puller
-            pullTasks[localProjectID] = Task { [weak self] in
-                _ = try? await puller.pull(
-                    localProjectID: localProjectID,
-                    serverProjectID: serverProjectID,
-                    editingGuards: [:]
-                )
-                await self?.pullFinished(localProjectID)
+            if pullTasks[localProjectID] != nil {
+                pendingProjects.insert(localProjectID)
+                continue
             }
+            startPull(
+                localProjectID: localProjectID,
+                serverProjectID: serverProjectID
+            )
         }
     }
 
-    private func pullFinished(_ localProjectID: ProjectID) {
+    private func startPull(
+        localProjectID: ProjectID,
+        serverProjectID: UUID
+    ) {
+        pullGenerations[localProjectID, default: 0] &+= 1
+        let pullGeneration = pullGenerations[localProjectID] ?? 0
+        let puller = self.puller
+        let timeout = pullTimeout
+        let timeoutSleep = pullTimeoutSleep
+        pullTasks[localProjectID] = Task { [weak self] in
+            let race = SyncV2WorkspacePullRace()
+            let operation = Task {
+                do {
+                    let report = try await puller.pull(
+                        localProjectID: localProjectID,
+                        serverProjectID: serverProjectID,
+                        editingGuards: [:]
+                    )
+                    await race.resolve(.success(report))
+                } catch let error as SyncV2ClientError {
+                    await race.resolve(.clientError(error))
+                } catch {
+                    await race.resolve(
+                        .failure(error.localizedDescription)
+                    )
+                }
+            }
+            let watchdog = Task {
+                do {
+                    try await timeoutSleep(timeout)
+                    await race.resolve(.timedOut)
+                } catch {
+                    // 정상 pull 또는 coordinator 종료가 먼저 끝났다.
+                }
+            }
+            _ = await race.value()
+            operation.cancel()
+            watchdog.cancel()
+            await self?.pullFinished(
+                localProjectID,
+                serverProjectID: serverProjectID,
+                generation: pullGeneration
+            )
+        }
+    }
+
+    private func pullFinished(
+        _ localProjectID: ProjectID,
+        serverProjectID: UUID,
+        generation: UInt64
+    ) {
+        guard pullGenerations[localProjectID] == generation else { return }
         pullTasks[localProjectID] = nil
+        guard isStarted,
+              activeLocalProjectID != localProjectID,
+              pendingProjects.remove(localProjectID) != nil
+        else { return }
+        startPull(
+            localProjectID: localProjectID,
+            serverProjectID: serverProjectID
+        )
     }
 }
 
@@ -1325,10 +1914,82 @@ private actor SyncV2WorkspaceAuthenticationOutcome {
     }
 }
 
+private enum SyncV2WorkspacePullOutcome: Sendable {
+    case success(SyncV2SnapshotPullReport)
+    case clientError(SyncV2ClientError)
+    case failure(String)
+    case timedOut
+}
+
+private enum SyncV2RealtimeStartOutcome: Sendable {
+    case completed
+    case failed
+    case timedOut
+}
+
+private actor SyncV2RealtimeStartRace {
+    private var outcome: SyncV2RealtimeStartOutcome?
+    private var waiters: [
+        CheckedContinuation<SyncV2RealtimeStartOutcome, Never>
+    ] = []
+
+    func resolve(_ outcome: SyncV2RealtimeStartOutcome) {
+        guard self.outcome == nil else { return }
+        self.outcome = outcome
+        if case .timedOut = outcome {
+            SyncV2Diagnostics.raceTimedOut("SyncV2RealtimeStartRace")
+        }
+        let pending = waiters
+        waiters.removeAll()
+        pending.forEach { $0.resume(returning: outcome) }
+    }
+
+    func value() async -> SyncV2RealtimeStartOutcome {
+        if let outcome { return outcome }
+        return await withCheckedContinuation { continuation in
+            waiters.append(continuation)
+        }
+    }
+}
+
+private actor SyncV2WorkspacePullRace {
+    private var outcome: SyncV2WorkspacePullOutcome?
+    private var waiters: [
+        CheckedContinuation<SyncV2WorkspacePullOutcome, Never>
+    ] = []
+
+    func resolve(_ outcome: SyncV2WorkspacePullOutcome) {
+        guard self.outcome == nil else { return }
+        self.outcome = outcome
+        if case .timedOut = outcome {
+            SyncV2Diagnostics.raceTimedOut("SyncV2WorkspacePullRace")
+        }
+        let pending = waiters
+        waiters.removeAll()
+        pending.forEach { $0.resume(returning: outcome) }
+    }
+
+    func value() async -> SyncV2WorkspacePullOutcome {
+        if let outcome { return outcome }
+        return await withCheckedContinuation { continuation in
+            waiters.append(continuation)
+        }
+    }
+}
+
 @MainActor
 final class SyncV2WorkspaceSyncModel: ObservableObject {
     @Published private(set) var serverState:
-        SyncV2WorkspaceServerState = .idle
+        SyncV2WorkspaceServerState = .idle {
+            didSet {
+                guard oldValue != serverState else { return }
+                SyncV2Diagnostics.serverState(
+                    localProjectID: localProjectID,
+                    from: oldValue,
+                    to: serverState
+                )
+            }
+        }
 
     private let localProjectID: ProjectID
     private let puller: (any SyncV2SnapshotPulling)?
@@ -1342,6 +2003,12 @@ final class SyncV2WorkspaceSyncModel: ObservableObject {
     private let authenticationTimeout: Duration
     private let authenticationRetryDelay: Duration
     private let authenticationSleep: SyncV2WorkspaceSleep
+    private let realtimeSubscriptionTimeout: Duration
+    private let realtimeTimeoutSleep: SyncV2WorkspaceSleep
+    private let pullTimeout: Duration
+    private let pullTimeoutSleep: SyncV2WorkspaceSleep
+    private let retryDelays: [Duration]
+    private let recoverySleep: SyncV2WorkspaceSleep
     private let networkMonitor: SyncV2NetworkRecoveryMonitor
     private var editingGuards:
         (@MainActor @Sendable () -> [UUID: SyncV2EditingGuard])?
@@ -1351,15 +2018,40 @@ final class SyncV2WorkspaceSyncModel: ObservableObject {
     private var periodicTask: Task<Void, Never>?
     private var pullTask: Task<Void, Never>?
     private var realtimeStartTask: Task<Void, Never>?
+    private var reconnectTask: Task<Void, Never>?
+    private var pullRetryTask: Task<Void, Never>?
     private var authenticationCheckTask: Task<Void, Never>?
+    private var authenticationUpdateTask: Task<Void, Never>?
     private var bindingUpdateTask: Task<Void, Never>?
     private var serverProjectID: UUID?
     private var isActive = false
     private var generation: UInt64 = 0
+    private var realtimeGeneration: UInt64 = 0
+    private var pullRequestID: UInt64 = 0
     private var authenticationCheckGeneration: UInt64 = 0
     private var authenticationCheckDeadline: ContinuousClock.Instant?
     private var authenticationCheckHasTimedOut = false
     private var quietProgressUntil: ContinuousClock.Instant?
+    private var pullPending = false
+    private var pullRetryAttempt = 0
+    private var reconnectAttempt = 0
+    private var lastSubscribedAt: ContinuousClock.Instant?
+    private var realtimeHealthy = false
+    private var hasRealtimeSubscribed = false
+
+    private func logTask(
+        _ name: String,
+        action: String,
+        reason: String
+    ) {
+        SyncV2Diagnostics.task(
+            scope: "workspace",
+            localProjectID: localProjectID,
+            name: name,
+            action: action,
+            reason: reason
+        )
+    }
 
     init(
         localProjectID: ProjectID,
@@ -1374,12 +2066,30 @@ final class SyncV2WorkspaceSyncModel: ObservableObject {
         periodicDelay: Duration = .seconds(90),
         authenticationTimeout: Duration = .seconds(12),
         authenticationRetryDelay: Duration = .seconds(3),
+        realtimeSubscriptionTimeout: Duration = .seconds(12),
+        pullTimeout: Duration = .seconds(15),
+        retryDelays: [Duration] = [
+            .seconds(1), .seconds(2), .seconds(5),
+            .seconds(10), .seconds(30),
+        ],
         authenticationSleep:
             @escaping SyncV2WorkspaceSleep = { duration in
                 try await ContinuousClock().sleep(for: duration)
             },
         networkMonitor: SyncV2NetworkRecoveryMonitor =
             SyncV2NetworkRecoveryMonitor(),
+        realtimeTimeoutSleep:
+            @escaping SyncV2WorkspaceSleep = { duration in
+                try await ContinuousClock().sleep(for: duration)
+            },
+        pullTimeoutSleep:
+            @escaping SyncV2WorkspaceSleep = { duration in
+                try await ContinuousClock().sleep(for: duration)
+            },
+        recoverySleep:
+            @escaping SyncV2WorkspaceSleep = { duration in
+                try await ContinuousClock().sleep(for: duration)
+            },
         sleep: @escaping SyncV2WorkspaceSleep = { duration in
             try await ContinuousClock().sleep(for: duration)
         }
@@ -1395,6 +2105,12 @@ final class SyncV2WorkspaceSyncModel: ObservableObject {
         self.authenticationTimeout = authenticationTimeout
         self.authenticationRetryDelay = authenticationRetryDelay
         self.authenticationSleep = authenticationSleep
+        self.realtimeSubscriptionTimeout = realtimeSubscriptionTimeout
+        self.realtimeTimeoutSleep = realtimeTimeoutSleep
+        self.pullTimeout = pullTimeout
+        self.pullTimeoutSleep = pullTimeoutSleep
+        self.retryDelays = retryDelays
+        self.recoverySleep = recoverySleep
         self.networkMonitor = networkMonitor
         self.sleep = sleep
     }
@@ -1415,8 +2131,16 @@ final class SyncV2WorkspaceSyncModel: ObservableObject {
     func updateSceneActivity(_ active: Bool) async {
         guard active != isActive else { return }
         generation &+= 1
+        SyncV2Diagnostics.generation(
+            scope: "workspace",
+            localProjectID: localProjectID,
+            counter: "generation",
+            value: generation,
+            reason: active ? "scene-active" : "scene-inactive"
+        )
         isActive = active
         if active {
+            await startAuthenticationObservation()
             networkMonitor.start { [weak self] in
                 Task { @MainActor [weak self] in
                     await self?.networkRecovered()
@@ -1425,17 +2149,44 @@ final class SyncV2WorkspaceSyncModel: ObservableObject {
             startBindingObservation()
             await activate()
         } else {
+            realtimeGeneration &+= 1
+            SyncV2Diagnostics.generation(
+                scope: "workspace",
+                localProjectID: localProjectID,
+                counter: "realtimeGeneration",
+                value: realtimeGeneration,
+                reason: "scene-inactive"
+            )
+            logTask("debounceTask", action: "cancel", reason: "scene-inactive")
             debounceTask?.cancel()
+            logTask("periodicTask", action: "cancel", reason: "scene-inactive")
             periodicTask?.cancel()
+            logTask("pullTask", action: "cancel", reason: "scene-inactive")
             pullTask?.cancel()
+            logTask("realtimeStartTask", action: "cancel", reason: "scene-inactive")
             realtimeStartTask?.cancel()
+            logTask("reconnectTask", action: "cancel", reason: "scene-inactive")
+            reconnectTask?.cancel()
+            logTask("pullRetryTask", action: "cancel", reason: "scene-inactive")
+            pullRetryTask?.cancel()
             cancelAuthenticationCheck()
+            authenticationUpdateTask?.cancel()
             bindingUpdateTask?.cancel()
+            logTask("debounceTask", action: "clear", reason: "scene-inactive")
             debounceTask = nil
+            logTask("periodicTask", action: "clear", reason: "scene-inactive")
             periodicTask = nil
+            logTask("pullTask", action: "clear", reason: "scene-inactive")
             pullTask = nil
+            logTask("realtimeStartTask", action: "clear", reason: "scene-inactive")
             realtimeStartTask = nil
+            logTask("reconnectTask", action: "clear", reason: "scene-inactive")
+            reconnectTask = nil
+            logTask("pullRetryTask", action: "clear", reason: "scene-inactive")
+            pullRetryTask = nil
+            authenticationUpdateTask = nil
             bindingUpdateTask = nil
+            pullPending = false
             networkMonitor.cancel()
             await realtime?.stop()
         }
@@ -1448,18 +2199,52 @@ final class SyncV2WorkspaceSyncModel: ObservableObject {
 
     func stop() async {
         generation &+= 1
+        SyncV2Diagnostics.generation(
+            scope: "workspace",
+            localProjectID: localProjectID,
+            counter: "generation",
+            value: generation,
+            reason: "stop"
+        )
+        realtimeGeneration &+= 1
+        SyncV2Diagnostics.generation(
+            scope: "workspace",
+            localProjectID: localProjectID,
+            counter: "realtimeGeneration",
+            value: realtimeGeneration,
+            reason: "stop"
+        )
         isActive = false
+        logTask("debounceTask", action: "cancel", reason: "stop")
         debounceTask?.cancel()
+        logTask("periodicTask", action: "cancel", reason: "stop")
         periodicTask?.cancel()
+        logTask("pullTask", action: "cancel", reason: "stop")
         pullTask?.cancel()
+        logTask("realtimeStartTask", action: "cancel", reason: "stop")
         realtimeStartTask?.cancel()
+        logTask("reconnectTask", action: "cancel", reason: "stop")
+        reconnectTask?.cancel()
+        logTask("pullRetryTask", action: "cancel", reason: "stop")
+        pullRetryTask?.cancel()
         cancelAuthenticationCheck()
+        authenticationUpdateTask?.cancel()
         bindingUpdateTask?.cancel()
+        logTask("debounceTask", action: "clear", reason: "stop")
         debounceTask = nil
+        logTask("periodicTask", action: "clear", reason: "stop")
         periodicTask = nil
+        logTask("pullTask", action: "clear", reason: "stop")
         pullTask = nil
+        logTask("realtimeStartTask", action: "clear", reason: "stop")
         realtimeStartTask = nil
+        logTask("reconnectTask", action: "clear", reason: "stop")
+        reconnectTask = nil
+        logTask("pullRetryTask", action: "clear", reason: "stop")
+        pullRetryTask = nil
+        authenticationUpdateTask = nil
         bindingUpdateTask = nil
+        pullPending = false
         networkMonitor.cancel()
         await realtime?.stop()
     }
@@ -1475,6 +2260,17 @@ final class SyncV2WorkspaceSyncModel: ObservableObject {
         if authenticationCheckTask == nil {
             scheduleAuthenticationCheck()
         }
+        logTask("reconnectTask", action: "cancel", reason: "networkRecovered")
+        reconnectTask?.cancel()
+        logTask("reconnectTask", action: "clear", reason: "networkRecovered")
+        reconnectTask = nil
+        if realtime != nil, serverProjectID != nil {
+            realtimeHealthy = false
+            serverState = .reconnecting
+            await realtime?.stop()
+            startRealtime(reconnecting: true)
+        }
+        await pullNow(forceVisibleProgress: true)
     }
 
     private func activate() async {
@@ -1513,30 +2309,150 @@ final class SyncV2WorkspaceSyncModel: ObservableObject {
         // 기존 pending operation을 먼저 dispatch해야 첫 pull이 단순
         // waiting이 아니라 자동 rebase/conflict 결과를 관찰할 수 있다.
         await requestDispatchRetry?()
-        realtimeStartTask?.cancel()
-        if let realtime {
-            realtimeStartTask = Task { [weak self] in
-                do {
-                    try await realtime.start(
-                        projectID: serverProjectID,
-                        onChange: { [weak self] in
-                            Task { @MainActor in
-                                self?.realtimeChanged()
-                            }
-                        },
-                        onSubscribed: { [weak self] in
-                            Task { @MainActor in
-                                self?.scheduleDebouncedPull()
-                            }
-                        }
-                    )
-                } catch {
-                    // Realtime 실패와 무관하게 즉시 및 주기 pull은 유지한다.
-                }
-            }
-        }
+        realtimeHealthy = realtime == nil
+        hasRealtimeSubscribed = false
+        startRealtime(reconnecting: false)
         startPeriodicPull()
         await pullNow(forceVisibleProgress: true)
+    }
+
+    private func startAuthenticationObservation() async {
+        guard authenticationUpdateTask == nil, isActive else { return }
+        let updates = await authenticationService.stateUpdates()
+        guard isActive else { return }
+        authenticationUpdateTask = Task { [weak self] in
+            for await state in updates {
+                guard !Task.isCancelled, let self, self.isActive else {
+                    return
+                }
+                await self.authenticationChanged(state)
+            }
+        }
+    }
+
+    private func authenticationChanged(
+        _ state: AuthenticationState
+    ) async {
+        guard isActive else { return }
+        switch state {
+        case .authenticated:
+            await activate()
+        case .restoring:
+            if !authenticationCheckHasTimedOut {
+                serverState = .checkingAuthentication
+            }
+            scheduleAuthenticationCheck()
+        case .localOnly:
+            await suspendCloudActivityForAuthentication(.localOnly)
+        case .signedOut:
+            await suspendCloudActivityForAuthentication(
+                .authenticationRequired
+            )
+        case .unavailable(.networkUnavailable):
+            await suspendCloudActivityForAuthentication(.offlineSaved)
+        case .unavailable:
+            await suspendCloudActivityForAuthentication(
+                .authenticationRequired
+            )
+        }
+    }
+
+    private func suspendCloudActivityForAuthentication(
+        _ state: SyncV2WorkspaceServerState
+    ) async {
+        generation &+= 1
+        SyncV2Diagnostics.generation(
+            scope: "workspace",
+            localProjectID: localProjectID,
+            counter: "generation",
+            value: generation,
+            reason: "authentication-state-change"
+        )
+        realtimeGeneration &+= 1
+        SyncV2Diagnostics.generation(
+            scope: "workspace",
+            localProjectID: localProjectID,
+            counter: "realtimeGeneration",
+            value: realtimeGeneration,
+            reason: "authentication-state-change"
+        )
+        logTask(
+            "debounceTask",
+            action: "cancel",
+            reason: "authentication-state-change"
+        )
+        debounceTask?.cancel()
+        logTask(
+            "periodicTask",
+            action: "cancel",
+            reason: "authentication-state-change"
+        )
+        periodicTask?.cancel()
+        logTask(
+            "pullTask",
+            action: "cancel",
+            reason: "authentication-state-change"
+        )
+        pullTask?.cancel()
+        logTask(
+            "realtimeStartTask",
+            action: "cancel",
+            reason: "authentication-state-change"
+        )
+        realtimeStartTask?.cancel()
+        logTask(
+            "reconnectTask",
+            action: "cancel",
+            reason: "authentication-state-change"
+        )
+        reconnectTask?.cancel()
+        logTask(
+            "pullRetryTask",
+            action: "cancel",
+            reason: "authentication-state-change"
+        )
+        pullRetryTask?.cancel()
+        cancelAuthenticationCheck()
+        logTask(
+            "debounceTask",
+            action: "clear",
+            reason: "authentication-state-change"
+        )
+        debounceTask = nil
+        logTask(
+            "periodicTask",
+            action: "clear",
+            reason: "authentication-state-change"
+        )
+        periodicTask = nil
+        logTask(
+            "pullTask",
+            action: "clear",
+            reason: "authentication-state-change"
+        )
+        pullTask = nil
+        logTask(
+            "realtimeStartTask",
+            action: "clear",
+            reason: "authentication-state-change"
+        )
+        realtimeStartTask = nil
+        logTask(
+            "reconnectTask",
+            action: "clear",
+            reason: "authentication-state-change"
+        )
+        reconnectTask = nil
+        logTask(
+            "pullRetryTask",
+            action: "clear",
+            reason: "authentication-state-change"
+        )
+        pullRetryTask = nil
+        pullPending = false
+        realtimeHealthy = false
+        serverState = state
+        await realtime?.stop()
     }
 
     private func scheduleAuthenticationCheck() {
@@ -1555,6 +2471,13 @@ final class SyncV2WorkspaceSyncModel: ObservableObject {
             return
         }
         authenticationCheckGeneration &+= 1
+        SyncV2Diagnostics.generation(
+            scope: "workspace",
+            localProjectID: localProjectID,
+            counter: "authenticationCheckGeneration",
+            value: authenticationCheckGeneration,
+            reason: "scheduleAuthenticationCheck"
+        )
         let requestGeneration = authenticationCheckGeneration
         let authenticationService = self.authenticationService
         let authenticationSleep = self.authenticationSleep
@@ -1624,6 +2547,13 @@ final class SyncV2WorkspaceSyncModel: ObservableObject {
     private func scheduleAuthenticationRetry() {
         guard authenticationCheckTask == nil, isActive else { return }
         authenticationCheckGeneration &+= 1
+        SyncV2Diagnostics.generation(
+            scope: "workspace",
+            localProjectID: localProjectID,
+            counter: "authenticationCheckGeneration",
+            value: authenticationCheckGeneration,
+            reason: "scheduleAuthenticationRetry"
+        )
         let requestGeneration = authenticationCheckGeneration
         let delay = authenticationRetryDelay
         authenticationCheckTask = Task { [weak self] in
@@ -1643,6 +2573,13 @@ final class SyncV2WorkspaceSyncModel: ObservableObject {
 
     private func cancelAuthenticationCheck() {
         authenticationCheckGeneration &+= 1
+        SyncV2Diagnostics.generation(
+            scope: "workspace",
+            localProjectID: localProjectID,
+            counter: "authenticationCheckGeneration",
+            value: authenticationCheckGeneration,
+            reason: "cancelAuthenticationCheck"
+        )
         authenticationCheckTask?.cancel()
         authenticationCheckTask = nil
         authenticationCheckDeadline = nil
@@ -1671,27 +2608,305 @@ final class SyncV2WorkspaceSyncModel: ObservableObject {
         guard isActive else { return }
         guard let serverProjectID = binding?.serverProjectID else {
             self.serverProjectID = nil
+            logTask("debounceTask", action: "cancel", reason: "bindingRemoved")
             debounceTask?.cancel()
+            logTask("periodicTask", action: "cancel", reason: "bindingRemoved")
             periodicTask?.cancel()
+            logTask("pullTask", action: "cancel", reason: "bindingRemoved")
             pullTask?.cancel()
+            logTask("realtimeStartTask", action: "cancel", reason: "bindingRemoved")
             realtimeStartTask?.cancel()
+            logTask("reconnectTask", action: "cancel", reason: "bindingRemoved")
+            reconnectTask?.cancel()
+            logTask("pullRetryTask", action: "cancel", reason: "bindingRemoved")
+            pullRetryTask?.cancel()
+            logTask("debounceTask", action: "clear", reason: "bindingRemoved")
+            debounceTask = nil
+            logTask("periodicTask", action: "clear", reason: "bindingRemoved")
+            periodicTask = nil
+            logTask("realtimeStartTask", action: "clear", reason: "bindingRemoved")
+            realtimeStartTask = nil
+            logTask("reconnectTask", action: "clear", reason: "bindingRemoved")
+            reconnectTask = nil
+            logTask("pullRetryTask", action: "clear", reason: "bindingRemoved")
+            pullRetryTask = nil
+            realtimeGeneration &+= 1
+            SyncV2Diagnostics.generation(
+                scope: "workspace",
+                localProjectID: localProjectID,
+                counter: "realtimeGeneration",
+                value: realtimeGeneration,
+                reason: "bindingRemoved"
+            )
             await realtime?.stop()
             serverState = .localOnly
             return
         }
         guard self.serverProjectID != serverProjectID else { return }
         self.serverProjectID = nil
+        logTask("pullTask", action: "cancel", reason: "bindingChanged")
         pullTask?.cancel()
+        logTask("realtimeStartTask", action: "cancel", reason: "bindingChanged")
         realtimeStartTask?.cancel()
+        logTask("reconnectTask", action: "cancel", reason: "bindingChanged")
+        reconnectTask?.cancel()
+        logTask("pullRetryTask", action: "cancel", reason: "bindingChanged")
+        pullRetryTask?.cancel()
+        logTask("realtimeStartTask", action: "clear", reason: "bindingChanged")
+        realtimeStartTask = nil
+        logTask("reconnectTask", action: "clear", reason: "bindingChanged")
+        reconnectTask = nil
+        logTask("pullRetryTask", action: "clear", reason: "bindingChanged")
+        pullRetryTask = nil
+        realtimeGeneration &+= 1
+        SyncV2Diagnostics.generation(
+            scope: "workspace",
+            localProjectID: localProjectID,
+            counter: "realtimeGeneration",
+            value: realtimeGeneration,
+            reason: "bindingChanged"
+        )
         await realtime?.stop()
         await activate()
     }
 
+    private func startRealtime(reconnecting: Bool) {
+        guard isActive,
+              let realtime,
+              let serverProjectID
+        else { return }
+        logTask(
+            "realtimeStartTask",
+            action: "cancel",
+            reason: "startRealtime"
+        )
+        realtimeStartTask?.cancel()
+        realtimeGeneration &+= 1
+        SyncV2Diagnostics.generation(
+            scope: "workspace",
+            localProjectID: localProjectID,
+            counter: "realtimeGeneration",
+            value: realtimeGeneration,
+            reason: reconnecting ? "startRealtime-reconnect" : "startRealtime-initial"
+        )
+        let requestGeneration = realtimeGeneration
+        realtimeHealthy = false
+        serverState = reconnecting
+            ? .reconnecting
+            : .connectionChecking
+        logTask(
+            "realtimeStartTask",
+            action: "create",
+            reason: reconnecting
+                ? "startRealtime-reconnect"
+                : "startRealtime-initial"
+        )
+        realtimeStartTask = Task { [weak self] in
+            guard let self else { return }
+            let race = SyncV2RealtimeStartRace()
+            let operation = Task {
+                do {
+                    try await realtime.start(
+                        projectID: serverProjectID,
+                        onChange: { [weak self] in
+                            Task { @MainActor in
+                                guard let self,
+                                      self.realtimeGeneration
+                                        == requestGeneration
+                                else { return }
+                                self.realtimeChanged()
+                            }
+                        },
+                        onStatus: { [weak self] status in
+                            Task { @MainActor in
+                                self?.receivedRealtimeStatus(
+                                    status,
+                                    generation: requestGeneration
+                                )
+                            }
+                        }
+                    )
+                    await race.resolve(.completed)
+                } catch {
+                    await race.resolve(.failed)
+                }
+            }
+            let timeout = realtimeSubscriptionTimeout
+            let timeoutSleep = realtimeTimeoutSleep
+            let watchdog = Task {
+                do {
+                    try await timeoutSleep(timeout)
+                    await race.resolve(.timedOut)
+                } catch {
+                    // 구독 완료, generation 교체 또는 scene 종료가 먼저 끝났다.
+                }
+            }
+            let outcome = await race.value()
+            operation.cancel()
+            watchdog.cancel()
+            guard isActive,
+                  realtimeGeneration == requestGeneration
+            else { return }
+            logTask(
+                "realtimeStartTask",
+                action: "clear",
+                reason: "realtimeStart-finished"
+            )
+            realtimeStartTask = nil
+            switch outcome {
+            case .completed:
+                break
+            case .failed:
+                receivedRealtimeStatus(
+                    .channelError,
+                    generation: requestGeneration
+                )
+            case .timedOut:
+                // SDK subscribeWithError 자체가 영구 대기하더라도 actor의
+                // reentrancy를 이용해 in-flight join을 명시적으로 취소한다.
+                await realtime.stop()
+                guard isActive,
+                      realtimeGeneration == requestGeneration
+                else { return }
+                receivedRealtimeStatus(
+                    .timedOut,
+                    generation: requestGeneration
+                )
+            }
+        }
+    }
+
+    private func receivedRealtimeStatus(
+        _ status: SyncV2RealtimeConnectionStatus,
+        generation requestGeneration: UInt64
+    ) {
+        guard isActive,
+              realtimeGeneration == requestGeneration
+        else { return }
+        switch status {
+        case .subscribing:
+            realtimeHealthy = false
+            if !preservesHigherPriorityServerState {
+                serverState = realtimeProgressState
+            }
+        case .subscribed:
+            realtimeHealthy = true
+            hasRealtimeSubscribed = true
+            lastSubscribedAt = ContinuousClock().now
+            logTask(
+                "reconnectTask",
+                action: "cancel",
+                reason: "realtime-subscribed"
+            )
+            reconnectTask?.cancel()
+            logTask(
+                "reconnectTask",
+                action: "clear",
+                reason: "realtime-subscribed"
+            )
+            reconnectTask = nil
+            if !preservesHigherPriorityServerState {
+                serverState = .connectionChecking
+            }
+            Task { @MainActor [weak self] in
+                // 재구독 직후 이벤트를 기다리지 않고 누락 snapshot을 확인한다.
+                await self?.pullNow(forceVisibleProgress: true)
+            }
+        case .closed, .channelError, .timedOut:
+            let now = ContinuousClock().now
+            if let lastSubscribedAt,
+               lastSubscribedAt.duration(to: now) >= .seconds(30)
+            {
+                reconnectAttempt = 0
+            }
+            lastSubscribedAt = nil
+            realtimeHealthy = false
+            if !preservesHigherPriorityServerState {
+                serverState = .reconnecting
+            }
+            scheduleRealtimeReconnect()
+        }
+    }
+
+    private var preservesHigherPriorityServerState: Bool {
+        switch serverState {
+        case .conflictRequired, .structuralConflict, .automaticallyMerged,
+             .waiting:
+            true
+        default:
+            false
+        }
+    }
+
+    private var realtimeProgressState: SyncV2WorkspaceServerState {
+        // 최초 연결만 "확인 중"이다. 한 번도 subscribed 되지 못했더라도
+        // terminal 상태 뒤 backoff 재시도를 시작했다면 실제 수명주기 상태는
+        // "재연결 중"이며, 뒤늦은 subscribing callback이 이를 되돌리면 안 된다.
+        hasRealtimeSubscribed || reconnectAttempt > 0
+            ? .reconnecting
+            : .connectionChecking
+    }
+
+    private func scheduleRealtimeReconnect() {
+        guard reconnectTask == nil,
+              isActive,
+              realtime != nil,
+              serverProjectID != nil
+        else { return }
+        let index = min(
+            reconnectAttempt,
+            max(0, retryDelays.count - 1)
+        )
+        let delay = retryDelays.isEmpty
+            ? Duration.seconds(30)
+            : retryDelays[index]
+        reconnectAttempt += 1
+        let sleep = recoverySleep
+        logTask(
+            "reconnectTask",
+            action: "create",
+            reason: "scheduleRealtimeReconnect"
+        )
+        reconnectTask = Task { [weak self] in
+            let didSleep: Bool
+            do {
+                try await sleep(delay)
+                try Task.checkCancellation()
+                didSleep = true
+            } catch {
+                didSleep = false
+            }
+            guard let self else { return }
+            self.logTask(
+                "reconnectTask",
+                action: "clear",
+                reason: didSleep
+                    ? "reconnect-delay-finished"
+                    : "reconnect-delay-cancelled"
+            )
+            self.reconnectTask = nil
+            guard didSleep, self.isActive else { return }
+            _ = await self.authenticationService.refreshSession(force: false)
+            await self.realtime?.stop()
+            self.startRealtime(reconnecting: true)
+        }
+    }
+
     private func scheduleDebouncedPull() {
         guard isActive else { return }
+        logTask(
+            "debounceTask",
+            action: "cancel",
+            reason: "scheduleDebouncedPull"
+        )
         debounceTask?.cancel()
         let delay = debounceDelay
         let sleep = sleep
+        logTask(
+            "debounceTask",
+            action: "create",
+            reason: "scheduleDebouncedPull"
+        )
         debounceTask = Task { [weak self] in
             do {
                 try await sleep(delay)
@@ -1704,9 +2919,19 @@ final class SyncV2WorkspaceSyncModel: ObservableObject {
     }
 
     private func startPeriodicPull() {
+        logTask(
+            "periodicTask",
+            action: "cancel",
+            reason: "startPeriodicPull"
+        )
         periodicTask?.cancel()
         let delay = periodicDelay
         let sleep = sleep
+        logTask(
+            "periodicTask",
+            action: "create",
+            reason: "startPeriodicPull"
+        )
         periodicTask = Task { [weak self] in
             while !Task.isCancelled {
                 do {
@@ -1725,9 +2950,21 @@ final class SyncV2WorkspaceSyncModel: ObservableObject {
     ) async {
         guard isActive, let puller, let serverProjectID else { return }
         if pullTask != nil {
-            scheduleDebouncedPull()
+            pullPending = true
             return
         }
+        logTask(
+            "pullRetryTask",
+            action: "cancel",
+            reason: "pullNow-start"
+        )
+        pullRetryTask?.cancel()
+        logTask(
+            "pullRetryTask",
+            action: "clear",
+            reason: "pullNow-start"
+        )
+        pullRetryTask = nil
         let now = ContinuousClock().now
         let isQuietFollowUp =
             !forceVisibleProgress
@@ -1742,36 +2979,207 @@ final class SyncV2WorkspaceSyncModel: ObservableObject {
         let guards = editingGuards?() ?? [:]
         let localProjectID = self.localProjectID
         let generation = self.generation
+        pullRequestID &+= 1
+        SyncV2Diagnostics.generation(
+            scope: "workspace",
+            localProjectID: localProjectID,
+            counter: "pullRequestID",
+            value: pullRequestID,
+            reason: "pullNow"
+        )
+        let requestID = pullRequestID
+        logTask(
+            "pullTask",
+            action: "create",
+            reason: "pullNow-start"
+        )
         pullTask = Task { [weak self] in
+            guard let self else { return }
+            let outcome = await self.performPullWithAuthenticationRetry(
+                puller: puller,
+                localProjectID: localProjectID,
+                serverProjectID: serverProjectID,
+                editingGuards: guards
+            )
+            await self.finishPull(
+                outcome,
+                requestID: requestID,
+                generation: generation
+            )
+        }
+    }
+
+    private func performPullWithAuthenticationRetry(
+        puller: any SyncV2SnapshotPulling,
+        localProjectID: ProjectID,
+        serverProjectID: UUID,
+        editingGuards: [UUID: SyncV2EditingGuard]
+    ) async -> SyncV2WorkspacePullOutcome {
+        var didRefresh = false
+        while true {
+            let outcome = await performWatchdogPull(
+                puller: puller,
+                localProjectID: localProjectID,
+                serverProjectID: serverProjectID,
+                editingGuards: editingGuards
+            )
+            guard !didRefresh,
+                  case .clientError(
+                    .remote(code: .authRequired, detail: _)
+                  ) = outcome
+            else { return outcome }
+            didRefresh = true
+            let state = await refreshWithTimeout()
+            guard state.isAuthenticated else { return outcome }
+            // 회전된 토큰을 Keychain과 Supabase client에 반영한 뒤 원래
+            // snapshot 요청만 정확히 한 번 재시도한다.
+        }
+    }
+
+    private func refreshWithTimeout() async -> AuthenticationState {
+        let outcome = SyncV2WorkspaceAuthenticationOutcome()
+        let authenticationService = self.authenticationService
+        let refreshTask = Task {
+            let state = await authenticationService.refreshSession(
+                force: true
+            )
+            await outcome.resolve(state)
+        }
+        let timeout = pullTimeout
+        let timeoutSleep = pullTimeoutSleep
+        let timeoutTask = Task {
+            do {
+                try await timeoutSleep(timeout)
+                await outcome.resolve(
+                    .unavailable(.networkUnavailable)
+                )
+            } catch {
+                // refresh 완료 또는 scene 종료가 먼저 끝났다.
+            }
+        }
+        let state = await outcome.value()
+        refreshTask.cancel()
+        timeoutTask.cancel()
+        return state
+    }
+
+    private func performWatchdogPull(
+        puller: any SyncV2SnapshotPulling,
+        localProjectID: ProjectID,
+        serverProjectID: UUID,
+        editingGuards: [UUID: SyncV2EditingGuard]
+    ) async -> SyncV2WorkspacePullOutcome {
+        let race = SyncV2WorkspacePullRace()
+        let operation = Task {
             do {
                 let report = try await puller.pull(
                     localProjectID: localProjectID,
                     serverProjectID: serverProjectID,
-                    editingGuards: guards
+                    editingGuards: editingGuards
                 )
-                guard !Task.isCancelled,
-                      self?.generation == generation,
-                      self?.isActive == true
-                else { return }
-                self?.complete(report)
+                await race.resolve(.success(report))
             } catch let error as SyncV2ClientError {
-                guard !Task.isCancelled,
-                      self?.generation == generation,
-                      self?.isActive == true
-                else { return }
-                self?.complete(error)
+                await race.resolve(.clientError(error))
             } catch {
-                guard !Task.isCancelled,
-                      self?.generation == generation,
-                      self?.isActive == true
-                else { return }
-                self?.completeFailure(error.localizedDescription)
+                await race.resolve(.failure(error.localizedDescription))
             }
+        }
+        let timeout = pullTimeout
+        let timeoutSleep = pullTimeoutSleep
+        let watchdog = Task {
+            do {
+                try await timeoutSleep(timeout)
+                await race.resolve(.timedOut)
+            } catch {
+                // 정상 완료 또는 scene 종료가 먼저 끝났다.
+            }
+        }
+        let outcome = await race.value()
+        operation.cancel()
+        watchdog.cancel()
+        return outcome
+    }
+
+    private func finishPull(
+        _ outcome: SyncV2WorkspacePullOutcome,
+        requestID: UInt64,
+        generation requestGeneration: UInt64
+    ) async {
+        guard pullRequestID == requestID else { return }
+        logTask(
+            "pullTask",
+            action: "clear",
+            reason: "finishPull"
+        )
+        pullTask = nil
+        guard generation == requestGeneration, isActive else {
+            pullPending = false
+            if case .syncing = serverState {
+                serverState = .idle
+            }
+            return
+        }
+        switch outcome {
+        case .success(let report):
+            pullRetryAttempt = 0
+            complete(report)
+        case .clientError(let error):
+            complete(error)
+            schedulePullRetry()
+        case .failure(let detail):
+            completeFailure(detail)
+            schedulePullRetry()
+        case .timedOut:
+            complete(.timedOut)
+            schedulePullRetry()
+        }
+
+        if pullPending {
+            pullPending = false
+            await pullNow()
+        }
+    }
+
+    private func schedulePullRetry() {
+        guard pullRetryTask == nil, isActive else { return }
+        let index = min(
+            pullRetryAttempt,
+            max(0, retryDelays.count - 1)
+        )
+        let delay = retryDelays.isEmpty
+            ? Duration.seconds(30)
+            : retryDelays[index]
+        pullRetryAttempt += 1
+        let sleep = recoverySleep
+        logTask(
+            "pullRetryTask",
+            action: "create",
+            reason: "schedulePullRetry"
+        )
+        pullRetryTask = Task { [weak self] in
+            let didSleep: Bool
+            do {
+                try await sleep(delay)
+                try Task.checkCancellation()
+                didSleep = true
+            } catch {
+                didSleep = false
+            }
+            guard let self else { return }
+            self.logTask(
+                "pullRetryTask",
+                action: "clear",
+                reason: didSleep
+                    ? "pullRetry-delay-finished"
+                    : "pullRetry-delay-cancelled"
+            )
+            self.pullRetryTask = nil
+            guard didSleep, self.isActive else { return }
+            await self.pullNow()
         }
     }
 
     private func complete(_ report: SyncV2SnapshotPullReport) {
-        pullTask = nil
         report.appliedSnapshots.forEach {
             applyOpenSnapshot?($0)
         }
@@ -1810,7 +3218,6 @@ final class SyncV2WorkspaceSyncModel: ObservableObject {
     }
 
     private func complete(_ error: SyncV2ClientError) {
-        pullTask = nil
         switch error {
         case .networkUnavailable, .timedOut:
             serverState = .offlineSaved
@@ -1822,7 +3229,6 @@ final class SyncV2WorkspaceSyncModel: ObservableObject {
     }
 
     private func completeFailure(_ detail: String) {
-        pullTask = nil
         serverState = .failed(detail: detail)
     }
 

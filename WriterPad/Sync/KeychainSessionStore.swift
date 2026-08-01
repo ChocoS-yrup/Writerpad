@@ -4,6 +4,19 @@ import Security
 struct StoredSessionTokens: Codable, Equatable, Sendable {
     let accessToken: String
     let refreshToken: String
+    /// 기존 v1 Keychain payload에는 없으므로 nil을 허용한다. 다음 서버
+    /// 검증 성공 시 만료 시각을 포함한 payload로 원자적으로 교체된다.
+    let expiresAt: Date?
+
+    init(
+        accessToken: String,
+        refreshToken: String,
+        expiresAt: Date? = nil
+    ) {
+        self.accessToken = accessToken
+        self.refreshToken = refreshToken
+        self.expiresAt = expiresAt
+    }
 }
 
 protocol SessionTokenStoring: Sendable {
