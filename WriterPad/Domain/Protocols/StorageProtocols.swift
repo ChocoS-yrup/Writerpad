@@ -54,7 +54,16 @@ protocol ProjectWorkspaceLocating: Sendable {
 
 /// TXT 교체 후 문서 해시와 수정 시각만 반영하는 경계다.
 protocol DocumentFileMetadataUpdating: Sendable {
+    /// 파일 교체 직전에 같은 UUID의 문서가 여전히 활성 상태이며 같은 경로를
+    /// 가리키는지 확인한다. 휴지통 이동과 경쟁한 늦은 저장을 차단한다.
+    func validateBeforeFileSave(_ request: DocumentSaveRequest) async throws
     func updateAfterFileSave(_ receipt: DocumentSaveReceipt) async throws
+}
+
+extension DocumentFileMetadataUpdating {
+    func validateBeforeFileSave(_ request: DocumentSaveRequest) async throws {
+        _ = request
+    }
 }
 
 /// 백업 생성·조회·복원을 담당할 경계다.

@@ -1066,6 +1066,7 @@ struct BinderPanel: View {
         case .characters: "person.2"
         case .settings: "books.vertical"
         case .notes: "note.text"
+        case .storyPlot: "chart.xyaxis.line"
         case .flow: "point.3.connected.trianglepath.dotted"
         case .foreshadowing: "link"
         case .places: "map"

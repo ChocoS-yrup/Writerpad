@@ -47,7 +47,9 @@ actor SyncV2AutomaticRebaser {
     func rebase(
         _ operation: SyncV2DispatchOperation
     ) async throws -> SyncV2AutomaticRebaseOutcome {
-        guard operation.kind == .documentCommit,
+        guard operation.kind == .documentCommit
+                || operation.kind == .treeOrder
+                || operation.kind == .trashPurge,
               !operation.isDeleted,
               let remote = try await snapshotClient.fetchDocument(
                   projectID: operation.projectID,
@@ -67,6 +69,82 @@ actor SyncV2AutomaticRebaser {
         }
         guard remote.revision > operation.baseRevision else {
             throw SyncV2ClientError.invalidResponse
+        }
+
+        if operation.kind == .treeOrder {
+            guard operation.relativePath == syncV2TreeOrderPath,
+                  remote.relativePath == syncV2TreeOrderPath
+            else {
+                return .conflict(
+                    code: "PATH_CONFLICT",
+                    detail: "tree-order 숨은 문서의 고정 경로가 변경되었습니다."
+                )
+            }
+            let local = try await store.latestLocalSnapshot(for: operation)
+            let result = try await store.rebaseAfterRevisionConflict(
+                operation,
+                remote: remote,
+                local: local,
+                mergedContent: local.content,
+                mergedPath: syncV2TreeOrderPath
+            )
+            switch result {
+            case .rebased:
+                return .rebased
+            case .localGenerationAdvanced:
+                return .generationAdvanced
+            case .pathOccupiedByDifferentDocument:
+                return .conflict(
+                    code: "PATH_CONFLICT",
+                    detail: "tree-order 숨은 문서 경로를 다른 UUID가 사용 중입니다."
+                )
+            }
+        }
+
+        if operation.kind == .trashPurge {
+            let expectedID = syncV2UUIDv5(
+                namespace: operation.projectID,
+                name: syncV2TrashPurgePath
+            )
+            guard
+                operation.documentID == expectedID,
+                remote.documentID == expectedID,
+                operation.relativePath == syncV2TrashPurgePath,
+                remote.relativePath == syncV2TrashPurgePath,
+                let localPayload = try? SyncV2TrashPurgePayload(
+                    strictContent: operation.content
+                ),
+                let remotePayload = try? SyncV2TrashPurgePayload(
+                    strictContent: remote.content
+                ),
+                let mergedContent = try? remotePayload
+                    .merging(localPayload)
+                    .canonicalContent()
+            else {
+                return .conflict(
+                    code: "PATH_CONFLICT",
+                    detail: "trash-purge 숨은 문서 계약을 검증하지 못했습니다."
+                )
+            }
+            let local = try await store.latestLocalSnapshot(for: operation)
+            let result = try await store.rebaseAfterRevisionConflict(
+                operation,
+                remote: remote,
+                local: local,
+                mergedContent: mergedContent,
+                mergedPath: syncV2TrashPurgePath
+            )
+            switch result {
+            case .rebased:
+                return .rebased
+            case .localGenerationAdvanced:
+                return .generationAdvanced
+            case .pathOccupiedByDifferentDocument:
+                return .conflict(
+                    code: "PATH_CONFLICT",
+                    detail: "trash-purge 숨은 문서 경로를 다른 UUID가 사용 중입니다."
+                )
+            }
         }
 
         let queuedLocal = try await store.latestLocalSnapshot(

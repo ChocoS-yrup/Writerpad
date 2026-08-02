@@ -10,6 +10,7 @@ enum BinderFixedCategory: String, CaseIterable, Codable, Sendable {
     case characters
     case settings
     case notes
+    case storyPlot
     case flow
     case foreshadowing
     case places
@@ -21,6 +22,7 @@ enum BinderFixedCategory: String, CaseIterable, Codable, Sendable {
         case .characters: "캐릭터"
         case .settings: "설정집"
         case .notes: "메모장"
+        case .storyPlot: "스토리 플롯"
         case .flow: "흐름 정리"
         case .foreshadowing: "복선"
         case .places: "장소"
@@ -34,6 +36,7 @@ enum BinderFixedCategory: String, CaseIterable, Codable, Sendable {
         case .characters: "캐릭터"
         case .settings: "설정집"
         case .notes: "메모장"
+        case .storyPlot: "스토리 플롯"
         case .flow: "흐름정리"
         case .foreshadowing: "복선"
         case .places: "장소"

@@ -94,6 +94,35 @@ final class LocalDocumentStoreTests: XCTestCase {
         XCTAssertEqual(generations, [1, 2])
     }
 
+    func testTombstonedDocumentRejectsLateSaveBeforeReplacingTXT()
+        async throws {
+        let workspace = try LocalDocumentTestWorkspace.create()
+        defer { workspace.remove() }
+        try Data("휴지통으로 이동할 원본".utf8).write(to: workspace.fileURL)
+        let store = makeStore(
+            workspace,
+            updater: TombstonedMetadataUpdater(
+                documentID: workspace.documentID
+            )
+        )
+
+        do {
+            _ = try await store.save(
+                workspace.request(text: "늦게 도착한 편집 저장", generation: 9)
+            )
+            XCTFail("tombstone 이후 저장은 거부되어야 합니다.")
+        } catch let error as LocalDocumentStoreError {
+            XCTAssertEqual(
+                error,
+                .documentNoLongerWritable(workspace.documentID)
+            )
+        }
+        XCTAssertEqual(
+            try String(contentsOf: workspace.fileURL, encoding: .utf8),
+            "휴지통으로 이동할 원본"
+        )
+    }
+
     func testSuccessfulSaveHandsImmutableSnapshotToQueueAfterMetadata()
         async throws {
         let workspace = try LocalDocumentTestWorkspace.create()

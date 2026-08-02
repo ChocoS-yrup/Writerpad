@@ -105,6 +105,7 @@ actor LocalDocumentStore: LocalDocumentStoring {
     }
 
     private func performSave(_ request: DocumentSaveRequest) async throws -> DocumentSaveReceipt {
+        try await metadataUpdater.validateBeforeFileSave(request)
         let workspaceRoot = try await workspaceLocator.workspaceRoot(for: request.projectID)
         let destinationURL = try validatedTextURL(
             request.relativePath,

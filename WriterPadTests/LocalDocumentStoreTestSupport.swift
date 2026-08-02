@@ -1,4 +1,5 @@
 import Foundation
+import XCTest
 @testable import WriterPad
 
 struct FixedWorkspaceLocator: ProjectWorkspaceLocating {
@@ -47,6 +48,25 @@ actor BlockingMetadataUpdater: DocumentFileMetadataUpdating {
     func releaseFirstUpdate() {
         continuation?.resume()
         continuation = nil
+    }
+}
+
+actor TombstonedMetadataUpdater: DocumentFileMetadataUpdating {
+    private let documentID: DocumentID
+
+    init(documentID: DocumentID) {
+        self.documentID = documentID
+    }
+
+    func validateBeforeFileSave(
+        _ request: DocumentSaveRequest
+    ) async throws {
+        _ = request
+        throw LocalDocumentStoreError.documentNoLongerWritable(documentID)
+    }
+
+    func updateAfterFileSave(_ receipt: DocumentSaveReceipt) async throws {
+        XCTFail("차단된 늦은 저장은 메타데이터를 갱신하면 안 됩니다.")
     }
 }
 

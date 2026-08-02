@@ -1,6 +1,245 @@
 import Foundation
 
 extension LocalBinderCommandService {
+    /// 구형 Windows 표시명이 실제 루트 경로로 수신된 13-2 초기 빌드의 흔적만
+    /// 정리한다. 정확한 UUIDv5, 빈 폴더, 하위 메타데이터 없음이 모두 확인돼야 한다.
+    func removeEmptyLegacySyncRootAliases(
+        in projectID: ProjectID,
+        workspaceRoot: URL
+    ) async throws {
+        let aliases = [
+            "📚 원고",
+            "👤 캐릭터",
+            "📖 설정집",
+            "📝 메모장",
+            "🗺️ 메인 스토리 틀",
+            "🌊 흐름 정리",
+            "🔍 복선",
+            "📌 장소",
+            "🗑️ 휴지통",
+        ].map { RelativeDocumentPath(rawValue: "메인/\($0)") }
+        let documents = try await metadataStore.binderDocuments(in: projectID)
+        var conflicts: [String] = []
+        var cleanups: [(url: URL, document: DocumentNode, existed: Bool)] = []
+
+        for path in aliases {
+            let key = normalizedPathKey(path)
+            let matching = documents.filter {
+                let documentKey = normalizedPathKey($0.relativePath)
+                return documentKey == key || documentKey.hasPrefix(key + "/")
+            }
+            let exact = matching.first {
+                normalizedPathKey($0.relativePath) == key
+            }
+            let url = try validatedURL(path, workspaceRoot: workspaceRoot)
+            var isDirectory: ObjCBool = false
+            let exists = fileManager.fileExists(
+                atPath: url.path,
+                isDirectory: &isDirectory
+            )
+            guard exists || exact != nil else { continue }
+
+            let expectedID = DocumentID(
+                rawValue: syncV2UUIDv5(
+                    namespace: projectID.rawValue,
+                    name: "writerpad-local-folder/" + key
+                )
+            )
+            let isSafeMetadata = exact?.kind == .folder
+                && exact?.id == expectedID
+                && matching.count == 1
+            let isSafeDirectory: Bool
+            if exists {
+                let isSymbolicLink = (try? url.resourceValues(
+                    forKeys: [.isSymbolicLinkKey]
+                ).isSymbolicLink) == true
+                let isEmpty = isDirectory.boolValue
+                    && !isSymbolicLink
+                    && (try? fileManager.contentsOfDirectory(
+                        at: url,
+                        includingPropertiesForKeys: nil,
+                        options: []
+                    ).isEmpty) == true
+                isSafeDirectory = isEmpty
+            } else {
+                isSafeDirectory = true
+            }
+            guard isSafeMetadata, isSafeDirectory, let exact else {
+                conflicts.append(path.rawValue)
+                continue
+            }
+
+            cleanups.append((url: url, document: exact, existed: exists))
+        }
+        guard conflicts.isEmpty else {
+            throw BinderCommandError.legacySyncFolderConflict(conflicts)
+        }
+
+        var completed: [(url: URL, document: DocumentNode, existed: Bool)] = []
+        do {
+            for cleanup in cleanups {
+                if cleanup.existed {
+                    try fileManager.removeItem(at: cleanup.url)
+                }
+                completed.append(cleanup)
+                try await metadataStore.reconcileBinderMetadata(
+                    in: projectID,
+                    upserting: [],
+                    removingSubtrees: [cleanup.document.id]
+                )
+            }
+        } catch {
+            for cleanup in completed.reversed() {
+                if cleanup.existed {
+                    try? fileManager.createDirectory(
+                        at: cleanup.url,
+                        withIntermediateDirectories: false
+                    )
+                }
+                try? await metadataStore.reconcileBinderMetadata(
+                    in: projectID,
+                    upserting: [cleanup.document],
+                    removingSubtrees: []
+                )
+            }
+            throw error
+        }
+    }
+
+    /// 13-2 호환 전환: 구형 플롯 루트는 UUID와 하위 메타데이터를 유지한 채
+    /// 새 고정 루트로 한 번만 이동한다. 둘 이상이 공존하면 병합하지 않는다.
+    func ensureCanonicalStoryPlotFolder(
+        in projectID: ProjectID,
+        workspaceRoot: URL
+    ) async throws {
+        let canonicalPath = BinderFixedCategory.storyPlot.relativePath
+        let legacyPaths = [
+            ProjectPathResolver.legacyPlotPath,
+            ProjectPathResolver.legacyMainStoryPath,
+        ]
+        let candidatePaths = [canonicalPath] + legacyPaths
+        var diskPaths: [RelativeDocumentPath] = []
+
+        for path in candidatePaths {
+            let url = try validatedURL(path, workspaceRoot: workspaceRoot)
+            var isDirectory: ObjCBool = false
+            guard fileManager.fileExists(
+                atPath: url.path,
+                isDirectory: &isDirectory
+            ) else { continue }
+            let isSymbolicLink = (try? url.resourceValues(
+                forKeys: [.isSymbolicLinkKey]
+            ).isSymbolicLink) == true
+            guard isDirectory.boolValue,
+                  !isSymbolicLink
+            else {
+                throw BinderCommandError.storyPlotMigrationConflict([
+                    path.rawValue,
+                ])
+            }
+            diskPaths.append(path)
+        }
+
+        let canonicalExists = diskPaths.contains(canonicalPath)
+        let existingLegacyPaths = legacyPaths.filter(diskPaths.contains)
+        if canonicalExists {
+            guard existingLegacyPaths.isEmpty else {
+                throw BinderCommandError.storyPlotMigrationConflict(
+                    ([canonicalPath] + existingLegacyPaths).map(\.rawValue)
+                )
+            }
+            return
+        }
+        guard existingLegacyPaths.count <= 1 else {
+            throw BinderCommandError.storyPlotMigrationConflict(
+                existingLegacyPaths.map(\.rawValue)
+            )
+        }
+
+        let documents = try await metadataStore.binderDocuments(in: projectID)
+        let canonicalKey = normalizedPathKey(canonicalPath)
+        let metadataAtCanonicalPath = documents.filter {
+            let key = normalizedPathKey($0.relativePath)
+            return key == canonicalKey || key.hasPrefix(canonicalKey + "/")
+        }
+
+        guard let legacyPath = existingLegacyPaths.first else {
+            let staleLegacyPaths = legacyPaths.filter { path in
+                let key = normalizedPathKey(path)
+                return documents.contains {
+                    let documentKey = normalizedPathKey($0.relativePath)
+                    return documentKey == key || documentKey.hasPrefix(key + "/")
+                }
+            }
+            guard metadataAtCanonicalPath.allSatisfy({ $0.kind == .folder })
+                    || metadataAtCanonicalPath.isEmpty,
+                  staleLegacyPaths.isEmpty
+            else {
+                throw BinderCommandError.storyPlotMigrationConflict(
+                    (staleLegacyPaths + [canonicalPath]).map(\.rawValue)
+                )
+            }
+            let destination = try validatedURL(
+                canonicalPath,
+                workspaceRoot: workspaceRoot
+            )
+            try fileManager.createDirectory(
+                at: destination,
+                withIntermediateDirectories: false
+            )
+            return
+        }
+
+        guard metadataAtCanonicalPath.isEmpty else {
+            throw BinderCommandError.storyPlotMigrationConflict(
+                [legacyPath.rawValue, canonicalPath.rawValue]
+            )
+        }
+        let legacyKey = normalizedPathKey(legacyPath)
+        let oldNodes = documents.filter {
+            let key = normalizedPathKey($0.relativePath)
+            return key == legacyKey || key.hasPrefix(legacyKey + "/")
+        }.sorted {
+            $0.relativePath.rawValue.split(separator: "/").count
+                < $1.relativePath.rawValue.split(separator: "/").count
+        }
+        if let source = oldNodes.first(where: {
+            normalizedPathKey($0.relativePath) == legacyKey
+        }) {
+            guard source.kind == .folder,
+                  let parentID = source.parentID
+            else {
+                throw BinderCommandError.storyPlotMigrationConflict([
+                    legacyPath.rawValue,
+                ])
+            }
+            let newNodes = relocatedSubtree(
+                oldNodes,
+                source: source,
+                destinationPath: canonicalPath,
+                destinationParentID: parentID,
+                rootOrder: source.userOrder,
+                trashed: false
+            )
+            let journal = relocationJournal(
+                kind: .relocate,
+                projectID: projectID,
+                source: source,
+                destinationPath: canonicalPath,
+                oldNodes: oldNodes,
+                newNodes: newNodes
+            )
+            try await execute(journal, workspaceRoot: workspaceRoot)
+            return
+        }
+
+        // 아직 스캔되지 않은 구형 폴더는 파일 시스템 이름만 원자적으로 바꾼다.
+        // 다음 rootNodes 스캔에서 새 고정 루트 메타데이터가 생성된다.
+        let source = try validatedURL(legacyPath, workspaceRoot: workspaceRoot)
+        let destination = try validatedURL(canonicalPath, workspaceRoot: workspaceRoot)
+        try fileManager.moveItem(at: source, to: destination)
+    }
+
     func addNewVolume(projectID: ProjectID) async throws -> BinderVolumeCreationResult {
         guard volumeCreationProjects.insert(projectID).inserted else {
             throw BinderCommandError.volumeCreationInProgress
@@ -227,6 +466,23 @@ extension LocalBinderCommandService {
         _ originalJournal: BinderCommandJournal,
         workspaceRoot: URL
     ) async throws {
+        let documentIDs = (originalJournal.oldNodes + originalJournal.newNodes)
+            .filter { $0.kind == .text }
+            .map { $0.id.rawValue }
+        try await syncMutationGate.withCriticalSections(
+            documentIDs: documentIDs
+        ) { [self] in
+            try await executeInsideMutationGate(
+                originalJournal,
+                workspaceRoot: workspaceRoot
+            )
+        }
+    }
+
+    private func executeInsideMutationGate(
+        _ originalJournal: BinderCommandJournal,
+        workspaceRoot: URL
+    ) async throws {
         var journal = originalJournal
         let journalURL = transactionJournalURL(
             journal.transactionID,
@@ -339,11 +595,6 @@ extension LocalBinderCommandService {
         for journal: BinderCommandJournal,
         workspaceRoot: URL
     ) async throws -> LocalMutationBatch? {
-        if journal.kind == .create, journal.createdKind == .folder {
-            // 서버에는 folder entity가 없어 빈 폴더는 교차 기기 보존 대상이 아니다.
-            return nil
-        }
-
         let batchKind: DurableLocalBatchKind
         switch journal.kind {
         case .create, .relocate, .reorder:
@@ -355,19 +606,31 @@ extension LocalBinderCommandService {
         }
 
         var mutations: [DurableLocalMutation] = []
-        let emptyHash = hasher.sha256(for: Data())
         switch journal.kind {
         case .trash:
             for node in journal.oldNodes
                 .filter({ $0.kind == .text })
                 .sorted(by: { $0.relativePath.rawValue < $1.relativePath.rawValue }) {
+                guard let trashed = journal.newNodes.first(where: {
+                    $0.id == node.id && $0.kind == .text
+                }) else {
+                    throw BinderCommandError.missingDocument(node.id)
+                }
+                let url = try validatedURL(
+                    trashed.relativePath,
+                    workspaceRoot: workspaceRoot
+                )
+                let data = try Data(contentsOf: url)
+                guard let content = String(data: data, encoding: .utf8) else {
+                    throw LocalDocumentStoreError.invalidUTF8(url.path)
+                }
                 mutations.append(
                     .documentSnapshot(
                         operationID: uuidGenerator.makeUUID(),
                         documentID: node.id,
                         relativePath: node.relativePath,
-                        content: "",
-                        contentHash: emptyHash,
+                        content: content,
+                        contentHash: hasher.sha256(for: data),
                         localSaveGeneration: 0,
                         isDeleted: true
                     )

@@ -990,11 +990,18 @@ actor WindowsProjectImporter: ProjectImporting {
         _ kind: ImportIssueKind,
         path: String
     ) -> ImportIssue {
-        ImportIssue(
+        let message: String
+        if (kind == .legacyPlot || kind == .legacyMainStory),
+           path.hasPrefix("메인/") {
+            message = "가져온 뒤 작품을 처음 열 때 메인/스토리 플롯으로 안전하게 전환합니다. 신·구 폴더가 함께 있으면 병합하지 않고 중단합니다."
+        } else {
+            message = "고정 카테고리로 승격하거나 병합하지 않고 일반 레거시 자료로 보존합니다."
+        }
+        return ImportIssue(
             severity: .warning,
             kind: kind,
             relativePath: path,
-            message: "고정 카테고리로 승격하거나 병합하지 않고 일반 레거시 자료로 보존합니다."
+            message: message
         )
     }
 

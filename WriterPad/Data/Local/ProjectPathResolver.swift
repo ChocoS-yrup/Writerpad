@@ -25,6 +25,7 @@ struct StandardProjectPaths: Equatable {
     let charactersURL: URL
     let settingsCollectionURL: URL
     let notesURL: URL
+    let storyPlotURL: URL
     let flowURL: URL
     let foreshadowingURL: URL
     let placesURL: URL
@@ -44,6 +45,7 @@ struct StandardProjectPaths: Equatable {
             charactersURL,
             settingsCollectionURL,
             notesURL,
+            storyPlotURL,
             flowURL,
             foreshadowingURL,
             placesURL,
@@ -59,6 +61,7 @@ struct StandardProjectPaths: Equatable {
 /// 작품 경로 생성을 한곳에 모으고 표준화 후 루트 포함 여부를 재검사한다.
 struct ProjectPathResolver: @unchecked Sendable {
     static let legacyPlotPath = RelativeDocumentPath(rawValue: "메인/플롯")
+    static let legacyMainStoryPath = RelativeDocumentPath(rawValue: "메인/메인 스토리 틀")
     static let legacyPreMigrationBackupPath = RelativeDocumentPath(rawValue: "백업/전환직전")
 
     let projectsRootURL: URL
@@ -171,6 +174,7 @@ struct ProjectPathResolver: @unchecked Sendable {
             charactersURL: main.appendingPathComponent("캐릭터", isDirectory: true),
             settingsCollectionURL: main.appendingPathComponent("설정집", isDirectory: true),
             notesURL: main.appendingPathComponent("메모장", isDirectory: true),
+            storyPlotURL: main.appendingPathComponent("스토리 플롯", isDirectory: true),
             flowURL: main.appendingPathComponent("흐름정리", isDirectory: true),
             foreshadowingURL: main.appendingPathComponent("복선", isDirectory: true),
             placesURL: main.appendingPathComponent("장소", isDirectory: true),

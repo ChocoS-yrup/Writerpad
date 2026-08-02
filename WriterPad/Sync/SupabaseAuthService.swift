@@ -42,14 +42,6 @@ protocol SupabaseAuthTransporting: Sendable {
     func signOut() async throws
 }
 
-extension SupabaseAuthTransporting {
-    func refresh(
-        tokens: StoredSessionTokens
-    ) async throws -> ValidatedAuthSession {
-        try await restore(tokens: tokens)
-    }
-}
-
 actor LiveSupabaseAuthTransport: SupabaseAuthTransporting {
     private let client: SupabaseClient
 
@@ -202,11 +194,6 @@ extension AuthenticationServicing {
     func stateUpdates() async -> AsyncStream<AuthenticationState> {
         AsyncStream { $0.finish() }
     }
-
-    func refreshSession(force: Bool) async -> AuthenticationState {
-        _ = force
-        return await restoreSession()
-    }
 }
 
 typealias AuthenticationSleep =
@@ -223,6 +210,7 @@ actor SupabaseAuthService: AuthenticationServicing {
     private let sessionStore: any SessionTokenStoring
     private let restoreTimeout: Duration
     private let refreshMargin: TimeInterval
+    private let refreshRetryDelay: Duration
     private let sleep: AuthenticationSleep
     private let now: AuthenticationNow
     private var stateObservers: [
@@ -248,8 +236,10 @@ actor SupabaseAuthService: AuthenticationServicing {
     init(
         transport: (any SupabaseAuthTransporting)?,
         sessionStore: any SessionTokenStoring,
-        restoreTimeout: Duration = .seconds(12),
-        refreshMargin: TimeInterval = 5 * 60,
+        restoreTimeout: Duration = SyncV2Timing.standard.authRestoreTimeout,
+        refreshMargin: TimeInterval = SyncV2Timing.standard.refreshMargin,
+        refreshRetryDelay: Duration =
+            SyncV2Timing.standard.refreshRetryDelay,
         now: @escaping AuthenticationNow = Date.init,
         sleep: @escaping AuthenticationSleep = {
             try await ContinuousClock().sleep(for: $0)
@@ -259,6 +249,7 @@ actor SupabaseAuthService: AuthenticationServicing {
         self.sessionStore = sessionStore
         self.restoreTimeout = restoreTimeout
         self.refreshMargin = refreshMargin
+        self.refreshRetryDelay = refreshRetryDelay
         self.now = now
         self.sleep = sleep
     }
@@ -399,26 +390,26 @@ actor SupabaseAuthService: AuthenticationServicing {
             return state
         }
 
-        let outcome = AuthenticationRestoreOutcome()
+        let race = AuthenticationRestoreRace()
         let transportTask = Task {
             do {
                 let session = try await transport.refresh(tokens: storedTokens)
-                await outcome.resolve(.success(session))
+                await race.resolve(.success(session))
             } catch let error as SupabaseAuthTransportError {
-                await outcome.resolve(.failure(error))
+                await race.resolve(.failure(error))
             } catch {
-                await outcome.resolve(.failure(.serverRejected))
+                await race.resolve(.failure(.serverRejected))
             }
         }
         let timeoutTask = Task {
             do {
                 try await sleep(restoreTimeout)
-                await outcome.resolve(.failure(.networkUnavailable))
+                await race.resolve(.failure(.networkUnavailable))
             } catch {
                 // 갱신 또는 다른 인증 작업이 먼저 끝났다.
             }
         }
-        let result = await outcome.value()
+        let result = await race.value()
         transportTask.cancel()
         timeoutTask.cancel()
 
@@ -457,17 +448,17 @@ actor SupabaseAuthService: AuthenticationServicing {
             return state
         }
 
-        let outcome = AuthenticationRestoreOutcome()
+        let race = AuthenticationRestoreRace()
         let transportTask = Task {
             do {
                 let session = try await transport.restore(
                     tokens: storedTokens
                 )
-                await outcome.resolve(.success(session))
+                await race.resolve(.success(session))
             } catch let error as SupabaseAuthTransportError {
-                await outcome.resolve(.failure(error))
+                await race.resolve(.failure(error))
             } catch {
-                await outcome.resolve(.failure(.serverRejected))
+                await race.resolve(.failure(.serverRejected))
             }
         }
         let timeout = restoreTimeout
@@ -475,12 +466,12 @@ actor SupabaseAuthService: AuthenticationServicing {
         let timeoutTask = Task {
             do {
                 try await sleep(timeout)
-                await outcome.resolve(.failure(.networkUnavailable))
+                await race.resolve(.failure(.networkUnavailable))
             } catch {
                 // 정상 완료 또는 다른 인증 작업이 먼저 끝나 취소된 경로다.
             }
         }
-        let result = await outcome.value()
+        let result = await race.value()
         transportTask.cancel()
         timeoutTask.cancel()
 
@@ -683,9 +674,10 @@ actor SupabaseAuthService: AuthenticationServicing {
     private func scheduleRefreshRetry() {
         guard refreshRetryTask == nil else { return }
         let sleep = self.sleep
+        let refreshRetryDelay = self.refreshRetryDelay
         refreshRetryTask = Task { [weak self] in
             do {
-                try await sleep(.seconds(30))
+                try await sleep(refreshRetryDelay)
                 try Task.checkCancellation()
             } catch {
                 return
@@ -723,34 +715,6 @@ actor SupabaseAuthService: AuthenticationServicing {
     }
 }
 
-private actor AuthenticationRestoreOutcome {
-    private var result:
-        Result<ValidatedAuthSession, SupabaseAuthTransportError>?
-    private var continuations: [
-        CheckedContinuation<
-            Result<ValidatedAuthSession, SupabaseAuthTransportError>,
-            Never
-        >
-    ] = []
-
-    func resolve(
-        _ result:
-            Result<ValidatedAuthSession, SupabaseAuthTransportError>
-    ) {
-        guard self.result == nil else { return }
-        self.result = result
-        let pending = continuations
-        continuations.removeAll()
-        pending.forEach { $0.resume(returning: result) }
-    }
-
-    func value() async
-        -> Result<ValidatedAuthSession, SupabaseAuthTransportError> {
-        if let result {
-            return result
-        }
-        return await withCheckedContinuation { continuation in
-            continuations.append(continuation)
-        }
-    }
-}
+private typealias AuthenticationRestoreRace = SyncV2OneShotRace<
+    Result<ValidatedAuthSession, SupabaseAuthTransportError>
+>

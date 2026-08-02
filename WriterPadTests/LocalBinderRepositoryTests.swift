@@ -48,7 +48,7 @@ final class LocalBinderRepositoryTests: XCTestCase {
     }
 
     @MainActor
-    func testThousandChapterProjectInitiallyScansOnlyMainAndShowsEightFixedRoots() async throws {
+    func testThousandChapterProjectInitiallyScansOnlyMainAndShowsNineFixedRoots() async throws {
         let harness = try await makeHarness(projectName: "천화 작품")
         let manuscript = harness.workspace.appendingPathComponent("메인/원고/1권")
         try FileManager.default.createDirectory(at: manuscript, withIntermediateDirectories: true)
@@ -68,7 +68,7 @@ final class LocalBinderRepositoryTests: XCTestCase {
         let metadata = try await harness.repository.documents(in: harness.project.id)
 
         XCTAssertEqual(
-            Array(roots.prefix(7).compactMap(\.fixedCategory)),
+            Array(roots.prefix(8).compactMap(\.fixedCategory)),
             BinderFixedCategory.allCases.filter { $0 != .trash }
         )
         XCTAssertEqual(roots.first?.fixedCategory, .manuscript)

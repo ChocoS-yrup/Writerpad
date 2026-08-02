@@ -86,6 +86,8 @@ enum BinderCommandError: Error, Equatable, LocalizedError, Sendable {
     case ruleDenied(reason: String, suggestedName: String?)
     case sourceMissing(String)
     case destinationAlreadyExists(String, suggestedName: String?)
+    case storyPlotMigrationConflict([String])
+    case legacySyncFolderConflict([String])
     case recoveryRequired(String)
     case volumeCreationInProgress
     case missingManuscriptRoot
@@ -124,6 +126,10 @@ enum BinderCommandError: Error, Equatable, LocalizedError, Sendable {
         case let .destinationAlreadyExists(path, suggestion):
             suggestion.map { "동일한 이름이 이미 있습니다. ‘\($0)’을(를) 사용해 보세요." }
                 ?? "동일한 이름이 이미 있습니다: \(path)"
+        case let .storyPlotMigrationConflict(paths):
+            "스토리 플롯 폴더를 자동 전환할 수 없습니다. 병합하거나 삭제하지 않았습니다: \(paths.joined(separator: ", "))"
+        case let .legacySyncFolderConflict(paths):
+            "이전 동기화가 만든 중복 폴더를 안전하게 정리할 수 없습니다. 내용과 경로를 확인하세요: \(paths.joined(separator: ", "))"
         case let .recoveryRequired(path):
             "바인더 작업을 자동 복구하지 못했습니다. 복구 기록을 보존했습니다: \(path)"
         case .volumeCreationInProgress:

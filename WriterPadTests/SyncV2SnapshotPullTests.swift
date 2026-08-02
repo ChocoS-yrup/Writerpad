@@ -4,6 +4,61 @@ import XCTest
 @testable import WriterPad
 
 final class SyncV2SnapshotPullTests: XCTestCase {
+    func testOneShotRaceResolvesOnceAndIntentionallyIgnoresCancellation()
+        async {
+        let race = SyncV2OneShotRace<Int>()
+        let waiter = Task { await race.value() }
+        waiter.cancel()
+
+        let acceptedFirst = await race.resolve(1)
+        let acceptedSecond = await race.resolve(2)
+        let waiterValue = await waiter.value
+        let resolvedValue = await race.value()
+
+        XCTAssertTrue(acceptedFirst)
+        XCTAssertFalse(acceptedSecond)
+        XCTAssertEqual(waiterValue, 1)
+        XCTAssertEqual(resolvedValue, 1)
+    }
+
+    func testTrashPurgePayloadRequiresExactVersionTypesAndCanonicalIDs()
+        throws {
+        let first = UUID(
+            uuidString: "00000000-0000-0000-0000-000000000111"
+        )!
+        let generation = UUID(
+            uuidString: "00000000-0000-0000-0000-000000000222"
+        )!
+        let valid = try SyncV2TrashPurgePayload(
+            strictContent:
+                "{\"empty_generation\":\"\(generation.uuidString.lowercased())\",\"purged_revisions\":{\"\(first.uuidString.lowercased())\":7},\"version\":1}"
+        )
+        XCTAssertEqual(valid.purgedRevisions[first], 7)
+        XCTAssertEqual(
+            valid.emptyGeneration,
+            generation.uuidString.lowercased()
+        )
+
+        let invalidPayloads = [
+            "{\"empty_generation\":\"\",\"purged_revisions\":{},\"version\":2}",
+            "{\"empty_generation\":\"\",\"purged_revisions\":{},\"version\":\"1\"}",
+            "{\"empty_generation\":\"\",\"purged_revisions\":{},\"version\":1.0}",
+            "{\"empty_generation\":\"\",\"purged_revisions\":{},\"version\":true}",
+            "{\"empty_generation\":1,\"purged_revisions\":{},\"version\":1}",
+            "{\"empty_generation\":\"not-a-uuid\",\"purged_revisions\":{},\"version\":1}",
+            "{\"empty_generation\":\"\",\"purged_revisions\":{\"not-a-uuid\":1},\"version\":1}",
+            "{\"empty_generation\":\"\",\"purged_revisions\":{\"\(first.uuidString.lowercased())\":\"7\"},\"version\":1}",
+            "{\"empty_generation\":\"\",\"purged_revisions\":{\"\(first.uuidString.lowercased())\":7.0},\"version\":1}",
+            "{\"empty_generation\":\"\",\"extra\":0,\"purged_revisions\":{},\"version\":1}",
+        ]
+        for content in invalidPayloads {
+            XCTAssertThrowsError(
+                try SyncV2TrashPurgePayload(strictContent: content),
+                content
+            )
+        }
+    }
+
     func testConflictTextRenderTrackerSkipsRepeatedLargeSource() {
         let base = String(repeating: "한글🙂긴 원고", count: 1_000)
         var tracker = ConflictTextRenderTracker()
@@ -208,6 +263,11 @@ final class SyncV2SnapshotPullTests: XCTestCase {
                     isDirty: false,
                     isComposing: true
                 ),
+                deleted: .init(
+                    isOpen: true,
+                    isDirty: false,
+                    isComposing: false
+                ),
             ]
         )
 
@@ -230,6 +290,189 @@ final class SyncV2SnapshotPullTests: XCTestCase {
             report.outcomes.contains(
                 .upToDate(documentID: current, revision: 5)
             )
+        )
+    }
+
+    func testClosedCleanRemoteTombstoneIsAppliedInsteadOfPreserved()
+        async throws {
+        let documentID = UUID()
+        let stateStore = SnapshotStateStoreStub(
+            states: [documentID: localState(revision: 2)]
+        )
+        let applier = SnapshotApplierSpy()
+        let merge = SnapshotMergeStoreSpy()
+        let service = SyncV2SnapshotPullService(
+            client: SnapshotClientStub(
+                snapshots: [
+                    makeSnapshot(
+                        id: documentID,
+                        revision: 3,
+                        isDeleted: true
+                    ),
+                ]
+            ),
+            stateStore: stateStore,
+            localApplier: applier,
+            mergeStore: merge
+        )
+
+        let report = try await service.pull(
+            localProjectID: ProjectID(rawValue: UUID()),
+            serverProjectID: UUID()
+        )
+
+        let appliedIDs = await applier.appliedIDs()
+        let committedIDs = await stateStore.committedIDs()
+        let mergeReasons = await merge.reasons()
+        XCTAssertEqual(appliedIDs, [documentID])
+        XCTAssertEqual(committedIDs, [documentID])
+        XCTAssertEqual(mergeReasons, [])
+        XCTAssertEqual(
+            report.outcomes,
+            [
+                .applied(
+                    documentID: documentID,
+                    revision: 3,
+                    wasOpen: false
+                ),
+            ]
+        )
+    }
+
+    func testSameRevisionRepairsOnlyCleanMissingCopyAndSkipsEveryQueueBlocker()
+        async throws {
+        let clean = UUID()
+        let pending = UUID()
+        let conflict = UUID()
+        let blocked = UUID()
+        let dirty = UUID()
+        let stale = UUID()
+        let snapshots = [clean, pending, conflict, blocked, dirty].map {
+            makeSnapshot(id: $0, revision: 5)
+        } + [makeSnapshot(id: stale, revision: 4)]
+        let stateStore = SnapshotStateStoreStub(
+            states: [
+                clean: localState(revision: 5),
+                pending: localState(revision: 5, active: true),
+                conflict: localState(revision: 5, conflict: true),
+                blocked: localState(
+                    revision: 5,
+                    active: true,
+                    blockingErrorCode: "CONTENT_TOO_LARGE"
+                ),
+                dirty: localState(revision: 5),
+                stale: localState(revision: 5),
+            ]
+        )
+        let applier = SnapshotRecoveryApplierSpy(
+            recoveryIDs: Set([clean, pending, conflict, blocked, dirty, stale])
+        )
+        let merge = SnapshotMergeStoreSpy()
+        let service = SyncV2SnapshotPullService(
+            client: SnapshotClientStub(snapshots: snapshots),
+            stateStore: stateStore,
+            localApplier: applier,
+            mergeStore: merge
+        )
+
+        let report = try await service.pull(
+            localProjectID: ProjectID(rawValue: UUID()),
+            serverProjectID: UUID(),
+            editingGuards: [
+                dirty: SyncV2EditingGuard(
+                    isOpen: true,
+                    isDirty: true,
+                    isComposing: false
+                ),
+            ]
+        )
+
+        let appliedIDs = await applier.appliedIDs()
+        let committedIDs = await stateStore.committedIDs()
+        let mergeReasons = await merge.reasons()
+        XCTAssertEqual(appliedIDs, [clean])
+        XCTAssertEqual(committedIDs, [])
+        XCTAssertEqual(mergeReasons, [.dirtyEditor])
+        XCTAssertTrue(
+            report.outcomes.contains(
+                .applied(
+                    documentID: clean,
+                    revision: 5,
+                    wasOpen: false
+                )
+            )
+        )
+        XCTAssertTrue(
+            report.outcomes.contains(
+                .upToDate(documentID: stale, revision: 5)
+            )
+        )
+        XCTAssertTrue(
+            report.outcomes.contains(
+                .mergeRequired(
+                    documentID: pending,
+                    revision: 5,
+                    reason: .pendingOperation
+                )
+            )
+        )
+        XCTAssertTrue(
+            report.outcomes.contains(
+                .mergeRequired(
+                    documentID: conflict,
+                    revision: 5,
+                    reason: .unresolvedConflict
+                )
+            )
+        )
+        XCTAssertTrue(
+            report.outcomes.contains(
+                .mergeRequired(
+                    documentID: blocked,
+                    revision: 5,
+                    reason: .blockedOperation
+                )
+            )
+        )
+    }
+
+    func testSameRevisionRecoveryNeverOverwritesDifferentUUIDPath()
+        async throws {
+        let documentID = UUID()
+        let applier = SnapshotRecoveryApplierSpy(
+            recoveryIDs: [documentID],
+            applyError: .pathOccupiedByDifferentDocument
+        )
+        let merge = SnapshotMergeStoreSpy()
+        let service = SyncV2SnapshotPullService(
+            client: SnapshotClientStub(
+                snapshots: [makeSnapshot(id: documentID, revision: 3)]
+            ),
+            stateStore: SnapshotStateStoreStub(
+                states: [documentID: localState(revision: 3)]
+            ),
+            localApplier: applier,
+            mergeStore: merge
+        )
+
+        let report = try await service.pull(
+            localProjectID: ProjectID(rawValue: UUID()),
+            serverProjectID: UUID()
+        )
+
+        let appliedIDs = await applier.appliedIDs()
+        let mergeReasons = await merge.reasons()
+        XCTAssertEqual(appliedIDs, [])
+        XCTAssertEqual(mergeReasons, [.pathOccupiedByDifferentDocument])
+        XCTAssertEqual(
+            report.outcomes,
+            [
+                .mergeRequired(
+                    documentID: documentID,
+                    revision: 3,
+                    reason: .pathOccupiedByDifferentDocument
+                ),
+            ]
         )
     }
 
@@ -385,6 +628,1389 @@ final class SyncV2SnapshotPullTests: XCTestCase {
         let stored = try await repository.document(id: documentID)
         XCTAssertEqual(text, "보존할 iPad 로컬 본문")
         XCTAssertEqual(stored, document)
+    }
+
+    func testFailedTombstoneCASRestoresOriginalTXTAndMetadata()
+        async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("WriterPad-Snapshot-\(UUID())")
+        defer { try? FileManager.default.removeItem(at: root) }
+        let notesURL = root.appendingPathComponent("메인/자료")
+        let trashURL = root.appendingPathComponent("메인/휴지통")
+        try FileManager.default.createDirectory(
+            at: notesURL,
+            withIntermediateDirectories: true
+        )
+        try FileManager.default.createDirectory(
+            at: trashURL,
+            withIntermediateDirectories: true
+        )
+        let projectID = ProjectID(rawValue: UUID())
+        let notesID = DocumentID(rawValue: UUID())
+        let trashID = DocumentID(rawValue: UUID())
+        let documentID = DocumentID(rawValue: UUID())
+        let path = RelativeDocumentPath(rawValue: "메인/자료/사건.txt")
+        let notes = DocumentNode(
+            id: notesID,
+            projectID: projectID,
+            kind: .folder,
+            parentID: nil,
+            relativePath: RelativeDocumentPath(rawValue: "메인/자료"),
+            userOrder: 0,
+            modifiedAt: .distantPast,
+            contentHash: nil
+        )
+        let trash = DocumentNode(
+            id: trashID,
+            projectID: projectID,
+            kind: .folder,
+            parentID: nil,
+            relativePath: BinderFixedCategory.trash.relativePath,
+            userOrder: 1,
+            modifiedAt: .distantPast,
+            contentHash: nil
+        )
+        let document = DocumentNode(
+            id: documentID,
+            projectID: projectID,
+            kind: .text,
+            parentID: notesID,
+            relativePath: path,
+            userOrder: 2,
+            modifiedAt: .distantPast,
+            contentHash: SHA256ContentHasher().sha256(
+                for: Data("CAS 경쟁 전 본문".utf8)
+            )
+        )
+        let originalURL = root.appendingPathComponent(path.rawValue)
+        try Data("CAS 경쟁 전 본문".utf8).write(to: originalURL)
+        let repository = SnapshotDocumentRepository(
+            documents: [notes, trash, document]
+        )
+        let service = SyncV2SnapshotPullService(
+            client: SnapshotClientStub(
+                snapshots: [
+                    makeSnapshot(
+                        id: documentID.rawValue,
+                        path: path.rawValue,
+                        content: "",
+                        revision: 2,
+                        isDeleted: true
+                    ),
+                ]
+            ),
+            stateStore: SnapshotStateStoreStub(
+                states: [documentID.rawValue: localState(revision: 1)],
+                commitResult: false
+            ),
+            localApplier: LocalSyncV2SnapshotApplier(
+                documentRepository: repository,
+                workspaceLocator: SnapshotWorkspaceLocator(root: root)
+            ),
+            mergeStore: SnapshotMergeStoreSpy()
+        )
+
+        _ = try await service.pull(
+            localProjectID: projectID,
+            serverProjectID: UUID()
+        )
+
+        let stored = try await repository.document(id: documentID)
+        XCTAssertEqual(stored, document)
+        XCTAssertEqual(
+            try String(contentsOf: originalURL, encoding: .utf8),
+            "CAS 경쟁 전 본문"
+        )
+        XCTAssertEqual(
+            try FileManager.default.contentsOfDirectory(atPath: trashURL.path),
+            []
+        )
+        let trashRecordURL = root.appendingPathComponent(
+            ".writerpad-trash-"
+                + documentID.rawValue.uuidString.lowercased()
+                + ".json"
+        )
+        XCTAssertFalse(
+            FileManager.default.fileExists(atPath: trashRecordURL.path)
+        )
+    }
+
+    func testSameRevisionRestoresMissingLiveAndTombstoneCopies()
+        async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("WriterPad-CopyRecovery-\(UUID())")
+        defer { try? FileManager.default.removeItem(at: root) }
+        try FileManager.default.createDirectory(
+            at: root.appendingPathComponent("메인/메모장"),
+            withIntermediateDirectories: true
+        )
+        try FileManager.default.createDirectory(
+            at: root.appendingPathComponent("메인/휴지통"),
+            withIntermediateDirectories: true
+        )
+        let projectID = ProjectID(rawValue: UUID())
+        let notesID = DocumentID(rawValue: UUID())
+        let trashID = DocumentID(rawValue: UUID())
+        let documentID = DocumentID(rawValue: UUID())
+        let path = RelativeDocumentPath(rawValue: "메인/메모장/복구.txt")
+        let notes = DocumentNode(
+            id: notesID,
+            projectID: projectID,
+            kind: .folder,
+            parentID: nil,
+            relativePath: RelativeDocumentPath(rawValue: "메인/메모장"),
+            userOrder: 0,
+            modifiedAt: .distantPast,
+            contentHash: nil
+        )
+        let trash = DocumentNode(
+            id: trashID,
+            projectID: projectID,
+            kind: .folder,
+            parentID: nil,
+            relativePath: BinderFixedCategory.trash.relativePath,
+            userOrder: 1,
+            modifiedAt: .distantPast,
+            contentHash: nil
+        )
+        let document = DocumentNode(
+            id: documentID,
+            projectID: projectID,
+            kind: .text,
+            parentID: notesID,
+            relativePath: path,
+            userOrder: 0,
+            modifiedAt: .distantPast,
+            contentHash: nil
+        )
+        let repository = SnapshotDocumentRepository(
+            documents: [notes, trash, document]
+        )
+        let applier = LocalSyncV2SnapshotApplier(
+            documentRepository: repository,
+            workspaceLocator: SnapshotWorkspaceLocator(root: root)
+        )
+        let live = makeSnapshot(
+            id: documentID.rawValue,
+            path: path.rawValue,
+            content: "복구할 본문",
+            revision: 1
+        )
+        let requiresLiveRecovery = await applier.requiresCopyRecovery(
+            localProjectID: projectID,
+            snapshot: live
+        )
+        XCTAssertTrue(requiresLiveRecovery)
+        try await applier.apply(localProjectID: projectID, snapshot: live)
+        await applier.finish(
+            localProjectID: projectID,
+            documentID: documentID.rawValue
+        )
+        XCTAssertEqual(
+            try String(
+                contentsOf: root.appendingPathComponent(path.rawValue),
+                encoding: .utf8
+            ),
+            "복구할 본문"
+        )
+
+        let tombstone = makeSnapshot(
+            id: documentID.rawValue,
+            path: path.rawValue,
+            content: "복구할 본문",
+            revision: 2,
+            isDeleted: true
+        )
+        try await applier.apply(
+            localProjectID: projectID,
+            snapshot: tombstone
+        )
+        await applier.finish(
+            localProjectID: projectID,
+            documentID: documentID.rawValue
+        )
+        let firstStoredTrash = try await repository.document(id: documentID)
+        let firstTrash = try XCTUnwrap(firstStoredTrash)
+        try FileManager.default.removeItem(
+            at: root.appendingPathComponent(firstTrash.relativePath.rawValue)
+        )
+        let requiresTombstoneRecovery = await applier.requiresCopyRecovery(
+            localProjectID: projectID,
+            snapshot: tombstone
+        )
+        XCTAssertTrue(requiresTombstoneRecovery)
+
+        await repository.failNextSave()
+        do {
+            try await applier.apply(
+                localProjectID: projectID,
+                snapshot: tombstone
+            )
+            XCTFail("복구 metadata 실패가 발생하지 않았습니다.")
+        } catch SnapshotTestError.injectedMetadataFailure {}
+        let requiresRetry = await applier.requiresCopyRecovery(
+            localProjectID: projectID,
+            snapshot: tombstone
+        )
+        XCTAssertTrue(requiresRetry)
+        try await applier.apply(localProjectID: projectID, snapshot: tombstone)
+        await applier.finish(
+            localProjectID: projectID,
+            documentID: documentID.rawValue
+        )
+
+        let repairedDocument = try await repository.document(id: documentID)
+        let repaired = try XCTUnwrap(repairedDocument)
+        XCTAssertTrue(
+            repaired.relativePath.rawValue.contains(
+                documentID.rawValue.uuidString.lowercased()
+            )
+        )
+        XCTAssertEqual(repaired.parentID, trashID)
+        XCTAssertEqual(
+            try String(
+                contentsOf: root.appendingPathComponent(
+                    repaired.relativePath.rawValue
+                ),
+                encoding: .utf8
+            ),
+            "복구할 본문"
+        )
+        XCTAssertTrue(
+            FileManager.default.fileExists(
+                atPath: root.appendingPathComponent(
+                    ".writerpad-trash-"
+                        + documentID.rawValue.uuidString.lowercased()
+                        + ".json"
+                ).path
+            )
+        )
+
+        try FileManager.default.removeItem(
+            at: root.appendingPathComponent(repaired.relativePath.rawValue)
+        )
+        let replacementID = DocumentID(rawValue: UUID())
+        let replacement = DocumentNode(
+            id: replacementID,
+            projectID: projectID,
+            kind: .text,
+            parentID: notesID,
+            relativePath: path,
+            userOrder: 1,
+            modifiedAt: .distantPast,
+            contentHash: nil
+        )
+        try await repository.save(replacement)
+        try Data("새 UUID 본문".utf8).write(
+            to: root.appendingPathComponent(path.rawValue)
+        )
+
+        let requiresRelocatedRecovery = await applier.requiresCopyRecovery(
+            localProjectID: projectID,
+            snapshot: tombstone
+        )
+        XCTAssertTrue(requiresRelocatedRecovery)
+        try await applier.apply(localProjectID: projectID, snapshot: tombstone)
+        await applier.finish(
+            localProjectID: projectID,
+            documentID: documentID.rawValue
+        )
+
+        XCTAssertEqual(
+            try String(
+                contentsOf: root.appendingPathComponent(path.rawValue),
+                encoding: .utf8
+            ),
+            "새 UUID 본문"
+        )
+        let relocatedDocument = try await repository.document(id: documentID)
+        let relocated = try XCTUnwrap(relocatedDocument)
+        XCTAssertTrue(
+            relocated.relativePath.rawValue.contains(
+                documentID.rawValue.uuidString.lowercased()
+            )
+        )
+        XCTAssertEqual(
+            try String(
+                contentsOf: root.appendingPathComponent(
+                    relocated.relativePath.rawValue
+                ),
+                encoding: .utf8
+            ),
+            "복구할 본문"
+        )
+        let storedReplacement = try await repository.document(
+            id: replacementID
+        )
+        XCTAssertEqual(storedReplacement, replacement)
+    }
+
+    func testRemoteTXTMaterializesMissingNonemptyFolderHierarchy()
+        async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("WriterPad-TreeOrder-\(UUID())")
+        defer { try? FileManager.default.removeItem(at: root) }
+        try FileManager.default.createDirectory(
+            at: root.appendingPathComponent("메인/메모장"),
+            withIntermediateDirectories: true
+        )
+        let projectID = ProjectID(rawValue: UUID())
+        let main = DocumentNode(
+            id: DocumentID(rawValue: UUID()),
+            projectID: projectID,
+            kind: .folder,
+            parentID: nil,
+            relativePath: RelativeDocumentPath(rawValue: "메인"),
+            userOrder: -1,
+            modifiedAt: .distantPast,
+            contentHash: nil
+        )
+        let notes = DocumentNode(
+            id: DocumentID(rawValue: UUID()),
+            projectID: projectID,
+            kind: .folder,
+            parentID: main.id,
+            relativePath: BinderFixedCategory.notes.relativePath,
+            userOrder: 0,
+            modifiedAt: .distantPast,
+            contentHash: nil
+        )
+        let repository = SnapshotDocumentRepository(documents: [main, notes])
+        let documentID = UUID()
+        let path = "메인/메모장/Windows 폴더/하위 폴더/새 문서.txt"
+        let applier = LocalSyncV2SnapshotApplier(
+            documentRepository: repository,
+            workspaceLocator: SnapshotWorkspaceLocator(root: root)
+        )
+
+        try await applier.apply(
+            localProjectID: projectID,
+            snapshot: makeSnapshot(
+                id: documentID,
+                path: path,
+                content: "Windows에서 작성한 본문",
+                revision: 1
+            )
+        )
+        await applier.finish(
+            localProjectID: projectID,
+            documentID: documentID
+        )
+
+        let documents = try await repository.documents(in: projectID)
+        let firstFolder = try XCTUnwrap(documents.first {
+            $0.relativePath.rawValue == "메인/메모장/Windows 폴더"
+        })
+        let secondFolder = try XCTUnwrap(documents.first {
+            $0.relativePath.rawValue
+                == "메인/메모장/Windows 폴더/하위 폴더"
+        })
+        let created = try XCTUnwrap(documents.first {
+            $0.id.rawValue == documentID
+        })
+        XCTAssertEqual(firstFolder.kind, .folder)
+        XCTAssertEqual(firstFolder.parentID, notes.id)
+        XCTAssertEqual(secondFolder.parentID, firstFolder.id)
+        XCTAssertEqual(created.parentID, secondFolder.id)
+        XCTAssertEqual(created.relativePath.rawValue, path)
+        XCTAssertEqual(
+            try String(
+                contentsOf: root.appendingPathComponent(path),
+                encoding: .utf8
+            ),
+            "Windows에서 작성한 본문"
+        )
+    }
+
+    func testTreeOrderAppliesAfterDocumentsAndNeverCreatesHiddenFile()
+        async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("WriterPad-TreeOrder-\(UUID())")
+        defer { try? FileManager.default.removeItem(at: root) }
+        let notesURL = root.appendingPathComponent("메인/메모장")
+        try FileManager.default.createDirectory(
+            at: notesURL,
+            withIntermediateDirectories: true
+        )
+        let projectID = ProjectID(rawValue: UUID())
+        let serverProjectID = UUID()
+        let main = DocumentNode(
+            id: DocumentID(rawValue: UUID()),
+            projectID: projectID,
+            kind: .folder,
+            parentID: nil,
+            relativePath: RelativeDocumentPath(rawValue: "메인"),
+            userOrder: -1,
+            modifiedAt: .distantPast,
+            contentHash: nil
+        )
+        let notes = DocumentNode(
+            id: DocumentID(rawValue: UUID()),
+            projectID: projectID,
+            kind: .folder,
+            parentID: main.id,
+            relativePath: BinderFixedCategory.notes.relativePath,
+            userOrder: 0,
+            modifiedAt: .distantPast,
+            contentHash: nil
+        )
+        let firstID = DocumentID(rawValue: UUID())
+        let secondID = DocumentID(rawValue: UUID())
+        let first = DocumentNode(
+            id: firstID,
+            projectID: projectID,
+            kind: .text,
+            parentID: notes.id,
+            relativePath: RelativeDocumentPath(
+                rawValue: "메인/메모장/첫째.txt"
+            ),
+            userOrder: 0,
+            modifiedAt: .distantPast,
+            contentHash: nil
+        )
+        let second = DocumentNode(
+            id: secondID,
+            projectID: projectID,
+            kind: .text,
+            parentID: notes.id,
+            relativePath: RelativeDocumentPath(
+                rawValue: "메인/메모장/둘째.txt"
+            ),
+            userOrder: 1,
+            modifiedAt: .distantPast,
+            contentHash: nil
+        )
+        try Data("첫째".utf8).write(
+            to: notesURL.appendingPathComponent("첫째.txt")
+        )
+        try Data("둘째".utf8).write(
+            to: notesURL.appendingPathComponent("둘째.txt")
+        )
+        let repository = SnapshotDocumentRepository(
+            documents: [main, notes, first, second]
+        )
+        let treeID = syncV2UUIDv5(
+            namespace: serverProjectID,
+            name: syncV2TreeOrderPath
+        )
+        let service = SyncV2SnapshotPullService(
+            client: SnapshotClientStub(
+                snapshots: [
+                    makeSnapshot(
+                        id: treeID,
+                        path: syncV2TreeOrderPath,
+                        content:
+                            "{\"tree_order\":{\"메인/메모장\":[\"둘째.txt\",\"첫째.txt\"]},\"version\":1}",
+                        revision: 1
+                    ),
+                    makeSnapshot(
+                        id: firstID.rawValue,
+                        path: first.relativePath.rawValue,
+                        content: "첫째",
+                        revision: 1
+                    ),
+                    makeSnapshot(
+                        id: secondID.rawValue,
+                        path: second.relativePath.rawValue,
+                        content: "둘째",
+                        revision: 1
+                    ),
+                ]
+            ),
+            stateStore: SnapshotStateStoreStub(states: [:]),
+            localApplier: LocalSyncV2SnapshotApplier(
+                documentRepository: repository,
+                workspaceLocator: SnapshotWorkspaceLocator(root: root)
+            ),
+            mergeStore: SnapshotMergeStoreSpy()
+        )
+
+        let report = try await service.pull(
+            localProjectID: projectID,
+            serverProjectID: serverProjectID
+        )
+
+        let updatedFirst = try await repository.document(id: firstID)
+        let updatedSecond = try await repository.document(id: secondID)
+        XCTAssertEqual(updatedSecond?.userOrder, 0)
+        XCTAssertEqual(updatedFirst?.userOrder, 1)
+        let appliedIDs = report.appliedSnapshots.map(\.documentID)
+        XCTAssertEqual(appliedIDs.last, treeID)
+        XCTAssertEqual(
+            Set(appliedIDs.dropLast()),
+            Set([firstID.rawValue, secondID.rawValue])
+        )
+        XCTAssertFalse(
+            FileManager.default.fileExists(
+                atPath: root.appendingPathComponent("__antigravity__").path
+            )
+        )
+    }
+
+    func testTrashPurgeRequiresExactHiddenUUIDAndRunsBeforeTombstoneLiveAndTree()
+        async throws {
+        let serverProjectID = UUID()
+        let purgeID = syncV2UUIDv5(
+            namespace: serverProjectID,
+            name: syncV2TrashPurgePath
+        )
+        let treeID = syncV2UUIDv5(
+            namespace: serverProjectID,
+            name: syncV2TreeOrderPath
+        )
+        let tombstoneID = UUID()
+        let liveID = UUID()
+        let payload =
+            "{\"empty_generation\":\"\",\"purged_revisions\":{},\"version\":1}"
+        let applier = SnapshotApplierSpy()
+        let service = SyncV2SnapshotPullService(
+            client: SnapshotClientStub(
+                snapshots: [
+                    makeSnapshot(
+                        id: liveID,
+                        path: "메인/메모장/live.txt",
+                        revision: 1
+                    ),
+                    makeSnapshot(
+                        id: treeID,
+                        path: syncV2TreeOrderPath,
+                        content: "{\"tree_order\":{},\"version\":1}",
+                        revision: 1
+                    ),
+                    makeSnapshot(
+                        id: tombstoneID,
+                        path: "메인/메모장/deleted.txt",
+                        content: "",
+                        revision: 1,
+                        isDeleted: true
+                    ),
+                    makeSnapshot(
+                        id: purgeID,
+                        path: syncV2TrashPurgePath,
+                        content: payload,
+                        revision: 1
+                    ),
+                ]
+            ),
+            stateStore: SnapshotStateStoreStub(states: [:]),
+            localApplier: applier,
+            mergeStore: SnapshotMergeStoreSpy()
+        )
+
+        _ = try await service.pull(
+            localProjectID: ProjectID(rawValue: UUID()),
+            serverProjectID: serverProjectID
+        )
+
+        let appliedIDs = await applier.appliedIDs()
+        XCTAssertEqual(appliedIDs, [purgeID, tombstoneID, liveID, treeID])
+
+        let wrongID = UUID()
+        let merge = SnapshotMergeStoreSpy()
+        let invalidService = SyncV2SnapshotPullService(
+            client: SnapshotClientStub(
+                snapshots: [
+                    makeSnapshot(
+                        id: wrongID,
+                        path: syncV2TrashPurgePath,
+                        content: payload,
+                        revision: 2
+                    ),
+                ]
+            ),
+            stateStore: SnapshotStateStoreStub(states: [:]),
+            localApplier: SnapshotApplierSpy(),
+            mergeStore: merge
+        )
+        let invalidReport = try await invalidService.pull(
+            localProjectID: ProjectID(rawValue: UUID()),
+            serverProjectID: serverProjectID
+        )
+        XCTAssertEqual(
+            invalidReport.outcomes,
+            [
+                .mergeRequired(
+                    documentID: wrongID,
+                    revision: 2,
+                    reason: .invalidLocalHierarchy
+                ),
+            ]
+        )
+        let reasons = await merge.reasons()
+        XCTAssertEqual(reasons, [.invalidLocalHierarchy])
+    }
+
+    func testTrashPurgeMergesMaximumDeletesStaleTombstoneAndAllowsHigherRedelete()
+        async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("WriterPad-TrashPurge-\(UUID())")
+        defer { try? FileManager.default.removeItem(at: root) }
+        let projectID = ProjectID(rawValue: UUID())
+        let serverProjectID = UUID()
+        let targetID = UUID()
+        let retainedID = UUID()
+        let fixture = try makeTrashPurgeFixture(
+            root: root,
+            projectID: projectID,
+            documentID: targetID,
+            fileName: "최종직전테스트.txt"
+        )
+        let previous = SyncV2TrashPurgePayload(
+            purgedRevisions: [targetID: 1, retainedID: 9],
+            emptyGeneration: ""
+        )
+        try Data(try previous.canonicalContent().utf8).write(
+            to: root.appendingPathComponent(
+                LocalSyncV2SnapshotApplier.trashPurgeStateName
+            ),
+            options: [.atomic]
+        )
+        let purgeID = syncV2UUIDv5(
+            namespace: serverProjectID,
+            name: syncV2TrashPurgePath
+        )
+        let purge = SyncV2TrashPurgePayload(
+            purgedRevisions: [targetID: 2, retainedID: 4],
+            emptyGeneration: ""
+        )
+        let mergeURL = root.appendingPathComponent(
+            LocalSyncV2SnapshotMergeStore.prefix
+                + purgeID.uuidString.lowercased()
+                + LocalSyncV2SnapshotMergeStore.suffix
+        )
+        try Data("기존 invalidLocalHierarchy 표식".utf8).write(to: mergeURL)
+        let applier = LocalSyncV2SnapshotApplier(
+            documentRepository: fixture.repository,
+            workspaceLocator: SnapshotWorkspaceLocator(root: root)
+        )
+        let service = SyncV2SnapshotPullService(
+            client: SnapshotClientStub(
+                snapshots: [
+                    makeSnapshot(
+                        id: targetID,
+                        path: fixture.originalPath.rawValue,
+                        content: "",
+                        revision: 2,
+                        isDeleted: true
+                    ),
+                    makeSnapshot(
+                        id: purgeID,
+                        path: syncV2TrashPurgePath,
+                        content: try purge.canonicalContent(),
+                        revision: 2
+                    ),
+                ]
+            ),
+            stateStore: SnapshotStateStoreStub(
+                states: [targetID: localState(revision: 1)]
+            ),
+            localApplier: applier,
+            mergeStore: LocalSyncV2SnapshotMergeStore(
+                workspaceLocator: SnapshotWorkspaceLocator(root: root)
+            )
+        )
+
+        let report = try await service.pull(
+            localProjectID: projectID,
+            serverProjectID: serverProjectID
+        )
+
+        XCTAssertEqual(
+            report.appliedSnapshots.map(\.documentID),
+            [purgeID, targetID]
+        )
+        let purgedDocument = try await fixture.repository.document(
+            id: DocumentID(rawValue: targetID)
+        )
+        XCTAssertNil(purgedDocument)
+        XCTAssertFalse(
+            FileManager.default.fileExists(atPath: fixture.trashFileURL.path)
+        )
+        XCTAssertFalse(FileManager.default.fileExists(atPath: mergeURL.path))
+        let mergedState = await applier.trashPurgeState(
+            localProjectID: projectID
+        )
+        XCTAssertEqual(mergedState.purgedRevisions[targetID], 2)
+        XCTAssertEqual(mergedState.purgedRevisions[retainedID], 9)
+
+        let restored = DocumentNode(
+            id: DocumentID(rawValue: targetID),
+            projectID: projectID,
+            kind: .text,
+            parentID: fixture.notesID,
+            relativePath: fixture.originalPath,
+            userOrder: 0,
+            modifiedAt: .distantPast,
+            contentHash: nil
+        )
+        try await fixture.repository.save(restored)
+        let liveURL = root.appendingPathComponent(
+            fixture.originalPath.rawValue
+        )
+        try Data("더 높은 revision의 재삭제".utf8).write(to: liveURL)
+        let redeletionService = SyncV2SnapshotPullService(
+            client: SnapshotClientStub(
+                snapshots: [
+                    makeSnapshot(
+                        id: targetID,
+                        path: fixture.originalPath.rawValue,
+                        content: "",
+                        revision: 3,
+                        isDeleted: true
+                    ),
+                ]
+            ),
+            stateStore: SnapshotStateStoreStub(
+                states: [targetID: localState(revision: 2)]
+            ),
+            localApplier: applier,
+            mergeStore: SnapshotMergeStoreSpy()
+        )
+
+        let redeletion = try await redeletionService.pull(
+            localProjectID: projectID,
+            serverProjectID: serverProjectID
+        )
+
+        XCTAssertEqual(
+            redeletion.outcomes,
+            [.applied(documentID: targetID, revision: 3, wasOpen: false)]
+        )
+        let redeletedDocument = try await fixture.repository.document(
+            id: DocumentID(rawValue: targetID)
+        )
+        let trashedAgain = try XCTUnwrap(redeletedDocument)
+        guard case .trashed = trashedAgain.deletionStatus else {
+            return XCTFail("purge보다 높은 revision은 새 tombstone이어야 합니다.")
+        }
+    }
+
+    func testTrashPurgeBaselineFailureRollsBackFileMetadataAndState()
+        async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("WriterPad-TrashPurgeRollback-\(UUID())")
+        defer { try? FileManager.default.removeItem(at: root) }
+        let projectID = ProjectID(rawValue: UUID())
+        let serverProjectID = UUID()
+        let targetID = UUID()
+        let fixture = try makeTrashPurgeFixture(
+            root: root,
+            projectID: projectID,
+            documentID: targetID,
+            fileName: "rollback.txt"
+        )
+        let purgeID = syncV2UUIDv5(
+            namespace: serverProjectID,
+            name: syncV2TrashPurgePath
+        )
+        let applier = LocalSyncV2SnapshotApplier(
+            documentRepository: fixture.repository,
+            workspaceLocator: SnapshotWorkspaceLocator(root: root)
+        )
+        let service = SyncV2SnapshotPullService(
+            client: SnapshotClientStub(
+                snapshots: [
+                    makeSnapshot(
+                        id: targetID,
+                        path: fixture.originalPath.rawValue,
+                        content: "",
+                        revision: 2,
+                        isDeleted: true
+                    ),
+                    makeSnapshot(
+                        id: purgeID,
+                        path: syncV2TrashPurgePath,
+                        content: try SyncV2TrashPurgePayload(
+                            purgedRevisions: [targetID: 2],
+                            emptyGeneration: ""
+                        ).canonicalContent(),
+                        revision: 1
+                    ),
+                ]
+            ),
+            stateStore: SnapshotStateStoreStub(
+                states: [targetID: localState(revision: 1)],
+                commitResult: false
+            ),
+            localApplier: applier,
+            mergeStore: SnapshotMergeStoreSpy()
+        )
+
+        _ = try await service.pull(
+            localProjectID: projectID,
+            serverProjectID: serverProjectID
+        )
+
+        let restoredDocument = try await fixture.repository.document(
+            id: DocumentID(rawValue: targetID)
+        )
+        XCTAssertNotNil(restoredDocument)
+        XCTAssertEqual(
+            try String(contentsOf: fixture.trashFileURL, encoding: .utf8),
+            "휴지통 본문"
+        )
+        let restoredState = await applier.trashPurgeState(
+            localProjectID: projectID
+        )
+        XCTAssertEqual(restoredState, .empty)
+        XCTAssertFalse(
+            FileManager.default.fileExists(
+                atPath: root.appendingPathComponent(
+                    LocalSyncV2SnapshotApplier.trashPurgeStagePrefix
+                        + purgeID.uuidString.lowercased()
+                ).path
+            )
+        )
+    }
+
+    func testTrashPurgeRecoveryMarkerRollsBackThenReappliesCommittedBaseline()
+        async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("WriterPad-TrashPurgeRecovery-\(UUID())")
+        defer { try? FileManager.default.removeItem(at: root) }
+        let projectID = ProjectID(rawValue: UUID())
+        let serverProjectID = UUID()
+        let targetID = UUID()
+        let fixture = try makeTrashPurgeFixture(
+            root: root,
+            projectID: projectID,
+            documentID: targetID,
+            fileName: "recovery.txt"
+        )
+        let purgeID = syncV2UUIDv5(
+            namespace: serverProjectID,
+            name: syncV2TrashPurgePath
+        )
+        let content = try SyncV2TrashPurgePayload(
+            purgedRevisions: [targetID: 2],
+            emptyGeneration: ""
+        ).canonicalContent()
+        let firstApplier = LocalSyncV2SnapshotApplier(
+            documentRepository: fixture.repository,
+            workspaceLocator: SnapshotWorkspaceLocator(root: root)
+        )
+        try await firstApplier.applyTrashPurge(
+            localProjectID: projectID,
+            snapshot: makeSnapshot(
+                id: purgeID,
+                path: syncV2TrashPurgePath,
+                content: content,
+                revision: 1
+            ),
+            eligibleDocumentIDs: [targetID]
+        )
+        let markerURL = root.appendingPathComponent(
+            LocalSyncV2SnapshotApplier.markerPrefix
+                + purgeID.uuidString.lowercased()
+                + LocalSyncV2SnapshotApplier.markerSuffix
+        )
+        XCTAssertTrue(FileManager.default.fileExists(atPath: markerURL.path))
+
+        let recoveringApplier = LocalSyncV2SnapshotApplier(
+            documentRepository: fixture.repository,
+            workspaceLocator: SnapshotWorkspaceLocator(root: root)
+        )
+        let service = SyncV2SnapshotPullService(
+            client: SnapshotClientStub(
+                snapshots: [
+                    makeSnapshot(
+                        id: targetID,
+                        path: fixture.originalPath.rawValue,
+                        content: "",
+                        revision: 2,
+                        isDeleted: true
+                    ),
+                    makeSnapshot(
+                        id: purgeID,
+                        path: syncV2TrashPurgePath,
+                        content: content,
+                        revision: 1
+                    ),
+                ]
+            ),
+            stateStore: SnapshotStateStoreStub(
+                states: [
+                    purgeID: localState(revision: 1),
+                    targetID: localState(revision: 2),
+                ]
+            ),
+            localApplier: recoveringApplier,
+            mergeStore: SnapshotMergeStoreSpy()
+        )
+
+        _ = try await service.pull(
+            localProjectID: projectID,
+            serverProjectID: serverProjectID
+        )
+
+        let recoveredDocument = try await fixture.repository.document(
+            id: DocumentID(rawValue: targetID)
+        )
+        XCTAssertNil(recoveredDocument)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: markerURL.path))
+        XCTAssertFalse(
+            FileManager.default.fileExists(atPath: fixture.trashFileURL.path)
+        )
+    }
+
+    func testTrashEmptyGenerationAppliesOnlyOnce() async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("WriterPad-TrashEmptyGeneration-\(UUID())")
+        defer { try? FileManager.default.removeItem(at: root) }
+        let projectID = ProjectID(rawValue: UUID())
+        let firstID = UUID()
+        let fixture = try makeTrashPurgeFixture(
+            root: root,
+            projectID: projectID,
+            documentID: firstID,
+            fileName: "첫 사건.txt"
+        )
+        let applier = LocalSyncV2SnapshotApplier(
+            documentRepository: fixture.repository,
+            workspaceLocator: SnapshotWorkspaceLocator(root: root)
+        )
+        let generation = UUID().uuidString.lowercased()
+        let purgeID = UUID()
+        let content = try SyncV2TrashPurgePayload(
+            purgedRevisions: [:],
+            emptyGeneration: generation
+        ).canonicalContent()
+        try await applier.applyTrashPurge(
+            localProjectID: projectID,
+            snapshot: makeSnapshot(
+                id: purgeID,
+                path: syncV2TrashPurgePath,
+                content: content,
+                revision: 1
+            ),
+            eligibleDocumentIDs: []
+        )
+        await applier.finish(localProjectID: projectID, documentID: purgeID)
+        let firstDocument = try await fixture.repository.document(
+            id: DocumentID(rawValue: firstID)
+        )
+        XCTAssertNil(firstDocument)
+
+        let secondID = DocumentID(rawValue: UUID())
+        let secondPath = RelativeDocumentPath(
+            rawValue: "메인/휴지통/새 사건.txt"
+        )
+        try await fixture.repository.save(
+            DocumentNode(
+                id: secondID,
+                projectID: projectID,
+                kind: .text,
+                parentID: fixture.trashID,
+                relativePath: secondPath,
+                userOrder: 0,
+                modifiedAt: .distantPast,
+                contentHash: nil,
+                deletionStatus: .trashed(
+                    originalPath: RelativeDocumentPath(
+                        rawValue: "메인/메모장/새 사건.txt"
+                    ),
+                    deletedAt: .distantPast
+                )
+            )
+        )
+        let secondURL = root.appendingPathComponent(secondPath.rawValue)
+        try Data("새 사건".utf8).write(to: secondURL)
+
+        try await applier.applyTrashPurge(
+            localProjectID: projectID,
+            snapshot: makeSnapshot(
+                id: purgeID,
+                path: syncV2TrashPurgePath,
+                content: content,
+                revision: 2
+            ),
+            eligibleDocumentIDs: []
+        )
+        await applier.finish(localProjectID: projectID, documentID: purgeID)
+
+        let secondDocument = try await fixture.repository.document(id: secondID)
+        XCTAssertNotNil(secondDocument)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: secondURL.path))
+    }
+
+    func testTreeOrderMaterializesEmptyFolderWithoutHiddenFile() async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("WriterPad-TreeOrder-\(UUID())")
+        defer { try? FileManager.default.removeItem(at: root) }
+        try FileManager.default.createDirectory(
+            at: root.appendingPathComponent("메인"),
+            withIntermediateDirectories: true
+        )
+        let projectID = ProjectID(rawValue: UUID())
+        let main = DocumentNode(
+            id: DocumentID(rawValue: UUID()),
+            projectID: projectID,
+            kind: .folder,
+            parentID: nil,
+            relativePath: RelativeDocumentPath(rawValue: "메인"),
+            userOrder: -1,
+            modifiedAt: .distantPast,
+            contentHash: nil
+        )
+        let repository = SnapshotDocumentRepository(documents: [main])
+        let applier = LocalSyncV2SnapshotApplier(
+            documentRepository: repository,
+            workspaceLocator: SnapshotWorkspaceLocator(root: root)
+        )
+
+        try await applier.apply(
+            localProjectID: projectID,
+            snapshot: makeSnapshot(
+                path: syncV2TreeOrderPath,
+                content:
+                    "{\"tree_order\":{\"<root>\":[\"빈 폴더\"],\"메인/빈 폴더\":[\"하위 빈 폴더\"]},\"version\":1}",
+                revision: 1
+            )
+        )
+
+        let documents = try await repository.documents(in: projectID)
+        let emptyFolder = try XCTUnwrap(documents.first(where: {
+            $0.relativePath.rawValue == "메인/빈 폴더"
+        }))
+        XCTAssertEqual(emptyFolder.kind, .folder)
+        XCTAssertEqual(emptyFolder.parentID, main.id)
+        let nestedFolder = try XCTUnwrap(documents.first(where: {
+            $0.relativePath.rawValue == "메인/빈 폴더/하위 빈 폴더"
+        }))
+        XCTAssertEqual(nestedFolder.kind, .folder)
+        XCTAssertEqual(nestedFolder.parentID, emptyFolder.id)
+        XCTAssertTrue(
+            FileManager.default.fileExists(
+                atPath: root.appendingPathComponent(
+                    "메인/빈 폴더/하위 빈 폴더"
+                ).path
+            )
+        )
+        XCTAssertFalse(
+            FileManager.default.fileExists(
+                atPath: root.appendingPathComponent("__antigravity__").path
+            )
+        )
+    }
+
+    func testTreeOrderNeverMistakesBlockedRemoteTXTForEmptyFolder()
+        async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("WriterPad-TreeOrder-\(UUID())")
+        defer { try? FileManager.default.removeItem(at: root) }
+        try FileManager.default.createDirectory(
+            at: root.appendingPathComponent("메인/메모장"),
+            withIntermediateDirectories: true
+        )
+        let projectID = ProjectID(rawValue: UUID())
+        let serverProjectID = UUID()
+        let main = DocumentNode(
+            id: DocumentID(rawValue: UUID()),
+            projectID: projectID,
+            kind: .folder,
+            parentID: nil,
+            relativePath: RelativeDocumentPath(rawValue: "메인"),
+            userOrder: -1,
+            modifiedAt: .distantPast,
+            contentHash: nil
+        )
+        let notes = DocumentNode(
+            id: DocumentID(rawValue: UUID()),
+            projectID: projectID,
+            kind: .folder,
+            parentID: main.id,
+            relativePath: BinderFixedCategory.notes.relativePath,
+            userOrder: 0,
+            modifiedAt: .distantPast,
+            contentHash: nil
+        )
+        let documentID = UUID()
+        let treeID = syncV2UUIDv5(
+            namespace: serverProjectID,
+            name: syncV2TreeOrderPath
+        )
+        let repository = SnapshotDocumentRepository(documents: [main, notes])
+        let service = SyncV2SnapshotPullService(
+            client: SnapshotClientStub(
+                snapshots: [
+                    makeSnapshot(
+                        id: documentID,
+                        path: "메인/메모장/대기.txt",
+                        content: "편집 중이라 아직 적용하지 않을 본문",
+                        revision: 1
+                    ),
+                    makeSnapshot(
+                        id: treeID,
+                        path: syncV2TreeOrderPath,
+                        content:
+                            "{\"tree_order\":{\"메인/메모장\":[\"대기.txt\"]},\"version\":1}",
+                        revision: 1
+                    ),
+                ]
+            ),
+            stateStore: SnapshotStateStoreStub(states: [:]),
+            localApplier: LocalSyncV2SnapshotApplier(
+                documentRepository: repository,
+                workspaceLocator: SnapshotWorkspaceLocator(root: root)
+            ),
+            mergeStore: SnapshotMergeStoreSpy()
+        )
+
+        _ = try await service.pull(
+            localProjectID: projectID,
+            serverProjectID: serverProjectID,
+            editingGuards: [
+                documentID: .init(
+                    isOpen: true,
+                    isDirty: true,
+                    isComposing: false
+                ),
+            ]
+        )
+
+        let documents = try await repository.documents(in: projectID)
+        XCTAssertFalse(documents.contains(where: {
+            $0.relativePath.rawValue == "메인/메모장/대기.txt"
+        }))
+        var isDirectory: ObjCBool = false
+        XCTAssertFalse(
+            FileManager.default.fileExists(
+                atPath: root.appendingPathComponent(
+                    "메인/메모장/대기.txt"
+                ).path,
+                isDirectory: &isDirectory
+            )
+        )
+    }
+
+    func testPullAppliesTombstoneBeforeNewUUIDReusesSamePath()
+        async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("WriterPad-PathReuse-\(UUID())")
+        defer { try? FileManager.default.removeItem(at: root) }
+        let notesURL = root.appendingPathComponent("메인/메모장")
+        let trashURL = root.appendingPathComponent("메인/휴지통")
+        try FileManager.default.createDirectory(
+            at: notesURL,
+            withIntermediateDirectories: true
+        )
+        try FileManager.default.createDirectory(
+            at: trashURL,
+            withIntermediateDirectories: true
+        )
+        let projectID = ProjectID(rawValue: UUID())
+        let main = DocumentNode(
+            id: DocumentID(rawValue: UUID()),
+            projectID: projectID,
+            kind: .folder,
+            parentID: nil,
+            relativePath: RelativeDocumentPath(rawValue: "메인"),
+            userOrder: -1,
+            modifiedAt: .distantPast,
+            contentHash: nil
+        )
+        let notes = DocumentNode(
+            id: DocumentID(rawValue: UUID()),
+            projectID: projectID,
+            kind: .folder,
+            parentID: main.id,
+            relativePath: BinderFixedCategory.notes.relativePath,
+            userOrder: 0,
+            modifiedAt: .distantPast,
+            contentHash: nil
+        )
+        let trash = DocumentNode(
+            id: DocumentID(rawValue: UUID()),
+            projectID: projectID,
+            kind: .folder,
+            parentID: main.id,
+            relativePath: BinderFixedCategory.trash.relativePath,
+            userOrder: 1,
+            modifiedAt: .distantPast,
+            contentHash: nil
+        )
+        let oldID = DocumentID(
+            rawValue: UUID(
+                uuidString: "ffffffff-0000-0000-0000-000000000001"
+            )!
+        )
+        let newID = DocumentID(
+            rawValue: UUID(
+                uuidString: "00000000-0000-0000-0000-000000000001"
+            )!
+        )
+        let path = RelativeDocumentPath(rawValue: "메인/메모장/재사용.txt")
+        let old = DocumentNode(
+            id: oldID,
+            projectID: projectID,
+            kind: .text,
+            parentID: notes.id,
+            relativePath: path,
+            userOrder: 0,
+            modifiedAt: .distantPast,
+            contentHash: nil
+        )
+        try Data("이전 UUID".utf8).write(
+            to: root.appendingPathComponent(path.rawValue)
+        )
+        let repository = SnapshotDocumentRepository(
+            documents: [main, notes, trash, old]
+        )
+        let service = SyncV2SnapshotPullService(
+            client: SnapshotClientStub(
+                snapshots: [
+                    makeSnapshot(
+                        id: newID.rawValue,
+                        path: path.rawValue,
+                        content: "새 UUID",
+                        revision: 1
+                    ),
+                    makeSnapshot(
+                        id: oldID.rawValue,
+                        path: path.rawValue,
+                        content: "",
+                        revision: 2,
+                        isDeleted: true
+                    ),
+                ]
+            ),
+            stateStore: SnapshotStateStoreStub(states: [:]),
+            localApplier: LocalSyncV2SnapshotApplier(
+                documentRepository: repository,
+                workspaceLocator: SnapshotWorkspaceLocator(root: root)
+            ),
+            mergeStore: SnapshotMergeStoreSpy()
+        )
+
+        let report = try await service.pull(
+            localProjectID: projectID,
+            serverProjectID: UUID()
+        )
+
+        let oldStored = try await repository.document(id: oldID)
+        let newStored = try await repository.document(id: newID)
+        guard case .trashed = oldStored?.deletionStatus else {
+            return XCTFail("이전 UUID는 먼저 휴지통으로 이동해야 합니다.")
+        }
+        XCTAssertEqual(newStored?.relativePath, path)
+        XCTAssertEqual(newStored?.deletionStatus, .active)
+        XCTAssertEqual(
+            try String(
+                contentsOf: root.appendingPathComponent(path.rawValue),
+                encoding: .utf8
+            ),
+            "새 UUID"
+        )
+        XCTAssertEqual(
+            report.appliedSnapshots.map(\.documentID),
+            [oldID.rawValue, newID.rawValue]
+        )
+    }
+
+    func testFailedTreeOrderCASRestoresPreviousOrder() async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("WriterPad-TreeOrder-\(UUID())")
+        defer { try? FileManager.default.removeItem(at: root) }
+        try FileManager.default.createDirectory(
+            at: root.appendingPathComponent("메인/메모장"),
+            withIntermediateDirectories: true
+        )
+        let projectID = ProjectID(rawValue: UUID())
+        let serverProjectID = UUID()
+        let main = DocumentNode(
+            id: DocumentID(rawValue: UUID()),
+            projectID: projectID,
+            kind: .folder,
+            parentID: nil,
+            relativePath: RelativeDocumentPath(rawValue: "메인"),
+            userOrder: -1,
+            modifiedAt: .distantPast,
+            contentHash: nil
+        )
+        let notes = DocumentNode(
+            id: DocumentID(rawValue: UUID()),
+            projectID: projectID,
+            kind: .folder,
+            parentID: main.id,
+            relativePath: BinderFixedCategory.notes.relativePath,
+            userOrder: 0,
+            modifiedAt: .distantPast,
+            contentHash: nil
+        )
+        let first = DocumentNode(
+            id: DocumentID(rawValue: UUID()),
+            projectID: projectID,
+            kind: .text,
+            parentID: notes.id,
+            relativePath: RelativeDocumentPath(
+                rawValue: "메인/메모장/첫째.txt"
+            ),
+            userOrder: 0,
+            modifiedAt: .distantPast,
+            contentHash: nil
+        )
+        let second = DocumentNode(
+            id: DocumentID(rawValue: UUID()),
+            projectID: projectID,
+            kind: .text,
+            parentID: notes.id,
+            relativePath: RelativeDocumentPath(
+                rawValue: "메인/메모장/둘째.txt"
+            ),
+            userOrder: 1,
+            modifiedAt: .distantPast,
+            contentHash: nil
+        )
+        let repository = SnapshotDocumentRepository(
+            documents: [main, notes, first, second]
+        )
+        let treeID = syncV2UUIDv5(
+            namespace: serverProjectID,
+            name: syncV2TreeOrderPath
+        )
+        let service = SyncV2SnapshotPullService(
+            client: SnapshotClientStub(
+                snapshots: [
+                    makeSnapshot(
+                        id: treeID,
+                        path: syncV2TreeOrderPath,
+                        content:
+                            "{\"tree_order\":{\"<root>\":[\"메모장\",\"빈 폴더\"],\"메인/메모장\":[\"둘째.txt\",\"첫째.txt\"]},\"version\":1}",
+                        revision: 2
+                    ),
+                ]
+            ),
+            stateStore: SnapshotStateStoreStub(
+                states: [treeID: localState(revision: 1)],
+                commitResult: false
+            ),
+            localApplier: LocalSyncV2SnapshotApplier(
+                documentRepository: repository,
+                workspaceLocator: SnapshotWorkspaceLocator(root: root)
+            ),
+            mergeStore: SnapshotMergeStoreSpy()
+        )
+
+        _ = try await service.pull(
+            localProjectID: projectID,
+            serverProjectID: serverProjectID
+        )
+
+        let restoredFirst = try await repository.document(id: first.id)
+        let restoredSecond = try await repository.document(id: second.id)
+        XCTAssertEqual(restoredFirst, first)
+        XCTAssertEqual(restoredSecond, second)
+        XCTAssertFalse(
+            FileManager.default.fileExists(
+                atPath: root.appendingPathComponent("메인/빈 폴더").path
+            )
+        )
+        let restoredDocuments = try await repository.documents(in: projectID)
+        XCTAssertFalse(
+            restoredDocuments.contains(where: {
+                $0.relativePath.rawValue == "메인/빈 폴더"
+            })
+        )
     }
 
     func testEqualServerRevisionWithPendingLocalOperationIsNotUpToDate()
@@ -617,6 +2243,148 @@ final class SyncV2SnapshotPullTests: XCTestCase {
         )
     }
 
+    func testLocalApplierMovesRemoteTombstoneToNumberedTrashAndRestoresSameUUID()
+        async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("WriterPad-Tombstone-\(UUID())")
+        defer { try? FileManager.default.removeItem(at: root) }
+        let notesURL = root.appendingPathComponent("메인/메모장")
+        let trashURL = root.appendingPathComponent("메인/휴지통")
+        try FileManager.default.createDirectory(
+            at: notesURL,
+            withIntermediateDirectories: true
+        )
+        try FileManager.default.createDirectory(
+            at: trashURL,
+            withIntermediateDirectories: true
+        )
+        try Data("기존 휴지통 사본".utf8).write(
+            to: trashURL.appendingPathComponent("사건.txt")
+        )
+
+        let projectID = ProjectID(rawValue: UUID())
+        let notesID = DocumentID(rawValue: UUID())
+        let trashID = DocumentID(rawValue: UUID())
+        let documentID = DocumentID(rawValue: UUID())
+        let originalPath = RelativeDocumentPath(
+            rawValue: "메인/메모장/사건.txt"
+        )
+        let notes = DocumentNode(
+            id: notesID,
+            projectID: projectID,
+            kind: .folder,
+            parentID: nil,
+            relativePath: BinderFixedCategory.notes.relativePath,
+            userOrder: 0,
+            modifiedAt: .distantPast,
+            contentHash: nil
+        )
+        let trash = DocumentNode(
+            id: trashID,
+            projectID: projectID,
+            kind: .folder,
+            parentID: nil,
+            relativePath: BinderFixedCategory.trash.relativePath,
+            userOrder: 1,
+            modifiedAt: .distantPast,
+            contentHash: nil
+        )
+        let document = DocumentNode(
+            id: documentID,
+            projectID: projectID,
+            kind: .text,
+            parentID: notesID,
+            relativePath: originalPath,
+            userOrder: 2,
+            modifiedAt: .distantPast,
+            contentHash: SHA256ContentHasher().sha256(
+                for: Data("보존할 로컬 본문".utf8)
+            )
+        )
+        let originalURL = root.appendingPathComponent(originalPath.rawValue)
+        try Data("보존할 로컬 본문".utf8).write(to: originalURL)
+        let repository = SnapshotDocumentRepository(
+            documents: [notes, trash, document]
+        )
+        let applier = LocalSyncV2SnapshotApplier(
+            documentRepository: repository,
+            workspaceLocator: SnapshotWorkspaceLocator(root: root)
+        )
+        let tombstone = makeSnapshot(
+            id: documentID.rawValue,
+            path: originalPath.rawValue,
+            content: "",
+            revision: 2,
+            isDeleted: true
+        )
+
+        try await applier.apply(
+            localProjectID: projectID,
+            snapshot: tombstone
+        )
+        await applier.finish(
+            localProjectID: projectID,
+            documentID: documentID.rawValue
+        )
+
+        let numberedTrashURL = trashURL.appendingPathComponent("사건_2.txt")
+        XCTAssertFalse(FileManager.default.fileExists(atPath: originalURL.path))
+        XCTAssertEqual(
+            try String(contentsOf: numberedTrashURL, encoding: .utf8),
+            "보존할 로컬 본문"
+        )
+        let trashedDocument = try await repository.document(id: documentID)
+        let trashed = try XCTUnwrap(trashedDocument)
+        XCTAssertEqual(trashed.id, documentID)
+        XCTAssertEqual(
+            trashed.relativePath.rawValue,
+            "메인/휴지통/사건_2.txt"
+        )
+        guard case let .trashed(restoredOriginalPath, _) =
+                trashed.deletionStatus else {
+            return XCTFail("원격 tombstone이 로컬 휴지통 상태여야 합니다.")
+        }
+        XCTAssertEqual(restoredOriginalPath, originalPath)
+        let trashRecordURL = root.appendingPathComponent(
+            ".writerpad-trash-"
+                + documentID.rawValue.uuidString.lowercased()
+                + ".json"
+        )
+        XCTAssertTrue(
+            FileManager.default.fileExists(atPath: trashRecordURL.path)
+        )
+
+        try await applier.apply(
+            localProjectID: projectID,
+            snapshot: makeSnapshot(
+                id: documentID.rawValue,
+                path: originalPath.rawValue,
+                content: "서버에서 복원한 본문",
+                revision: 3
+            )
+        )
+        await applier.finish(
+            localProjectID: projectID,
+            documentID: documentID.rawValue
+        )
+
+        let restoredDocument = try await repository.document(id: documentID)
+        let restored = try XCTUnwrap(restoredDocument)
+        XCTAssertEqual(restored.id, documentID)
+        XCTAssertEqual(restored.relativePath, originalPath)
+        XCTAssertEqual(restored.deletionStatus, .active)
+        XCTAssertEqual(
+            try String(contentsOf: originalURL, encoding: .utf8),
+            "서버에서 복원한 본문"
+        )
+        XCTAssertFalse(
+            FileManager.default.fileExists(atPath: numberedTrashURL.path)
+        )
+        XCTAssertFalse(
+            FileManager.default.fileExists(atPath: trashRecordURL.path)
+        )
+    }
+
     func testLocalApplierRecoversRenameAfterMetadataFailure()
         async throws {
         let root = FileManager.default.temporaryDirectory
@@ -711,6 +2479,69 @@ final class SyncV2SnapshotPullTests: XCTestCase {
         )
     }
 
+    func testSyncV2StandardTimingPreservesBudgetsAndConstraints() throws {
+        let timing = SyncV2Timing.standard
+
+        XCTAssertEqual(timing.authRestoreTimeout, .seconds(12))
+        XCTAssertEqual(
+            timing.realtimeSubscriptionTimeout,
+            .seconds(12)
+        )
+        XCTAssertEqual(timing.pullTimeout, .seconds(15))
+        XCTAssertEqual(
+            timing.workspaceAuthenticationTimeout,
+            .seconds(12)
+        )
+        XCTAssertEqual(timing.authenticationRetryDelay, .seconds(3))
+        XCTAssertEqual(timing.periodicDelay, .seconds(90))
+        XCTAssertEqual(timing.debounceDelay, .milliseconds(450))
+        XCTAssertEqual(timing.refreshMargin, 5 * 60)
+        XCTAssertEqual(timing.refreshRetryDelay, .seconds(30))
+        XCTAssertEqual(
+            timing.backoff,
+            [
+                .seconds(1), .seconds(2), .seconds(5),
+                .seconds(10), .seconds(30),
+            ]
+        )
+        XCTAssertEqual(timing.gateHoldTimeout, .seconds(20))
+        XCTAssertEqual(
+            timing.authenticationRestoringYieldDelay,
+            .milliseconds(100)
+        )
+        XCTAssertEqual(
+            timing.stableSubscriptionResetInterval,
+            .seconds(30)
+        )
+        XCTAssertEqual(timing.quietProgressInterval, .seconds(3))
+
+        XCTAssertGreaterThan(
+            timing.pullTimeout,
+            timing.authRestoreTimeout
+        )
+        XCTAssertLessThan(
+            timing.realtimeSubscriptionTimeout,
+            timing.pullTimeout
+        )
+        XCTAssertLessThan(timing.maximumBackoff, timing.periodicDelay)
+        XCTAssertLessThan(
+            timing.debounceDelay,
+            try XCTUnwrap(timing.backoff.min())
+        )
+        XCTAssertGreaterThan(
+            timing.gateHoldTimeout,
+            timing.pullTimeout
+        )
+        XCTAssertLessThan(
+            timing.refreshRetryDelay,
+            .seconds(timing.refreshMargin)
+        )
+        XCTAssertEqual(
+            timing.workspaceAuthenticationTimeout,
+            timing.authRestoreTimeout
+        )
+    }
+
     func testWorkspaceStatusReducerUsesTextIconDetailAndStablePriority() {
         let hash = ContentHash(
             rawValue: String(repeating: "a", count: 64)
@@ -723,7 +2554,9 @@ final class SyncV2SnapshotPullTests: XCTestCase {
         let editing = WorkspaceSyncStatusReducer.presentation(
             saveState: .editing(generation: 2),
             handoffState: .failed(generation: 2, message: "record"),
-            serverState: .failed(detail: "server"),
+            workspaceState: SyncV2WorkspaceState(
+                lastResult: .failed(detail: "server")
+            ),
             leaseState: .heldByOther(expiresAt: nil)
         )
         XCTAssertEqual(editing.label, "편집 중")
@@ -733,46 +2566,46 @@ final class SyncV2SnapshotPullTests: XCTestCase {
         let cases: [(
             SaveState,
             SyncHandoffState,
-            SyncV2WorkspaceServerState,
+            SyncV2WorkspaceState,
             EditLeaseDisplayState,
             String
         )] = [
-            (.saving(generation: 1), .idle, .idle, .localOnly, "로컬 저장 중"),
-            (saved, .failed(generation: 1, message: "기록"), .idle, .localOnly, "동기화 기록 실패"),
-            (saved, .idle, .syncing, .localOnly, "서버 동기화 중"),
-            (saved, .idle, .checkingAuthentication, .localOnly, "로그인 확인 중"),
-            (saved, .idle, .synced(at: .distantPast), .localOnly, "서버 동기화됨"),
-            (saved, .idle, .offlineSaved, .localOnly, "오프라인 저장됨"),
+            (.saving(generation: 1), .idle, .init(), .localOnly, "로컬 저장 중"),
+            (saved, .failed(generation: 1, message: "기록"), .init(), .localOnly, "동기화 기록 실패"),
+            (saved, .idle, .init(progress: .pulling), .localOnly, "서버 동기화 중"),
+            (saved, .idle, .init(progress: .checkingAuthentication), .localOnly, "로그인 확인 중"),
+            (saved, .idle, .init(lastResult: .synced(at: .distantPast)), .localOnly, "서버 동기화됨"),
+            (saved, .idle, .init(connection: .offline), .localOnly, "오프라인 저장됨"),
             (
                 saved,
                 .queued(generation: 1, operationIDs: [UUID()]),
-                .syncing,
+                .init(progress: .pulling),
                 .heldByOther(expiresAt: nil),
                 "다른 기기 편집 중"
             ),
             (
                 saved,
                 .queued(generation: 1, operationIDs: [UUID()]),
-                .waiting,
+                .init(lastResult: .waiting),
                 .heldByOther(expiresAt: nil),
                 "다른 기기 편집 중"
             ),
             (
                 saved,
                 .queued(generation: 1, operationIDs: [UUID()]),
-                .synced(at: Date(timeIntervalSince1970: 0)),
+                .init(lastResult: .synced(at: Date(timeIntervalSince1970: 0))),
                 .localOnly,
                 "동기화 대기"
             ),
             (
                 saved,
                 .queued(generation: 1, operationIDs: [UUID()]),
-                .synced(at: Date(timeIntervalSince1970: 2)),
+                .init(lastResult: .synced(at: Date(timeIntervalSince1970: 2))),
                 .localOnly,
                 "서버 동기화됨"
             ),
-            (saved, .queued(generation: 1, operationIDs: [UUID()]), .idle, .localOnly, "동기화 대기"),
-            (saved, .idle, .authenticationRequired, .localOnly, "인증 필요"),
+            (saved, .queued(generation: 1, operationIDs: [UUID()]), .init(), .localOnly, "동기화 대기"),
+            (saved, .idle, .init(lastResult: .authenticationRequired), .localOnly, "인증 필요"),
             (
                 saved,
                 .serverSizeLimitExceeded(
@@ -780,35 +2613,35 @@ final class SyncV2SnapshotPullTests: XCTestCase {
                     byteCount: 11,
                     limit: 10
                 ),
-                .idle,
+                .init(),
                 .localOnly,
                 "서버 크기 제한 초과"
             ),
-            (saved, .idle, .idle, .heldByOther(expiresAt: nil), "다른 기기 편집 중"),
-            (saved, .idle, .automaticallyMerged, .localOnly, "자동 병합됨"),
-            (saved, .idle, .conflictRequired(detail: "충돌"), .localOnly, "충돌 해결 필요"),
+            (saved, .idle, .init(), .heldByOther(expiresAt: nil), "다른 기기 편집 중"),
+            (saved, .idle, .init(lastResult: .automaticallyMerged), .localOnly, "자동 병합됨"),
+            (saved, .idle, .init(lastResult: .conflictRequired(detail: "충돌")), .localOnly, "충돌 해결 필요"),
             (
                 saved,
                 .idle,
-                .structuralConflict(detail: "경로 충돌"),
+                .init(lastResult: .structuralConflict(detail: "경로 충돌")),
                 .localOnly,
                 "제목·경로 확인 필요"
             ),
             (
                 saved,
                 .queued(generation: 1, operationIDs: [UUID()]),
-                .conflictRequired(detail: "보존된 충돌"),
+                .init(lastResult: .conflictRequired(detail: "보존된 충돌")),
                 .localOnly,
                 "충돌 해결 필요"
             ),
-            (saved, .idle, .failed(detail: "실패"), .localOnly, "동기화 실패"),
-            (saved, .idle, .idle, .localOnly, "클라우드 전송 준비"),
+            (saved, .idle, .init(lastResult: .failed(detail: "실패")), .localOnly, "동기화 실패"),
+            (saved, .idle, .init(), .localOnly, "클라우드 전송 준비"),
         ]
         for (save, handoff, server, lease, expected) in cases {
             let presentation = WorkspaceSyncStatusReducer.presentation(
                 saveState: save,
                 handoffState: handoff,
-                serverState: server,
+                workspaceState: server,
                 leaseState: lease
             )
             XCTAssertEqual(presentation.label, expected)
@@ -829,10 +2662,10 @@ final class SyncV2SnapshotPullTests: XCTestCase {
         let connectedStates: [(
             SaveState,
             SyncHandoffState,
-            SyncV2WorkspaceServerState
+            SyncV2WorkspaceState
         )] = [
-            (.editing(generation: 1), .idle, .idle),
-            (.saving(generation: 1), .idle, .idle),
+            (.editing(generation: 1), .idle, .init()),
+            (.saving(generation: 1), .idle, .init()),
             (
                 .saved(
                     generation: 1,
@@ -840,7 +2673,7 @@ final class SyncV2SnapshotPullTests: XCTestCase {
                     contentHash: hash
                 ),
                 .idle,
-                .idle
+                .init()
             ),
             (
                 .saved(
@@ -849,7 +2682,7 @@ final class SyncV2SnapshotPullTests: XCTestCase {
                     contentHash: hash
                 ),
                 .queued(generation: 1, operationIDs: [UUID()]),
-                .idle
+                .init()
             ),
             (
                 .saved(
@@ -858,7 +2691,7 @@ final class SyncV2SnapshotPullTests: XCTestCase {
                     contentHash: hash
                 ),
                 .idle,
-                .synced(at: savedAt)
+                .init(lastResult: .synced(at: savedAt))
             ),
         ]
 
@@ -866,7 +2699,7 @@ final class SyncV2SnapshotPullTests: XCTestCase {
             let presentation = WorkspaceSyncStatusReducer.presentation(
                 saveState: saveState,
                 handoffState: handoffState,
-                serverState: serverState,
+                workspaceState: serverState,
                 leaseState: .localOnly
             )
             XCTAssertTrue(
@@ -886,11 +2719,113 @@ final class SyncV2SnapshotPullTests: XCTestCase {
                 contentHash: hash
             ),
             handoffState: .idle,
-            serverState: .localOnly,
+            workspaceState: SyncV2WorkspaceState(lastResult: .localOnly),
             leaseState: .localOnly
         )
         XCTAssertEqual(localOnly.label, "로컬 저장됨")
         XCTAssertEqual(localOnly.systemImage, "checkmark.circle")
+    }
+
+    func testWorkspaceStatusReducerComposesIndependentAxes() {
+        let conflict = SyncV2WorkspaceState.Result.conflictRequired(
+            detail: "본문 변경이 겹쳐 원본과 병합 후보를 보존했습니다."
+        )
+        let cases: [(SyncV2WorkspaceState, String)] = [
+            (
+                .init(
+                    progress: .pulling,
+                    connection: .offline,
+                    lastResult: conflict
+                ),
+                "서버 동기화 중"
+            ),
+            (
+                .init(connection: .reconnecting, lastResult: conflict),
+                "충돌 해결 필요"
+            ),
+            (
+                .init(connection: .reconnecting, lastResult: .waiting),
+                "동기화 대기"
+            ),
+            (
+                .init(
+                    connection: .unknown,
+                    lastResult: .synced(at: .distantPast)
+                ),
+                "서버 동기화됨"
+            ),
+            (
+                .init(
+                    connection: .reconnecting,
+                    lastResult: .synced(at: .distantPast)
+                ),
+                "서버 재연결 중"
+            ),
+        ]
+
+        for (workspaceState, expectedLabel) in cases {
+            let presentation = WorkspaceSyncStatusReducer.presentation(
+                saveState: .idle,
+                handoffState: .idle,
+                workspaceState: workspaceState,
+                leaseState: .localOnly
+            )
+            XCTAssertEqual(presentation.label, expectedLabel)
+        }
+    }
+
+    @MainActor
+    func testWorkspaceStartsWithActualInactiveSceneWithoutStaleAuthCheck()
+        async throws {
+        let previous = GlobalSyncPreference.isEnabled()
+        GlobalSyncPreference.setEnabled(true)
+        defer { GlobalSyncPreference.setEnabled(previous) }
+        let localProjectID = ProjectID(rawValue: UUID())
+        let puller = WorkspacePullerStub()
+        let model = SyncV2WorkspaceSyncModel(
+            localProjectID: localProjectID,
+            puller: puller,
+            realtime: nil,
+            authenticationService: WorkspaceAuthenticationStub(
+                state: .authenticated(
+                    AuthenticatedAccount(
+                        userID: UUID(),
+                        maskedEmail: "u***@example.com"
+                    )
+                )
+            ),
+            projectBindingService: WorkspaceBindingStub(
+                binding: .connected(
+                    localProjectID: localProjectID,
+                    serverProjectID: UUID(),
+                    kind: .existingServerProject,
+                    projectName: "initial inactive scene",
+                    ownerSubject: UUID()
+                )
+            ),
+            periodicDelay: .seconds(600)
+        )
+
+        await model.start(
+            sceneIsActive: false,
+            editingGuards: { [:] }
+        ) { _ in }
+        XCTAssertEqual(model.state, SyncV2WorkspaceState())
+        var pullCount = await puller.count()
+        XCTAssertEqual(pullCount, 0)
+
+        await model.updateSceneActivity(true)
+        for _ in 0..<500 where await puller.count() == 0 {
+            await Task.yield()
+        }
+        pullCount = await puller.count()
+        XCTAssertEqual(pullCount, 1)
+        if case .synced = model.state.lastResult {
+            // expected
+        } else {
+            XCTFail("Expected synced, got \(model.state)")
+        }
+        await model.stop()
     }
 
     @MainActor
@@ -1005,11 +2940,11 @@ final class SyncV2SnapshotPullTests: XCTestCase {
         try await Task.sleep(for: .milliseconds(80))
         let pullCount = await puller.count()
         XCTAssertEqual(pullCount, 1)
-        if case .synced = model.serverState {
+        if case .synced = model.state.lastResult {
             // expected
         } else {
             XCTFail(
-                "Expected synced after successful pull, got \(model.serverState)"
+                "Expected synced after successful pull, got \(model.state)"
             )
         }
         await model.stop()
@@ -1058,16 +2993,16 @@ final class SyncV2SnapshotPullTests: XCTestCase {
         }
 
         await authentication.setState(.signedOut(.userInitiated))
-        for _ in 0..<500 where model.serverState != .authenticationRequired {
+        for _ in 0..<500 where model.state.lastResult != .authenticationRequired {
             await Task.yield()
         }
-        XCTAssertEqual(model.serverState, .authenticationRequired)
+        XCTAssertEqual(model.state.lastResult, .authenticationRequired)
 
         let pullsBeforeLogin = await puller.count()
         await authentication.setState(.authenticated(account))
         for _ in 0..<500 {
             if await puller.count() > pullsBeforeLogin,
-               case .synced = model.serverState {
+               case .synced = model.state.lastResult {
                 break
             }
             await Task.yield()
@@ -1075,10 +3010,10 @@ final class SyncV2SnapshotPullTests: XCTestCase {
 
         let pullsAfterLogin = await puller.count()
         XCTAssertGreaterThan(pullsAfterLogin, pullsBeforeLogin)
-        if case .synced = model.serverState {
+        if case .synced = model.state.lastResult {
             // expected
         } else {
-            XCTFail("Expected synced, got \(model.serverState)")
+            XCTFail("Expected synced, got \(model.state)")
         }
         await model.stop()
     }
@@ -1109,7 +3044,7 @@ final class SyncV2SnapshotPullTests: XCTestCase {
 
         let stopCount = await realtime.stopCount()
         XCTAssertGreaterThanOrEqual(stopCount, 1)
-        XCTAssertEqual(model.serverState, .reconnecting)
+        XCTAssertEqual(model.state.connection, .reconnecting)
         await model.stop()
     }
 
@@ -1143,7 +3078,7 @@ final class SyncV2SnapshotPullTests: XCTestCase {
         await realtime.emitStatus(.subscribing)
         for _ in 0..<10 { await Task.yield() }
 
-        XCTAssertEqual(model.serverState, .reconnecting)
+        XCTAssertEqual(model.state.connection, .reconnecting)
         await model.stop()
     }
 
@@ -1158,30 +3093,38 @@ final class SyncV2SnapshotPullTests: XCTestCase {
         let documentID = UUID()
         let cases: [(
             SyncV2SnapshotMergeReason,
-            SyncV2WorkspaceServerState
+            SyncV2WorkspaceState
         )] = [
             (
                 .unresolvedConflict,
-                .conflictRequired(
-                    detail: "본문 변경이 겹쳐 원본과 병합 후보를 보존했습니다."
+                SyncV2WorkspaceState(
+                    lastResult: .conflictRequired(
+                        detail: "본문 변경이 겹쳐 원본과 병합 후보를 보존했습니다."
+                    )
                 )
             ),
             (
                 .blockedOperation,
-                .failed(
-                    detail: "서버가 저장 작업을 거부했습니다. 로그인 계정과 작품 접근 권한을 확인한 뒤 다시 시도하세요. 로컬 TXT는 보존되어 있습니다."
+                SyncV2WorkspaceState(
+                    lastResult: .failed(
+                        detail: "서버가 저장 작업을 거부했습니다. 로그인 계정과 작품 접근 권한을 확인한 뒤 다시 시도하세요. 로컬 TXT는 보존되어 있습니다."
+                    )
                 )
             ),
             (
                 .pathOccupiedByDifferentDocument,
-                .structuralConflict(
-                    detail: "서버 문서의 새 제목과 같은 경로를 다른 로컬 문서가 사용 중입니다. 로컬 TXT는 덮어쓰지 않았습니다."
+                SyncV2WorkspaceState(
+                    lastResult: .structuralConflict(
+                        detail: "서버 문서의 새 제목과 같은 경로를 다른 로컬 문서가 사용 중입니다. 로컬 TXT는 덮어쓰지 않았습니다."
+                    )
                 )
             ),
             (
                 .invalidLocalHierarchy,
-                .structuralConflict(
-                    detail: "서버 문서의 제목 또는 폴더 위치를 현재 로컬 바인더에 안전하게 적용할 수 없습니다. 로컬 TXT는 덮어쓰지 않았습니다."
+                SyncV2WorkspaceState(
+                    lastResult: .structuralConflict(
+                        detail: "서버 문서의 제목 또는 폴더 위치를 현재 로컬 바인더에 안전하게 적용할 수 없습니다. 로컬 TXT는 덮어쓰지 않았습니다."
+                    )
                 )
             ),
         ]
@@ -1225,7 +3168,7 @@ final class SyncV2SnapshotPullTests: XCTestCase {
 
             await model.start(editingGuards: { [:] }) { _ in }
             try await Task.sleep(for: .milliseconds(50))
-            XCTAssertEqual(model.serverState, expectedState)
+            XCTAssertEqual(model.state, expectedState)
             await model.stop()
         }
     }
@@ -1598,7 +3541,7 @@ final class SyncV2SnapshotPullTests: XCTestCase {
         )
 
         await model.start(editingGuards: { [:] }) { _ in }
-        XCTAssertEqual(model.serverState, .checkingAuthentication)
+        XCTAssertEqual(model.state.progress, .checkingAuthentication)
         var count = await puller.count()
         XCTAssertEqual(count, 0)
 
@@ -1615,10 +3558,10 @@ final class SyncV2SnapshotPullTests: XCTestCase {
         }
         count = await puller.count()
         XCTAssertEqual(count, 1)
-        if case .synced = model.serverState {
+        if case .synced = model.state.lastResult {
             // expected
         } else {
-            XCTFail("Expected synced, got \(model.serverState)")
+            XCTFail("Expected synced, got \(model.state)")
         }
         await model.stop()
     }
@@ -1646,14 +3589,14 @@ final class SyncV2SnapshotPullTests: XCTestCase {
         )
 
         await model.start(editingGuards: { [:] }) { _ in }
-        XCTAssertEqual(model.serverState, .checkingAuthentication)
+        XCTAssertEqual(model.state.progress, .checkingAuthentication)
         await timeout.waitUntilSleeping()
         await timeout.fire()
-        for _ in 0..<100 where model.serverState != .offlineSaved {
+        for _ in 0..<100 where model.state.connection != .offline {
             await Task.yield()
         }
 
-        XCTAssertEqual(model.serverState, .offlineSaved)
+        XCTAssertEqual(model.state.connection, .offline)
         await model.stop()
     }
 
@@ -1676,15 +3619,15 @@ final class SyncV2SnapshotPullTests: XCTestCase {
         )
 
         await model.start(editingGuards: { [:] }) { _ in }
-        for _ in 0..<50 where model.serverState != .offlineSaved {
+        for _ in 0..<50 where model.state.connection != .offline {
             try? await Task.sleep(for: .milliseconds(10))
         }
 
-        XCTAssertEqual(model.serverState, .offlineSaved)
+        XCTAssertEqual(model.state.connection, .offline)
         try? await Task.sleep(for: .milliseconds(150))
-        XCTAssertEqual(model.serverState, .offlineSaved)
+        XCTAssertEqual(model.state.connection, .offline)
         await model.networkRecovered()
-        XCTAssertEqual(model.serverState, .offlineSaved)
+        XCTAssertEqual(model.state.connection, .offline)
         let restoreCallCount = await authentication.restoreCallCount()
         XCTAssertGreaterThanOrEqual(restoreCallCount, 2)
         await model.stop()
@@ -1736,10 +3679,10 @@ final class SyncV2SnapshotPullTests: XCTestCase {
         let pullCount = await puller.count()
         XCTAssertEqual(restoreCallCount, 2)
         XCTAssertEqual(pullCount, 1)
-        if case .synced = model.serverState {
+        if case .synced = model.state.lastResult {
             // expected
         } else {
-            XCTFail("Expected synced, got \(model.serverState)")
+            XCTFail("Expected synced, got \(model.state)")
         }
         await model.stop()
     }
@@ -1791,10 +3734,10 @@ final class SyncV2SnapshotPullTests: XCTestCase {
         let pullCount = await puller.count()
         XCTAssertEqual(restoreCallCount, 2)
         XCTAssertEqual(pullCount, 1)
-        if case .synced = model.serverState {
+        if case .synced = model.state.lastResult {
             // expected
         } else {
-            XCTFail("Expected synced, got \(model.serverState)")
+            XCTFail("Expected synced, got \(model.state)")
         }
         await model.stop()
     }
@@ -1828,7 +3771,7 @@ final class SyncV2SnapshotPullTests: XCTestCase {
         )
 
         await model.start(editingGuards: { [:] }) { _ in }
-        XCTAssertEqual(model.serverState, .offlineSaved)
+        XCTAssertEqual(model.state.connection, .offline)
 
         await auth.setState(
             .authenticated(
@@ -1844,10 +3787,10 @@ final class SyncV2SnapshotPullTests: XCTestCase {
         }
         let pullCount = await puller.count()
         XCTAssertEqual(pullCount, 1)
-        if case .synced = model.serverState {
+        if case .synced = model.state.lastResult {
             // expected
         } else {
-            XCTFail("Expected synced, got \(model.serverState)")
+            XCTFail("Expected synced, got \(model.state)")
         }
         await model.stop()
     }
@@ -1878,7 +3821,7 @@ final class SyncV2SnapshotPullTests: XCTestCase {
         )
 
         await model.start(editingGuards: { [:] }) { _ in }
-        XCTAssertEqual(model.serverState, .localOnly)
+        XCTAssertEqual(model.state.lastResult, .localOnly)
         var pullCount = await puller.count()
         XCTAssertEqual(pullCount, 0)
 
@@ -1895,10 +3838,10 @@ final class SyncV2SnapshotPullTests: XCTestCase {
 
         pullCount = await puller.count()
         XCTAssertEqual(pullCount, 1)
-        if case .synced = model.serverState {
+        if case .synced = model.state.lastResult {
             // expected
         } else {
-            XCTFail("Expected synced, got \(model.serverState)")
+            XCTFail("Expected synced, got \(model.state)")
         }
         await model.stop()
     }
@@ -1941,10 +3884,10 @@ final class SyncV2SnapshotPullTests: XCTestCase {
         let refreshCount = await authentication.refreshCount()
         XCTAssertEqual(pullCount, 2)
         XCTAssertEqual(refreshCount, 1)
-        if case .synced = model.serverState {
+        if case .synced = model.state.lastResult {
             // expected
         } else {
-            XCTFail("Expected synced, got \(model.serverState)")
+            XCTFail("Expected synced, got \(model.state)")
         }
         await model.stop()
     }
@@ -1980,7 +3923,7 @@ final class SyncV2SnapshotPullTests: XCTestCase {
                 where await realtime.startCount() <= oldIndex + 1 {
                 await Task.yield()
             }
-            XCTAssertEqual(model.serverState, .reconnecting)
+            XCTAssertEqual(model.state.connection, .reconnecting)
 
             let beforeStale = await puller.count()
             await realtime.emitStatus(.subscribed, at: oldIndex)
@@ -2023,7 +3966,7 @@ final class SyncV2SnapshotPullTests: XCTestCase {
 
         let pullCount = await puller.count()
         XCTAssertEqual(pullCount, 2)
-        if case .synced = model.serverState {
+        if case .synced = model.state.lastResult {
             // expected
         } else {
             XCTFail("Expected synced after watchdog retry")
@@ -2099,16 +4042,16 @@ final class SyncV2SnapshotPullTests: XCTestCase {
         await model.start(editingGuards: { [:] }) { _ in }
         await realtime.emitStatus(.subscribed)
         for _ in 0..<100 {
-            if case .synced = model.serverState { break }
+            if case .synced = model.state.lastResult { break }
             await Task.yield()
         }
         await realtime.emitStatus(.closed)
 
-        XCTAssertEqual(model.serverState, .reconnecting)
+        XCTAssertEqual(model.state.connection, .reconnecting)
         let presentation = WorkspaceSyncStatusReducer.presentation(
             saveState: .idle,
             handoffState: .idle,
-            serverState: model.serverState,
+            workspaceState: model.state,
             leaseState: .localOnly
         )
         XCTAssertEqual(presentation.label, "서버 재연결 중")
@@ -2307,17 +4250,72 @@ final class SyncV2SnapshotPullTests: XCTestCase {
 
         await model.start(editingGuards: { [:] }) { _ in }
         for _ in 0..<500 {
-            if case .synced = model.serverState { break }
+            if case .synced = model.state.lastResult { break }
             await Task.yield()
         }
 
         let pullCount = await puller.count()
         XCTAssertEqual(pullCount, 1)
-        if case .synced = model.serverState {
+        if case .synced = model.state.lastResult {
             // expected
         } else {
-            XCTFail("Expected synced, got \(model.serverState)")
+            XCTFail("Expected synced, got \(model.state)")
         }
+        XCTAssertEqual(model.state.connection, .unknown)
+        let presentation = WorkspaceSyncStatusReducer.presentation(
+            saveState: .idle,
+            handoffState: .idle,
+            workspaceState: model.state,
+            leaseState: .localOnly
+        )
+        XCTAssertEqual(presentation.label, "서버 동기화됨")
+        await model.stop()
+    }
+
+    @MainActor
+    func testRealtimeFailureCannotOverwriteConflictResult() async throws {
+        let previous = GlobalSyncPreference.isEnabled()
+        GlobalSyncPreference.setEnabled(true)
+        defer { GlobalSyncPreference.setEnabled(previous) }
+        let realtime = WorkspaceRealtimeStub()
+        let puller = WorkspacePullerStub(
+            report: SyncV2SnapshotPullReport(
+                outcomes: [
+                    .mergeRequired(
+                        documentID: UUID(),
+                        revision: 2,
+                        reason: .unresolvedConflict
+                    ),
+                ],
+                appliedSnapshots: []
+            )
+        )
+        let model = makeLifecycleModel(
+            puller: puller,
+            realtime: realtime,
+            retryDelays: [.seconds(60)]
+        )
+
+        await model.start(editingGuards: { [:] }) { _ in }
+        for _ in 0..<500 {
+            if case .conflictRequired = model.state.lastResult { break }
+            await Task.yield()
+        }
+        await realtime.emitStatus(.closed)
+
+        XCTAssertEqual(model.state.connection, .reconnecting)
+        if case .conflictRequired = model.state.lastResult {
+            // expected
+        } else {
+            XCTFail("Expected preserved conflict, got \(model.state)")
+        }
+        let presentation = WorkspaceSyncStatusReducer.presentation(
+            saveState: .idle,
+            handoffState: .idle,
+            workspaceState: model.state,
+            leaseState: .localOnly
+        )
+        XCTAssertEqual(presentation.label, "충돌 해결 필요")
         await model.stop()
     }
 
@@ -2365,7 +4363,7 @@ final class SyncV2SnapshotPullTests: XCTestCase {
         }
         await pullTimeoutSleep.resumeLast()
         for _ in 0..<500 {
-            if case .authenticationRequired = model.serverState { break }
+            if case .authenticationRequired = model.state.lastResult { break }
             await Task.yield()
         }
 
@@ -2376,7 +4374,7 @@ final class SyncV2SnapshotPullTests: XCTestCase {
 
         let pullCount = await puller.count()
         XCTAssertEqual(pullCount, 2)
-        if case .synced = model.serverState {
+        if case .synced = model.state.lastResult {
             // expected
         } else {
             XCTFail("Expected retry to start after refresh timeout")
@@ -2402,7 +4400,7 @@ final class SyncV2SnapshotPullTests: XCTestCase {
         await model.updateSceneActivity(false)
         await puller.finishFirst()
         for _ in 0..<100 { await Task.yield() }
-        XCTAssertEqual(model.serverState, .idle)
+        XCTAssertEqual(model.state, SyncV2WorkspaceState())
         await model.updateSceneActivity(true)
         for _ in 0..<500 where await puller.count() < 2 {
             await Task.yield()
@@ -2415,7 +4413,7 @@ final class SyncV2SnapshotPullTests: XCTestCase {
             2,
             "무효화된 pull의 pending 요청이 scene 재개 pull 뒤 남으면 안 됩니다."
         )
-        if case .synced = model.serverState {
+        if case .synced = model.state.lastResult {
             // expected
         } else {
             XCTFail("Expected resumed generation to settle as synced")
@@ -2485,6 +4483,157 @@ final class SyncV2SnapshotPullTests: XCTestCase {
         let secondCompleted = await second.value
         XCTAssertTrue(secondCompleted)
         await operation.releaseHungOperation()
+    }
+
+    func testDocumentMutationGateTimesOutHungOperationAndReleasesWaiter()
+        async {
+        let gate = SyncV2DocumentMutationGate()
+        let documentID = UUID()
+        let operation = SequencedRealtimeGateOperation()
+        let timeoutSleep = ManualWorkspaceSleep()
+        let first = Task { () -> SyncV2DocumentMutationGateError? in
+            do {
+                try await gate.withCriticalSection(
+                    documentID: documentID,
+                    holdTimeout: .seconds(20),
+                    timeoutSleep: { duration in
+                        try await timeoutSleep.sleep(duration)
+                    }
+                ) {
+                    await operation.run()
+                }
+                return nil
+            } catch let error as SyncV2DocumentMutationGateError {
+                return error
+            } catch {
+                return nil
+            }
+        }
+        await operation.waitUntilStarted(1)
+        let second = Task { () -> Bool in
+            do {
+                try await gate.withCriticalSection(
+                    documentID: documentID,
+                    holdTimeout: .seconds(20),
+                    timeoutSleep: { duration in
+                        try await timeoutSleep.sleep(duration)
+                    }
+                ) {
+                    await operation.run()
+                }
+                return true
+            } catch {
+                return false
+            }
+        }
+        for _ in 0..<100 { await Task.yield() }
+        let startCountWhileHeld = await operation.startCount()
+        XCTAssertEqual(startCountWhileHeld, 1)
+        await timeoutSleep.waitUntilCalled(1)
+        await timeoutSleep.resumeNext()
+        let emergencyRelease = Task {
+            for _ in 0..<50_000 { await Task.yield() }
+            return await operation.releaseHungIfSecondDidNotStart()
+        }
+        await operation.waitUntilStarted(2)
+        let startCountAfterTimeout = await operation.startCount()
+        let requiredEmergencyRelease = await emergencyRelease.value
+        let firstError = await first.value
+        let secondCompleted = await second.value
+        XCTAssertEqual(startCountAfterTimeout, 2)
+        XCTAssertFalse(requiredEmergencyRelease)
+        XCTAssertEqual(firstError, .holdTimedOut)
+        XCTAssertTrue(secondCompleted)
+        await operation.releaseHungOperation()
+    }
+
+    func testLegacyWindowsRootLabelsAreCanonicalizedWithoutDuplicateFolders()
+        async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("WriterPad-RootAlias-\(UUID())")
+        defer { try? FileManager.default.removeItem(at: root) }
+        try FileManager.default.createDirectory(
+            at: root.appendingPathComponent("메인"),
+            withIntermediateDirectories: true
+        )
+        try FileManager.default.createDirectory(
+            at: root.appendingPathComponent("메인/휴지통"),
+            withIntermediateDirectories: false
+        )
+        let projectID = ProjectID(rawValue: UUID())
+        let main = DocumentNode(
+            id: DocumentID(rawValue: UUID()),
+            projectID: projectID,
+            kind: .folder,
+            parentID: nil,
+            relativePath: RelativeDocumentPath(rawValue: "메인"),
+            userOrder: -1,
+            modifiedAt: .distantPast,
+            contentHash: nil
+        )
+        let trash = DocumentNode(
+            id: DocumentID(rawValue: UUID()),
+            projectID: projectID,
+            kind: .folder,
+            parentID: main.id,
+            relativePath: BinderFixedCategory.trash.relativePath,
+            userOrder: BinderFixedCategory.trash.fixedOrder,
+            modifiedAt: .distantPast,
+            contentHash: nil
+        )
+        let repository = SnapshotDocumentRepository(documents: [main, trash])
+        let applier = LocalSyncV2SnapshotApplier(
+            documentRepository: repository,
+            workspaceLocator: SnapshotWorkspaceLocator(root: root)
+        )
+        let treeID = UUID()
+        let content = """
+        {"tree_order":{"<root>":["📚 원고","👤 캐릭터","📖 설정집","📝 메모장","🗺️ 메인 스토리 틀","🌊 흐름 정리","🔍 복선","📌 장소","🗑️ 휴지통"],"메인/플롯":["빈 장면"]},"version":1}
+        """
+
+        try await applier.apply(
+            localProjectID: projectID,
+            snapshot: makeSnapshot(
+                id: treeID,
+                path: syncV2TreeOrderPath,
+                content: content,
+                revision: 1
+            )
+        )
+        await applier.finish(localProjectID: projectID, documentID: treeID)
+
+        let canonicalRoots = [
+            "원고", "캐릭터", "설정집", "메모장", "스토리 플롯",
+            "흐름정리", "복선", "장소", "휴지통",
+        ]
+        for name in canonicalRoots {
+            XCTAssertTrue(
+                FileManager.default.fileExists(
+                    atPath: root.appendingPathComponent("메인/\(name)").path
+                ),
+                name
+            )
+        }
+        XCTAssertTrue(
+            FileManager.default.fileExists(
+                atPath: root.appendingPathComponent("메인/스토리 플롯/빈 장면").path
+            )
+        )
+        for name in ["📚 원고", "🗺️ 메인 스토리 틀", "🌊 흐름 정리"] {
+            XCTAssertFalse(
+                FileManager.default.fileExists(
+                    atPath: root.appendingPathComponent("메인/\(name)").path
+                ),
+                name
+            )
+        }
+        let documents = try await repository.documents(in: projectID)
+        XCTAssertTrue(documents.contains {
+            $0.relativePath == BinderFixedCategory.storyPlot.relativePath
+        })
+        XCTAssertFalse(documents.contains {
+            $0.relativePath.rawValue.contains("🗺️")
+        })
     }
 
     @MainActor
@@ -2574,6 +4723,100 @@ private func localState(
         hasActiveOperation: active,
         hasUnresolvedConflict: conflict,
         blockingErrorCode: blockingErrorCode
+    )
+}
+
+private struct TrashPurgeFixture {
+    let repository: SnapshotDocumentRepository
+    let notesID: DocumentID
+    let trashID: DocumentID
+    let originalPath: RelativeDocumentPath
+    let trashFileURL: URL
+}
+
+private func makeTrashPurgeFixture(
+    root: URL,
+    projectID: ProjectID,
+    documentID: UUID,
+    fileName: String
+) throws -> TrashPurgeFixture {
+    let notesURL = root.appendingPathComponent("메인/메모장")
+    let trashURL = root.appendingPathComponent("메인/휴지통")
+    try FileManager.default.createDirectory(
+        at: notesURL,
+        withIntermediateDirectories: true
+    )
+    try FileManager.default.createDirectory(
+        at: trashURL,
+        withIntermediateDirectories: true
+    )
+    let main = DocumentNode(
+        id: DocumentID(rawValue: UUID()),
+        projectID: projectID,
+        kind: .folder,
+        parentID: nil,
+        relativePath: RelativeDocumentPath(rawValue: "메인"),
+        userOrder: -1,
+        modifiedAt: .distantPast,
+        contentHash: nil
+    )
+    let notes = DocumentNode(
+        id: DocumentID(rawValue: UUID()),
+        projectID: projectID,
+        kind: .folder,
+        parentID: main.id,
+        relativePath: BinderFixedCategory.notes.relativePath,
+        userOrder: 0,
+        modifiedAt: .distantPast,
+        contentHash: nil
+    )
+    let trash = DocumentNode(
+        id: DocumentID(rawValue: UUID()),
+        projectID: projectID,
+        kind: .folder,
+        parentID: main.id,
+        relativePath: BinderFixedCategory.trash.relativePath,
+        userOrder: 1,
+        modifiedAt: .distantPast,
+        contentHash: nil
+    )
+    let originalPath = RelativeDocumentPath(
+        rawValue: "메인/메모장/" + fileName
+    )
+    let trashPath = RelativeDocumentPath(
+        rawValue: "메인/휴지통/" + fileName
+    )
+    let document = DocumentNode(
+        id: DocumentID(rawValue: documentID),
+        projectID: projectID,
+        kind: .text,
+        parentID: trash.id,
+        relativePath: trashPath,
+        userOrder: 0,
+        modifiedAt: .distantPast,
+        contentHash: nil,
+        deletionStatus: .trashed(
+            originalPath: originalPath,
+            deletedAt: .distantPast
+        )
+    )
+    let trashFileURL = root.appendingPathComponent(trashPath.rawValue)
+    try Data("휴지통 본문".utf8).write(to: trashFileURL)
+    try Data("휴지통 record".utf8).write(
+        to: root.appendingPathComponent(
+            ".writerpad-trash-"
+                + documentID.uuidString.lowercased()
+                + ".json"
+        )
+    )
+    return TrashPurgeFixture(
+        repository: SnapshotDocumentRepository(
+            documents: [main, notes, trash, document]
+        ),
+        notesID: notes.id,
+        trashID: trash.id,
+        originalPath: originalPath,
+        trashFileURL: trashFileURL
     )
 }
 
@@ -2740,6 +4983,40 @@ private actor SnapshotApplierSpy: SyncV2LocalSnapshotApplying {
     func appliedIDs() -> [UUID] { identifiers }
 }
 
+private actor SnapshotRecoveryApplierSpy:
+    SyncV2LocalSnapshotApplying {
+    private let recoveryIDs: Set<UUID>
+    private let applyError: SyncV2LocalSnapshotApplyError?
+    private var identifiers: [UUID] = []
+
+    init(
+        recoveryIDs: Set<UUID>,
+        applyError: SyncV2LocalSnapshotApplyError? = nil
+    ) {
+        self.recoveryIDs = recoveryIDs
+        self.applyError = applyError
+    }
+
+    func requiresCopyRecovery(
+        localProjectID: ProjectID,
+        snapshot: SyncV2RemoteDocumentSnapshot
+    ) async -> Bool {
+        _ = localProjectID
+        return recoveryIDs.contains(snapshot.documentID)
+    }
+
+    func apply(
+        localProjectID: ProjectID,
+        snapshot: SyncV2RemoteDocumentSnapshot
+    ) async throws {
+        _ = localProjectID
+        if let applyError { throw applyError }
+        identifiers.append(snapshot.documentID)
+    }
+
+    func appliedIDs() -> [UUID] { identifiers }
+}
+
 private actor WorkspaceDispatchRetrySpy {
     private var value = 0
 
@@ -2794,6 +5071,10 @@ private actor SnapshotDocumentRepository: DocumentRepository {
 
     func removeMetadata(id: DocumentID) async throws {
         values[id] = nil
+    }
+
+    func failNextSave() {
+        saveFailuresRemaining += 1
     }
 }
 
@@ -3273,6 +5554,11 @@ private actor WorkspaceAuthenticationStub: AuthenticationServicing {
             restoreWaiters.append(continuation)
         }
     }
+    // 이 대기 상태 더블은 refresh와 restore를 의도적으로 같은 요청으로 본다.
+    func refreshSession(force: Bool) async -> AuthenticationState {
+        _ = force
+        return await restoreSession()
+    }
     func signIn(
         email: String,
         password: String
@@ -3304,6 +5590,11 @@ private actor ObservableWorkspaceAuthenticationStub:
 
     func currentState() -> AuthenticationState { state }
     func restoreSession() -> AuthenticationState { state }
+    // 이 관찰 더블은 refresh와 restore를 의도적으로 구분하지 않는다.
+    func refreshSession(force: Bool) -> AuthenticationState {
+        _ = force
+        return state
+    }
 
     func signIn(
         email: String,
@@ -3438,6 +5729,12 @@ private actor SequencedWorkspaceAuthenticationStub:
         return state
     }
 
+    // 이 순서 더블은 refresh를 restore와 같은 다음 응답 소비로 모델링한다.
+    func refreshSession(force: Bool) -> AuthenticationState {
+        _ = force
+        return restoreSession()
+    }
+
     func signIn(
         email: String,
         password: String
@@ -3463,6 +5760,12 @@ private actor AlwaysRestoringAuthenticationStub:
     func restoreSession() -> AuthenticationState {
         restoreCalls += 1
         return .restoring
+    }
+
+    // 이 영구 restoring 더블은 refresh와 restore를 의도적으로 구분하지 않는다.
+    func refreshSession(force: Bool) -> AuthenticationState {
+        _ = force
+        return restoreSession()
     }
 
     func signIn(

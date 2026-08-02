@@ -1366,6 +1366,285 @@ final class SyncV2StoreTests: XCTestCase {
         await store.close()
     }
 
+    func testCreateDeleteRestoreAndRedeleteKeepOneUUIDAndIncreaseRevision()
+        async throws {
+        let url = try databaseURL()
+        let context = QueueAPIContext()
+        let store = try await connectedStore(at: url, context: context)
+        let operationIDs = (0..<4).map { _ in UUID() }
+        let deleted = [false, true, false, true]
+        let contents = ["최초", "", "복원", ""]
+
+        for index in operationIDs.indices {
+            _ = try await store.enqueue(
+                context.batch(
+                    kind: index == 0 ? .documentSave : .trashChange,
+                    mutations: [
+                        context.documentMutation(
+                            operationID: operationIDs[index],
+                            content: contents[index],
+                            isDeleted: deleted[index],
+                            generation: index + 1
+                        ),
+                    ]
+                )
+            )
+        }
+
+        var claimedRevisions: [Int64] = []
+        var claimedDeleted: [Bool] = []
+        for index in operationIDs.indices {
+            let claims = try await store.claimReadyOperations(
+                limit: 1,
+                now: Date(timeIntervalSince1970: 100 + Double(index))
+            )
+            let operation = try XCTUnwrap(claims.first)
+            XCTAssertEqual(operation.operationID, operationIDs[index])
+            XCTAssertEqual(operation.documentID, context.documentID)
+            claimedRevisions.append(operation.baseRevision)
+            claimedDeleted.append(operation.isDeleted)
+            try await store.complete(
+                operation,
+                result: commitResult(for: operation)
+            )
+        }
+
+        XCTAssertEqual(claimedRevisions, [0, 1, 2, 3])
+        XCTAssertEqual(claimedDeleted, deleted)
+        let serverRevision = try await store.serverRevision(
+            for: context.documentID
+        )
+        XCTAssertEqual(serverRevision, 4)
+        await store.close()
+    }
+
+    func testTombstoneFreesLivePathAndDropsLateDocumentSave()
+        async throws {
+        let url = try databaseURL()
+        let context = QueueAPIContext()
+        let store = try await connectedStore(at: url, context: context)
+        let reusedPath = "원고/1권/같은 이름.txt"
+        let replacementDocumentID = UUID()
+        let createID = UUID()
+        let deleteID = UUID()
+        let replacementID = UUID()
+        let lateSaveID = UUID()
+
+        _ = try await store.enqueue(
+            context.batch(
+                mutations: [
+                    context.documentMutation(
+                        operationID: createID,
+                        relativePath: reusedPath,
+                        content: "삭제 전 최신 본문",
+                        generation: 1
+                    ),
+                ]
+            )
+        )
+        _ = try await store.enqueue(
+            context.batch(
+                kind: .trashChange,
+                mutations: [
+                    context.documentMutation(
+                        operationID: deleteID,
+                        relativePath: reusedPath,
+                        content: "",
+                        isDeleted: true,
+                        generation: 2
+                    ),
+                ]
+            )
+        )
+
+        let replacementReceipt = try await store.enqueue(
+            context.batch(
+                mutations: [
+                    context.documentMutation(
+                        operationID: replacementID,
+                        documentID: replacementDocumentID,
+                        relativePath: reusedPath,
+                        content: "새 UUID 본문",
+                        generation: 3
+                    ),
+                ]
+            )
+        )
+        let lateReceipt = try await store.enqueue(
+            context.batch(
+                mutations: [
+                    context.documentMutation(
+                        operationID: lateSaveID,
+                        relativePath: reusedPath,
+                        content: "늦게 도착한 편집 저장",
+                        generation: 1
+                    ),
+                ]
+            )
+        )
+
+        XCTAssertEqual(replacementReceipt.operationIDs, [replacementID])
+        XCTAssertEqual(lateReceipt.operationIDs, [])
+        XCTAssertEqual(lateReceipt.noOpOperationIDs, [lateSaveID])
+        let originalOperations = try await store.queuedOperations(
+            documentID: context.documentID
+        )
+        let replacementOperations = try await store.queuedOperations(
+            documentID: replacementDocumentID
+        )
+        XCTAssertEqual(
+            originalOperations.map(\.operationID),
+            [createID, deleteID]
+        )
+        XCTAssertEqual(replacementOperations.map(\.operationID), [replacementID])
+        await store.close()
+    }
+
+    func testRapidTreeOrderCoalescesOnlyUnsentOperation() async throws {
+        let url = try databaseURL()
+        let context = QueueAPIContext()
+        let store = try await connectedStore(at: url, context: context)
+        let treeDocumentID = syncV2UUIDv5(
+            namespace: context.serverProjectID,
+            name: syncV2TreeOrderPath
+        )
+        let firstID = UUID()
+        let secondID = UUID()
+
+        _ = try await store.enqueue(
+            context.batch(
+                kind: .structureChange,
+                mutations: [
+                    context.documentMutation(
+                        operationID: firstID,
+                        documentID: treeDocumentID,
+                        relativePath: syncV2TreeOrderPath,
+                        content:
+                            "{\"tree_order\":{\"메인/메모장\":[\"첫째.txt\",\"둘째.txt\"]},\"version\":1}",
+                        generation: 1,
+                        kind: .treeOrder
+                    ),
+                ]
+            )
+        )
+        _ = try await store.enqueue(
+            context.batch(
+                kind: .structureChange,
+                mutations: [
+                    context.documentMutation(
+                        operationID: secondID,
+                        documentID: treeDocumentID,
+                        relativePath: syncV2TreeOrderPath,
+                        content:
+                            "{\"tree_order\":{\"메인/메모장\":[\"둘째.txt\",\"첫째.txt\"]},\"version\":1}",
+                        generation: 2,
+                        kind: .treeOrder
+                    ),
+                ]
+            )
+        )
+
+        let operations = try await store.queuedOperations(
+            documentID: treeDocumentID
+        )
+        let firstStatus = try await store.operationStatus(operationID: firstID)
+        let secondStatus = try await store.operationStatus(operationID: secondID)
+        let claimed = try await store.claimReadyOperations(
+            limit: 5,
+            now: Date(timeIntervalSince1970: 100)
+        )
+        XCTAssertEqual(operations.map(\.operationID), [firstID, secondID])
+        XCTAssertEqual(firstStatus, SyncV2OperationStatus.cancelled.rawValue)
+        XCTAssertEqual(secondStatus, SyncV2OperationStatus.pending.rawValue)
+        XCTAssertEqual(claimed.map(\.operationID), [secondID])
+        XCTAssertEqual(claimed.first?.baseRevision, 0)
+        await store.close()
+    }
+
+    func testTrashPurgeWaitsForTombstoneAndMaterializesItsCommittedRevision()
+        async throws {
+        let url = try databaseURL()
+        let context = QueueAPIContext()
+        let store = try await connectedStore(at: url, context: context)
+        let createID = UUID()
+        let deleteID = UUID()
+        let purgeOperationID = UUID()
+        let purgeDocumentID = syncV2UUIDv5(
+            namespace: context.serverProjectID,
+            name: syncV2TrashPurgePath
+        )
+
+        _ = try await store.enqueue(
+            context.batch(
+                mutations: [
+                    context.documentMutation(operationID: createID),
+                ]
+            )
+        )
+        let createClaims = try await store.claimReadyOperations(
+            limit: 1,
+            now: Date(timeIntervalSince1970: 100)
+        )
+        let create = try XCTUnwrap(createClaims.first)
+        try await store.complete(create, result: commitResult(for: create))
+
+        _ = try await store.enqueue(
+            context.batch(
+                kind: .trashChange,
+                mutations: [
+                    context.documentMutation(
+                        operationID: deleteID,
+                        content: "",
+                        isDeleted: true,
+                        generation: 2
+                    ),
+                ]
+            )
+        )
+        let purgeContent = try SyncV2TrashPurgePayload(
+            purgedRevisions: [context.documentID: 0],
+            emptyGeneration: ""
+        ).canonicalContent()
+        _ = try await store.enqueue(
+            context.batch(
+                kind: .trashChange,
+                mutations: [
+                    context.documentMutation(
+                        operationID: purgeOperationID,
+                        documentID: purgeDocumentID,
+                        relativePath: syncV2TrashPurgePath,
+                        content: purgeContent,
+                        generation: nil,
+                        kind: .trashPurge
+                    ),
+                ]
+            )
+        )
+
+        let beforeDelete = try await store.claimReadyOperations(
+            limit: 5,
+            now: Date(timeIntervalSince1970: 101)
+        )
+        XCTAssertEqual(beforeDelete.map(\.operationID), [deleteID])
+        let deletion = try XCTUnwrap(beforeDelete.first)
+        try await store.complete(
+            deletion,
+            result: commitResult(for: deletion)
+        )
+
+        let afterDelete = try await store.claimReadyOperations(
+            limit: 5,
+            now: Date(timeIntervalSince1970: 102)
+        )
+        let purge = try XCTUnwrap(afterDelete.first)
+        XCTAssertEqual(purge.operationID, purgeOperationID)
+        let materialized = try SyncV2TrashPurgePayload(
+            strictContent: purge.content
+        )
+        XCTAssertEqual(materialized.purgedRevisions[context.documentID], 2)
+        await store.close()
+    }
+
     func testIndependentDocumentsEachStartAtSequenceOne()
         async throws {
         let url = try databaseURL()

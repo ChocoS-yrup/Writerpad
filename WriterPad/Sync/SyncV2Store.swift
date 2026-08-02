@@ -1,4 +1,5 @@
 import CryptoKit
+import CoreFoundation
 import Foundation
 import SQLite3
 
@@ -67,8 +68,150 @@ enum SyncV2BatchKind: String, Codable, Equatable, Sendable {
     case windowsImport = "windows_import"
 }
 
-private let syncV2TreeOrderPath = "__antigravity__/tree-order.json"
-private let syncV2TrashPurgePath = "__antigravity__/trash-purge.json"
+let syncV2TreeOrderPath = "__antigravity__/tree-order.json"
+let syncV2TrashPurgePath = "__antigravity__/trash-purge.json"
+private let syncV2TombstoneLocalPathPrefix = "__writerpad_tombstone__/"
+
+enum SyncV2TrashPurgePayloadError: Error, Equatable, Sendable {
+    case invalidEnvelope
+    case invalidWireTypes
+    case invalidVersion
+    case invalidGeneration
+    case invalidRevision
+}
+
+struct SyncV2TrashPurgePayload: Equatable, Sendable {
+    private struct StrictWirePayload: Decodable {
+        let version: Int64
+        let purgedRevisions: [String: Int64]
+        let emptyGeneration: String
+
+        private enum CodingKeys: String, CodingKey {
+            case version
+            case purgedRevisions = "purged_revisions"
+            case emptyGeneration = "empty_generation"
+        }
+    }
+
+    let purgedRevisions: [UUID: Int64]
+    let emptyGeneration: String
+
+    static let empty = SyncV2TrashPurgePayload(
+        purgedRevisions: [:],
+        emptyGeneration: ""
+    )
+
+    init(purgedRevisions: [UUID: Int64], emptyGeneration: String) {
+        self.purgedRevisions = purgedRevisions
+        self.emptyGeneration = emptyGeneration
+    }
+
+    init(strictContent content: String) throws {
+        let data = Data(content.utf8)
+        guard let object = try? JSONSerialization.jsonObject(
+            with: data
+        ) as? [String: Any],
+        Set(object.keys) == Set([
+            "version", "purged_revisions", "empty_generation",
+        ]),
+        Self.isStrictJSONInteger(object["version"]),
+        let rawPurges = object["purged_revisions"] as? [String: Any],
+        rawPurges.values.allSatisfy(Self.isStrictJSONInteger)
+        else {
+            throw SyncV2TrashPurgePayloadError.invalidEnvelope
+        }
+        guard let wire = try? JSONDecoder().decode(
+            StrictWirePayload.self,
+            from: data
+        ) else {
+            throw SyncV2TrashPurgePayloadError.invalidWireTypes
+        }
+        guard wire.version == 1 else {
+            throw SyncV2TrashPurgePayloadError.invalidVersion
+        }
+        guard wire.emptyGeneration.isEmpty
+                || Self.isCanonicalUUID(wire.emptyGeneration) else {
+            throw SyncV2TrashPurgePayloadError.invalidGeneration
+        }
+
+        var purges: [UUID: Int64] = [:]
+        purges.reserveCapacity(wire.purgedRevisions.count)
+        for (rawID, revision) in wire.purgedRevisions {
+            guard
+                Self.isCanonicalUUID(rawID),
+                let documentID = UUID(uuidString: rawID),
+                revision >= 0
+            else {
+                throw SyncV2TrashPurgePayloadError.invalidRevision
+            }
+            purges[documentID] = revision
+        }
+        self.purgedRevisions = purges
+        self.emptyGeneration = wire.emptyGeneration
+    }
+
+    func merging(_ other: SyncV2TrashPurgePayload)
+        -> SyncV2TrashPurgePayload {
+        var merged = purgedRevisions
+        for (documentID, revision) in other.purgedRevisions {
+            merged[documentID] = max(merged[documentID] ?? 0, revision)
+        }
+        return SyncV2TrashPurgePayload(
+            purgedRevisions: merged,
+            emptyGeneration: other.emptyGeneration.isEmpty
+                ? emptyGeneration
+                : other.emptyGeneration
+        )
+    }
+
+    func canonicalContent() throws -> String {
+        let purges = Dictionary(
+            uniqueKeysWithValues: purgedRevisions.map {
+                ($0.key.uuidString.lowercased(), $0.value)
+            }
+        )
+        let data = try JSONSerialization.data(
+            withJSONObject: [
+                "version": 1,
+                "purged_revisions": purges,
+                "empty_generation": emptyGeneration,
+            ],
+            options: [.sortedKeys]
+        )
+        guard let content = String(data: data, encoding: .utf8) else {
+            throw SyncV2TrashPurgePayloadError.invalidEnvelope
+        }
+        return content
+    }
+
+    private static func isCanonicalUUID(_ value: String) -> Bool {
+        let bytes = Array(value.utf8)
+        guard bytes.count == 36, UUID(uuidString: value) != nil else {
+            return false
+        }
+        let hyphens: Set<Int> = [8, 13, 18, 23]
+        for (index, byte) in bytes.enumerated() {
+            if hyphens.contains(index) {
+                guard byte == 45 else { return false }
+            } else {
+                guard (48...57).contains(byte) || (97...102).contains(byte)
+                else { return false }
+            }
+        }
+        return true
+    }
+
+    private static func isStrictJSONInteger(_ value: Any?) -> Bool {
+        guard let number = value as? NSNumber else { return false }
+        return CFGetTypeID(number) != CFBooleanGetTypeID()
+            && !CFNumberIsFloatType(number)
+    }
+}
+
+private func syncV2TombstoneLocalPath(documentID: UUID) -> String {
+    syncV2TombstoneLocalPathPrefix
+        + documentID.uuidString.lowercased()
+}
 
 enum SyncV2ServerPath {
     static func canonical(_ path: String) -> String {
@@ -87,7 +230,7 @@ enum SyncV2ServerPath {
     }
 }
 
-private func syncV2UUIDv5(namespace: UUID, name: String) -> UUID {
+func syncV2UUIDv5(namespace: UUID, name: String) -> UUID {
     var namespaceBytes = namespace.uuid
     var data = withUnsafeBytes(of: &namespaceBytes) { Data($0) }
     data.append(contentsOf: name.utf8)
@@ -733,6 +876,9 @@ actor SyncV2Store:
                 return false
             }
 
+            let localPath = snapshot.isDeleted
+                ? syncV2TombstoneLocalPath(documentID: snapshot.documentID)
+                : snapshot.relativePath
             let pathOccupied = try withStatement(
                 """
                 SELECT EXISTS(
@@ -749,7 +895,7 @@ actor SyncV2Store:
                     at: 1,
                     to: statement
                 )
-                try bind(snapshot.relativePath, at: 2, to: statement)
+                try bind(localPath, at: 2, to: statement)
                 try bind(
                     snapshot.documentID.uuidString.lowercased(),
                     at: 3,
@@ -794,7 +940,7 @@ actor SyncV2Store:
                         at: 3,
                         to: statement
                     )
-                    try bind(snapshot.relativePath, at: 4, to: statement)
+                    try bind(localPath, at: 4, to: statement)
                     try bind(snapshot.relativePath, at: 5, to: statement)
                     try bind(snapshot.revision, at: 6, to: statement)
                     try bind(snapshot.content, at: 7, to: statement)
@@ -819,7 +965,7 @@ actor SyncV2Store:
                       AND document_id = ?;
                     """
                 ) { statement in
-                    try bind(snapshot.relativePath, at: 1, to: statement)
+                    try bind(localPath, at: 1, to: statement)
                     try bind(snapshot.relativePath, at: 2, to: statement)
                     try bind(snapshot.revision, at: 3, to: statement)
                     try bind(snapshot.content, at: 4, to: statement)
@@ -3391,7 +3537,6 @@ actor SyncV2Store:
                     AND earlier.status NOT IN ('completed', 'cancelled')
               )
             ORDER BY o.queue_id
-            LIMIT ?;
             """
         ) { statement in
             let projectValue =
@@ -3399,7 +3544,6 @@ actor SyncV2Store:
             try bind(projectValue, at: 1, to: statement)
             try bind(projectValue, at: 2, to: statement)
             try bind(nowValue, at: 3, to: statement)
-            try bind(limit, at: 4, to: statement)
             var candidates: [DispatchCandidate] = []
             while true {
                 let status = sqlite3_step(statement)
@@ -3438,6 +3582,39 @@ actor SyncV2Store:
                         sqlite3_column_int64(statement, 7)
                     )
                 }
+                var dispatchContent = content
+                if kind == .trashPurge {
+                    guard let materialized = try materializedTrashPurgeContent(
+                        content,
+                        operationID: operationID
+                    ) else {
+                        continue
+                    }
+                    dispatchContent = materialized
+                    if materialized != content {
+                        let data = Data(materialized.utf8)
+                        try withStatement(
+                            """
+                            UPDATE sync_operations
+                            SET content = ?, content_byte_count = ?,
+                                content_hash = ?, updated_at = ?
+                            WHERE operation_id = ?
+                              AND status IN ('pending', 'retry_wait');
+                            """
+                        ) { update in
+                            try bind(materialized, at: 1, to: update)
+                            try bind(data.count, at: 2, to: update)
+                            try bind(Self.sha256Hex(data), at: 3, to: update)
+                            try bind(nowValue, at: 4, to: update)
+                            try bind(
+                                operationID.uuidString.lowercased(),
+                                at: 5,
+                                to: update
+                            )
+                            try stepDone(update)
+                        }
+                    }
+                }
                 candidates.append(
                     DispatchCandidate(
                         operationID: operationID,
@@ -3458,12 +3635,89 @@ actor SyncV2Store:
                         baseServerPath: baseServerPath,
                         localPath: localPath,
                         relativePath: relativePath,
-                        content: content,
+                        content: dispatchContent,
                         isDeleted: sqlite3_column_int(statement, 15) == 1,
                         attempts: Int(sqlite3_column_int(statement, 16))
                     )
                 )
+                if candidates.count == limit {
+                    return candidates
+                }
             }
+        }
+    }
+
+    private func materializedTrashPurgeContent(
+        _ content: String,
+        operationID: UUID
+    ) throws -> String? {
+        let payload: SyncV2TrashPurgePayload
+        do {
+            payload = try SyncV2TrashPurgePayload(strictContent: content)
+        } catch {
+            throw SyncV2DispatchStoreError.integrityFailure
+        }
+        var revisions = payload.purgedRevisions
+        for documentID in payload.purgedRevisions.keys {
+            let values = try withStatement(
+                """
+                SELECT
+                    EXISTS(
+                        SELECT 1
+                        FROM sync_operations active
+                        WHERE active.document_id = ?
+                          AND active.operation_id <> ?
+                          AND active.status NOT IN ('completed', 'cancelled')
+                    ),
+                    COALESCE((
+                        SELECT MAX(completed.base_revision + 1)
+                        FROM sync_operations completed
+                        WHERE completed.document_id = ?
+                          AND completed.is_deleted = 1
+                          AND completed.status = 'completed'
+                          AND completed.base_revision IS NOT NULL
+                    ), 0),
+                    COALESCE((
+                        SELECT CASE WHEN d.is_deleted = 1
+                            THEN d.server_revision ELSE 0 END
+                        FROM sync_documents d
+                        WHERE d.document_id = ?
+                    ), 0);
+                """
+            ) { statement in
+                let identifier = documentID.uuidString.lowercased()
+                try bind(identifier, at: 1, to: statement)
+                try bind(
+                    operationID.uuidString.lowercased(),
+                    at: 2,
+                    to: statement
+                )
+                try bind(identifier, at: 3, to: statement)
+                try bind(identifier, at: 4, to: statement)
+                guard sqlite3_step(statement) == SQLITE_ROW else {
+                    throw sqliteError()
+                }
+                return (
+                    sqlite3_column_int(statement, 0) == 1,
+                    sqlite3_column_int64(statement, 1),
+                    sqlite3_column_int64(statement, 2)
+                )
+            }
+            guard !values.0 else { return nil }
+            let revision = max(values.1, values.2)
+            guard revision > 0 else { return nil }
+            revisions[documentID] = max(
+                revisions[documentID] ?? 0,
+                revision
+            )
+        }
+        do {
+            return try SyncV2TrashPurgePayload(
+                purgedRevisions: revisions,
+                emptyGeneration: payload.emptyGeneration
+            ).canonicalContent()
+        } catch {
+            throw SyncV2DispatchStoreError.integrityFailure
         }
     }
 
@@ -3980,6 +4234,36 @@ actor SyncV2Store:
                 throw SyncV2EnqueueError.invalidMutation
             }
         }
+        if payload.kind == .treeOrder {
+            try coalescePendingTreeOrderOperations(
+                documentID: payload.documentID,
+                timestamp: timestamp
+            )
+        }
+        let latestLifecycle = try latestActiveDocumentLifecycle(
+            documentID: payload.documentID
+        )
+        if batch.kind == .documentSave,
+           payload.kind == .documentCommit,
+           !payload.isDeleted {
+            if latestLifecycle?.isDeleted == true
+                || (latestLifecycle == nil && existingState?.isDeleted == true) {
+                // 휴지통 이동보다 늦게 도착한 편집 handoff는 서버 문서를
+                // 조용히 복원하지 않는다. 로컬 휴지통 사본이 최신 원본이다.
+                return .noOp
+            }
+            if let latestLifecycle,
+               latestLifecycle.batchKind == .trashChange,
+               !latestLifecycle.isDeleted,
+               SyncV2ServerPath.hasExactBytes(
+                   latestLifecycle.relativePath,
+                   payload.relativePath
+               ),
+               latestLifecycle.content == payload.content {
+                // 복원 전에 만들어진 동일 snapshot이 뒤늦게 flush된 경우다.
+                return .noOp
+            }
+        }
         let hasEarlierOperation = try hasActiveOperation(
             documentID: payload.documentID
         )
@@ -4031,6 +4315,9 @@ actor SyncV2Store:
             ? ""
             : state.baseContent
 
+        let storedLocalPath = payload.isDeleted
+            ? syncV2TombstoneLocalPath(documentID: payload.documentID)
+            : payload.localPath
         try withStatement(
             """
             INSERT INTO sync_operations(
@@ -4091,7 +4378,7 @@ actor SyncV2Store:
             try bind(payload.kind.rawValue, at: 10, to: statement)
             try bind(baseRevision, at: 11, to: statement)
             try bind(baseContent, at: 12, to: statement)
-            try bind(payload.localPath, at: 13, to: statement)
+            try bind(storedLocalPath, at: 13, to: statement)
             try bind(payload.relativePath, at: 14, to: statement)
             try bind(payload.content, at: 15, to: statement)
             try bind(payload.contentByteCount, at: 16, to: statement)
@@ -4116,7 +4403,7 @@ actor SyncV2Store:
             WHERE document_id = ?;
             """
         ) { statement in
-            try bind(payload.localPath, at: 1, to: statement)
+            try bind(storedLocalPath, at: 1, to: statement)
             try bind(state.nextSequence + 1, at: 2, to: statement)
             try bind(isOversized ? "blocked" : "pending", at: 3, to: statement)
             try bind(errorCode, at: 4, to: statement)
@@ -4129,6 +4416,104 @@ actor SyncV2Store:
             try stepDone(statement)
         }
         return isOversized ? .blockedBySize : .queued
+    }
+
+    private func coalescePendingTreeOrderOperations(
+        documentID: UUID,
+        timestamp: String
+    ) throws {
+        let affectedBatchIDs = try withStatement(
+            """
+            SELECT DISTINCT batch_id
+            FROM sync_operations
+            WHERE document_id = ?
+              AND operation_kind = 'tree_order'
+              AND status IN ('pending', 'retry_wait', 'blocked');
+            """
+        ) { statement in
+            try bind(
+                documentID.uuidString.lowercased(),
+                at: 1,
+                to: statement
+            )
+            var identifiers: [UUID] = []
+            while true {
+                let status = sqlite3_step(statement)
+                if status == SQLITE_DONE { return identifiers }
+                guard status == SQLITE_ROW,
+                      let value = columnText(statement, at: 0),
+                      let identifier = UUID(uuidString: value)
+                else {
+                    throw SyncV2EnqueueError.integrityFailure
+                }
+                identifiers.append(identifier)
+            }
+        }
+        guard !affectedBatchIDs.isEmpty else { return }
+        try withStatement(
+            """
+            UPDATE sync_operations
+            SET status = 'cancelled',
+                last_error_code = 'SUPERSEDED_BY_TREE_ORDER',
+                last_error_detail = NULL,
+                next_attempt_at = NULL,
+                updated_at = ?
+            WHERE document_id = ?
+              AND operation_kind = 'tree_order'
+              AND status IN ('pending', 'retry_wait', 'blocked');
+            """
+        ) { statement in
+            try bind(timestamp, at: 1, to: statement)
+            try bind(
+                documentID.uuidString.lowercased(),
+                at: 2,
+                to: statement
+            )
+            try stepDone(statement)
+        }
+        for batchID in affectedBatchIDs {
+            try refreshBatchState(batchID: batchID, timestamp: timestamp)
+        }
+    }
+
+    private func latestActiveDocumentLifecycle(
+        documentID: UUID
+    ) throws -> ActiveDocumentLifecycle? {
+        try withStatement(
+            """
+            SELECT o.is_deleted, o.relative_path, o.content, b.batch_kind
+            FROM sync_operations o
+            JOIN sync_batches b ON b.batch_id = o.batch_id
+            WHERE o.document_id = ?
+              AND o.status NOT IN ('completed', 'cancelled')
+            ORDER BY o.document_sequence DESC, o.queue_id DESC
+            LIMIT 1;
+            """
+        ) { statement in
+            try bind(
+                documentID.uuidString.lowercased(),
+                at: 1,
+                to: statement
+            )
+            let status = sqlite3_step(statement)
+            if status == SQLITE_DONE {
+                return nil
+            }
+            guard status == SQLITE_ROW,
+                  let relativePath = columnText(statement, at: 1),
+                  let content = columnText(statement, at: 2),
+                  let kindValue = columnText(statement, at: 3),
+                  let batchKind = SyncV2BatchKind(rawValue: kindValue)
+            else {
+                throw SyncV2EnqueueError.integrityFailure
+            }
+            return ActiveDocumentLifecycle(
+                isDeleted: sqlite3_column_int(statement, 0) == 1,
+                relativePath: relativePath,
+                content: content,
+                batchKind: batchKind
+            )
+        }
     }
 
     private func hasActiveOperation(documentID: UUID) throws -> Bool {
@@ -5864,6 +6249,13 @@ private struct DocumentState {
     let baseContent: String
     let isDeleted: Bool
     let nextSequence: Int
+}
+
+private struct ActiveDocumentLifecycle {
+    let isDeleted: Bool
+    let relativePath: String
+    let content: String
+    let batchKind: SyncV2BatchKind
 }
 
 private struct ConflictResolutionOperation {

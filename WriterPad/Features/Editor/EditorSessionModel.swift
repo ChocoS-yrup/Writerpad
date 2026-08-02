@@ -177,8 +177,12 @@ final class EditorSessionModel: ObservableObject {
     @Published private(set) var isLoading = false
     @Published private(set) var errorMessage: String?
     @Published private(set) var pendingDisplayName: String?
-    @Published private(set) var isComposing = false
-    @Published private(set) var focusPhase = EditorFocusPhase.idle
+    /// UIKit 조합·포커스 콜백은 SwiftUI 갱신 패스 안에서 동기로 되돌아올 수 있어
+    /// `@Published`로 두면 갱신 도중 발행 경고가 난다. 값은 콜백 순간에 동기 반영하고
+    /// 관찰자 통지만 미루므로 `@Published`를 쓰지 않는다. 자세한 규칙은
+    /// `scheduleObservationNotice()` 주석을 참고한다.
+    private(set) var isComposing = false
+    private(set) var focusPhase = EditorFocusPhase.idle
     @Published private(set) var saveState = SaveState.idle
     @Published private(set) var syncHandoffState = SyncHandoffState.idle
     @Published private(set) var editLeaseState = EditLeaseDisplayState.localOnly
@@ -209,6 +213,7 @@ final class EditorSessionModel: ObservableObject {
     private var lastSavedDirtyGeneration: UInt64 = 0
     private var pendingSaveAfterComposition = false
     private var compositionStateGeneration: UInt64 = 0
+    private var observationNoticeGeneration: UInt64 = 0
     private var syncHandoffStates: [DocumentID: SyncHandoffState] = [:]
     private var statisticsGeneration: UInt64 = 0
     private var statisticsTask: Task<Void, Never>?
@@ -548,7 +553,10 @@ final class EditorSessionModel: ObservableObject {
         _ = focusStateMachine.handle(
             composing ? .compositionStarted : .compositionEnded
         )
-        focusPhase = focusStateMachine.phase
+        synchronizeFocusPhase()
+        // 조합 시작·종료로 phase가 그대로인 경우(backgrounded)에도 isComposing은
+        // 바뀌었으므로 통지는 반드시 예약한다.
+        scheduleObservationNotice()
         return generation
     }
 
@@ -575,7 +583,32 @@ final class EditorSessionModel: ObservableObject {
 
     func updateFocusState(_ hasFocus: Bool) {
         _ = focusStateMachine.handle(hasFocus ? .focusGained : .focusLost)
+        synchronizeFocusPhase()
+    }
+
+    /// 상태 기계가 곧 진실이므로 발행용 사본만 맞춘다. 값 반영은 동기라서
+    /// 콜백 직후 읽어도 항상 최신이고, 통지만 갱신 패스 밖으로 밀린다.
+    private func synchronizeFocusPhase() {
+        guard focusPhase != focusStateMachine.phase else { return }
         focusPhase = focusStateMachine.phase
+        scheduleObservationNotice()
+    }
+
+    /// `textViewDidBeginEditing`/`textViewDidEndEditing` 같은 UIKit 콜백은
+    /// `updateUIView`나 문서 전환 teardown 도중 동기로 불린다. 그 자리에서
+    /// `objectWillChange`를 보내면 SwiftUI 갱신 패스에 재진입해 "Publishing changes
+    /// from within view updates" 경고가 나므로, 통지만 다음 메인 루프로 미룬다.
+    /// 미루는 사이 새 전이가 들어오면 generation이 어긋나 낡은 통지는 버려지고
+    /// 마지막 한 번만 발행된다.
+    private func scheduleObservationNotice() {
+        observationNoticeGeneration &+= 1
+        let generation = observationNoticeGeneration
+        Task { @MainActor [weak self] in
+            guard let self,
+                  generation == self.observationNoticeGeneration
+            else { return }
+            self.objectWillChange.send()
+        }
     }
 
     func requestFocus() {
@@ -636,7 +669,7 @@ final class EditorSessionModel: ObservableObject {
                 ? .sceneBecameActive(hasDocument: currentDocumentID != nil)
                 : .sceneBecameInactive
         )
-        focusPhase = focusStateMachine.phase
+        synchronizeFocusPhase()
         if active {
             if isComposing {
                 // 백그라운드 전환 중 UIKit이 marked text를 끝냈지만 콜백이

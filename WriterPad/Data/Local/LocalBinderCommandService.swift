@@ -75,6 +75,7 @@ actor LocalBinderCommandService: BinderCommanding {
     let hasher: any ContentHashing
     let futureChangeNotifier: any FutureChangeNotifying
     let durableChangeRecorder: any DurableLocalChangeRecording
+    let syncMutationGate: SyncV2DocumentMutationGate
     let backupStore: (any BackupStoring)?
     let backupPolicyStore: (any BackupPolicyStoring)?
     let faultPlan: BinderCommandFaultPlan?
@@ -96,6 +97,8 @@ actor LocalBinderCommandService: BinderCommanding {
         futureChangeNotifier: any FutureChangeNotifying = NoOpFutureChangeNotifier(),
         durableChangeRecorder: any DurableLocalChangeRecording =
             NoOpDurableLocalChangeRecorder(),
+        syncMutationGate: SyncV2DocumentMutationGate =
+            SyncV2DocumentMutationGate(),
         backupStore: (any BackupStoring)? = nil,
         backupPolicyStore: (any BackupPolicyStoring)? = nil,
         faultPlan: BinderCommandFaultPlan? = nil
@@ -112,6 +115,7 @@ actor LocalBinderCommandService: BinderCommanding {
         self.hasher = hasher
         self.futureChangeNotifier = futureChangeNotifier
         self.durableChangeRecorder = durableChangeRecorder
+        self.syncMutationGate = syncMutationGate
         self.backupStore = backupStore
         self.backupPolicyStore = backupPolicyStore
         self.faultPlan = faultPlan
@@ -174,6 +178,14 @@ actor LocalBinderCommandService: BinderCommanding {
                 throw BinderCommandError.recoveryRequired(url.path)
             }
         }
+        try await removeEmptyLegacySyncRootAliases(
+            in: projectID,
+            workspaceRoot: workspaceRoot
+        )
+        try await ensureCanonicalStoryPlotFolder(
+            in: projectID,
+            workspaceRoot: workspaceRoot
+        )
     }
 
     func commandDescriptors(

@@ -1615,6 +1615,18 @@ final class SyncV2DispatcherTests: XCTestCase {
         )
     }
 
+    private func waitForRelease(
+        _ expectedCount: Int,
+        client: EditLeaseClientStub
+    ) async {
+        for _ in 0..<100 {
+            if await client.releaseCount() >= expectedCount {
+                return
+            }
+            await Task.yield()
+        }
+    }
+
     func testExistingCommitUsesLeaseTokenAndReleasesInactiveLease() async {
         let documentID = UUID()
         let deviceID = UUID()
@@ -1654,6 +1666,7 @@ final class SyncV2DispatcherTests: XCTestCase {
 
         let request = (await client.receivedRequests()).first
         let acquireCount = await leaseClient.acquireCount()
+        await waitForRelease(1, client: leaseClient)
         let releaseCount = await leaseClient.releaseCount()
         XCTAssertNotNil(request?.leaseToken)
         XCTAssertEqual(acquireCount, 1)
@@ -1933,6 +1946,132 @@ final class SyncV2DispatcherTests: XCTestCase {
             recorded?.mergedPath,
             operation.relativePath
         )
+    }
+
+    func testTreeOrderRevisionConflictRebasesLatestLocalSnapshot()
+        async throws {
+        let projectID = UUID()
+        let documentID = syncV2UUIDv5(
+            namespace: projectID,
+            name: syncV2TreeOrderPath
+        )
+        let localContent =
+            "{\"tree_order\":{\"메인/메모장\":[\"둘째.txt\",\"첫째.txt\"]},\"version\":1}"
+        let operation = SyncV2DispatchOperation(
+            operationID: UUID(),
+            batchID: UUID(),
+            localProjectID: ProjectID(rawValue: UUID()),
+            projectID: projectID,
+            documentID: documentID,
+            deviceID: UUID(),
+            documentSequence: 2,
+            localSaveGeneration: 20,
+            kind: .treeOrder,
+            baseRevision: 3,
+            baseContent:
+                "{\"tree_order\":{\"메인/메모장\":[\"첫째.txt\"]},\"version\":1}",
+            baseServerPath: syncV2TreeOrderPath,
+            localPath: syncV2TreeOrderPath,
+            relativePath: syncV2TreeOrderPath,
+            content: localContent,
+            isDeleted: false,
+            attempts: 1
+        )
+        let local = SyncV2RebaseLocalSnapshot(
+            content: localContent,
+            localPath: syncV2TreeOrderPath,
+            relativePath: syncV2TreeOrderPath,
+            localSaveGeneration: 20
+        )
+        let remote = remoteSnapshot(
+            documentID: documentID,
+            path: syncV2TreeOrderPath,
+            content:
+                "{\"tree_order\":{\"메인/메모장\":[\"첫째.txt\",\"둘째.txt\"]},\"version\":1}"
+        )
+        let store = AutomaticRebaseStoreStub(local: local)
+        let rebaser = SyncV2AutomaticRebaser(
+            store: store,
+            snapshotClient: AutomaticRebaseSnapshotClientStub(
+                snapshot: remote
+            )
+        )
+
+        let outcome = try await rebaser.rebase(operation)
+        let recorded = await store.recordedRebase()
+
+        XCTAssertEqual(outcome, .rebased)
+        XCTAssertEqual(recorded?.remote, remote)
+        XCTAssertEqual(recorded?.mergedContent, localContent)
+        XCTAssertEqual(recorded?.mergedPath, syncV2TreeOrderPath)
+    }
+
+    func testTrashPurgeRevisionConflictMergesMaximumsAndLocalGeneration()
+        async throws {
+        let projectID = UUID()
+        let documentID = syncV2UUIDv5(
+            namespace: projectID,
+            name: syncV2TrashPurgePath
+        )
+        let firstID = UUID()
+        let secondID = UUID()
+        let localGeneration = UUID().uuidString.lowercased()
+        let remoteGeneration = UUID().uuidString.lowercased()
+        let localContent = try SyncV2TrashPurgePayload(
+            purgedRevisions: [firstID: 5, secondID: 7],
+            emptyGeneration: localGeneration
+        ).canonicalContent()
+        let remoteContent = try SyncV2TrashPurgePayload(
+            purgedRevisions: [firstID: 6, secondID: 4],
+            emptyGeneration: remoteGeneration
+        ).canonicalContent()
+        let operation = SyncV2DispatchOperation(
+            operationID: UUID(),
+            batchID: UUID(),
+            localProjectID: ProjectID(rawValue: UUID()),
+            projectID: projectID,
+            documentID: documentID,
+            deviceID: UUID(),
+            documentSequence: 2,
+            kind: .trashPurge,
+            baseRevision: 3,
+            baseContent: "",
+            baseServerPath: syncV2TrashPurgePath,
+            localPath: syncV2TrashPurgePath,
+            relativePath: syncV2TrashPurgePath,
+            content: localContent,
+            isDeleted: false,
+            attempts: 1
+        )
+        let local = SyncV2RebaseLocalSnapshot(
+            content: localContent,
+            localPath: syncV2TrashPurgePath,
+            relativePath: syncV2TrashPurgePath,
+            localSaveGeneration: nil
+        )
+        let remote = remoteSnapshot(
+            documentID: documentID,
+            path: syncV2TrashPurgePath,
+            content: remoteContent
+        )
+        let store = AutomaticRebaseStoreStub(local: local)
+        let rebaser = SyncV2AutomaticRebaser(
+            store: store,
+            snapshotClient: AutomaticRebaseSnapshotClientStub(
+                snapshot: remote
+            )
+        )
+
+        let outcome = try await rebaser.rebase(operation)
+        let recorded = await store.recordedRebase()
+        let merged = try XCTUnwrap(recorded).mergedContent
+        let payload = try SyncV2TrashPurgePayload(strictContent: merged)
+
+        XCTAssertEqual(outcome, .rebased)
+        XCTAssertEqual(payload.purgedRevisions[firstID], 6)
+        XCTAssertEqual(payload.purgedRevisions[secondID], 7)
+        XCTAssertEqual(payload.emptyGeneration, localGeneration)
+        XCTAssertEqual(recorded?.mergedPath, syncV2TrashPurgePath)
     }
 
     func testAutomaticRebaseLeavesOverlappingEditAsConflict()

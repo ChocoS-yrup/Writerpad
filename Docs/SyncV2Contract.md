@@ -88,6 +88,13 @@ filter project_id == 연결된 프로젝트 UUID
 `trash-purge`, tombstone, live 문서 순으로 나눈 뒤 revision을 사용해 로컬에서
 정렬한다. Swift도 서버 반환 순서에 의존하면 안 된다.
 
+clean baseline과 remote snapshot의 revision이 같은데 로컬 live TXT 또는
+tombstone 사본만 사라진 경우에는 remote full snapshot으로 사본만 복구한다.
+pending·inflight·blocked operation이나 unresolved conflict가 있는 문서는
+자동 복구하지 않는다. live path를 다른 UUID가 점유하면 덮어쓰지 않고 충돌로
+보존하며, 누락 tombstone은 document UUID를 포함한 로컬 휴지통 경로에 새로
+materialize할 수 있다. tombstone commit도 삭제 직전 full content를 보존한다.
+
 Windows는 현재 `projects`, `project_members`, `document_versions`를 직접
 조회하지 않는다. 이 세 table의 `SELECT` 권한은 서버 계약에는 있지만 초기
 Swift 동기화 경로에 필수는 아니다.
@@ -460,10 +467,10 @@ __antigravity__/trash-purge.json
 - 일반 원고 목록과 검색·편집 UI에서는 제외한다.
 - Realtime payload는 적용 원문이 아니라 pull wake-up 신호로만 사용한다.
 
-서버에는 folder table 또는 folder UUID가 없다. 빈 폴더 자체와 폴더 identity는
-이 계약만으로 표현되지 않는다. 현재 Windows의 tree-order payload가 어느
-범위까지 빈 폴더를 보존하는지는 8-3 사건 매핑에서 결정해야 하며, 이번
-감사에서 새 서버 표현을 추측하지 않는다.
+서버에는 folder table 또는 folder UUID가 없다. 다만 Windows tree-order의
+parent child name 목록으로 빈 폴더의 이름·경로·계층은 표현한다. 수신기는 같은
+snapshot의 live TXT 경로와 대조해 남은 child를 폴더로 재구성한다. 폴더의 독립
+identity는 서버 계약에 포함되지 않으며 iPad 로컬 UUID는 경로에서 파생한다.
 
 ## 확인된 차이와 보류
 

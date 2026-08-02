@@ -35,7 +35,7 @@ struct ImportReportView: View {
                 }
 
                 Section {
-                    Text("원본 폴더는 수정하지 않습니다. 플롯·메인 스토리 틀·레거시 백업은 일반 사용자 폴더로 그대로 보존됩니다.")
+                    Text("원본 폴더는 수정하지 않습니다. 가져온 메인/플롯 또는 메인/메인 스토리 틀은 작품을 처음 열 때 메인/스토리 플롯으로 안전하게 전환하며, 공존 시 병합하지 않고 중단합니다. 그 밖의 레거시 자료는 그대로 보존합니다.")
                         .font(.footnote)
                         .foregroundStyle(.secondary)
                 }

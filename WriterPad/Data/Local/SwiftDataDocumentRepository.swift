@@ -92,6 +92,21 @@ extension SwiftDataMetadataRepository: DocumentRepository {
 }
 
 extension SwiftDataMetadataRepository: DocumentFileMetadataUpdating {
+    func validateBeforeFileSave(
+        _ request: DocumentSaveRequest
+    ) async throws {
+        let record = try requireDocumentRecord(id: request.documentID)
+        guard record.projectID == request.projectID.rawValue,
+              record.kindRawValue == DocumentKind.text.rawValue,
+              !record.isTrashed,
+              record.relativePath == request.relativePath.rawValue
+        else {
+            throw LocalDocumentStoreError.documentNoLongerWritable(
+                request.documentID
+            )
+        }
+    }
+
     func updateAfterFileSave(_ receipt: DocumentSaveReceipt) async throws {
         let record = try requireDocumentRecord(id: receipt.documentID)
         guard record.projectID == receipt.projectID.rawValue else {

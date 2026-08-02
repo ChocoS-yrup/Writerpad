@@ -7,13 +7,13 @@ let syncV2Logger = Logger(
 )
 
 enum SyncV2Diagnostics {
-    static func serverState(
+    static func workspaceState(
         localProjectID: ProjectID,
-        from oldValue: SyncV2WorkspaceServerState,
-        to newValue: SyncV2WorkspaceServerState
+        from oldValue: SyncV2WorkspaceState,
+        to newValue: SyncV2WorkspaceState
     ) {
         syncV2Logger.info(
-            "event=serverState localProjectID=\(localProjectID.rawValue.uuidString, privacy: .public) from=\(oldValue.logName, privacy: .public) to=\(newValue.logName, privacy: .public)"
+            "event=workspaceState localProjectID=\(localProjectID.rawValue.uuidString, privacy: .public) from=\(oldValue.logName, privacy: .public) to=\(newValue.logName, privacy: .public)"
         )
     }
 
@@ -77,17 +77,39 @@ enum SyncV2Diagnostics {
     }
 }
 
-private extension SyncV2WorkspaceServerState {
+private extension SyncV2WorkspaceState {
+    var logName: String {
+        "progress=\(progress.logName),connection=\(connection.logName),lastResult=\(lastResult.logName)"
+    }
+}
+
+private extension SyncV2WorkspaceState.Progress {
     var logName: String {
         switch self {
-        case .localOnly: "localOnly"
         case .idle: "idle"
+        case .pulling: "pulling"
         case .checkingAuthentication: "checkingAuthentication"
-        case .connectionChecking: "connectionChecking"
+        }
+    }
+}
+
+private extension SyncV2WorkspaceState.Connection {
+    var logName: String {
+        switch self {
+        case .unknown: "unknown"
+        case .healthy: "healthy"
         case .reconnecting: "reconnecting"
-        case .syncing: "syncing"
+        case .offline: "offline"
+        }
+    }
+}
+
+private extension SyncV2WorkspaceState.Result {
+    var logName: String {
+        switch self {
+        case .idle: "idle"
+        case .localOnly: "localOnly"
         case .synced: "synced"
-        case .offlineSaved: "offlineSaved"
         case .waiting: "waiting"
         case .authenticationRequired: "authenticationRequired"
         case .automaticallyMerged: "automaticallyMerged"

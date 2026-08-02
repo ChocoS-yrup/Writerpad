@@ -1058,6 +1058,44 @@ final class LocalBinderCommandServiceTests: XCTestCase {
         )
     }
 
+    func testEmptyFolderCreationQueuesTreeOrderBatch() async throws {
+        let recorder = RecordingDurableChangeRecorder()
+        let harness = try await makeHarness(durableChangeRecorder: recorder)
+        let notes = try await fixedRoot(.notes, harness: harness)
+
+        let created = try await harness.commands.create(
+            kind: .folder,
+            named: "서버 빈 폴더",
+            in: notes.id,
+            projectID: harness.project.id
+        )
+
+        let batches = await recorder.recordedBatches()
+        XCTAssertEqual(batches.count, 1)
+        XCTAssertEqual(batches[0].kind, .structureChange)
+        XCTAssertNotNil(batches[0].localTransactionID)
+        XCTAssertEqual(batches[0].mutations.count, 1)
+        guard case let .treeOrder(_, content, _) = batches[0].mutations[0]
+        else {
+            return XCTFail("빈 폴더 tree-order가 없습니다.")
+        }
+        let object = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: Data(content.utf8))
+                as? [String: Any]
+        )
+        let treeOrder = try XCTUnwrap(
+            object["tree_order"] as? [String: [String]]
+        )
+        XCTAssertEqual(
+            treeOrder[notes.relativePath.rawValue],
+            ["서버 빈 폴더"]
+        )
+        XCTAssertEqual(
+            created.relativePath.rawValue,
+            notes.relativePath.rawValue + "/서버 빈 폴더"
+        )
+    }
+
     func testStructureTrashRestoreAndPurgeCaptureCorrectSnapshots() async throws {
         let recorder = RecordingDurableChangeRecorder()
         let harness = try await makeHarness(durableChangeRecorder: recorder)
@@ -1106,7 +1144,7 @@ final class LocalBinderCommandServiceTests: XCTestCase {
             _,
             _,
             tombstonePath,
-            _,
+            tombstoneContent,
             _,
             _,
             tombstoneDeleted
@@ -1114,6 +1152,7 @@ final class LocalBinderCommandServiceTests: XCTestCase {
             return XCTFail("trash tombstone이 없습니다.")
         }
         XCTAssertEqual(tombstonePath, renamed.relativePath)
+        XCTAssertEqual(tombstoneContent, "본문 snapshot")
         XCTAssertFalse(tombstonePath.rawValue.contains("/휴지통/"))
         XCTAssertTrue(tombstoneDeleted)
 
@@ -1374,6 +1413,197 @@ final class LocalBinderCommandServiceTests: XCTestCase {
         XCTAssertEqual(
             try String(contentsOf: fileURL(result.document.relativePath.rawValue, harness: harness)),
             "과거 장면"
+        )
+    }
+
+    func testRecoverMigratesLegacyPlotAndPreservesSubtreeIDs() async throws {
+        let harness = try await makeHarness()
+        let storyPlot = try await fixedRoot(.storyPlot, harness: harness)
+        let created = try await harness.commands.create(
+            kind: .text,
+            named: "구상",
+            in: storyPlot.id,
+            projectID: harness.project.id
+        )
+        let documents = try await harness.repository.documents(in: harness.project.id)
+        let folder = try XCTUnwrap(documents.first { $0.id == storyPlot.id })
+        let text = try XCTUnwrap(documents.first { $0.id == created.affectedDocumentID })
+        let legacyFolderPath = RelativeDocumentPath(rawValue: "메인/플롯")
+        let legacyTextPath = RelativeDocumentPath(rawValue: "메인/플롯/구상.txt")
+        try FileManager.default.moveItem(
+            at: fileURL(folder.relativePath.rawValue, harness: harness),
+            to: fileURL(legacyFolderPath.rawValue, harness: harness)
+        )
+        let legacyFolder = copy(folder, path: legacyFolderPath)
+        let legacyText = copy(text, path: legacyTextPath)
+        try await harness.repository.reconcileBinderMetadata(
+            in: harness.project.id,
+            upserting: [legacyFolder, legacyText],
+            removingSubtrees: []
+        )
+
+        try await harness.commands.recoverPendingTransactions(in: harness.project.id)
+
+        XCTAssertTrue(fileExists("메인/스토리 플롯/구상.txt", harness: harness))
+        XCTAssertFalse(fileExists("메인/플롯", harness: harness))
+        let migrated = try await harness.repository.documents(in: harness.project.id)
+        XCTAssertEqual(
+            migrated.first { $0.id == folder.id }?.relativePath,
+            BinderFixedCategory.storyPlot.relativePath
+        )
+        XCTAssertEqual(
+            migrated.first { $0.id == text.id }?.relativePath.rawValue,
+            "메인/스토리 플롯/구상.txt"
+        )
+    }
+
+    func testRecoverStopsWithoutMergingWhenCanonicalAndLegacyPlotCoexist() async throws {
+        let harness = try await makeHarness()
+        try FileManager.default.createDirectory(
+            at: fileURL("메인/플롯", harness: harness),
+            withIntermediateDirectories: false
+        )
+
+        await assertBinderError(
+            .storyPlotMigrationConflict(["메인/스토리 플롯", "메인/플롯"])
+        ) {
+            try await harness.commands.recoverPendingTransactions(
+                in: harness.project.id
+            )
+        }
+
+        XCTAssertTrue(fileExists("메인/스토리 플롯", harness: harness))
+        XCTAssertTrue(fileExists("메인/플롯", harness: harness))
+    }
+
+    func testRecoverRemovesOnlyEmptyDeterministicLegacySyncRootAlias() async throws {
+        let harness = try await makeHarness()
+        let initialDocuments = try await harness.repository.documents(
+            in: harness.project.id
+        )
+        let main = try XCTUnwrap(
+            initialDocuments.first { $0.relativePath.rawValue == "메인" }
+        )
+        let path = RelativeDocumentPath(rawValue: "메인/📚 원고")
+        let identifier = DocumentID(
+            rawValue: syncV2UUIDv5(
+                namespace: harness.project.id.rawValue,
+                name: "writerpad-local-folder/"
+                    + path.rawValue.precomposedStringWithCanonicalMapping.lowercased()
+            )
+        )
+        let duplicate = DocumentNode(
+            id: identifier,
+            projectID: harness.project.id,
+            kind: .folder,
+            parentID: main.id,
+            relativePath: path,
+            userOrder: 99,
+            modifiedAt: harness.clock.now(),
+            contentHash: nil
+        )
+        try FileManager.default.createDirectory(
+            at: fileURL(path.rawValue, harness: harness),
+            withIntermediateDirectories: false
+        )
+        try await harness.repository.reconcileBinderMetadata(
+            in: harness.project.id,
+            upserting: [duplicate],
+            removingSubtrees: []
+        )
+
+        try await harness.commands.recoverPendingTransactions(in: harness.project.id)
+
+        XCTAssertFalse(fileExists(path.rawValue, harness: harness))
+        let removed = try await harness.repository.document(id: identifier)
+        XCTAssertNil(removed)
+    }
+
+    func testRecoverPreservesNonemptyLegacySyncRootAliasAndReportsConflict() async throws {
+        let harness = try await makeHarness()
+        let initialDocuments = try await harness.repository.documents(
+            in: harness.project.id
+        )
+        let main = try XCTUnwrap(
+            initialDocuments.first { $0.relativePath.rawValue == "메인" }
+        )
+        let path = RelativeDocumentPath(rawValue: "메인/📚 원고")
+        let identifier = DocumentID(
+            rawValue: syncV2UUIDv5(
+                namespace: harness.project.id.rawValue,
+                name: "writerpad-local-folder/"
+                    + path.rawValue.precomposedStringWithCanonicalMapping.lowercased()
+            )
+        )
+        let duplicate = DocumentNode(
+            id: identifier,
+            projectID: harness.project.id,
+            kind: .folder,
+            parentID: main.id,
+            relativePath: path,
+            userOrder: 99,
+            modifiedAt: harness.clock.now(),
+            contentHash: nil
+        )
+        let safePath = RelativeDocumentPath(rawValue: "메인/👤 캐릭터")
+        let safeID = DocumentID(
+            rawValue: syncV2UUIDv5(
+                namespace: harness.project.id.rawValue,
+                name: "writerpad-local-folder/"
+                    + safePath.rawValue.precomposedStringWithCanonicalMapping.lowercased()
+            )
+        )
+        let safeDuplicate = DocumentNode(
+            id: safeID,
+            projectID: harness.project.id,
+            kind: .folder,
+            parentID: main.id,
+            relativePath: safePath,
+            userOrder: 100,
+            modifiedAt: harness.clock.now(),
+            contentHash: nil
+        )
+        try writeText("보존", at: "메인/📚 원고/확인.txt", harness: harness)
+        try FileManager.default.createDirectory(
+            at: fileURL(safePath.rawValue, harness: harness),
+            withIntermediateDirectories: false
+        )
+        try await harness.repository.reconcileBinderMetadata(
+            in: harness.project.id,
+            upserting: [duplicate, safeDuplicate],
+            removingSubtrees: []
+        )
+
+        await assertBinderError(.legacySyncFolderConflict([path.rawValue])) {
+            try await harness.commands.recoverPendingTransactions(
+                in: harness.project.id
+            )
+        }
+
+        XCTAssertTrue(fileExists("메인/📚 원고/확인.txt", harness: harness))
+        XCTAssertTrue(fileExists(safePath.rawValue, harness: harness))
+        let preserved = try await harness.repository.document(id: identifier)
+        let safePreserved = try await harness.repository.document(id: safeID)
+        XCTAssertNotNil(preserved)
+        XCTAssertNotNil(safePreserved)
+    }
+
+    private func copy(
+        _ document: DocumentNode,
+        path: RelativeDocumentPath
+    ) -> DocumentNode {
+        DocumentNode(
+            id: document.id,
+            projectID: document.projectID,
+            kind: document.kind,
+            parentID: document.parentID,
+            relativePath: path,
+            userOrder: document.userOrder,
+            modifiedAt: document.modifiedAt,
+            contentHash: document.contentHash,
+            deletionStatus: document.deletionStatus,
+            cursor: document.cursor,
+            isExpanded: document.isExpanded
         )
     }
 

@@ -123,6 +123,13 @@
 		A90000000000000000000015 /* SyncV2SnapshotPull.swift in Sources */ = {isa = PBXBuildFile; fileRef = B90000000000000000000019 /* SyncV2SnapshotPull.swift */; };
 		A90000000000000000000016 /* SyncV2SnapshotPullTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = B9000000000000000000001A /* SyncV2SnapshotPullTests.swift */; };
 		A93000000000000000000001 /* SyncV2Diagnostics.swift in Sources */ = {isa = PBXBuildFile; fileRef = B93000000000000000000001 /* SyncV2Diagnostics.swift */; };
+		A94000000000000000000001 /* SyncV2SnapshotTransport.swift in Sources */ = {isa = PBXBuildFile; fileRef = B94000000000000000000001 /* SyncV2SnapshotTransport.swift */; };
+		A94000000000000000000002 /* SyncV2SnapshotModels.swift in Sources */ = {isa = PBXBuildFile; fileRef = B94000000000000000000002 /* SyncV2SnapshotModels.swift */; };
+		A94000000000000000000003 /* SyncV2SnapshotPullService.swift in Sources */ = {isa = PBXBuildFile; fileRef = B94000000000000000000003 /* SyncV2SnapshotPullService.swift */; };
+		A94000000000000000000004 /* SyncV2RealtimeTrigger.swift in Sources */ = {isa = PBXBuildFile; fileRef = B94000000000000000000004 /* SyncV2RealtimeTrigger.swift */; };
+		A94000000000000000000007 /* SyncV2LocalSnapshotApply.swift in Sources */ = {isa = PBXBuildFile; fileRef = B94000000000000000000007 /* SyncV2LocalSnapshotApply.swift */; };
+		A94000000000000000000008 /* WorkspaceSyncStatusPresentation.swift in Sources */ = {isa = PBXBuildFile; fileRef = B94000000000000000000008 /* WorkspaceSyncStatusPresentation.swift */; };
+		A95000000000000000000001 /* SyncV2Timing.swift in Sources */ = {isa = PBXBuildFile; fileRef = B95000000000000000000001 /* SyncV2Timing.swift */; };
 		A92000000000000000000001 /* ThreeWayMerge.swift in Sources */ = {isa = PBXBuildFile; fileRef = B92000000000000000000001 /* ThreeWayMerge.swift */; };
 		A92000000000000000000002 /* ThreeWayMergeTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = B92000000000000000000002 /* ThreeWayMergeTests.swift */; };
 		A92000000000000000000003 /* three_way_merge_cases.json in Resources */ = {isa = PBXBuildFile; fileRef = B92000000000000000000003 /* three_way_merge_cases.json */; };
@@ -268,6 +275,13 @@
 		B90000000000000000000019 /* SyncV2SnapshotPull.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SyncV2SnapshotPull.swift; sourceTree = "<group>"; };
 		B9000000000000000000001A /* SyncV2SnapshotPullTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SyncV2SnapshotPullTests.swift; sourceTree = "<group>"; };
 		B93000000000000000000001 /* SyncV2Diagnostics.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SyncV2Diagnostics.swift; sourceTree = "<group>"; };
+		B94000000000000000000001 /* SyncV2SnapshotTransport.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SyncV2SnapshotTransport.swift; sourceTree = "<group>"; };
+		B94000000000000000000002 /* SyncV2SnapshotModels.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SyncV2SnapshotModels.swift; sourceTree = "<group>"; };
+		B94000000000000000000003 /* SyncV2SnapshotPullService.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SyncV2SnapshotPullService.swift; sourceTree = "<group>"; };
+		B94000000000000000000004 /* SyncV2RealtimeTrigger.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SyncV2RealtimeTrigger.swift; sourceTree = "<group>"; };
+		B94000000000000000000007 /* SyncV2LocalSnapshotApply.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SyncV2LocalSnapshotApply.swift; sourceTree = "<group>"; };
+		B94000000000000000000008 /* WorkspaceSyncStatusPresentation.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WorkspaceSyncStatusPresentation.swift; sourceTree = "<group>"; };
+		B95000000000000000000001 /* SyncV2Timing.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SyncV2Timing.swift; sourceTree = "<group>"; };
 		B90000000000000000000016 /* SyncSettingsView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SyncSettingsView.swift; sourceTree = "<group>"; };
 		B90000000000000000000018 /* EditLeaseManager.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = EditLeaseManager.swift; sourceTree = "<group>"; };
 		B90000000000000000000017 /* SyncSettingsModelTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SyncSettingsModelTests.swift; sourceTree = "<group>"; };
@@ -401,6 +415,12 @@
 				B90000000000000000000013 /* SyncV2Client.swift */,
 				B90000000000000000000015 /* SyncV2Dispatcher.swift */,
 				B90000000000000000000019 /* SyncV2SnapshotPull.swift */,
+				B95000000000000000000001 /* SyncV2Timing.swift */,
+				B94000000000000000000001 /* SyncV2SnapshotTransport.swift */,
+				B94000000000000000000002 /* SyncV2SnapshotModels.swift */,
+				B94000000000000000000003 /* SyncV2SnapshotPullService.swift */,
+				B94000000000000000000004 /* SyncV2RealtimeTrigger.swift */,
+				B94000000000000000000007 /* SyncV2LocalSnapshotApply.swift */,
 				B93000000000000000000001 /* SyncV2Diagnostics.swift */,
 				B92000000000000000000001 /* ThreeWayMerge.swift */,
 				B90000000000000000000018 /* EditLeaseManager.swift */,
@@ -595,6 +615,7 @@
 				B1000000000000000000005D /* WorkspaceLayoutSupport.swift */,
 				B1000000000000000000005E /* ImportReportView.swift */,
 				B1000000000000000000005F /* WritingWorkspaceView.swift */,
+				B94000000000000000000008 /* WorkspaceSyncStatusPresentation.swift */,
 				B10000000000000000000031 /* ProjectListModel.swift */,
 				B10000000000000000000056 /* ManuscriptExportView.swift */,
 				B10000000000000000000058 /* ManuscriptExportSupport.swift */,
@@ -869,6 +890,13 @@
 				A9000000000000000000000F /* SyncV2Client.swift in Sources */,
 				A90000000000000000000011 /* SyncV2Dispatcher.swift in Sources */,
 				A90000000000000000000015 /* SyncV2SnapshotPull.swift in Sources */,
+				A95000000000000000000001 /* SyncV2Timing.swift in Sources */,
+				A94000000000000000000001 /* SyncV2SnapshotTransport.swift in Sources */,
+				A94000000000000000000002 /* SyncV2SnapshotModels.swift in Sources */,
+				A94000000000000000000003 /* SyncV2SnapshotPullService.swift in Sources */,
+				A94000000000000000000004 /* SyncV2RealtimeTrigger.swift in Sources */,
+				A94000000000000000000007 /* SyncV2LocalSnapshotApply.swift in Sources */,
+				A94000000000000000000008 /* WorkspaceSyncStatusPresentation.swift in Sources */,
 				A93000000000000000000001 /* SyncV2Diagnostics.swift in Sources */,
 				A92000000000000000000001 /* ThreeWayMerge.swift in Sources */,
 				A90000000000000000000012 /* SyncSettingsView.swift in Sources */,

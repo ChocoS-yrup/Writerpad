@@ -73,11 +73,11 @@ snapshot, 저장 generation, rename·move·reorder, purge generation이 없고
 | TXT 본문 저장 | v2 문서 commit | document UUID, path, full snapshot, save generation |
 | TXT 이름 변경 | v2 문서 commit + 숨은 tree-order commit | 같은 UUID의 move와 새 순서 |
 | TXT 폴더 이동 | v2 문서 commit + 숨은 tree-order commit | 같은 UUID의 move와 양쪽 부모 순서 |
-| 폴더 생성 | 숨은 tree-order commit 또는 보류 | 비어 있으면 아래 제한 때문에 교차 기기 보존 불가 |
+| 폴더 생성 | 숨은 tree-order commit | 비어 있어도 parent의 child name으로 경로를 표현한다. |
 | 폴더 이름 변경 | 하위 TXT v2 commit + 숨은 tree-order commit | 모든 descendant path move를 한 local batch로 기록 |
 | 폴더 이동 | 하위 TXT v2 commit + 숨은 tree-order commit | 모든 descendant path move와 순서를 한 batch로 기록 |
 | 폴더 삭제·휴지통 이동 | 하위 TXT tombstone + 숨은 tree-order commit | 각 descendant UUID 삭제와 live tree 제거 |
-| 빈 폴더 삭제 | 로컬 전용 | 서버가 해당 폴더 identity를 가진 적이 없다. |
+| 빈 폴더 삭제 | 숨은 tree-order commit | child list에서는 제거한다. 수신 기기의 기존 로컬 폴더 자동 제거는 별도 충돌 정책 전까지 보류한다. |
 
 폴더는 서버 entity가 아니며 UUID commit 대상도 아니다. 폴더 아래 TXT는 각자의
 UUID를 유지한다. 폴더 구조는 TXT의 relative path와 tree-order projection으로
@@ -142,18 +142,28 @@ Windows 가져오기 연결 확인 화면은 최소한 다음 선택을 구분�
 
 ## 빈 폴더 정책
 
-현재 Windows `save_tree_order`는 parent에게 실제 자식이 있을 때만 그 parent
-key를 기록한다. `tree-order.json` 적용부는 설정의 순서를 바꾸지만 물리 폴더를
-만들지 않는다. 서버에도 folder table이나 folder UUID가 없다.
+Windows `save_tree_order`는 빈 폴더 자신의 key는 생략할 수 있지만 parent의
+child name에는 그 폴더를 남긴다. iPad pull은 같은 snapshot에 포함된 live TXT
+경로와 child name을 대조해, TXT가 아닌 항목을 물리 폴더와 로컬 metadata로
+재구성한다. 중첩된 빈 폴더도 parent-first 순서로 만든다.
 
-따라서 현재 계약으로 빈 폴더를 다른 기기에 생성·복원할 수 없다.
+서버에는 여전히 folder table이나 folder UUID가 없다. 따라서 서버가 보존하는
+것은 폴더의 독립 identity가 아니라 tree-order 시점의 이름·경로·계층이다.
+iPad의 폴더 UUID는 이 경로에서 결정적으로 파생하며 일반 문서 UUID 계약에
+포함하지 않는다. `__antigravity__` 실제 폴더나 파일은 만들지 않는다.
 
-- 빈 폴더는 로컬 생성에 성공하지만 “이 기기에만 있음” 상태다.
-- 빈 폴더가 TXT descendant를 갖게 되면 relative path로 구조가 표현된다.
-- tree-order가 빈 폴더 동기화를 보장한다고 UI나 문서에서 표시하지 않는다.
-- 8-4에서 추측성 folder row나 숨은 별도 형식을 추가하지 않는다.
-- 교차 기기 빈 폴더가 필수 요구가 되면 Windows 호환성 테스트와 순방향
-  서버 계약 변경 승인을 먼저 받는다.
+### 고정 루트 이름 계약
+
+`tree_order["<root>"]`에는 UI 표시명이나 이모지를 넣지 않고 실제 저장 폴더의
+basename만 기록한다. 현행 고정 루트는 다음 9개다.
+
+`원고`, `캐릭터`, `설정집`, `메모장`, `스토리 플롯`, `흐름정리`, `복선`, `장소`, `휴지통`
+
+스토리 플롯의 canonical 경로는 `메인/스토리 플롯`이다. iPad는 구형
+`메인/플롯`, `메인/메인 스토리 틀`과 이전 Windows UI 표시명 payload를
+canonical 이름으로 읽되, 신·구 실제 폴더가 공존하면 자동 병합·삭제하지 않고
+구조 충돌로 중단한다. 초기 13-2 수신부가 만든 이모지 루트는 경로 기반 UUIDv5,
+빈 디렉터리, 하위 metadata 없음이 모두 확인될 때만 정리한다.
 
 ## 듀얼 편집기 정책
 

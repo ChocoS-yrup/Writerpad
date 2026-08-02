@@ -330,6 +330,7 @@ final class AppEnvironment: ObservableObject {
             clock: clock,
             futureChangeNotifier: futureChangeNotifier,
             durableChangeRecorder: durableChangeRecorder,
+            syncMutationGate: syncMutationGate,
             backupStore: backupStore,
             backupPolicyStore: backupPolicyStore
         )

@@ -239,6 +239,12 @@ private actor SyncSettingsAuthenticationStub: AuthenticationServicing {
         state
     }
 
+    // 설정 화면용 더블은 refresh와 restore를 의도적으로 구분하지 않는다.
+    func refreshSession(force: Bool) -> AuthenticationState {
+        _ = force
+        return state
+    }
+
     func signIn(
         email: String,
         password: String

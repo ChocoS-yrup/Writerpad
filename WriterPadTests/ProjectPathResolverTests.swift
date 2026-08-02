@@ -20,6 +20,10 @@ final class ProjectPathResolverTests: XCTestCase {
             }
             XCTAssertTrue(FileManager.default.fileExists(atPath: paths.settingsFileURL.path))
             XCTAssertEqual(paths.trashURL.path, paths.mainURL.appendingPathComponent("휴지통").path)
+            XCTAssertEqual(
+                paths.storyPlotURL.path,
+                paths.mainURL.appendingPathComponent("스토리 플롯").path
+            )
             XCTAssertFalse(
                 FileManager.default.fileExists(
                     atPath: paths.workspaceRootURL.appendingPathComponent("휴지통").path

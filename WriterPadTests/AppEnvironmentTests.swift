@@ -4290,6 +4290,11 @@ private actor AlwaysAuthenticatedService: AuthenticationServicing {
 
     func currentState() -> AuthenticationState { state }
     func restoreSession() -> AuthenticationState { state }
+    // 이 고정 상태 더블은 refresh와 restore를 의도적으로 구분하지 않는다.
+    func refreshSession(force: Bool) -> AuthenticationState {
+        _ = force
+        return state
+    }
     func signIn(
         email: String,
         password: String

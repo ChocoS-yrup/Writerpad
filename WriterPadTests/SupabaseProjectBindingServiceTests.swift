@@ -577,6 +577,12 @@ private actor AuthenticationServiceStub: AuthenticationServicing {
         state
     }
 
+    // 바인딩 테스트 더블은 refresh와 restore를 의도적으로 구분하지 않는다.
+    func refreshSession(force: Bool) -> AuthenticationState {
+        _ = force
+        return state
+    }
+
     func signIn(email: String, password: String) -> AuthenticationState {
         _ = email
         _ = password

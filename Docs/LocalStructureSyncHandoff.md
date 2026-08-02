@@ -9,8 +9,9 @@
   tree-order를 한 batch로 기록한다.
 - 바인더 재정렬: 파일 변경 없는 로컬 transaction journal을 거쳐
   tree-order를 기록한다.
-- 휴지통 이동: 휴지통 path가 아니라 변경 전 live path의 tombstone과
-  tree-order를 한 batch로 기록한다.
+- 휴지통 이동: 휴지통 path가 아니라 변경 전 live path와 삭제 직전 본문을
+  담은 tombstone, tree-order를 한 batch로 기록한다. tombstone 본문은 같은
+  revision의 누락 휴지통 사본 복구에 사용한다.
 - 휴지통 복원: 같은 문서 UUID, 새 live path, 확정 본문과 tree-order를
   한 batch로 기록한다.
 - 새 권: 25개 빈 TXT snapshot과 tree-order를 한 `volumeCreation` batch로
@@ -46,8 +47,8 @@ Windows 초기 snapshot은 작품 root의
 `UUIDv5(server_project_id, hidden_path)`로 만든다. 휴지통 항목은
 tree-order와 Windows 초기 live snapshot에서 제외한다.
 
-서버에는 folder entity가 없으므로 비어 있는 폴더의 생성·이름·위치는
-교차 기기 보존을 보장하지 않는다.
+서버에는 folder entity가 없지만, 빈 폴더의 이름·경로·계층은 tree-order의
+parent child name으로 교차 기기에 전달한다. 폴더의 독립 UUID는 전달하지 않는다.
 
 ## 10-5 연결
 

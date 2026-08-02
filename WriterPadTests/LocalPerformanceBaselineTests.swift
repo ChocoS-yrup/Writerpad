@@ -30,8 +30,8 @@ final class LocalPerformanceBaselineTests: XCTestCase {
         let initialRootSeconds =
             ProcessInfo.processInfo.systemUptime - rootStartedAt
         try require(
-            initialRoots.count == 8,
-            "최상위 바인더는 고정 항목 8개여야 합니다."
+            initialRoots.count == 9,
+            "최상위 바인더는 고정 항목 9개여야 합니다."
         )
         let manuscript = try requireValue(
             initialRoots.first { $0.fixedCategory == .manuscript },
@@ -43,7 +43,7 @@ final class LocalPerformanceBaselineTests: XCTestCase {
                 in: fixture.projectID
             )
             try require(
-                roots.count == 8,
+                roots.count == 9,
                 "최상위 바인더 새로고침 결과가 달라졌습니다."
             )
         }

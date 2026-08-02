@@ -317,6 +317,7 @@ struct WritingWorkspaceShell: View {
             Task {
                 await restoreWorkspaceIfNeeded()
                 await workspaceSyncModel.start(
+                    sceneIsActive: scenePhase == .active,
                     editingGuards: currentSyncEditingGuards,
                     applyOpenSnapshot: applyOpenServerSnapshot
                 )
@@ -2111,7 +2112,7 @@ private struct EditorSaveStatusBadge: View {
         SaveStatusBadge(
             state: model.saveState,
             syncHandoffState: model.syncHandoffState,
-            serverState: workspaceSyncModel.serverState,
+            workspaceState: workspaceSyncModel.state,
             leaseState: model.editLeaseState,
             onRetry: onRetry,
             onResolveConflict: onResolveConflict
@@ -2123,7 +2124,7 @@ private struct SaveStatusBadge: View {
     @State private var isShowingDetail = false
     let state: SaveState
     let syncHandoffState: SyncHandoffState
-    let serverState: SyncV2WorkspaceServerState
+    let workspaceState: SyncV2WorkspaceState
     let leaseState: EditLeaseDisplayState
     let onRetry: () -> Void
     let onResolveConflict: (() -> Void)?
@@ -2132,7 +2133,7 @@ private struct SaveStatusBadge: View {
         WorkspaceSyncStatusReducer.presentation(
             saveState: state,
             handoffState: syncHandoffState,
-            serverState: serverState,
+            workspaceState: workspaceState,
             leaseState: leaseState
         )
     }
@@ -2183,7 +2184,7 @@ private struct SaveStatusBadge: View {
     }
 
     private var requiresConflictResolution: Bool {
-        if case .conflictRequired = serverState {
+        if case .conflictRequired = workspaceState.lastResult {
             return true
         }
         return false

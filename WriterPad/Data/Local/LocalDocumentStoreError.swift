@@ -18,6 +18,7 @@ enum LocalDocumentStoreError: Error, Equatable, LocalizedError, Sendable {
     case storageFull(path: String)
     case operationFailed(operation: LocalDocumentOperation, path: String, code: Int32)
     case staleGeneration(documentID: DocumentID, requested: UInt64, latest: UInt64)
+    case documentNoLongerWritable(DocumentID)
     case metadataUpdateFailed(receipt: DocumentSaveReceipt, markerPath: String, reason: String)
 
     var errorDescription: String? {
@@ -38,6 +39,8 @@ enum LocalDocumentStoreError: Error, Equatable, LocalizedError, Sendable {
             "\(operation.rawValue) 중 오류가 발생했습니다(errno \(code)): \(path)"
         case let .staleGeneration(id, requested, latest):
             "오래된 저장 요청을 무시했습니다(\(id.rawValue), \(requested) < \(latest))."
+        case let .documentNoLongerWritable(id):
+            "휴지통으로 이동했거나 경로가 바뀐 문서의 늦은 저장을 무시했습니다(\(id.rawValue))."
         case let .metadataUpdateFailed(_, markerPath, reason):
             "원고는 저장됐지만 메타데이터 반영에 실패했습니다. 복구 기록: \(markerPath) (\(reason))"
         }
