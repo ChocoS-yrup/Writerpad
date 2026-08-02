@@ -7,6 +7,29 @@ struct ThreeWayMergeResult: Equatable, Sendable {
 }
 
 enum ThreeWayMerge {
+    /// 오프라인 중 두 기기가 같은 경로에 각각 새 문서를 만들면 공통 원본이
+    /// 없다. 이때 `바꾸기 전 원본`은 빈 칸이 되고 `차이점`은 양쪽 본문 전체를
+    /// 그대로 반복하므로, 두 칸만 남겨 한 문서에 나란히 보존한다. 어느 쪽을
+    /// 남길지는 작가가 편집기에서 직접 정리한다.
+    static func sideBySide(
+        local: String,
+        remote: String
+    ) -> String {
+        var output = "=========\n\n"
+        output += "로컬 편집본\n\n"
+        output += ensureTrailingNewline(local)
+        output += "\n=========\n\n"
+        output += "서버 최신본\n\n"
+        output += ensureTrailingNewline(remote)
+        output += "\n=========\n"
+        return output
+    }
+
+    private static func ensureTrailingNewline(_ value: String) -> String {
+        guard !value.isEmpty else { return "\n" }
+        return value.hasSuffix("\n") ? value : value + "\n"
+    }
+
     static func merge(
         base: String,
         local: String,

@@ -2183,11 +2183,15 @@ private struct SaveStatusBadge: View {
         .accessibilityHint("상태 상세 정보를 엽니다.")
     }
 
+    /// 경로 충돌(`structuralConflict`)도 저절로 풀리지 않으므로 같은 입구를
+    /// 쓴다. 두 상태 모두 사용자가 해결해야 진행된다.
     private var requiresConflictResolution: Bool {
-        if case .conflictRequired = workspaceState.lastResult {
+        switch workspaceState.lastResult {
+        case .conflictRequired, .structuralConflict:
             return true
+        default:
+            return false
         }
-        return false
     }
 
     private var badgeLabel: some View {

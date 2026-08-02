@@ -225,6 +225,15 @@ actor SyncV2SnapshotPullService: SyncV2SnapshotPulling {
                     revision: state.serverRevision,
                     reason: .blockedOperation
                 )
+            } else if state.hasPathCollision {
+                // `conflict` 상태 operation은 아래 hasActiveOperation에도 걸려
+                // 진행 중으로 보고된다. 경로 충돌은 저절로 풀리지 않으므로 더
+                // 먼저 판정해 사용자에게 해결이 필요한 상태로 알린다.
+                outcome = .mergeRequired(
+                    documentID: snapshot.documentID,
+                    revision: state.serverRevision,
+                    reason: .pathOccupiedByDifferentDocument
+                )
             } else if state.hasActiveOperation {
                 outcome = .mergeRequired(
                     documentID: snapshot.documentID,

@@ -2067,6 +2067,125 @@ final class SyncV2StoreTests: XCTestCase {
         await store.close()
     }
 
+    /// 경로 충돌로 굳은 operation은 `conflict` 상태라 "완료도 취소도 아님"에
+    /// 걸려 진행 중으로 집계된다. 그대로 두면 사용자에게는 끝나지 않는
+    /// "동기화 중"으로만 보이므로, 해결이 필요한 상태로 따로 드러나야 한다.
+    func testPathConflictSurfacesAsCollisionNotJustPendingWork()
+        async throws {
+        let url = try databaseURL()
+        let context = QueueAPIContext()
+        let store = try await connectedStore(at: url, context: context)
+        let operationID = UUID()
+        _ = try await store.enqueue(
+            context.batch(
+                mutations: [
+                    context.documentMutation(
+                        operationID: operationID,
+                        content: "아이패드에서 쓴 3화"
+                    ),
+                ]
+            )
+        )
+        let claims = try await store.claimReadyOperations(
+            limit: 1,
+            now: Date(timeIntervalSince1970: 10)
+        )
+        let claimed = try XCTUnwrap(claims.first)
+
+        try await store.markConflict(
+            claimed,
+            errorCode: "PATH_CONFLICT",
+            detail: nil
+        )
+
+        let state = try await store.snapshotState(
+            localProjectID: context.localProjectID,
+            serverProjectID: context.serverProjectID,
+            documentID: context.documentID
+        )
+        XCTAssertEqual(state?.hasPathCollision, true)
+        XCTAssertNil(
+            state?.blockingErrorCode,
+            "경로 충돌은 blocked가 아니라 conflict 상태다."
+        )
+        await store.close()
+    }
+
+    /// 다른 이유로 굳은 conflict는 경로 충돌로 보고되면 안 된다.
+    func testNonPathConflictDoesNotReportPathCollision() async throws {
+        let url = try databaseURL()
+        let context = QueueAPIContext()
+        let store = try await connectedStore(at: url, context: context)
+        _ = try await store.enqueue(
+            context.batch(
+                mutations: [
+                    context.documentMutation(operationID: UUID()),
+                ]
+            )
+        )
+        let claims = try await store.claimReadyOperations(
+            limit: 1,
+            now: Date(timeIntervalSince1970: 10)
+        )
+        let claimed = try XCTUnwrap(claims.first)
+
+        try await store.markConflict(
+            claimed,
+            errorCode: "OPERATION_ID_REUSED",
+            detail: nil
+        )
+
+        let state = try await store.snapshotState(
+            localProjectID: context.localProjectID,
+            serverProjectID: context.serverProjectID,
+            documentID: context.documentID
+        )
+        XCTAssertEqual(state?.hasPathCollision, false)
+        await store.close()
+    }
+
+    /// 오프라인 중 두 기기가 같은 화를 각각 만들면 공통 원본이 없다. 기존
+    /// 3-way 형식의 `바꾸기 전 원본`은 빈 칸이 되고 `차이점`은 본문 전체를
+    /// 그대로 반복하므로, 두 칸만 남긴 형식을 쓴다.
+    func testSideBySideKeepsBothBodiesWithoutBaseOrDifferenceSections() {
+        let merged = ThreeWayMerge.sideBySide(
+            local: "아이패드에서 쓴 3화",
+            remote: "윈도우에서 쓴 3화"
+        )
+
+        XCTAssertEqual(
+            merged,
+            """
+            =========
+
+            로컬 편집본
+
+            아이패드에서 쓴 3화
+
+            =========
+
+            서버 최신본
+
+            윈도우에서 쓴 3화
+
+            =========
+
+            """
+        )
+        XCTAssertFalse(merged.contains("바꾸기 전 원본"))
+        XCTAssertFalse(merged.contains("로컬과 서버 차이점"))
+    }
+
+    func testSideBySideKeepsBothBodiesWhenOneSideIsEmpty() {
+        let merged = ThreeWayMerge.sideBySide(
+            local: "",
+            remote: "윈도우에서 쓴 3화"
+        )
+
+        XCTAssertTrue(merged.contains("로컬 편집본"))
+        XCTAssertTrue(merged.contains("윈도우에서 쓴 3화"))
+    }
+
     /// Windows는 모든 server path를 NFC로 정규화해 보낸다. macOS 파일 이름은
     /// 한글 자모가 분리된 형태로 들어올 수 있으므로 iPad도 queue 입구에서 같은
     /// 정규화를 해야 서버 경로와 로컬 비교가 어긋나지 않는다. 디스크의 실제

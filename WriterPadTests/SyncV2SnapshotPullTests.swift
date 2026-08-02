@@ -293,6 +293,86 @@ final class SyncV2SnapshotPullTests: XCTestCase {
         )
     }
 
+    /// 경로 충돌로 굳은 operation은 `conflict` 상태라 hasActiveOperation에도
+    /// 걸린다. 진행 중으로 먼저 판정하면 사용자에게는 끝나지 않는 "동기화 중"이
+    /// 되므로, 경로 충돌을 더 앞에서 판정해야 한다. 이 순서가 뒤집히면 원래의
+    /// 무한 대기 증상이 그대로 돌아온다.
+    func testPathCollisionOutranksPendingOperationSoUserSeesItNeedsResolving()
+        async throws {
+        let documentID = UUID()
+        let stateStore = SnapshotStateStoreStub(
+            states: [
+                documentID: localState(
+                    revision: 4,
+                    active: true,
+                    pathCollision: true
+                ),
+            ]
+        )
+        let service = SyncV2SnapshotPullService(
+            client: SnapshotClientStub(
+                snapshots: [makeSnapshot(id: documentID, revision: 4)]
+            ),
+            stateStore: stateStore,
+            localApplier: SnapshotApplierSpy(),
+            mergeStore: SnapshotMergeStoreSpy()
+        )
+
+        let report = try await service.pull(
+            localProjectID: ProjectID(rawValue: UUID()),
+            serverProjectID: UUID(),
+            editingGuards: [:]
+        )
+
+        XCTAssertEqual(
+            report.outcomes,
+            [
+                .mergeRequired(
+                    documentID: documentID,
+                    revision: 4,
+                    reason: .pathOccupiedByDifferentDocument
+                ),
+            ],
+            "진행 중으로 묻히면 무한 동기화 대기로 되돌아간다."
+        )
+    }
+
+    /// 경로 충돌이 없으면 기존대로 진행 중으로 보고해야 한다.
+    func testActiveOperationWithoutPathCollisionStaysPendingOperation()
+        async throws {
+        let documentID = UUID()
+        let stateStore = SnapshotStateStoreStub(
+            states: [
+                documentID: localState(revision: 4, active: true),
+            ]
+        )
+        let service = SyncV2SnapshotPullService(
+            client: SnapshotClientStub(
+                snapshots: [makeSnapshot(id: documentID, revision: 4)]
+            ),
+            stateStore: stateStore,
+            localApplier: SnapshotApplierSpy(),
+            mergeStore: SnapshotMergeStoreSpy()
+        )
+
+        let report = try await service.pull(
+            localProjectID: ProjectID(rawValue: UUID()),
+            serverProjectID: UUID(),
+            editingGuards: [:]
+        )
+
+        XCTAssertEqual(
+            report.outcomes,
+            [
+                .mergeRequired(
+                    documentID: documentID,
+                    revision: 4,
+                    reason: .pendingOperation
+                ),
+            ]
+        )
+    }
+
     func testClosedCleanRemoteTombstoneIsAppliedInsteadOfPreserved()
         async throws {
         let documentID = UUID()
@@ -4715,14 +4795,16 @@ private func localState(
     revision: Int64,
     active: Bool = false,
     conflict: Bool = false,
-    blockingErrorCode: String? = nil
+    blockingErrorCode: String? = nil,
+    pathCollision: Bool = false
 ) -> SyncV2SnapshotLocalState {
     SyncV2SnapshotLocalState(
         serverRevision: revision,
         serverPath: "메인/1권/001화.txt",
         hasActiveOperation: active,
         hasUnresolvedConflict: conflict,
-        blockingErrorCode: blockingErrorCode
+        blockingErrorCode: blockingErrorCode,
+        hasPathCollision: pathCollision
     )
 }
 

@@ -117,6 +117,10 @@ struct SyncV2SnapshotLocalState: Equatable, Sendable {
     let hasActiveOperation: Bool
     let hasUnresolvedConflict: Bool
     let blockingErrorCode: String?
+    /// 서버가 같은 경로를 다른 문서에 이미 내준 상태다. `conflict` 상태
+    /// operation은 진행 중으로도 집계되므로, 이 값이 없으면 사용자에게는
+    /// 끝나지 않는 "동기화 중"으로만 보인다.
+    var hasPathCollision: Bool = false
 }
 
 struct SyncV2EditingGuard: Equatable, Sendable {

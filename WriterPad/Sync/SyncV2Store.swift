@@ -814,6 +814,13 @@ actor SyncV2Store:
                          AND o.status = 'blocked'
                        ORDER BY o.document_sequence, o.queue_id
                        LIMIT 1
+                   ),
+                   EXISTS(
+                       SELECT 1
+                       FROM sync_operations o
+                       WHERE o.document_id = d.document_id
+                         AND o.status = 'conflict'
+                         AND o.last_error_code = 'PATH_CONFLICT'
                    )
             FROM sync_documents d
             WHERE d.local_project_id = ?
@@ -851,7 +858,9 @@ actor SyncV2Store:
                 hasActiveOperation: sqlite3_column_int(statement, 2) == 1,
                 hasUnresolvedConflict:
                     sqlite3_column_int(statement, 3) == 1,
-                blockingErrorCode: columnText(statement, at: 4)
+                blockingErrorCode: columnText(statement, at: 4),
+                hasPathCollision:
+                    sqlite3_column_int(statement, 5) == 1
             )
         }
     }
