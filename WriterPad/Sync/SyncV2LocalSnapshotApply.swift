@@ -949,6 +949,14 @@ actor LocalSyncV2SnapshotApplier: SyncV2LocalSnapshotApplying {
         let root = try await workspaceLocator.workspaceRoot(
             for: localProjectID
         )
+        // 폴더를 만들기 전에 이름 변경부터 반영한다. 새 이름을 먼저 만들면
+        // 옛 폴더가 그대로 남아 폴더가 둘로 늘어난다.
+        documents = try await renameSyncedEmptyFolders(
+            payload: payload,
+            localProjectID: localProjectID,
+            documents: documents,
+            root: root
+        )
         let hierarchy = try planTreeOrderFolders(
             payload: payload,
             localProjectID: localProjectID,
@@ -1154,6 +1162,132 @@ actor LocalSyncV2SnapshotApplier: SyncV2LocalSnapshotApplying {
 
     private func canonicalRootTreeOrderName(_ name: String) -> String {
         legacyRootTreeOrderAliases[name] ?? name
+    }
+
+    /// 빈 폴더는 서버에 문서로 존재하지 않고 tree-order의 child name으로만
+    /// 전달된다. 그래서 Windows의 이름 변경이 "옛 이름 사라짐 + 새 이름 생김"
+    /// 으로 도착하고, 새 이름만 만들면 폴더가 둘로 늘어난다.
+    ///
+    /// 한 부모 안에서 사라진 폴더와 새로 생긴 이름이 각각 하나뿐일 때만 짝으로
+    /// 보고 옮긴다. 여러 개가 동시에 바뀌면 어느 것이 어느 것인지 알 수 없으므로
+    /// 기존 동작(새 이름만 만들고 옛 폴더는 유지)을 그대로 둔다.
+    ///
+    /// 지우지 않고 옮기므로, 추적하지 않는 파일이 디스크에 남아 있었더라도 함께
+    /// 따라간다. 대상은 동기화가 만든 빈 폴더로 한정한다. 사용자가 직접 만든
+    /// 폴더는 경로 파생 UUID가 아니라서 걸러지고, 문서가 들어 있는 폴더는 그
+    /// 문서들의 경로가 서버를 따르므로 건드리면 안 된다.
+    private func renameSyncedEmptyFolders(
+        payload: TreeOrderPayload,
+        localProjectID: ProjectID,
+        documents initialDocuments: [DocumentNode],
+        root: URL
+    ) async throws -> [DocumentNode] {
+        var documents = initialDocuments
+        let remotePaths = remoteLiveDocumentPaths[localProjectID] ?? []
+
+        for key in payload.treeOrder.keys.sorted() {
+            guard let names = payload.treeOrder[key] else { continue }
+            let parentValue = key == "<root>" ? "메인" : key
+            let parentPath = RelativeDocumentPath(rawValue: parentValue)
+            guard !isInTrash(parentPath) else { continue }
+            guard let parent = documents.first(where: {
+                $0.kind == .folder
+                    && isActive($0)
+                    && normalized($0.relativePath.rawValue)
+                        == normalized(parentValue)
+            }) else { continue }
+
+            let remoteKeys = Set(names.map { pathPolicy.collisionKey(for: $0) })
+            let children = documents.filter {
+                $0.parentID == parent.id && isActive($0)
+            }
+            let vanished = children.filter { child in
+                child.kind == .folder
+                    && !remoteKeys.contains(
+                        pathPolicy.collisionKey(for: storedName(of: child))
+                    )
+                    && child.id == syncedFolderIdentifier(
+                        localProjectID: localProjectID,
+                        path: child.relativePath.rawValue
+                    )
+                    && !documents.contains { candidate in
+                        isActive(candidate)
+                            && candidate.id != child.id
+                            && normalized(candidate.relativePath.rawValue)
+                                .hasPrefix(
+                                    normalized(child.relativePath.rawValue) + "/"
+                                )
+                    }
+            }
+            let childKeys = Set(
+                children.map { pathPolicy.collisionKey(for: storedName(of: $0)) }
+            )
+            let added = names.filter { name in
+                !childKeys.contains(pathPolicy.collisionKey(for: name))
+                    && !remotePaths.contains(
+                        normalized(parentValue + "/" + name)
+                    )
+            }
+            guard vanished.count == 1, added.count == 1,
+                  let source = vanished.first,
+                  let newName = added.first
+            else { continue }
+
+            let destinationValue = parentValue + "/" + newName
+            let destinationPath = RelativeDocumentPath(
+                rawValue: destinationValue
+            )
+            try pathPolicy.validateRelativePath(destinationPath)
+            let sourceURL = root.appendingPathComponent(
+                source.relativePath.rawValue
+            ).standardizedFileURL
+            let destinationURL = root.appendingPathComponent(
+                destinationValue
+            ).standardizedFileURL
+            guard !fileManager.fileExists(atPath: destinationURL.path) else {
+                continue
+            }
+            if fileManager.fileExists(atPath: sourceURL.path) {
+                try fileManager.moveItem(at: sourceURL, to: destinationURL)
+            } else {
+                try fileManager.createDirectory(
+                    at: destinationURL,
+                    withIntermediateDirectories: false
+                )
+            }
+            let moved = DocumentNode(
+                id: syncedFolderIdentifier(
+                    localProjectID: localProjectID,
+                    path: destinationValue
+                ),
+                projectID: source.projectID,
+                kind: .folder,
+                parentID: source.parentID,
+                relativePath: destinationPath,
+                userOrder: source.userOrder,
+                modifiedAt: source.modifiedAt,
+                contentHash: nil
+            )
+            try await documentRepository.removeMetadata(id: source.id)
+            try await documentRepository.save(moved)
+            documents.removeAll { $0.id == source.id }
+            documents.append(moved)
+        }
+        return documents
+    }
+
+    /// 동기화가 tree-order에서 만든 폴더의 UUID는 경로에서 결정적으로 파생한다.
+    /// 사용자가 직접 만든 폴더와 구별하는 기준이 된다.
+    private func syncedFolderIdentifier(
+        localProjectID: ProjectID,
+        path: String
+    ) -> DocumentID {
+        DocumentID(
+            rawValue: syncV2UUIDv5(
+                namespace: localProjectID.rawValue,
+                name: "writerpad-local-folder/" + normalized(path)
+            )
+        )
     }
 
     private func planTreeOrderFolders(

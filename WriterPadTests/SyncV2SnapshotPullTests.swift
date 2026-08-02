@@ -1773,6 +1773,144 @@ final class SyncV2SnapshotPullTests: XCTestCase {
         )
     }
 
+    /// 빈 폴더는 tree-order의 child name으로만 전달되므로 Windows의 이름 변경은
+    /// "옛 이름 사라짐 + 새 이름 생김"으로 도착한다. 새 이름만 만들고 옛 폴더를
+    /// 두면 폴더가 둘로 늘어난다. 지우는 대신 옮겨야 안에 무엇이 있었더라도
+    /// 잃지 않는다.
+    func testTreeOrderRenamesSyncedEmptyFolderInsteadOfDuplicating()
+        async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("WriterPad-TreeOrder-\(UUID())")
+        defer { try? FileManager.default.removeItem(at: root) }
+        try FileManager.default.createDirectory(
+            at: root.appendingPathComponent("메인"),
+            withIntermediateDirectories: true
+        )
+        let projectID = ProjectID(rawValue: UUID())
+        let main = DocumentNode(
+            id: DocumentID(rawValue: UUID()),
+            projectID: projectID,
+            kind: .folder,
+            parentID: nil,
+            relativePath: RelativeDocumentPath(rawValue: "메인"),
+            userOrder: -1,
+            modifiedAt: .distantPast,
+            contentHash: nil
+        )
+        let repository = SnapshotDocumentRepository(documents: [main])
+        let applier = LocalSyncV2SnapshotApplier(
+            documentRepository: repository,
+            workspaceLocator: SnapshotWorkspaceLocator(root: root)
+        )
+        try await applier.apply(
+            localProjectID: projectID,
+            snapshot: makeSnapshot(
+                path: syncV2TreeOrderPath,
+                content:
+                    "{\"tree_order\":{\"<root>\":[\"새 폴더\"]},\"version\":1}",
+                revision: 1
+            )
+        )
+        let created = try await repository.documents(in: projectID)
+        let before = try XCTUnwrap(created.first(where: {
+            $0.relativePath.rawValue == "메인/새 폴더"
+        }))
+
+        try await applier.apply(
+            localProjectID: projectID,
+            snapshot: makeSnapshot(
+                path: syncV2TreeOrderPath,
+                content:
+                    "{\"tree_order\":{\"<root>\":[\"새 폴 더\"]},\"version\":1}",
+                revision: 2
+            )
+        )
+
+        let documents = try await repository.documents(in: projectID)
+        let folders = documents.filter {
+            $0.kind == .folder && $0.parentID == main.id
+        }
+        XCTAssertEqual(
+            folders.map(\.relativePath.rawValue),
+            ["메인/새 폴 더"],
+            "이름만 바뀌어야 하고 폴더가 둘로 늘면 안 된다."
+        )
+        XCTAssertFalse(
+            FileManager.default.fileExists(
+                atPath: root.appendingPathComponent("메인/새 폴더").path
+            ),
+            "옛 이름의 디렉터리는 남지 않아야 한다."
+        )
+        XCTAssertTrue(
+            FileManager.default.fileExists(
+                atPath: root.appendingPathComponent("메인/새 폴 더").path
+            )
+        )
+        XCTAssertNotEqual(
+            before.id,
+            folders.first?.id,
+            "폴더 UUID는 경로에서 파생하므로 새 경로 값으로 바뀐다."
+        )
+    }
+
+    /// 이름이 여럿 바뀌면 어느 것이 어느 것인지 짝지을 수 없다. 이때는 지금처럼
+    /// 새 이름만 만들고 옛 폴더는 그대로 둔다. 잘못 옮기는 것보다 낫다.
+    func testTreeOrderKeepsBothWhenRenamePairingIsAmbiguous() async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("WriterPad-TreeOrder-\(UUID())")
+        defer { try? FileManager.default.removeItem(at: root) }
+        try FileManager.default.createDirectory(
+            at: root.appendingPathComponent("메인"),
+            withIntermediateDirectories: true
+        )
+        let projectID = ProjectID(rawValue: UUID())
+        let main = DocumentNode(
+            id: DocumentID(rawValue: UUID()),
+            projectID: projectID,
+            kind: .folder,
+            parentID: nil,
+            relativePath: RelativeDocumentPath(rawValue: "메인"),
+            userOrder: -1,
+            modifiedAt: .distantPast,
+            contentHash: nil
+        )
+        let repository = SnapshotDocumentRepository(documents: [main])
+        let applier = LocalSyncV2SnapshotApplier(
+            documentRepository: repository,
+            workspaceLocator: SnapshotWorkspaceLocator(root: root)
+        )
+        try await applier.apply(
+            localProjectID: projectID,
+            snapshot: makeSnapshot(
+                path: syncV2TreeOrderPath,
+                content:
+                    "{\"tree_order\":{\"<root>\":[\"가\",\"나\"]},\"version\":1}",
+                revision: 1
+            )
+        )
+
+        try await applier.apply(
+            localProjectID: projectID,
+            snapshot: makeSnapshot(
+                path: syncV2TreeOrderPath,
+                content:
+                    "{\"tree_order\":{\"<root>\":[\"다\",\"라\"]},\"version\":1}",
+                revision: 2
+            )
+        )
+
+        let documents = try await repository.documents(in: projectID)
+        let names = Set(
+            documents
+                .filter { $0.kind == .folder && $0.parentID == main.id }
+                .map(\.relativePath.rawValue)
+        )
+        XCTAssertEqual(
+            names,
+            ["메인/가", "메인/나", "메인/다", "메인/라"]
+        )
+    }
+
     func testTreeOrderNeverMistakesBlockedRemoteTXTForEmptyFolder()
         async throws {
         let root = FileManager.default.temporaryDirectory
