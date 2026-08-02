@@ -1539,6 +1539,10 @@ actor SyncV2Store:
                     localProjectID: nil,
                     timestamp: timestamp
                 )
+                try recoverPersistedAlreadyExistsConflicts(
+                    localProjectID: nil,
+                    timestamp: timestamp
+                )
                 // 서버 프로젝트가 삭제 후 같은 UUID로 다시 만들어지는 등
                 // 로컬 revision 기준선만 남은 경우, 이전 실행에서
                 // DOCUMENT_NOT_FOUND로 막힌 첫 operation을 create로 되돌린다.
@@ -3340,7 +3344,44 @@ actor SyncV2Store:
         }
     }
 
+    /// 편집 lease는 시간이 지나면 저절로 풀리므로 굳은 operation을 그대로
+    /// 다시 세운다. 기준선은 건드리지 않는다.
+    private static let leaseConflictErrorCodeList =
+        "'LEASE_REQUIRED', 'LEASE_CONFLICT', 'LEASE_EXPIRED'"
+
+    /// base revision 0으로 보낸 create가 이미 있는 문서를 만난 경우다. 서버가
+    /// 최신 문서를 갖고 있으므로 DOCUMENT_NOT_FOUND 복구와 달리 기준선을 0으로
+    /// 되돌리면 안 된다. 그대로 다시 세우면 자동 rebase가 서버 revision을 읽어
+    /// 기준선을 맞춘다. 구버전에서 굳은 기록은 이 경로로만 풀린다.
+    private static let alreadyExistsErrorCodeList =
+        "'DOCUMENT_ALREADY_EXISTS'"
+
     private func recoverPersistedLeaseConflicts(
+        localProjectID: ProjectID?,
+        timestamp: String
+    ) throws {
+        try requeuePersistedConflicts(
+            errorCodeList: Self.leaseConflictErrorCodeList,
+            localProjectID: localProjectID,
+            timestamp: timestamp
+        )
+    }
+
+    private func recoverPersistedAlreadyExistsConflicts(
+        localProjectID: ProjectID?,
+        timestamp: String
+    ) throws {
+        try requeuePersistedConflicts(
+            errorCodeList: Self.alreadyExistsErrorCodeList,
+            localProjectID: localProjectID,
+            timestamp: timestamp
+        )
+    }
+
+    /// `errorCodeList`는 위의 private 상수만 받는 SQL 리터럴 조각이다. 외부
+    /// 입력이 들어오는 경로가 아니므로 바인딩 대신 문자열로 합친다.
+    private func requeuePersistedConflicts(
+        errorCodeList: String,
         localProjectID: ProjectID?,
         timestamp: String
     ) throws {
@@ -3351,9 +3392,7 @@ actor SyncV2Store:
             SELECT DISTINCT o.batch_id
             FROM sync_operations o
             WHERE o.status = 'conflict'
-              AND o.last_error_code IN (
-                  'LEASE_REQUIRED', 'LEASE_CONFLICT', 'LEASE_EXPIRED'
-              )
+              AND o.last_error_code IN (\(errorCodeList))
               AND (? IS NULL OR o.local_project_id = ?)
               AND NOT EXISTS (
                   SELECT 1
@@ -3393,9 +3432,7 @@ actor SyncV2Store:
                 FROM sync_operations o
                 WHERE o.document_id = sync_documents.document_id
                   AND o.status = 'conflict'
-                  AND o.last_error_code IN (
-                      'LEASE_REQUIRED', 'LEASE_CONFLICT', 'LEASE_EXPIRED'
-                  )
+                  AND o.last_error_code IN (\(errorCodeList))
                   AND (? IS NULL OR o.local_project_id = ?)
             )
               AND NOT EXISTS (
@@ -3421,9 +3458,7 @@ actor SyncV2Store:
                 next_attempt_at = NULL,
                 updated_at = ?
             WHERE status = 'conflict'
-              AND last_error_code IN (
-                  'LEASE_REQUIRED', 'LEASE_CONFLICT', 'LEASE_EXPIRED'
-              )
+              AND last_error_code IN (\(errorCodeList))
               AND (? IS NULL OR local_project_id = ?)
               AND NOT EXISTS (
                   SELECT 1

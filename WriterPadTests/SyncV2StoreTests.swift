@@ -2067,6 +2067,73 @@ final class SyncV2StoreTests: XCTestCase {
         await store.close()
     }
 
+    /// 구버전에서 DOCUMENT_ALREADY_EXISTS로 굳은 operation은 사용자에게 보이는
+    /// 충돌 목록에 없고 재시도 대상도 아니라 영구 정지로 남는다. 시작 시 복구가
+    /// 이를 다시 대기열에 세워야 자동 rebase 경로를 탈 수 있다. 서버가 이미 최신
+    /// 문서를 갖고 있으므로 DOCUMENT_NOT_FOUND 복구와 달리 기준선을 0으로
+    /// 되돌리지 않고 그대로 두어 서버가 알려준 revision으로 맞추게 한다.
+    func testLaunchRecoveryRequeuesPersistedDocumentAlreadyExistsConflict()
+        async throws {
+        let url = try databaseURL()
+        let context = QueueAPIContext()
+        let store = try await connectedStore(at: url, context: context)
+        let baseline = SyncV2RemoteDocumentSnapshot(
+            documentID: context.documentID,
+            relativePath: "원고/1권/001화.txt",
+            content: "",
+            revision: 2,
+            isDeleted: false,
+            deletedAt: nil,
+            updatedAt: Date(timeIntervalSince1970: 10)
+        )
+        let baselineApplied = try await store.applySnapshotBaseline(
+            localProjectID: context.localProjectID,
+            serverProjectID: context.serverProjectID,
+            snapshot: baseline,
+            expectedRevision: nil
+        )
+        XCTAssertTrue(baselineApplied)
+        let operationID = UUID()
+        _ = try await store.enqueue(
+            context.batch(
+                mutations: [
+                    context.documentMutation(
+                        operationID: operationID,
+                        content: "이미 있는 문서에 얹을 저장",
+                        generation: 1
+                    ),
+                ]
+            )
+        )
+        let claims = try await store.claimReadyOperations(
+            limit: 1,
+            now: Date(timeIntervalSince1970: 20)
+        )
+        let claimed = try XCTUnwrap(claims.first)
+        try await store.markConflict(
+            claimed,
+            errorCode: "DOCUMENT_ALREADY_EXISTS",
+            detail: nil
+        )
+        let blockedClaims = try await store.claimReadyOperations(
+            limit: 1,
+            now: Date(timeIntervalSince1970: 21)
+        )
+        XCTAssertTrue(blockedClaims.isEmpty)
+
+        try await store.recoverInterruptedWork()
+
+        let recoveredClaims = try await store.claimReadyOperations(
+            limit: 1,
+            now: Date(timeIntervalSince1970: 22)
+        )
+        let recovered = try XCTUnwrap(recoveredClaims.first)
+        XCTAssertEqual(recovered.operationID, operationID)
+        XCTAssertEqual(recovered.content, "이미 있는 문서에 얹을 저장")
+        XCTAssertEqual(recovered.baseRevision, 2)
+        await store.close()
+    }
+
     func testLaunchRecoveryUnblocksPersistedDocumentNotFoundConflict()
         async throws {
         let url = try databaseURL()

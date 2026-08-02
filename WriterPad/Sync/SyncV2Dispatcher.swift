@@ -888,7 +888,13 @@ actor SyncV2Dispatcher {
                     // 이 경우 기존 blocked 처리로 내려간다.
                 }
             }
-            if case .remote(code: .revisionConflict, detail: _) = error,
+            // DOCUMENT_ALREADY_EXISTS는 base revision 0으로 보낸 create가 이미
+            // 있는 문서를 만난 경우다. tree-order·trash-purge의 document UUID는
+            // 양쪽 기기가 같은 값으로 계산하므로, 두 기기가 같은 작품에 처음
+            // 연결하면 늦은 쪽에서 반드시 발생한다. 서버가 알려준 최신 revision
+            // 위로 rebase하면 다음 시도는 update가 되어 그대로 이어진다.
+            // Windows 클라이언트도 이 코드를 REVISION_CONFLICT와 같이 취급한다.
+            if Self.isAutomaticRebaseCandidate(error),
                let automaticRebaser {
                 do {
                     switch try await automaticRebaser.rebase(operation) {
@@ -970,6 +976,20 @@ actor SyncV2Dispatcher {
                 detail: error.localizedDescription,
                 nextAttemptAt: now.addingTimeInterval(delay)
             )
+        }
+    }
+
+    private static func isAutomaticRebaseCandidate(
+        _ error: SyncV2ClientError
+    ) -> Bool {
+        guard case let .remote(code, _) = error else { return false }
+        switch code {
+        case .revisionConflict, .documentAlreadyExists:
+            return true
+        case .documentNotFound, .operationIDReused, .pathConflict,
+             .authRequired, .leaseRequired, .leaseConflict,
+             .leaseExpired, .forbidden, .invalidArgument:
+            return false
         }
     }
 

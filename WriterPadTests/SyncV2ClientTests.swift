@@ -1615,6 +1615,73 @@ final class SyncV2DispatcherTests: XCTestCase {
         )
     }
 
+    /// 두 기기가 같은 작품에 처음 연결하면 tree-order의 document UUID는
+    /// 양쪽이 같은 값으로 계산하므로 늦은 쪽은 base revision 0으로 보낸
+    /// create가 DOCUMENT_ALREADY_EXISTS로 거절된다. Windows 클라이언트는 이
+    /// 코드를 REVISION_CONFLICT와 같이 취급해 서버 최신 revision 위로
+    /// rebase한다. iPad도 같은 경로를 타야 영구 정지가 생기지 않는다.
+    func testDocumentAlreadyExistsRebasesTreeOrderInsteadOfBlocking() async {
+        let projectID = UUID()
+        let documentID = syncV2UUIDv5(
+            namespace: projectID,
+            name: syncV2TreeOrderPath
+        )
+        let localContent =
+            "{\"tree_order\":{\"메인/메모장\":[\"둘째.txt\",\"첫째.txt\"]},\"version\":1}"
+        let operation = SyncV2DispatchOperation(
+            operationID: UUID(),
+            batchID: UUID(),
+            localProjectID: ProjectID(rawValue: projectID),
+            projectID: projectID,
+            documentID: documentID,
+            deviceID: UUID(),
+            documentSequence: 1,
+            localSaveGeneration: 7,
+            kind: .treeOrder,
+            baseRevision: 0,
+            baseContent: "",
+            baseServerPath: syncV2TreeOrderPath,
+            localPath: syncV2TreeOrderPath,
+            relativePath: syncV2TreeOrderPath,
+            content: localContent,
+            isDeleted: false,
+            attempts: 0
+        )
+        let store = DispatcherStoreStub(operations: [operation])
+        let client = DispatcherClientStub(
+            alreadyExistsOperationIDs: [operation.operationID]
+        )
+        let rebaser = SyncV2AutomaticRebaser(
+            store: store,
+            snapshotClient: AutomaticRebaseSnapshotClientStub(
+                snapshot: remoteSnapshot(
+                    documentID: documentID,
+                    path: syncV2TreeOrderPath,
+                    content:
+                        "{\"tree_order\":{\"메인/메모장\":[\"첫째.txt\"]},\"version\":1}"
+                )
+            )
+        )
+        let dispatcher = SyncV2Dispatcher(
+            store: store,
+            client: client,
+            automaticRebaser: rebaser
+        )
+
+        await dispatcher.dispatchReadyOperations(
+            now: Date(timeIntervalSince1970: 1_800_000_000)
+        )
+
+        let conflicts = await store.conflictOperationIDs()
+        let rebase = await store.rebaseRecord(
+            operationID: operation.operationID
+        )
+        XCTAssertFalse(conflicts.contains(operation.operationID))
+        XCTAssertEqual(rebase?.remoteRevision, 4)
+        XCTAssertEqual(rebase?.mergedContent, localContent)
+        XCTAssertEqual(rebase?.mergedPath, syncV2TreeOrderPath)
+    }
+
     private func waitForRelease(
         _ expectedCount: Int,
         client: EditLeaseClientStub
@@ -2526,10 +2593,17 @@ private actor DispatcherStoreStub: SyncV2DispatchStoring {
         let nextAttemptAt: Date
     }
 
+    struct RebaseRecord: Equatable {
+        let remoteRevision: Int64
+        let mergedContent: String
+        let mergedPath: String
+    }
+
     private var operations: [UUID: SyncV2DispatchOperation]
     private var order: [UUID]
     private var statuses: [UUID: Status]
     private var retries: [UUID: RetryRecord] = [:]
+    private var rebases: [UUID: RebaseRecord] = [:]
     private var opportunities = 0
     private var missingRecoveries = 0
     private var missingProjectRecoveries = 0
@@ -2784,6 +2858,49 @@ private actor DispatcherStoreStub: SyncV2DispatchStoring {
         retries[operationID]
     }
 
+    func rebaseRecord(operationID: UUID) -> RebaseRecord? {
+        rebases[operationID]
+    }
+
+    /// 실제 저장소처럼 기준선을 서버 최신 revision으로 올린 뒤 다시 대기열에
+    /// 넣는다. 기준선을 올리지 않으면 재시도가 계속 create로 나가 같은 거절이
+    /// 무한 반복된다.
+    func rebaseAfterRevisionConflict(
+        _ operation: SyncV2DispatchOperation,
+        remote: SyncV2RemoteDocumentSnapshot,
+        local: SyncV2RebaseLocalSnapshot,
+        mergedContent: String,
+        mergedPath: String
+    ) -> SyncV2AutomaticRebaseStoreResult {
+        _ = local
+        rebases[operation.operationID] = RebaseRecord(
+            remoteRevision: remote.revision,
+            mergedContent: mergedContent,
+            mergedPath: mergedPath
+        )
+        operations[operation.operationID] = SyncV2DispatchOperation(
+            operationID: operation.operationID,
+            batchID: operation.batchID,
+            localProjectID: operation.localProjectID,
+            projectID: operation.projectID,
+            documentID: operation.documentID,
+            deviceID: operation.deviceID,
+            documentSequence: operation.documentSequence,
+            localSaveGeneration: operation.localSaveGeneration,
+            kind: operation.kind,
+            baseRevision: remote.revision,
+            baseContent: remote.content,
+            baseServerPath: remote.relativePath,
+            localPath: operation.localPath,
+            relativePath: mergedPath,
+            content: mergedContent,
+            isDeleted: operation.isDeleted,
+            attempts: 0
+        )
+        statuses[operation.operationID] = .pending
+        return .rebased
+    }
+
     func missingRecoveryCount() -> Int {
         missingRecoveries
     }
@@ -2791,6 +2908,7 @@ private actor DispatcherStoreStub: SyncV2DispatchStoring {
 
 private actor DispatcherClientStub: SyncV2CommitClienting {
     private let conflictOperationIDs: Set<UUID>
+    private let alreadyExistsOperationIDs: Set<UUID>
     private let retryOperationIDs: Set<UUID>
     private let missingOperationIDs: Set<UUID>
     private let forbiddenOperationIDs: Set<UUID>
@@ -2803,6 +2921,7 @@ private actor DispatcherClientStub: SyncV2CommitClienting {
 
     init(
         conflictOperationIDs: Set<UUID> = [],
+        alreadyExistsOperationIDs: Set<UUID> = [],
         retryOperationIDs: Set<UUID> = [],
         missingOperationIDs: Set<UUID> = [],
         forbiddenCreateOperationIDs: Set<UUID> = [],
@@ -2810,6 +2929,7 @@ private actor DispatcherClientStub: SyncV2CommitClienting {
         delayNanosecondsByOperation: [UUID: UInt64] = [:]
     ) {
         self.conflictOperationIDs = conflictOperationIDs
+        self.alreadyExistsOperationIDs = alreadyExistsOperationIDs
         self.retryOperationIDs = retryOperationIDs
         self.missingOperationIDs = missingOperationIDs
         self.forbiddenOperationIDs =
@@ -2836,6 +2956,16 @@ private actor DispatcherClientStub: SyncV2CommitClienting {
             throw SyncV2ClientError.remote(
                 code: .revisionConflict,
                 detail: "fixture"
+            )
+        }
+        // 서버는 base revision 0(= 새로 만들기)일 때 같은 document UUID가
+        // 이미 있으면 DOCUMENT_ALREADY_EXISTS를 던진다. rebase로 기준선이
+        // 올라간 뒤의 재시도는 update가 되므로 그대로 성공한다.
+        if alreadyExistsOperationIDs.contains(parameters.operationID),
+           parameters.baseServerRevision == 0 {
+            throw SyncV2ClientError.remote(
+                code: .documentAlreadyExists,
+                detail: nil
             )
         }
         if missingOperationIDs.contains(parameters.operationID),
