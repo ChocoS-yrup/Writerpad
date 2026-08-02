@@ -207,6 +207,150 @@ final class SupabaseProjectBindingServiceTests: XCTestCase {
         XCTAssertEqual(calls[1].batchKind, .windowsImport)
     }
 
+    private func serverDocument(
+        path: String,
+        isDeleted: Bool = false
+    ) -> SyncV2RemoteDocumentSnapshot {
+        SyncV2RemoteDocumentSnapshot(
+            documentID: UUID(),
+            relativePath: path,
+            content: "서버 원고",
+            revision: 1,
+            isDeleted: isDeleted,
+            deletedAt: isDeleted ? Date(timeIntervalSince1970: 5) : nil,
+            updatedAt: Date(timeIntervalSince1970: 10)
+        )
+    }
+
+    /// Windows 가져오기 연결은 로컬 전체를 create로 올린다. 서버 작품에 이미
+    /// 원고가 있으면 그 자리를 다른 UUID가 점유해 PATH_CONFLICT로 멈추므로
+    /// 올리기 전에 막는다.
+    func testWindowsImportIsRefusedWhenServerProjectHasDocuments()
+        async throws {
+        let project = makeProject(
+            id: "00000000-0000-0000-0000-000000000601",
+            name: "이미 원고가 있는 서버"
+        )
+        let serverID = UUID(
+            uuidString: "00000000-0000-0000-0000-000000000602"
+        )!
+        let recorder = InitialSyncRecorderSpy()
+        let fixture = makeFixture(
+            projects: [project],
+            initialSyncRecorder: recorder,
+            serverDocuments: [serverDocument(path: "원고/1권/001화.txt")]
+        )
+        let confirmation = try ConfirmedServerProjectID(
+            expectedServerProjectID: serverID,
+            userEnteredUUID: serverID.uuidString
+        )
+
+        let result = await fixture.service.connectWindowsProject(
+            localProjectID: project.id,
+            confirmation: confirmation
+        )
+
+        XCTAssertEqual(result, .failed(.serverProjectNotEmpty))
+        let calls = await recorder.calls()
+        XCTAssertTrue(calls.isEmpty, "거부된 연결은 올리기를 예약하지 않는다.")
+        let stored = await fixture.store.binding(for: project.id)
+        XCTAssertNil(stored, "거부된 연결은 binding을 남기지 않는다.")
+    }
+
+    func testNewServerProjectIsRefusedWhenServerProjectHasDocuments()
+        async throws {
+        let project = makeProject(
+            id: "00000000-0000-0000-0000-000000000603",
+            name: "재사용된 서버 UUID"
+        )
+        let fixture = makeFixture(
+            projects: [project],
+            serverDocuments: [serverDocument(path: "원고/1권/001화.txt")]
+        )
+
+        let result = await fixture.service.createServerProject(
+            for: project.id
+        )
+
+        XCTAssertEqual(result, .failed(.serverProjectNotEmpty))
+    }
+
+    /// tombstone만 남은 작품은 live 문서가 없어 충돌할 상대가 없다.
+    func testConnectionIsAllowedWhenServerProjectHasOnlyTombstones()
+        async throws {
+        let project = makeProject(
+            id: "00000000-0000-0000-0000-000000000604",
+            name: "삭제만 남은 서버"
+        )
+        let fixture = makeFixture(
+            projects: [project],
+            serverDocuments: [
+                serverDocument(
+                    path: "원고/1권/001화.txt",
+                    isDeleted: true
+                ),
+            ]
+        )
+
+        let result = await fixture.service.createServerProject(
+            for: project.id
+        )
+
+        guard case .connected = result else {
+            return XCTFail("tombstone만 있으면 연결할 수 있어야 한다.")
+        }
+    }
+
+    /// 기존 서버 작품에 붙는 연결은 올리지 않고 pull로 받아오므로, 서버에
+    /// 원고가 있는 것이 정상이다. 두 번째 기기를 붙이는 경로가 막히면 안 된다.
+    func testExistingProjectConnectionIsAllowedWhenServerHasDocuments()
+        async throws {
+        let project = makeProject(
+            id: "00000000-0000-0000-0000-000000000605",
+            name: "두 번째 기기"
+        )
+        let serverID = UUID(
+            uuidString: "00000000-0000-0000-0000-000000000606"
+        )!
+        let fixture = makeFixture(
+            projects: [project],
+            serverDocuments: [serverDocument(path: "원고/1권/001화.txt")]
+        )
+        let confirmation = try ConfirmedServerProjectID(
+            expectedServerProjectID: serverID,
+            userEnteredUUID: serverID.uuidString
+        )
+
+        let result = await fixture.service.connectExistingProject(
+            localProjectID: project.id,
+            confirmation: confirmation
+        )
+
+        guard case let .connected(binding) = result else {
+            return XCTFail("기존 서버 작품 연결은 막히면 안 된다.")
+        }
+        XCTAssertEqual(binding.kind, .existingServerProject)
+    }
+
+    /// 서버 상태를 읽지 못했는데 비어 있다고 가정하고 올리면 기존 원고와
+    /// 충돌한다. 확인 실패는 연결 실패로 다룬다.
+    func testConnectionIsRefusedWhenServerStateCannotBeChecked() async {
+        let project = makeProject(
+            id: "00000000-0000-0000-0000-000000000607",
+            name: "확인 실패"
+        )
+        let fixture = makeFixture(
+            projects: [project],
+            snapshotClientFails: true
+        )
+
+        let result = await fixture.service.createServerProject(
+            for: project.id
+        )
+
+        XCTAssertEqual(result, .failed(.networkUnavailable))
+    }
+
     func testNameRefreshUsesSameServerUUID() async throws {
         let projectID = ProjectID(
             rawValue: UUID(
@@ -466,7 +610,9 @@ final class SupabaseProjectBindingServiceTests: XCTestCase {
             EnsureProjectTransportError
         >? = nil,
         initialSyncRecorder: any InitialProjectSyncRecording =
-            NoOpInitialProjectSyncRecorder()
+            NoOpInitialProjectSyncRecorder(),
+        serverDocuments: [SyncV2RemoteDocumentSnapshot] = [],
+        snapshotClientFails: Bool = false
     ) -> BindingFixture {
         let store = InMemoryProjectBindingStore()
         let transport = EnsureProjectTransportStub(result: transportResult)
@@ -480,7 +626,11 @@ final class SupabaseProjectBindingServiceTests: XCTestCase {
             bindingStore: store,
             projectRepository: projectRepository,
             authenticationService: auth,
-            initialSyncRecorder: initialSyncRecorder
+            initialSyncRecorder: initialSyncRecorder,
+            snapshotClient: BindingSnapshotClientStub(
+                documents: serverDocuments,
+                shouldFail: snapshotClientFails
+            )
         )
         let userID: UUID
         if case let .authenticated(account) =
@@ -495,6 +645,38 @@ final class SupabaseProjectBindingServiceTests: XCTestCase {
             transport: transport,
             userID: userID
         )
+    }
+}
+
+private struct BindingSnapshotClientStubError: Error {}
+
+private actor BindingSnapshotClientStub: SyncV2SnapshotClienting {
+    private let documents: [SyncV2RemoteDocumentSnapshot]
+    private let shouldFail: Bool
+
+    init(
+        documents: [SyncV2RemoteDocumentSnapshot],
+        shouldFail: Bool
+    ) {
+        self.documents = documents
+        self.shouldFail = shouldFail
+    }
+
+    func fetchDocuments(
+        projectID: UUID
+    ) throws -> [SyncV2RemoteDocumentSnapshot] {
+        _ = projectID
+        if shouldFail { throw BindingSnapshotClientStubError() }
+        return documents
+    }
+
+    func fetchDocument(
+        projectID: UUID,
+        documentID: UUID
+    ) throws -> SyncV2RemoteDocumentSnapshot? {
+        _ = projectID
+        if shouldFail { throw BindingSnapshotClientStubError() }
+        return documents.first { $0.documentID == documentID }
     }
 }
 

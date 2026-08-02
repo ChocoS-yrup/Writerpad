@@ -2067,6 +2067,55 @@ final class SyncV2StoreTests: XCTestCase {
         await store.close()
     }
 
+    /// Windows는 모든 server path를 NFC로 정규화해 보낸다. macOS 파일 이름은
+    /// 한글 자모가 분리된 형태로 들어올 수 있으므로 iPad도 queue 입구에서 같은
+    /// 정규화를 해야 서버 경로와 로컬 비교가 어긋나지 않는다. 디스크의 실제
+    /// 이름인 local path는 정규화하면 파일을 찾지 못하므로 그대로 둔다.
+    func testEnqueueCanonicalizesDecomposedHangulServerPathOnly()
+        async throws {
+        let url = try databaseURL()
+        let context = QueueAPIContext()
+        let store = try await connectedStore(at: url, context: context)
+        let composed = "원고/1권/001화.txt"
+        let decomposed = composed.decomposedStringWithCanonicalMapping
+        XCTAssertFalse(
+            SyncV2ServerPath.hasExactBytes(decomposed, composed),
+            "fixture가 실제로 분해된 형태여야 이 테스트가 의미를 갖는다."
+        )
+        let operationID = UUID()
+        _ = try await store.enqueue(
+            context.batch(
+                mutations: [
+                    context.documentMutation(
+                        operationID: operationID,
+                        relativePath: decomposed
+                    ),
+                ]
+            )
+        )
+
+        let claims = try await store.claimReadyOperations(
+            limit: 1,
+            now: Date(timeIntervalSince1970: 10)
+        )
+        let claimed = try XCTUnwrap(claims.first)
+        XCTAssertTrue(
+            SyncV2ServerPath.hasExactBytes(
+                claimed.relativePath,
+                composed
+            ),
+            "서버로 나가는 경로는 NFC여야 한다."
+        )
+        XCTAssertTrue(
+            SyncV2ServerPath.hasExactBytes(
+                claimed.localPath,
+                "/fixture/\(decomposed)"
+            ),
+            "로컬 파일 경로는 디스크 이름 그대로여야 한다."
+        )
+        await store.close()
+    }
+
     /// 구버전에서 DOCUMENT_ALREADY_EXISTS로 굳은 operation은 사용자에게 보이는
     /// 충돌 목록에 없고 재시도 대상도 아니라 영구 정지로 남는다. 시작 시 복구가
     /// 이를 다시 대기열에 세워야 자동 rebase 경로를 탈 수 있다. 서버가 이미 최신

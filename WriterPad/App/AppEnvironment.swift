@@ -249,7 +249,9 @@ final class AppEnvironment: ObservableObject {
             bindingStore: projectBindingStore,
             projectRepository: repository,
             authenticationService: authenticationService,
-            initialSyncRecorder: initialSyncRecorder
+            initialSyncRecorder: initialSyncRecorder,
+            // 초기 snapshot을 올리기 전에 서버 작품이 비어 있는지 확인한다.
+            snapshotClient: supabaseClientProvider.makeSnapshotClient()
         )
         let localDocumentStore = LocalDocumentStore(
             workspaceLocator: workspaceLocator,

@@ -275,6 +275,7 @@ enum ProjectBindingFailure: Equatable, Sendable {
     case invalidProjectName
     case confirmationRequired
     case serverProjectAlreadyBound
+    case serverProjectNotEmpty
     case forbidden
     case networkUnavailable
     case invalidServerResponse
@@ -357,6 +358,7 @@ actor SupabaseProjectBindingService: ProjectBindingServicing {
     private let projectRepository: any ProjectRepository
     private let authenticationService: any AuthenticationServicing
     private let initialSyncRecorder: any InitialProjectSyncRecording
+    private let snapshotClient: (any SyncV2SnapshotClienting)?
     private var bindingObservers: [
         ProjectID: [UUID: AsyncStream<ProjectSyncBinding?>.Continuation]
     ] = [:]
@@ -367,13 +369,15 @@ actor SupabaseProjectBindingService: ProjectBindingServicing {
         projectRepository: any ProjectRepository,
         authenticationService: any AuthenticationServicing,
         initialSyncRecorder: any InitialProjectSyncRecording =
-            NoOpInitialProjectSyncRecorder()
+            NoOpInitialProjectSyncRecorder(),
+        snapshotClient: (any SyncV2SnapshotClienting)? = nil
     ) {
         self.transport = transport
         self.bindingStore = bindingStore
         self.projectRepository = projectRepository
         self.authenticationService = authenticationService
         self.initialSyncRecorder = initialSyncRecorder
+        self.snapshotClient = snapshotClient
     }
 
     func currentBinding(
@@ -510,6 +514,30 @@ actor SupabaseProjectBindingService: ProjectBindingServicing {
         }
     }
 
+    private enum ServerProjectEmptiness {
+        case empty
+        case notEmpty
+        /// 서버 상태를 확인하지 못한 경우다. 비어 있다고 가정하고 올리면 기존
+        /// 원고와 충돌하므로 확인 실패는 연결 실패로 다룬다.
+        case unknown
+    }
+
+    /// tombstone만 남은 작품은 live 문서가 없으므로 초기 snapshot을 올려도
+    /// 충돌하지 않는다. 삭제된 문서는 비어 있음 판정에서 제외한다.
+    private func serverProjectEmptiness(
+        _ serverProjectID: UUID
+    ) async -> ServerProjectEmptiness {
+        guard let snapshotClient else { return .unknown }
+        do {
+            let documents = try await snapshotClient.fetchDocuments(
+                projectID: serverProjectID
+            )
+            return documents.contains { !$0.isDeleted } ? .notEmpty : .empty
+        } catch {
+            return .unknown
+        }
+    }
+
     private func connect(
         localProjectID: ProjectID,
         serverProjectID: UUID,
@@ -545,12 +573,18 @@ actor SupabaseProjectBindingService: ProjectBindingServicing {
             return .failed(.authenticationRequired)
         }
 
+        // 같은 로컬 작품이 이미 이 서버 작품에 붙어 있으면 최초 연결이 아니라
+        // 이름 새로고침 같은 재확인이다. 이때 서버에 원고가 있는 것은 이 기기가
+        // 올린 정상 상태이므로 아래 비어 있음 검사를 하지 않는다.
+        let isReconnect: Bool
         do {
-            if let collision = try await bindingStore.binding(
+            let existing = try await bindingStore.binding(
                 forServerProjectID: serverProjectID
-            ), collision.localProjectID != localProjectID {
+            )
+            if let existing, existing.localProjectID != localProjectID {
                 return .failed(.serverProjectAlreadyBound)
             }
+            isReconnect = existing != nil
         } catch {
             return .failed(storeFailure(error))
         }
@@ -573,6 +607,25 @@ actor SupabaseProjectBindingService: ProjectBindingServicing {
             normalizedName(ensured.name) == name
         else {
             return .failed(.invalidServerResponse)
+        }
+
+        // 초기 snapshot을 올리는 연결은 서버의 모든 live 문서를 create로 보낸다.
+        // 서버 작품에 이미 문서가 있으면 tree-order는 document UUID가 겹쳐
+        // DOCUMENT_ALREADY_EXISTS, 본문은 같은 경로를 다른 UUID가 점유해
+        // PATH_CONFLICT가 된다. 어느 쪽도 기존 원고를 덮어쓰지는 않지만 연결이
+        // 그 자리에서 멈추므로, 올리기 전에 비어 있는지 확인하고 막는다.
+        // 기존 서버 작품에 붙는 연결(.existingServerProject)은 올리지 않고
+        // pull로 받아오므로 이 검사를 하지 않는다.
+        if !isReconnect,
+           kind == .newServerProject || kind == .windowsImport {
+            switch await serverProjectEmptiness(serverProjectID) {
+            case .empty:
+                break
+            case .notEmpty:
+                return .failed(.serverProjectNotEmpty)
+            case .unknown:
+                return .failed(.networkUnavailable)
+            }
         }
 
         let binding = ProjectSyncBinding.connected(

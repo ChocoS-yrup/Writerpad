@@ -385,6 +385,12 @@ final class SyncSettingsModel: ObservableObject {
             return "서버 작품 ID를 다시 확인하세요."
         case .serverProjectAlreadyBound:
             return "해당 서버 작품은 이미 다른 로컬 작품에 연결되어 있습니다."
+        case .serverProjectNotEmpty:
+            return """
+                해당 서버 작품에 이미 원고가 있습니다. \
+                원고가 없는 서버 작품을 선택하거나 \
+                새 서버 작품으로 등록해 주세요.
+                """
         case .forbidden:
             return "이 계정에는 해당 서버 작품 권한이 없습니다."
         case .networkUnavailable:
