@@ -634,53 +634,6 @@ protocol SyncV2DispatchStoring: Sendable {
 }
 
 extension SyncV2DispatchStoring {
-    func claimReadyFolderOperations(
-        localProjectID: ProjectID,
-        limit: Int,
-        now: Date
-    ) async throws -> [SyncV2FolderDispatchOperation] {
-        _ = (localProjectID, limit, now)
-        return []
-    }
-
-    // 폴더 대기열이 없는 구현은 폴더 작업을 claim하지 못하므로 아래 넷은
-    // 호출될 일이 없다. 조용히 성공한 척하지 않고 막는다.
-    func complete(
-        _ operation: SyncV2FolderDispatchOperation,
-        result: SyncV2CommitFolderResult
-    ) async throws {
-        _ = (operation, result)
-        throw SyncV2DispatchStoreError.unavailable
-    }
-
-    func deferRetry(
-        _ operation: SyncV2FolderDispatchOperation,
-        errorCode: String,
-        detail: String?,
-        nextAttemptAt: Date
-    ) async throws {
-        _ = (operation, errorCode, detail, nextAttemptAt)
-        throw SyncV2DispatchStoreError.unavailable
-    }
-
-    func markConflict(
-        _ operation: SyncV2FolderDispatchOperation,
-        errorCode: String,
-        detail: String?
-    ) async throws {
-        _ = (operation, errorCode, detail)
-        throw SyncV2DispatchStoreError.unavailable
-    }
-
-    func markBlocked(
-        _ operation: SyncV2FolderDispatchOperation,
-        errorCode: String,
-        detail: String?
-    ) async throws {
-        _ = (operation, errorCode, detail)
-        throw SyncV2DispatchStoreError.unavailable
-    }
-
     func recoverMissingRemoteDocument(
         _ operation: SyncV2DispatchOperation
     ) async throws {
@@ -2137,11 +2090,26 @@ actor SyncV2Store:
     ) throws -> [SyncV2FolderDispatchOperation] {
         try withStatement(
             """
+            -- 서버는 내용이 있는 폴더의 삭제를 거부한다. 폴더가 자기 경로를
+            -- 알아야 그 아래 문서 작업이 끝났는지 볼 수 있는데, sync_folders는
+            -- 경로를 두지 않으므로 부모 사슬을 따라 여기서 만든다. 사슬이 고리를
+            -- 이루면 끝나지 않으므로 깊이로 막는다.
+            WITH RECURSIVE folder_path(folder_id, path, depth) AS (
+                SELECT folder_id, name, 1
+                FROM sync_folders
+                WHERE parent_folder_id IS NULL
+                UNION ALL
+                SELECT f.folder_id, fp.path || '/' || f.name, fp.depth + 1
+                FROM sync_folders f
+                JOIN folder_path fp ON f.parent_folder_id = fp.folder_id
+                WHERE fp.depth < 64
+            )
             SELECT o.operation_id, o.batch_id, o.local_project_id,
                    o.project_id, o.folder_id, o.parent_folder_id,
                    o.device_id, o.document_sequence, o.folder_name,
                    o.base_revision, o.is_deleted, o.attempts
             FROM sync_operations o
+            LEFT JOIN folder_path fp ON fp.folder_id = o.folder_id
             WHERE o.folder_id IS NOT NULL
               AND o.base_revision IS NOT NULL
               AND (? IS NULL OR o.local_project_id = ?)
@@ -2161,6 +2129,40 @@ actor SyncV2Store:
                   WHERE earlier.folder_id = o.folder_id
                     AND earlier.document_sequence < o.document_sequence
                     AND earlier.status NOT IN ('completed', 'cancelled')
+              )
+              AND (
+                  o.is_deleted = 0
+                  OR (
+                      -- 바로 아래 폴더만 본다. 그 폴더도 자기 자식을 기다리므로
+                      -- 가장 깊은 곳부터 차례로 풀린다.
+                      NOT EXISTS (
+                          SELECT 1
+                          FROM sync_folders child
+                          JOIN sync_operations childOperation
+                              ON childOperation.folder_id = child.folder_id
+                          WHERE child.parent_folder_id = o.folder_id
+                            AND childOperation.status NOT IN (
+                                'completed', 'cancelled'
+                            )
+                      )
+                      -- 폴더 안 문서가 아직 남아 있으면 부모를 먼저 지울 수
+                      -- 없다. LIKE는 이름에 %나 _가 있으면 어긋나므로 앞부분을
+                      -- 그대로 잘라 비교한다.
+                      AND NOT EXISTS (
+                          SELECT 1
+                          FROM sync_operations documentOperation
+                          WHERE documentOperation.document_id IS NOT NULL
+                            AND documentOperation.status NOT IN (
+                                'completed', 'cancelled'
+                            )
+                            AND fp.path IS NOT NULL
+                            AND substr(
+                                documentOperation.relative_path,
+                                1,
+                                length(fp.path) + 1
+                            ) = fp.path || '/'
+                      )
+                  )
               )
             ORDER BY o.queue_id
             """

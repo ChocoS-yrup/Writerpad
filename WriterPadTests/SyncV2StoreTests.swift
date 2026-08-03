@@ -4113,6 +4113,185 @@ final class SyncV2StoreTests: XCTestCase {
         await store.close()
     }
 
+    func testParentTombstoneWaitsForItsChildFolder() async throws {
+        let url = try databaseURL()
+        let context = QueueAPIContext()
+        let store = try await connectedStore(at: url, context: context)
+        let childID = UUID()
+        let parentDeleteID = UUID()
+        let childDeleteID = UUID()
+
+        _ = try await store.enqueue(
+            context.batch(
+                kind: .structureChange,
+                mutations: [
+                    context.folderMutation(
+                        operationID: UUID(),
+                        name: "부모"
+                    ),
+                    context.folderMutation(
+                        operationID: UUID(),
+                        folderID: childID,
+                        parentFolderID: context.folderID,
+                        name: "자식"
+                    ),
+                ]
+            )
+        )
+        // 두 폴더의 생성을 끝내 무덤이 기준선을 갖게 한다. 그러지 않으면
+        // 순번이 아니라 아직 비어 있는 base_revision이 무덤을 붙잡는다.
+        for created in try await store.claimReadyFolderOperations(
+            limit: 10,
+            now: Date(timeIntervalSince1970: 10)
+        ) {
+            try await store.complete(
+                created,
+                result: folderCommitResult(for: created)
+            )
+        }
+        _ = try await store.enqueue(
+            context.batch(
+                kind: .structureChange,
+                mutations: [
+                    context.folderMutation(
+                        operationID: parentDeleteID,
+                        name: "부모",
+                        isDeleted: true
+                    ),
+                    context.folderMutation(
+                        operationID: childDeleteID,
+                        folderID: childID,
+                        parentFolderID: context.folderID,
+                        name: "자식",
+                        isDeleted: true
+                    ),
+                ]
+            )
+        )
+
+        let ready = try await store.claimReadyFolderOperations(
+            limit: 10,
+            now: Date(timeIntervalSince1970: 20)
+        )
+
+        // 서버는 내용이 있는 폴더의 삭제를 FOLDER_NOT_EMPTY로 거부한다. 자식이
+        // 먼저 나가고 부모는 그 뒤에야 나갈 수 있다.
+        XCTAssertEqual(ready.map(\.operationID), [childDeleteID])
+        await store.close()
+    }
+
+    func testFolderTombstoneWaitsForDocumentsInsideIt() async throws {
+        let url = try databaseURL()
+        let context = QueueAPIContext()
+        let store = try await connectedStore(at: url, context: context)
+        let deleteID = UUID()
+
+        _ = try await store.enqueue(
+            context.batch(
+                kind: .structureChange,
+                mutations: [
+                    context.folderMutation(
+                        operationID: UUID(),
+                        name: "메모장"
+                    )
+                ]
+            )
+        )
+        for created in try await store.claimReadyFolderOperations(
+            limit: 10,
+            now: Date(timeIntervalSince1970: 10)
+        ) {
+            try await store.complete(
+                created,
+                result: folderCommitResult(for: created)
+            )
+        }
+        // 폴더 안 문서가 아직 대기열에 남아 있는 상태를 만든다.
+        _ = try await store.enqueue(
+            context.batch(
+                mutations: [
+                    context.documentMutation(
+                        operationID: UUID(),
+                        relativePath: "메모장/001화.txt"
+                    )
+                ]
+            )
+        )
+        _ = try await store.enqueue(
+            context.batch(
+                kind: .structureChange,
+                mutations: [
+                    context.folderMutation(
+                        operationID: deleteID,
+                        name: "메모장",
+                        isDeleted: true
+                    )
+                ]
+            )
+        )
+
+        let ready = try await store.claimReadyFolderOperations(
+            limit: 10,
+            now: Date(timeIntervalSince1970: 20)
+        )
+
+        // 문서를 먼저 보내지 않으면 서버가 폴더 삭제를 거부한다.
+        XCTAssertTrue(ready.isEmpty)
+        await store.close()
+    }
+
+    func testFolderTombstoneGoesOutOnceNothingIsLeftInside()
+        async throws {
+        let url = try databaseURL()
+        let context = QueueAPIContext()
+        let store = try await connectedStore(at: url, context: context)
+        let deleteID = UUID()
+
+        _ = try await store.enqueue(
+            context.batch(
+                kind: .structureChange,
+                mutations: [
+                    context.folderMutation(
+                        operationID: UUID(),
+                        name: "메모장"
+                    )
+                ]
+            )
+        )
+        _ = try await store.enqueue(
+            context.batch(
+                kind: .structureChange,
+                mutations: [
+                    context.folderMutation(
+                        operationID: deleteID,
+                        name: "메모장",
+                        isDeleted: true
+                    )
+                ]
+            )
+        )
+        // 앞선 생성이 끝나 무덤이 기준선을 갖게 한다.
+        let first = try await store.claimReadyFolderOperations(
+            limit: 10,
+            now: Date(timeIntervalSince1970: 10)
+        )
+        let created = try XCTUnwrap(first.first)
+        try await store.complete(
+            created,
+            result: folderCommitResult(for: created)
+        )
+
+        let ready = try await store.claimReadyFolderOperations(
+            limit: 10,
+            now: Date(timeIntervalSince1970: 20)
+        )
+
+        // 안이 빈 폴더의 무덤은 막을 이유가 없다. 막아 두면 폴더가 영영 서버에
+        // 남는다.
+        XCTAssertEqual(ready.map(\.operationID), [deleteID])
+        await store.close()
+    }
+
     func testProjectWithOnlyFolderWorkIsReportedAsReady() async throws {
         let url = try databaseURL()
         let context = QueueAPIContext()
@@ -4153,6 +4332,23 @@ final class SyncV2StoreTests: XCTestCase {
             contentHash: SHA256ContentHasher()
                 .sha256(for: Data(operation.content.utf8))
                 .rawValue,
+            committedAt: Date(timeIntervalSince1970: 1_800_000_001)
+        )
+    }
+
+    private func folderCommitResult(
+        for operation: SyncV2FolderDispatchOperation
+    ) -> SyncV2CommitFolderResult {
+        SyncV2CommitFolderResult(
+            status: .committed,
+            folderID: operation.folderID,
+            versionID: UUID(),
+            operationID: operation.operationID,
+            operationKind: operation.baseRevision == 0 ? .create : .update,
+            serverRevision: operation.baseRevision + 1,
+            parentFolderID: operation.parentFolderID,
+            name: operation.name,
+            isDeleted: operation.isDeleted,
             committedAt: Date(timeIntervalSince1970: 1_800_000_001)
         )
     }

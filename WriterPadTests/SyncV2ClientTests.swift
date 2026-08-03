@@ -3186,6 +3186,53 @@ private actor AutomaticRebaseStoreStub: SyncV2DispatchStoring {
     }
     func recordedRebase() -> Recorded? { recorded }
     func recordedConflict() -> RecordedConflict? { preservedConflict }
+
+    // 이 대역은 문서 줄만 흉내 낸다. 폴더 작업은 claim하지 않으므로 아래 넷은
+    // 불릴 일이 없다. 조용히 성공한 척하지 않고 막는다.
+    func claimReadyFolderOperations(
+        localProjectID: ProjectID,
+        limit: Int,
+        now: Date
+    ) async throws -> [SyncV2FolderDispatchOperation] {
+        _ = (localProjectID, limit, now)
+        return []
+    }
+
+    func complete(
+        _ operation: SyncV2FolderDispatchOperation,
+        result: SyncV2CommitFolderResult
+    ) async throws {
+        _ = (operation, result)
+        throw SyncV2DispatchStoreError.unavailable
+    }
+
+    func deferRetry(
+        _ operation: SyncV2FolderDispatchOperation,
+        errorCode: String,
+        detail: String?,
+        nextAttemptAt: Date
+    ) async throws {
+        _ = (operation, errorCode, detail, nextAttemptAt)
+        throw SyncV2DispatchStoreError.unavailable
+    }
+
+    func markConflict(
+        _ operation: SyncV2FolderDispatchOperation,
+        errorCode: String,
+        detail: String?
+    ) async throws {
+        _ = (operation, errorCode, detail)
+        throw SyncV2DispatchStoreError.unavailable
+    }
+
+    func markBlocked(
+        _ operation: SyncV2FolderDispatchOperation,
+        errorCode: String,
+        detail: String?
+    ) async throws {
+        _ = (operation, errorCode, detail)
+        throw SyncV2DispatchStoreError.unavailable
+    }
 }
 
 private actor AutomaticRebaseLocalApplierSpy:
@@ -3574,6 +3621,53 @@ private actor DispatcherStoreStub: SyncV2DispatchStoring {
         )
         statuses[operation.operationID] = .pending
         return .rebased
+    }
+
+    // 이 대역은 문서 줄만 흉내 낸다. 폴더 작업은 claim하지 않으므로 아래
+    // 넷은 불릴 일이 없다. 조용히 성공한 척하지 않고 막는다.
+    func claimReadyFolderOperations(
+        localProjectID: ProjectID,
+        limit: Int,
+        now: Date
+    ) async throws -> [SyncV2FolderDispatchOperation] {
+        _ = (localProjectID, limit, now)
+        return []
+    }
+
+    func complete(
+        _ operation: SyncV2FolderDispatchOperation,
+        result: SyncV2CommitFolderResult
+    ) async throws {
+        _ = (operation, result)
+        throw SyncV2DispatchStoreError.unavailable
+    }
+
+    func deferRetry(
+        _ operation: SyncV2FolderDispatchOperation,
+        errorCode: String,
+        detail: String?,
+        nextAttemptAt: Date
+    ) async throws {
+        _ = (operation, errorCode, detail, nextAttemptAt)
+        throw SyncV2DispatchStoreError.unavailable
+    }
+
+    func markConflict(
+        _ operation: SyncV2FolderDispatchOperation,
+        errorCode: String,
+        detail: String?
+    ) async throws {
+        _ = (operation, errorCode, detail)
+        throw SyncV2DispatchStoreError.unavailable
+    }
+
+    func markBlocked(
+        _ operation: SyncV2FolderDispatchOperation,
+        errorCode: String,
+        detail: String?
+    ) async throws {
+        _ = (operation, errorCode, detail)
+        throw SyncV2DispatchStoreError.unavailable
     }
 
     func missingRecoveryCount() -> Int {
