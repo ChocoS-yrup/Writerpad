@@ -270,6 +270,10 @@ final class AppEnvironment: ObservableObject {
                 mergeStore: LocalSyncV2SnapshotMergeStore(
                     workspaceLocator: workspaceLocator
                 ),
+                folderApplier: SyncV2RemoteFolderApplier(
+                    documentRepository: repository,
+                    workspaceLocator: workspaceLocator
+                ),
                 mutationGate: syncMutationGate
             )
         } else {
