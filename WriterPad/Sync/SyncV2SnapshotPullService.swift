@@ -38,6 +38,7 @@ actor SyncV2SnapshotPullService: SyncV2SnapshotPulling {
     private let folderMigration: SyncV2FolderMigration?
     private let folderMarker: (any SyncV2FolderMigrationMarking)?
     private let folderDocuments: (any DocumentRepository)?
+    private let folderSyncGate: any SyncV2FolderSyncGating
     private let mergeStore: any SyncV2SnapshotMergeStoring
     private let mutationGate: SyncV2DocumentMutationGate
 
@@ -50,6 +51,8 @@ actor SyncV2SnapshotPullService: SyncV2SnapshotPulling {
         folderMigration: SyncV2FolderMigration? = nil,
         folderMarker: (any SyncV2FolderMigrationMarking)? = nil,
         folderDocuments: (any DocumentRepository)? = nil,
+        folderSyncGate: any SyncV2FolderSyncGating =
+            StoredSyncV2FolderSyncGate(),
         mutationGate: SyncV2DocumentMutationGate =
             SyncV2DocumentMutationGate()
     ) {
@@ -60,6 +63,7 @@ actor SyncV2SnapshotPullService: SyncV2SnapshotPulling {
         self.folderMigration = folderMigration
         self.folderMarker = folderMarker
         self.folderDocuments = folderDocuments
+        self.folderSyncGate = folderSyncGate
         self.mergeStore = mergeStore
         self.mutationGate = mutationGate
     }
@@ -90,7 +94,11 @@ actor SyncV2SnapshotPullService: SyncV2SnapshotPulling {
         // 도착하면 옛 경로에 자리를 잡아, 뒤이은 폴더 이동이 목적지 충돌로
         // 막힌다.
         var folderRejections: [SyncV2RejectedStructureName] = []
-        if let folderApplier {
+        // 켠 작품에서만 폴더 UUID를 최종 권위로 쓴다. Windows는 아직 folders
+        // 표를 모르고 tree_order만 쓰므로, 켜지 않은 작품에서 이 기록을
+        // 앞세우면 Windows가 바꾼 이름을 낡은 서버 행으로 되돌리게 된다.
+        if let folderApplier,
+           folderSyncGate.isFolderSyncEnabled(for: localProjectID) {
             let folders = try await client.fetchFolders(
                 projectID: serverProjectID
             )

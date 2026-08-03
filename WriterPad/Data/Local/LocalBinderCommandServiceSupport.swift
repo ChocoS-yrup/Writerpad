@@ -684,6 +684,11 @@ extension LocalBinderCommandService {
             break
         }
 
+        // 폴더 자체를 서버에 알린다. tree_order는 이름 목록이라 이름이 바뀌면
+        // "옛 이름 사라짐 + 새 이름 생김"으로 도착한다. 같은 folder_id로 보내야
+        // 받는 기기가 옮기기로 처리한다.
+        mutations.append(contentsOf: folderMutations(for: journal))
+
         if journal.kind != .permanentDelete && journal.kind != .emptyTrash {
             let documents = try await metadataStore.binderDocuments(
                 in: journal.projectID
@@ -707,6 +712,89 @@ extension LocalBinderCommandService {
             kind: batchKind,
             mutations: mutations
         )
+    }
+
+    /// 바인더 명령 하나가 만든 폴더 변경을 대기열 작업으로 바꾼다.
+    ///
+    /// 식별자는 `DocumentNode.id`를 그대로 쓴다. 이름 변경과 이동은 같은 노드가
+    /// 경로만 바뀌어 오므로 folder_id가 저절로 유지되고, 새로 만든 폴더만 새
+    /// UUID를 갖는다.
+    ///
+    /// operation_id는 여기서 한 번만 만든다. 이 batch는 저널에 적혀 재시도에
+    /// 그대로 다시 쓰이므로, 끊겼다 이어져도 같은 값이 나간다.
+    func folderMutations(
+        for journal: BinderCommandJournal
+    ) -> [DurableLocalMutation] {
+        guard folderSyncGate.isFolderSyncEnabled(for: journal.projectID)
+        else {
+            // 꺼져 있으면 기존 tree_order 동작만 남는다. Windows가 폴더 UUID를
+            // 모르는 동안 폴더 기록이 최종 권위가 되면, Windows가 바꾼 이름을
+            // 낡은 서버 행을 근거로 되돌리게 된다.
+            return []
+        }
+
+        switch journal.kind {
+        case .reorder:
+            // 순서만 바뀐다. 이름도 부모도 그대로라 보낼 것이 없다.
+            return []
+        case .create, .createVolume:
+            return folderCommits(
+                for: journal.newNodes,
+                isDeleted: false
+            )
+        case .relocate:
+            // 이름이나 부모가 실제로 바뀐 폴더만 보낸다. 자식은 부모를 따라
+            // 경로가 바뀌지만 제 이름과 부모 연결은 그대로다.
+            let previous = Dictionary(
+                journal.oldNodes.map { ($0.id, $0) },
+                uniquingKeysWith: { first, _ in first }
+            )
+            let changed = journal.newNodes.filter { node in
+                guard let old = previous[node.id] else { return true }
+                return folderName(of: node) != folderName(of: old)
+                    || node.parentID != old.parentID
+            }
+            return folderCommits(for: changed, isDeleted: false)
+        case .trash:
+            return folderCommits(for: journal.newNodes, isDeleted: true)
+        case .restore:
+            return folderCommits(for: journal.newNodes, isDeleted: false)
+        case .permanentDelete, .emptyTrash:
+            // 휴지통으로 옮길 때 이미 무덤을 보냈다. 여기서 또 보내면 같은
+            // 폴더의 revision만 올라간다.
+            return []
+        }
+    }
+
+    private func folderCommits(
+        for nodes: [DocumentNode],
+        isDeleted: Bool
+    ) -> [DurableLocalMutation] {
+        nodes
+            .filter { $0.kind == .folder }
+            // 부모가 먼저 서버에 있어야 자식의 parent_folder_id가 가리킬
+            // 대상이 있다. 지울 때는 반대로 깊은 것부터 나가야 서버가
+            // FOLDER_NOT_EMPTY로 거부하지 않는다.
+            .sorted {
+                let left = $0.relativePath.rawValue
+                    .split(separator: "/").count
+                let right = $1.relativePath.rawValue
+                    .split(separator: "/").count
+                return isDeleted ? left > right : left < right
+            }
+            .map { node in
+                .folderSnapshot(
+                    operationID: uuidGenerator.makeUUID(),
+                    folderID: node.id,
+                    parentFolderID: node.parentID,
+                    name: folderName(of: node),
+                    isDeleted: isDeleted
+                )
+            }
+    }
+
+    private func folderName(of node: DocumentNode) -> String {
+        SyncV2FolderMigration.folderName(node.relativePath)
     }
 
     func recordEmptyTrashHandoff(

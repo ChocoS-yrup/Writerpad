@@ -6371,7 +6371,8 @@ final class SyncV2PullFolderWiringTests: XCTestCase {
                 changeRecorder: FolderWiringRecorderStub()
             ),
             folderMarker: marker,
-            folderDocuments: FolderWiringRepositoryStub(order: order)
+            folderDocuments: FolderWiringRepositoryStub(order: order),
+            folderSyncGate: FolderWiringGate(isEnabled: true)
         )
 
         _ = try await service.pull(
@@ -6382,6 +6383,44 @@ final class SyncV2PullFolderWiringTests: XCTestCase {
         let steps = await order.steps()
         XCTAssertEqual(steps.first, "migration")
         XCTAssertEqual(steps.last, "apply")
+    }
+
+    /// Windows가 아직 폴더 UUID를 모르는 동안 기본값은 꺼짐이어야 한다. 켜지
+    /// 않은 작품에서 폴더 기록을 앞세우면 Windows가 바꾼 이름을 낡은 서버 행을
+    /// 근거로 되돌리게 된다.
+    func testRemoteFoldersAreNotAppliedWhileTheProjectIsNotOptedIn()
+        async throws {
+        let order = FolderWiringOrderRecorder()
+        let applier = FolderWiringApplierSpy(order: order)
+        let service = SyncV2SnapshotPullService(
+            client: SnapshotClientStub(
+                snapshots: [],
+                folders: [
+                    SyncV2RemoteFolder(
+                        folderID: UUID(),
+                        parentFolderID: nil,
+                        name: "메인",
+                        revision: 1,
+                        isDeleted: false,
+                        updatedAt: Date(timeIntervalSince1970: 10)
+                    )
+                ]
+            ),
+            stateStore: SnapshotStateStoreStub(states: [:]),
+            localApplier: SnapshotApplierSpy(),
+            mergeStore: SnapshotMergeStoreSpy(),
+            folderApplier: applier,
+            folderMarker: FolderWiringMarkerStub(pendingFolderIDs: []),
+            folderSyncGate: FolderWiringGate(isEnabled: false)
+        )
+
+        _ = try await service.pull(
+            localProjectID: ProjectID(rawValue: UUID()),
+            serverProjectID: UUID()
+        )
+
+        let steps = await order.steps()
+        XCTAssertTrue(steps.isEmpty)
     }
 
     func testFolderWithUnsentWorkIsHandedToTheApplierAsBlocked()
@@ -6408,7 +6447,8 @@ final class SyncV2PullFolderWiringTests: XCTestCase {
             localApplier: SnapshotApplierSpy(),
             mergeStore: SnapshotMergeStoreSpy(),
             folderApplier: applier,
-            folderMarker: marker
+            folderMarker: marker,
+            folderSyncGate: FolderWiringGate(isEnabled: true)
         )
 
         _ = try await service.pull(
@@ -6420,6 +6460,15 @@ final class SyncV2PullFolderWiringTests: XCTestCase {
         // 값으로 덮인다.
         let blocked = await applier.blockedFolderIDs()
         XCTAssertEqual(blocked, [DocumentID(rawValue: blockedID)])
+    }
+}
+
+private struct FolderWiringGate: SyncV2FolderSyncGating {
+    let isEnabled: Bool
+
+    func isFolderSyncEnabled(for projectID: ProjectID) -> Bool {
+        _ = projectID
+        return isEnabled
     }
 }
 
