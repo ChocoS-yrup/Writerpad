@@ -117,6 +117,7 @@
 		A90000000000000000000032 /* SyncV2FolderMigrationTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = B90000000000000000000032 /* SyncV2FolderMigrationTests.swift */; };
 		A90000000000000000000033 /* SyncV2RemoteFolderPlannerTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = B90000000000000000000033 /* SyncV2RemoteFolderPlannerTests.swift */; };
 		A90000000000000000000034 /* SyncV2RemoteFolderApplierTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = B90000000000000000000034 /* SyncV2RemoteFolderApplierTests.swift */; };
+		A90000000000000000000035 /* SyncV2FolderEndToEndTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = B90000000000000000000035 /* SyncV2FolderEndToEndTests.swift */; };
 		A9000000000000000000000E /* SyncV2StoreSchemaV1.sql in Resources */ = {isa = PBXBuildFile; fileRef = B90000000000000000000012 /* SyncV2StoreSchemaV1.sql */; };
 		A90000000000000000000041 /* SyncV2StoreSchemaV2.sql in Resources */ = {isa = PBXBuildFile; fileRef = B90000000000000000000041 /* SyncV2StoreSchemaV2.sql */; };
 		A90000000000000000000042 /* SyncV2StoreSchemaV3.sql in Resources */ = {isa = PBXBuildFile; fileRef = B90000000000000000000042 /* SyncV2StoreSchemaV3.sql */; };
@@ -283,6 +284,7 @@
 		B90000000000000000000032 /* SyncV2FolderMigrationTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SyncV2FolderMigrationTests.swift; sourceTree = "<group>"; };
 		B90000000000000000000033 /* SyncV2RemoteFolderPlannerTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SyncV2RemoteFolderPlannerTests.swift; sourceTree = "<group>"; };
 		B90000000000000000000034 /* SyncV2RemoteFolderApplierTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SyncV2RemoteFolderApplierTests.swift; sourceTree = "<group>"; };
+		B90000000000000000000035 /* SyncV2FolderEndToEndTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SyncV2FolderEndToEndTests.swift; sourceTree = "<group>"; };
 		B90000000000000000000012 /* SyncV2StoreSchemaV1.sql */ = {isa = PBXFileReference; lastKnownFileType = text; path = Scripts/fixtures/SyncV2StoreSchemaV1.sql; sourceTree = SOURCE_ROOT; };
 		B90000000000000000000041 /* SyncV2StoreSchemaV2.sql */ = {isa = PBXFileReference; lastKnownFileType = text; path = Scripts/fixtures/SyncV2StoreSchemaV2.sql; sourceTree = SOURCE_ROOT; };
 		B90000000000000000000042 /* SyncV2StoreSchemaV3.sql */ = {isa = PBXFileReference; lastKnownFileType = text; path = Scripts/fixtures/SyncV2StoreSchemaV3.sql; sourceTree = SOURCE_ROOT; };
@@ -504,6 +506,7 @@
 				B90000000000000000000032 /* SyncV2FolderMigrationTests.swift */,
 				B90000000000000000000033 /* SyncV2RemoteFolderPlannerTests.swift */,
 				B90000000000000000000034 /* SyncV2RemoteFolderApplierTests.swift */,
+				B90000000000000000000035 /* SyncV2FolderEndToEndTests.swift */,
 				B90000000000000000000014 /* SyncV2ClientTests.swift */,
 				B9000000000000000000001A /* SyncV2SnapshotPullTests.swift */,
 				B92000000000000000000002 /* ThreeWayMergeTests.swift */,
@@ -975,6 +978,7 @@
 				A90000000000000000000032 /* SyncV2FolderMigrationTests.swift in Sources */,
 				A90000000000000000000033 /* SyncV2RemoteFolderPlannerTests.swift in Sources */,
 				A90000000000000000000034 /* SyncV2RemoteFolderApplierTests.swift in Sources */,
+				A90000000000000000000035 /* SyncV2FolderEndToEndTests.swift in Sources */,
 				A90000000000000000000010 /* SyncV2ClientTests.swift in Sources */,
 				A90000000000000000000016 /* SyncV2SnapshotPullTests.swift in Sources */,
 				A92000000000000000000002 /* ThreeWayMergeTests.swift in Sources */,
