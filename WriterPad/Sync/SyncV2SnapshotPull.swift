@@ -2047,9 +2047,18 @@ final class SyncV2WorkspaceSyncModel: ObservableObject {
         } else if mergeOutcomes.contains(.invalidLocalHierarchy) {
             // 무엇을 고쳐야 하는지 알려주지 않으면 사용자는 이 상태에서
             // 빠져나올 수 없다. 실기기에서 폴더 이름 끝의 공백 하나로 구조
-            // 동기화가 멈췄고, 화면에는 원인이 드러나지 않았다.
+            // 동기화가 멈췄고, 화면에는 원인이 드러나지 않았다. 이름을 알아낸
+            // 경우에는 그 이름을 그대로 보여준다.
             lastResult = .structuralConflict(
-                detail: "서버의 폴더나 문서 제목 중 iPad에서 쓸 수 없는 이름이 있어 구조를 적용하지 못했습니다. 이름 끝의 공백과 마침표를 지우고 < > : \" / \\ | ? * 문자를 뺀 뒤 다시 동기화해 주세요. 로컬 TXT는 덮어쓰지 않았습니다."
+                detail: report.rejectedStructureNames.first.map { rejected in
+                    """
+                    \(rejected.parent) 안의 '\(rejected.name)' \
+                    이름을 iPad에 적용할 수 없습니다. \
+                    \(rejected.reason) \
+                    보낸 기기에서 이 이름을 고친 뒤 다시 동기화해 주세요. \
+                    로컬 TXT는 덮어쓰지 않았습니다.
+                    """
+                } ?? "서버의 폴더나 문서 제목 중 iPad에서 쓸 수 없는 이름이 있어 구조를 적용하지 못했습니다. 이름 끝의 공백과 마침표를 지우고 < > : \" / \\ | ? * 문자를 뺀 뒤 다시 동기화해 주세요. 로컬 TXT는 덮어쓰지 않았습니다."
             )
         } else if !mergeOutcomes.isEmpty {
             lastResult = .waiting

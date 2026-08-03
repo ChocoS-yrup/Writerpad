@@ -1904,7 +1904,17 @@ final class SyncV2SnapshotPullTests: XCTestCase {
             )
             XCTFail("공백으로 끝나는 이름은 거부되어야 한다.")
         } catch let error as SyncV2LocalSnapshotApplyError {
-            XCTAssertEqual(error, .unsafePath)
+            guard case let .unsafeName(rejected) = error else {
+                return XCTFail(
+                    "어떤 이름이 막혔는지 담은 오류여야 한다: \(error)"
+                )
+            }
+            XCTAssertEqual(rejected.name, "가 나 다 라 ")
+            XCTAssertEqual(rejected.parent, "메인")
+            XCTAssertTrue(
+                rejected.reason.contains("공백이나 마침표"),
+                "사유가 사용자에게 그대로 쓰인다: \(rejected.reason)"
+            )
         } catch {
             XCTFail(
                 """
@@ -3451,6 +3461,78 @@ final class SyncV2SnapshotPullTests: XCTestCase {
             XCTAssertEqual(model.state, expectedState)
             await model.stop()
         }
+    }
+
+    /// 이름을 알아낸 경우에는 그 이름을 화면에 그대로 보여야 한다. 어떤 폴더가
+    /// 문제인지 모르면 보내는 기기에서 고칠 수가 없어 상태에서 빠져나올 수 없다.
+    @MainActor
+    func testStructuralConflictNamesTheRejectedFolderInTheMessage()
+        async throws {
+        let previous = GlobalSyncPreference.isEnabled()
+        GlobalSyncPreference.setEnabled(true)
+        defer { GlobalSyncPreference.setEnabled(previous) }
+        let localProjectID = ProjectID(rawValue: UUID())
+        let serverProjectID = UUID()
+        let documentID = UUID()
+        let puller = WorkspacePullerStub(
+            report: SyncV2SnapshotPullReport(
+                outcomes: [
+                    .mergeRequired(
+                        documentID: documentID,
+                        revision: 2,
+                        reason: .invalidLocalHierarchy
+                    ),
+                ],
+                appliedSnapshots: [],
+                rejectedStructureNames: [
+                    SyncV2RejectedStructureName(
+                        name: "가 나 다 라 ",
+                        parent: "메인",
+                        reason: "이름은 공백이나 마침표로 끝날 수 없습니다."
+                    ),
+                ]
+            )
+        )
+        let model = SyncV2WorkspaceSyncModel(
+            localProjectID: localProjectID,
+            puller: puller,
+            realtime: nil,
+            authenticationService: WorkspaceAuthenticationStub(
+                state: .authenticated(
+                    AuthenticatedAccount(
+                        userID: UUID(),
+                        maskedEmail: "u***@example.com"
+                    )
+                )
+            ),
+            projectBindingService: WorkspaceBindingStub(
+                binding: .connected(
+                    localProjectID: localProjectID,
+                    serverProjectID: serverProjectID,
+                    kind: .existingServerProject,
+                    projectName: "이름 표시",
+                    ownerSubject: UUID()
+                )
+            ),
+            periodicDelay: .seconds(600)
+        )
+
+        await model.start(editingGuards: { [:] }) { _ in }
+        try await Task.sleep(for: .milliseconds(50))
+
+        guard case let .structuralConflict(detail) = model.state.lastResult
+        else {
+            return XCTFail("구조 충돌 상태여야 한다.")
+        }
+        XCTAssertTrue(
+            detail.contains("가 나 다 라 "),
+            "막힌 이름이 문구에 그대로 나와야 한다: \(detail)"
+        )
+        XCTAssertTrue(
+            detail.contains("공백이나 마침표로 끝날 수 없습니다"),
+            "왜 막혔는지도 함께 나와야 한다: \(detail)"
+        )
+        await model.stop()
     }
 
     @MainActor

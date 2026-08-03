@@ -171,6 +171,16 @@ enum SyncV2SnapshotPullOutcome: Equatable, Sendable {
 struct SyncV2SnapshotPullReport: Equatable, Sendable {
     let outcomes: [SyncV2SnapshotPullOutcome]
     let appliedSnapshots: [SyncV2RemoteDocumentSnapshot]
+    /// 구조를 적용하지 못하게 만든 이름과 사유다. merge reason은 문자열 raw
+    /// value라 값을 담을 수 없어 보고서로 따로 올린다. 이것이 없으면 사용자는
+    /// 무엇을 고쳐야 할지 알 수 없어 상태에서 빠져나올 수 없다.
+    var rejectedStructureNames: [SyncV2RejectedStructureName] = []
+}
+
+struct SyncV2RejectedStructureName: Equatable, Sendable {
+    let name: String
+    let parent: String
+    let reason: String
 }
 
 /// Watchdog와 실제 작업 중 먼저 끝난 값을 한 번만 채택하는 one-shot Race다.

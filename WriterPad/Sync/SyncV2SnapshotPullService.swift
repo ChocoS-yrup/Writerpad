@@ -27,6 +27,8 @@ actor SyncV2SnapshotPullService: SyncV2SnapshotPulling {
     private struct ProcessedSnapshot: Sendable {
         let outcome: SyncV2SnapshotPullOutcome
         let appliedSnapshot: SyncV2RemoteDocumentSnapshot?
+        /// 구조를 막은 이름. 화면 문구로 올라간다.
+        var rejectedName: SyncV2RejectedStructureName? = nil
     }
 
     private let client: any SyncV2SnapshotClienting
@@ -82,6 +84,7 @@ actor SyncV2SnapshotPullService: SyncV2SnapshotPulling {
         }
         var outcomes: [SyncV2SnapshotPullOutcome] = []
         var appliedSnapshots: [SyncV2RemoteDocumentSnapshot] = []
+        var rejectedStructureNames: [SyncV2RejectedStructureName] = []
         outcomes.reserveCapacity(snapshots.count)
 
         var effectivePurgeState = await localApplier.trashPurgeState(
@@ -135,6 +138,9 @@ actor SyncV2SnapshotPullService: SyncV2SnapshotPulling {
                 )
             }
             outcomes.append(processed.outcome)
+            if let rejectedName = processed.rejectedName {
+                rejectedStructureNames.append(rejectedName)
+            }
             if let appliedSnapshot = processed.appliedSnapshot {
                 appliedSnapshots.append(appliedSnapshot)
                 if appliedSnapshot.relativePath == syncV2TrashPurgePath {
@@ -146,7 +152,8 @@ actor SyncV2SnapshotPullService: SyncV2SnapshotPulling {
         }
         return SyncV2SnapshotPullReport(
             outcomes: outcomes,
-            appliedSnapshots: appliedSnapshots
+            appliedSnapshots: appliedSnapshots,
+            rejectedStructureNames: rejectedStructureNames
         )
     }
 
@@ -285,8 +292,13 @@ actor SyncV2SnapshotPullService: SyncV2SnapshotPulling {
                         let reason: SyncV2SnapshotMergeReason = switch error {
                         case .pathOccupiedByDifferentDocument:
                             .pathOccupiedByDifferentDocument
-                        case .invalidHierarchy, .unsafePath:
+                        case .invalidHierarchy, .unsafePath,
+                             .unsafeName:
                             .invalidLocalHierarchy
+                        }
+                        var rejectedName: SyncV2RejectedStructureName?
+                        if case let .unsafeName(value) = error {
+                            rejectedName = value
                         }
                         try await preserve(
                             snapshot,
@@ -300,7 +312,8 @@ actor SyncV2SnapshotPullService: SyncV2SnapshotPulling {
                                 revision: state.serverRevision,
                                 reason: reason
                             ),
-                            appliedSnapshot: nil
+                            appliedSnapshot: nil,
+                            rejectedName: rejectedName
                         )
                     }
                     await localApplier.finish(
@@ -335,8 +348,13 @@ actor SyncV2SnapshotPullService: SyncV2SnapshotPulling {
                         let reason: SyncV2SnapshotMergeReason = switch error {
                         case .pathOccupiedByDifferentDocument:
                             .pathOccupiedByDifferentDocument
-                        case .invalidHierarchy, .unsafePath:
+                        case .invalidHierarchy, .unsafePath,
+                             .unsafeName:
                             .invalidLocalHierarchy
+                        }
+                        var rejectedName: SyncV2RejectedStructureName?
+                        if case let .unsafeName(value) = error {
+                            rejectedName = value
                         }
                         try await preserve(
                             snapshot,
@@ -350,7 +368,8 @@ actor SyncV2SnapshotPullService: SyncV2SnapshotPulling {
                                 revision: state.serverRevision,
                                 reason: reason
                             ),
-                            appliedSnapshot: nil
+                            appliedSnapshot: nil,
+                            rejectedName: rejectedName
                         )
                     }
                 }
@@ -417,11 +436,15 @@ actor SyncV2SnapshotPullService: SyncV2SnapshotPulling {
             }
         } catch let error as SyncV2LocalSnapshotApplyError {
             let reason: SyncV2SnapshotMergeReason
+            var rejectedName: SyncV2RejectedStructureName?
             switch error {
             case .pathOccupiedByDifferentDocument:
                 reason = .pathOccupiedByDifferentDocument
             case .invalidHierarchy, .unsafePath:
                 reason = .invalidLocalHierarchy
+            case let .unsafeName(value):
+                reason = .invalidLocalHierarchy
+                rejectedName = value
             }
             try await preserve(
                 snapshot,
@@ -435,7 +458,8 @@ actor SyncV2SnapshotPullService: SyncV2SnapshotPulling {
                     revision: snapshot.revision,
                     reason: reason
                 ),
-                appliedSnapshot: nil
+                appliedSnapshot: nil,
+                rejectedName: rejectedName
             )
         }
 

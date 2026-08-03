@@ -106,6 +106,9 @@ enum SyncV2LocalSnapshotApplyError: Error, Equatable, Sendable {
     case pathOccupiedByDifferentDocument
     case invalidHierarchy
     case unsafePath
+    /// 어떤 이름이 왜 막혔는지까지 담는다. 화면에 그대로 보여 사용자가 보내는
+    /// 쪽에서 고칠 수 있게 한다.
+    case unsafeName(SyncV2RejectedStructureName)
 }
 
 actor LocalSyncV2SnapshotMergeStore: SyncV2SnapshotMergeStoring {
@@ -1286,6 +1289,27 @@ actor LocalSyncV2SnapshotApplier: SyncV2LocalSnapshotApplying {
         return documents
     }
 
+    /// 거부한 이름을 로그와 오류에 함께 싣는다. 로그는 개발자용이고, 오류에
+    /// 담긴 값은 화면 문구가 된다. 폴더 이름은 원고 본문이 아니라 구조 정보다.
+    private func rejectedName(
+        _ name: String,
+        parent: String,
+        reason: String
+    ) -> SyncV2LocalSnapshotApplyError {
+        SyncV2Diagnostics.rejectedStructureName(
+            name,
+            parent: parent,
+            reason: reason
+        )
+        return .unsafeName(
+            SyncV2RejectedStructureName(
+                name: name,
+                parent: parent,
+                reason: reason
+            )
+        )
+    }
+
     /// 동기화가 tree-order에서 만든 폴더의 UUID는 경로에서 결정적으로 파생한다.
     /// 사용자가 직접 만든 폴더와 구별하는 기준이 된다.
     private func syncedFolderIdentifier(
@@ -1336,25 +1360,21 @@ actor LocalSyncV2SnapshotApplier: SyncV2LocalSnapshotApplying {
                 do {
                     try pathPolicy.validateName(name)
                 } catch {
-                    // 어떤 이름이 왜 막혔는지 남기지 않으면 사용자는 무엇을
-                    // 고쳐야 할지 알 수 없다. 구조 동기화는 여기서 멈춘다.
-                    SyncV2Diagnostics.rejectedStructureName(
+                    throw rejectedName(
                         name,
                         parent: parentValue,
                         reason: (error as? PathPolicyError)?.errorDescription
-                            ?? "\(error)"
+                            ?? "이 이름은 iPad에서 사용할 수 없습니다."
                     )
-                    throw SyncV2LocalSnapshotApplyError.unsafePath
                 }
                 guard childKeys.insert(
                     pathPolicy.collisionKey(for: name)
                 ).inserted else {
-                    SyncV2Diagnostics.rejectedStructureName(
+                    throw rejectedName(
                         name,
                         parent: parentValue,
-                        reason: "정규화 후 같은 이름이 둘 이상입니다."
+                        reason: "정규화하면 같은 이름이 둘 이상입니다."
                     )
-                    throw SyncV2LocalSnapshotApplyError.invalidHierarchy
                 }
                 let childValue = parentValue + "/" + name
                 let childPath = RelativeDocumentPath(rawValue: childValue)
