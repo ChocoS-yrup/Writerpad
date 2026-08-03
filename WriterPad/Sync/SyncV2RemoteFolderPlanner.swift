@@ -191,6 +191,30 @@ enum SyncV2RemoteFolderPlanner {
         return Plan(actions: moves + creates + deletes + conflicts)
     }
 
+    /// 서버가 아는 폴더의 경로와 식별자다. 이관할 때 계산값 대신 서버 값을
+    /// 쓰려면 어느 경로가 이미 서버에 있는지 알아야 한다.
+    static func serverFolderIDsByPath(
+        remote: [SyncV2RemoteFolder],
+        documents: [DocumentNode]
+    ) -> [String: DocumentID] {
+        let remoteByID = Dictionary(
+            remote.map { (DocumentID(rawValue: $0.folderID), $0) },
+            uniquingKeysWith: { first, _ in first }
+        )
+        let localByID = Dictionary(
+            documents.map { ($0.id, $0) },
+            uniquingKeysWith: { first, _ in first }
+        )
+        let paths = desiredPaths(
+            remoteByID: remoteByID,
+            localByID: localByID
+        )
+        return Dictionary(
+            paths.map { ($0.value, $0.key) },
+            uniquingKeysWith: { first, _ in first }
+        )
+    }
+
     /// 이름을 사슬로 이어 붙여 각 폴더가 있어야 할 자리를 구한다. 서버는 경로를
     /// 보내지 않으므로 여기서 만든다.
     private static func desiredPaths(

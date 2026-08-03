@@ -8,6 +8,9 @@ protocol SyncV2FolderMigrationMarking: Sendable {
     func markFolderMigrationCompleted(
         localProjectID: ProjectID
     ) async throws
+    func foldersWithPendingOperations(
+        localProjectID: ProjectID
+    ) async throws -> Set<UUID>
 }
 
 enum SyncV2FolderMigrationResult: Equatable, Sendable {

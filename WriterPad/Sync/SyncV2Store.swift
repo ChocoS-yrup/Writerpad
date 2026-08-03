@@ -1244,6 +1244,46 @@ actor SyncV2Store:
         }
     }
 
+    /// 아직 서버로 못 간 작업이 걸린 폴더다. 원격 변경으로 덮으면 사용자가 방금
+    /// 한 일이 사라지므로 반영에서 빼야 한다.
+    func foldersWithPendingOperations(
+        localProjectID: ProjectID
+    ) throws -> Set<UUID> {
+        guard availability() == .available else {
+            throw SyncV2StoreError.invalidStoredData
+        }
+        return try withStatement(
+            """
+            SELECT DISTINCT folder_id
+            FROM sync_operations
+            WHERE folder_id IS NOT NULL
+              AND local_project_id = ?
+              AND status NOT IN ('completed', 'cancelled');
+            """
+        ) { statement in
+            try bind(
+                localProjectID.rawValue.uuidString.lowercased(),
+                at: 1,
+                to: statement
+            )
+            var identifiers: Set<UUID> = []
+            while true {
+                let status = sqlite3_step(statement)
+                if status == SQLITE_DONE {
+                    return identifiers
+                }
+                guard
+                    status == SQLITE_ROW,
+                    let value = columnText(statement, at: 0),
+                    let identifier = UUID(uuidString: value)
+                else {
+                    throw SyncV2StoreError.invalidStoredData
+                }
+                identifiers.insert(identifier)
+            }
+        }
+    }
+
     func markFolderMigrationCompleted(
         localProjectID: ProjectID
     ) throws {
@@ -6743,6 +6783,17 @@ actor LazySyncV2ProjectBindingStore:
             throw SyncV2StoreError.invalidStoredData
         }
         try await store.markFolderMigrationCompleted(
+            localProjectID: localProjectID
+        )
+    }
+
+    func foldersWithPendingOperations(
+        localProjectID: ProjectID
+    ) async throws -> Set<UUID> {
+        guard let store = await resolvedStore() else {
+            throw SyncV2StoreError.invalidStoredData
+        }
+        return try await store.foldersWithPendingOperations(
             localProjectID: localProjectID
         )
     }

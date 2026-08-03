@@ -294,6 +294,13 @@ private actor FolderMigrationMarkerStub: SyncV2FolderMigrationMarking {
     func markFolderMigrationCompleted(localProjectID: ProjectID) {
         completed.insert(localProjectID)
     }
+
+    func foldersWithPendingOperations(
+        localProjectID: ProjectID
+    ) -> Set<UUID> {
+        _ = localProjectID
+        return []
+    }
 }
 
 private actor ChangeRecorderStub: DurableLocalChangeRecording {

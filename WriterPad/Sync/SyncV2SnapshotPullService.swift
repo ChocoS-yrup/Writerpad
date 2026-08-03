@@ -35,6 +35,9 @@ actor SyncV2SnapshotPullService: SyncV2SnapshotPulling {
     private let stateStore: any SyncV2SnapshotStateStoring
     private let localApplier: any SyncV2LocalSnapshotApplying
     private let folderApplier: (any SyncV2RemoteFolderApplying)?
+    private let folderMigration: SyncV2FolderMigration?
+    private let folderMarker: (any SyncV2FolderMigrationMarking)?
+    private let folderDocuments: (any DocumentRepository)?
     private let mergeStore: any SyncV2SnapshotMergeStoring
     private let mutationGate: SyncV2DocumentMutationGate
 
@@ -44,6 +47,9 @@ actor SyncV2SnapshotPullService: SyncV2SnapshotPulling {
         localApplier: any SyncV2LocalSnapshotApplying,
         mergeStore: any SyncV2SnapshotMergeStoring,
         folderApplier: (any SyncV2RemoteFolderApplying)? = nil,
+        folderMigration: SyncV2FolderMigration? = nil,
+        folderMarker: (any SyncV2FolderMigrationMarking)? = nil,
+        folderDocuments: (any DocumentRepository)? = nil,
         mutationGate: SyncV2DocumentMutationGate =
             SyncV2DocumentMutationGate()
     ) {
@@ -51,6 +57,9 @@ actor SyncV2SnapshotPullService: SyncV2SnapshotPulling {
         self.stateStore = stateStore
         self.localApplier = localApplier
         self.folderApplier = folderApplier
+        self.folderMigration = folderMigration
+        self.folderMarker = folderMarker
+        self.folderDocuments = folderDocuments
         self.mergeStore = mergeStore
         self.mutationGate = mutationGate
     }
@@ -85,10 +94,35 @@ actor SyncV2SnapshotPullService: SyncV2SnapshotPulling {
             let folders = try await client.fetchFolders(
                 projectID: serverProjectID
             )
+            // 이관을 먼저 돌린다. 기존 폴더에 공유 UUID가 붙어 있어야 서버가
+            // 보낸 폴더와 짝이 맞는다. 그러지 않으면 모든 원격 폴더가 "이 기기가
+            // 모르는 폴더"로 보여 옮기는 대신 새로 만들게 된다.
+            if let folderMigration {
+                let documents =
+                    (try? await folderDocuments?.documents(
+                        in: localProjectID
+                    )) ?? nil ?? []
+                _ = await folderMigration.migrateIfNeeded(
+                    localProjectID: localProjectID,
+                    serverProjectID: serverProjectID,
+                    serverFolderIDsByPath:
+                        SyncV2RemoteFolderPlanner.serverFolderIDsByPath(
+                            remote: folders,
+                            documents: documents
+                        )
+                )
+            }
+            let blockedFolderIDs = Set(
+                ((
+                    try? await folderMarker?.foldersWithPendingOperations(
+                        localProjectID: localProjectID
+                    )
+                ) ?? []).map(DocumentID.init(rawValue:))
+            )
             let report = await folderApplier.applyRemoteFolders(
                 localProjectID: localProjectID,
                 remote: folders,
-                blockedFolderIDs: []
+                blockedFolderIDs: blockedFolderIDs
             )
             folderRejections = report.rejectedNames
         }

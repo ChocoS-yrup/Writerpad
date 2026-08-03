@@ -180,6 +180,7 @@ final class AppEnvironment: ObservableObject {
         let networkRecoveryHub: SyncV2NetworkRecoveryHub?
         let conflictResolutionService: (any SyncV2ConflictResolving)?
         let snapshotStateStore: (any SyncV2SnapshotStateStoring)?
+        let folderMigrationMarker: (any SyncV2FolderMigrationMarking)?
         let editLeaseManager: EditLeaseManager?
         if isStoredInMemoryOnly {
             projectBindingStore = InMemoryProjectBindingStore()
@@ -188,6 +189,7 @@ final class AppEnvironment: ObservableObject {
             networkRecoveryHub = nil
             conflictResolutionService = nil
             snapshotStateStore = nil
+            folderMigrationMarker = nil
             editLeaseManager = nil
         } else {
             let dispatchWakeup = SyncV2DispatchWakeup()
@@ -201,6 +203,7 @@ final class AppEnvironment: ObservableObject {
             durableChangeRecorder = syncV2Store
             conflictResolutionService = syncV2Store
             snapshotStateStore = syncV2Store
+            folderMigrationMarker = syncV2Store
             editLeaseManager = supabaseClientProvider
                 .makeEditLeaseClient()
                 .map {
@@ -274,6 +277,15 @@ final class AppEnvironment: ObservableObject {
                     documentRepository: repository,
                     workspaceLocator: workspaceLocator
                 ),
+                folderMigration: folderMigrationMarker.map {
+                    SyncV2FolderMigration(
+                        documentRepository: repository,
+                        marker: $0,
+                        changeRecorder: durableChangeRecorder
+                    )
+                },
+                folderMarker: folderMigrationMarker,
+                folderDocuments: repository,
                 mutationGate: syncMutationGate
             )
         } else {

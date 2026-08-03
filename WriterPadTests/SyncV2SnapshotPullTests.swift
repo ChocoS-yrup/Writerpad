@@ -5200,9 +5200,14 @@ private actor SnapshotTransportStub: SyncV2SnapshotTransporting {
 
 private actor SnapshotClientStub: SyncV2SnapshotClienting {
     let snapshots: [SyncV2RemoteDocumentSnapshot]
+    let folders: [SyncV2RemoteFolder]
 
-    init(snapshots: [SyncV2RemoteDocumentSnapshot]) {
+    init(
+        snapshots: [SyncV2RemoteDocumentSnapshot],
+        folders: [SyncV2RemoteFolder] = []
+    ) {
         self.snapshots = snapshots
+        self.folders = folders
     }
 
     func fetchDocuments(
@@ -5211,6 +5216,10 @@ private actor SnapshotClientStub: SyncV2SnapshotClienting {
         snapshots.sorted {
             $0.documentID.uuidString < $1.documentID.uuidString
         }
+    }
+
+    func fetchFolders(projectID: UUID) async throws -> [SyncV2RemoteFolder] {
+        folders
     }
 }
 
@@ -6326,5 +6335,173 @@ private actor BackgroundPullerStub: SyncV2SnapshotPulling {
 
     func completedProjectIDs() -> [ProjectID] {
         completed
+    }
+}
+
+/// pull이 이관을 원격 폴더 반영보다 먼저 돌리는지 본다. 순서가 뒤집히면 기존
+/// 폴더에 공유 UUID가 없는 채로 서버 폴더와 짝을 맞추게 되어, 모든 원격 폴더가
+/// "이 기기가 모르는 폴더"로 보이고 옮기는 대신 새로 만들어진다.
+final class SyncV2PullFolderWiringTests: XCTestCase {
+    func testMigrationRunsBeforeRemoteFoldersAreApplied() async throws {
+        let localProjectID = ProjectID(rawValue: UUID())
+        let serverProjectID = UUID()
+        let order = FolderWiringOrderRecorder()
+        let marker = FolderWiringMarkerStub(pendingFolderIDs: [])
+        let service = SyncV2SnapshotPullService(
+            client: SnapshotClientStub(
+                snapshots: [],
+                folders: [
+                    SyncV2RemoteFolder(
+                        folderID: UUID(),
+                        parentFolderID: nil,
+                        name: "메인",
+                        revision: 1,
+                        isDeleted: false,
+                        updatedAt: Date(timeIntervalSince1970: 10)
+                    )
+                ]
+            ),
+            stateStore: SnapshotStateStoreStub(states: [:]),
+            localApplier: SnapshotApplierSpy(),
+            mergeStore: SnapshotMergeStoreSpy(),
+            folderApplier: FolderWiringApplierSpy(order: order),
+            folderMigration: SyncV2FolderMigration(
+                documentRepository: FolderWiringRepositoryStub(order: order),
+                marker: marker,
+                changeRecorder: FolderWiringRecorderStub()
+            ),
+            folderMarker: marker,
+            folderDocuments: FolderWiringRepositoryStub(order: order)
+        )
+
+        _ = try await service.pull(
+            localProjectID: localProjectID,
+            serverProjectID: serverProjectID
+        )
+
+        let steps = await order.steps()
+        XCTAssertEqual(steps.first, "migration")
+        XCTAssertEqual(steps.last, "apply")
+    }
+
+    func testFolderWithUnsentWorkIsHandedToTheApplierAsBlocked()
+        async throws {
+        let blockedID = UUID()
+        let order = FolderWiringOrderRecorder()
+        let applier = FolderWiringApplierSpy(order: order)
+        let marker = FolderWiringMarkerStub(pendingFolderIDs: [blockedID])
+        let service = SyncV2SnapshotPullService(
+            client: SnapshotClientStub(
+                snapshots: [],
+                folders: [
+                    SyncV2RemoteFolder(
+                        folderID: blockedID,
+                        parentFolderID: nil,
+                        name: "메인",
+                        revision: 1,
+                        isDeleted: false,
+                        updatedAt: Date(timeIntervalSince1970: 10)
+                    )
+                ]
+            ),
+            stateStore: SnapshotStateStoreStub(states: [:]),
+            localApplier: SnapshotApplierSpy(),
+            mergeStore: SnapshotMergeStoreSpy(),
+            folderApplier: applier,
+            folderMarker: marker
+        )
+
+        _ = try await service.pull(
+            localProjectID: ProjectID(rawValue: UUID()),
+            serverProjectID: UUID()
+        )
+
+        // 미전송 작업이 걸린 폴더를 그냥 넘기면 사용자가 방금 한 일이 원격
+        // 값으로 덮인다.
+        let blocked = await applier.blockedFolderIDs()
+        XCTAssertEqual(blocked, [DocumentID(rawValue: blockedID)])
+    }
+}
+
+private actor FolderWiringOrderRecorder {
+    private var recorded: [String] = []
+
+    func record(_ step: String) {
+        recorded.append(step)
+    }
+
+    func steps() -> [String] { recorded }
+}
+
+private actor FolderWiringApplierSpy: SyncV2RemoteFolderApplying {
+    private let order: FolderWiringOrderRecorder
+    private var blocked: Set<DocumentID> = []
+
+    init(order: FolderWiringOrderRecorder) {
+        self.order = order
+    }
+
+    func applyRemoteFolders(
+        localProjectID: ProjectID,
+        remote: [SyncV2RemoteFolder],
+        blockedFolderIDs: Set<DocumentID>
+    ) async -> SyncV2RemoteFolderApplyReport {
+        await order.record("apply")
+        blocked = blockedFolderIDs
+        return SyncV2RemoteFolderApplyReport()
+    }
+
+    func blockedFolderIDs() -> Set<DocumentID> { blocked }
+}
+
+private actor FolderWiringRepositoryStub: DocumentRepository {
+    private let order: FolderWiringOrderRecorder
+
+    init(order: FolderWiringOrderRecorder) {
+        self.order = order
+    }
+
+    func documents(in projectID: ProjectID) async throws -> [DocumentNode] {
+        await order.record("migration")
+        return []
+    }
+
+    func document(id: DocumentID) throws -> DocumentNode? { nil }
+    func save(_ document: DocumentNode) throws {}
+    func removeMetadata(id: DocumentID) throws {}
+}
+
+private actor FolderWiringMarkerStub: SyncV2FolderMigrationMarking {
+    private let pendingFolderIDs: Set<UUID>
+    private var completed = false
+
+    init(pendingFolderIDs: Set<UUID>) {
+        self.pendingFolderIDs = pendingFolderIDs
+    }
+
+    func isFolderMigrationCompleted(localProjectID: ProjectID) -> Bool {
+        completed
+    }
+
+    func markFolderMigrationCompleted(localProjectID: ProjectID) {
+        completed = true
+    }
+
+    func foldersWithPendingOperations(
+        localProjectID: ProjectID
+    ) -> Set<UUID> {
+        pendingFolderIDs
+    }
+}
+
+private actor FolderWiringRecorderStub: DurableLocalChangeRecording {
+    func requirement(
+        for projectID: ProjectID
+    ) async -> DurableRecordingRequirement {
+        .durableQueue
+    }
+
+    func record(_ batch: LocalMutationBatch) async -> DurableRecordResult {
+        .queued(operationIDs: [])
     }
 }
