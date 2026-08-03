@@ -111,6 +111,106 @@ struct SyncV2RemoteDocumentSnapshot: Codable, Equatable, Sendable {
     }
 }
 
+/// 서버 folders 한 줄이다. 문서와 달리 본문도 경로도 없다. 위치는
+/// parentFolderID 사슬로만 나타내므로, 경로는 받는 쪽에서 이름을 이어 붙여
+/// 만든다. 그래야 이름이 바뀌어도 같은 폴더임을 알아볼 수 있다.
+struct SyncV2RemoteFolder: Codable, Equatable, Sendable {
+    let folderID: UUID
+    let parentFolderID: UUID?
+    let name: String
+    let revision: Int64
+    let isDeleted: Bool
+    let updatedAt: Date
+
+    enum CodingKeys: String, CodingKey {
+        case folderID = "folder_id"
+        case parentFolderID = "parent_folder_id"
+        case name
+        case revision
+        case isDeleted = "is_deleted"
+        case updatedAt = "updated_at"
+    }
+
+    init(
+        folderID: UUID,
+        parentFolderID: UUID?,
+        name: String,
+        revision: Int64,
+        isDeleted: Bool,
+        updatedAt: Date
+    ) {
+        self.folderID = folderID
+        self.parentFolderID = parentFolderID
+        self.name = name
+        self.revision = revision
+        self.isDeleted = isDeleted
+        self.updatedAt = updatedAt
+    }
+
+    init(from decoder: Decoder) throws {
+        let values = try decoder.container(keyedBy: CodingKeys.self)
+        folderID = try values.decode(UUID.self, forKey: .folderID)
+        parentFolderID = try values.decodeIfPresent(
+            UUID.self,
+            forKey: .parentFolderID
+        )
+        name = try values.decode(String.self, forKey: .name)
+        revision = try values.decode(Int64.self, forKey: .revision)
+        isDeleted = try values.decode(Bool.self, forKey: .isDeleted)
+        updatedAt = try SyncV2RemoteFolder.decodeDate(
+            values,
+            key: .updatedAt
+        )
+    }
+
+    func encode(to encoder: Encoder) throws {
+        var values = encoder.container(keyedBy: CodingKeys.self)
+        try values.encode(folderID, forKey: .folderID)
+        try values.encode(parentFolderID, forKey: .parentFolderID)
+        try values.encode(name, forKey: .name)
+        try values.encode(revision, forKey: .revision)
+        try values.encode(isDeleted, forKey: .isDeleted)
+        try values.encode(
+            SyncV2RemoteFolder.encodeDate(updatedAt),
+            forKey: .updatedAt
+        )
+    }
+
+    private static func decodeDate(
+        _ values: KeyedDecodingContainer<CodingKeys>,
+        key: CodingKeys
+    ) throws -> Date {
+        let value = try values.decode(String.self, forKey: key)
+        let fractional = ISO8601DateFormatter()
+        fractional.formatOptions = [
+            .withInternetDateTime,
+            .withFractionalSeconds,
+        ]
+        if let date = fractional.date(from: value) {
+            return date
+        }
+        let seconds = ISO8601DateFormatter()
+        seconds.formatOptions = [.withInternetDateTime]
+        guard let date = seconds.date(from: value) else {
+            throw DecodingError.dataCorruptedError(
+                forKey: key,
+                in: values,
+                debugDescription: "Invalid server timestamp."
+            )
+        }
+        return date
+    }
+
+    private static func encodeDate(_ date: Date) -> String {
+        let formatter = ISO8601DateFormatter()
+        formatter.formatOptions = [
+            .withInternetDateTime,
+            .withFractionalSeconds,
+        ]
+        return formatter.string(from: date)
+    }
+}
+
 struct SyncV2SnapshotLocalState: Equatable, Sendable {
     let serverRevision: Int64
     let serverPath: String

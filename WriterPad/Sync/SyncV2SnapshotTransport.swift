@@ -27,6 +27,13 @@ extension SyncV2SnapshotTransporting {
             $0.documentID == documentID
         }
     }
+
+    /// 폴더 표를 아직 읽지 않는 구현은 빈 목록을 준다. 서버에 없는 폴더라는
+    /// 이유만으로 로컬 폴더를 지우지 않으므로 빈 목록은 아무 일도 하지 않는다.
+    func fetchFolders(projectID: UUID) async throws -> [SyncV2RemoteFolder] {
+        _ = projectID
+        return []
+    }
 }
 
 protocol SyncV2SnapshotClienting: Sendable {
@@ -37,6 +44,7 @@ protocol SyncV2SnapshotClienting: Sendable {
         projectID: UUID,
         documentID: UUID
     ) async throws -> SyncV2RemoteDocumentSnapshot?
+    func fetchFolders(projectID: UUID) async throws -> [SyncV2RemoteFolder]
 }
 
 extension SyncV2SnapshotClienting {
@@ -47,6 +55,11 @@ extension SyncV2SnapshotClienting {
         try await fetchDocuments(projectID: projectID).first {
             $0.documentID == documentID
         }
+    }
+
+    func fetchFolders(projectID: UUID) async throws -> [SyncV2RemoteFolder] {
+        _ = projectID
+        return []
     }
 }
 
@@ -73,6 +86,48 @@ actor LiveSyncV2SnapshotTransport: SyncV2SnapshotTransporting {
                 )
                 .eq("project_id", value: projectID.uuidString.lowercased())
                 .execute()
+            return response.value
+        } catch let error as PostgrestError {
+            throw SyncV2SnapshotTransportError.postgrest(
+                message: error.message,
+                postgresCode: error.code,
+                detail: error.detail
+            )
+        } catch let error as URLError {
+            throw SyncV2SnapshotTransportError.url(code: error.code)
+        } catch is DecodingError {
+            throw SyncV2SnapshotTransportError.invalidResponse
+        } catch {
+            let nsError = error as NSError
+            if nsError.domain == NSURLErrorDomain {
+                throw SyncV2SnapshotTransportError.url(
+                    code: URLError.Code(rawValue: nsError.code)
+                )
+            }
+            throw SyncV2SnapshotTransportError.unknown(
+                message: error.localizedDescription
+            )
+        }
+    }
+
+    func fetchFolders(
+        projectID: UUID
+    ) async throws -> [SyncV2RemoteFolder] {
+        do {
+            let response: PostgrestResponse<[SyncV2RemoteFolder]> =
+                try await client
+                    .from("folders")
+                    .select(
+                        """
+                        folder_id,parent_folder_id,name,revision,\
+                        is_deleted,updated_at
+                        """
+                    )
+                    .eq(
+                        "project_id",
+                        value: projectID.uuidString.lowercased()
+                    )
+                    .execute()
             return response.value
         } catch let error as PostgrestError {
             throw SyncV2SnapshotTransportError.postgrest(
@@ -214,6 +269,49 @@ actor SyncV2SnapshotClient: SyncV2SnapshotClienting {
                 )
             )
         }
+    }
+
+    func fetchFolders(
+        projectID: UUID
+    ) async throws -> [SyncV2RemoteFolder] {
+        do {
+            let folders = try await transport.fetchFolders(
+                projectID: projectID
+            )
+            var identifiers = Set<UUID>()
+            for folder in folders {
+                guard identifiers.insert(folder.folderID).inserted,
+                      Self.isValid(folder)
+                else {
+                    throw SyncV2ClientError.invalidResponse
+                }
+            }
+            // 부모가 먼저 오도록 정렬하지 않는다. 사슬은 받는 쪽에서 풀고,
+            // 순서에 기대면 서버가 준 순서가 바뀔 때 조용히 어긋난다.
+            return folders.sorted {
+                $0.folderID.uuidString < $1.folderID.uuidString
+            }
+        } catch let error as SyncV2ClientError {
+            throw error
+        } catch let error as SyncV2SnapshotTransportError {
+            throw Self.classify(error)
+        } catch {
+            throw SyncV2ClientError.serverRejected(
+                SyncV2RemoteRejection(
+                    postgresCode: nil,
+                    message: error.localizedDescription,
+                    detail: nil
+                )
+            )
+        }
+    }
+
+    private static func isValid(_ folder: SyncV2RemoteFolder) -> Bool {
+        guard folder.revision > 0,
+              folder.parentFolderID != folder.folderID,
+              SyncV2Client.isValidFolderName(folder.name)
+        else { return false }
+        return true
     }
 
     private static func isValid(
