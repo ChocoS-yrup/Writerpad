@@ -2183,15 +2183,16 @@ private struct SaveStatusBadge: View {
         .accessibilityHint("상태 상세 정보를 엽니다.")
     }
 
-    /// 경로 충돌(`structuralConflict`)도 저절로 풀리지 않으므로 같은 입구를
-    /// 쓴다. 두 상태 모두 사용자가 해결해야 진행된다.
+    /// 충돌 해결 화면은 보존된 본문 충돌만 다룬다. 경로·제목 문제
+    /// (`structuralConflict`)는 그 목록에 없으므로 버튼을 열어도 "보존 중인
+    /// 충돌을 찾지 못했습니다"로 끝난다. 구조 충돌용 해결 동작이 생기기 전까지는
+    /// 버튼을 노출하지 않고 상태 설명만 보여준다. 상태 자체는 "동기화 중"이
+    /// 아니라 확인이 필요한 것으로 드러나므로 무한 대기로는 보이지 않는다.
     private var requiresConflictResolution: Bool {
-        switch workspaceState.lastResult {
-        case .conflictRequired, .structuralConflict:
+        if case .conflictRequired = workspaceState.lastResult {
             return true
-        default:
-            return false
         }
+        return false
     }
 
     private var badgeLabel: some View {
