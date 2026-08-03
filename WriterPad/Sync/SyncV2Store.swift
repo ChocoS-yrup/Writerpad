@@ -635,8 +635,9 @@ actor SyncV2Store:
     SyncV2ConflictResolving,
     SyncV2DocumentRevisionProviding,
     SyncV2SnapshotStateStoring {
-    static let currentSchemaVersion = 1
-    static let migrationName = "SyncV2StoreSchemaV1"
+    static let currentSchemaVersion = 2
+    static let migrationName = "SyncV2StoreSchemaV2"
+    static let baseMigrationName = "SyncV2StoreSchemaV1"
     static let maximumContentByteCount = 10 * 1_024 * 1_024
     static let contentTooLargeErrorCode = "CONTENT_TOO_LARGE"
 
@@ -674,7 +675,7 @@ actor SyncV2Store:
         fileManager: FileManager = .default,
         resourceBundle: Bundle? = nil
     ) async -> SyncV2StoreAvailability {
-        let migration: MigrationResource
+        let migration: MigrationPlan
         do {
             migration = try loadMigrationResource(
                 bundle: resourceBundle
@@ -722,7 +723,7 @@ actor SyncV2Store:
         let connection = SQLiteConnection(handle: handle)
         let store = SyncV2Store(
             connection: connection,
-            migrationChecksum: migration.checksum
+            migrationChecksum: migration.head.checksum
         )
         do {
             try await store.prepare(migration: migration)
@@ -4787,7 +4788,7 @@ actor SyncV2Store:
     }
 
     private func prepare(
-        migration: MigrationResource
+        migration: MigrationPlan
     ) throws {
         try configureConnection()
         let version = try schemaVersion()
@@ -4807,7 +4808,8 @@ actor SyncV2Store:
                 )
             }
             do {
-                try execute(migration.executableSQL)
+                try execute(migration.base.executableSQL)
+                try execute(migration.head.executableSQL)
             } catch {
                 throw preparationFailure(
                     .migrationFailed,
@@ -4820,11 +4822,18 @@ actor SyncV2Store:
                 .schemaTooNew,
                 schemaVersion: version
             )
-        } else if version != Self.currentSchemaVersion {
-            throw preparationFailure(
-                .migrationMismatch,
-                schemaVersion: version
-            )
+        } else if version < Self.currentSchemaVersion {
+            // 이미 열려 있던 저장소는 남은 단계만 이어서 적용한다. 대기 중인
+            // 작업을 그대로 옮기므로 미전송 저장이 사라지지 않는다.
+            do {
+                try execute(migration.head.executableSQL)
+            } catch {
+                throw preparationFailure(
+                    .migrationFailed,
+                    sqliteCode: currentSQLiteCode(),
+                    schemaVersion: version
+                )
+            }
         }
 
         try verifyPragmas()
@@ -5276,9 +5285,31 @@ actor SyncV2Store:
 
     private static func loadMigrationResource(
         bundle: Bundle
+    ) throws -> MigrationPlan {
+        MigrationPlan(
+            base: try loadMigrationStep(
+                bundle: bundle,
+                resource: "SyncV2StoreSchemaV1",
+                marker: "design-fixture-v1"
+            ),
+            head: try loadMigrationStep(
+                bundle: bundle,
+                resource: "SyncV2StoreSchemaV2",
+                marker: "design-fixture-v2"
+            )
+        )
+    }
+
+    /// 버전별 SQL을 각각 읽는다. 새로 만드는 저장소는 V1을 올린 뒤 V2를
+    /// 이어서 적용하고, 이미 V1인 저장소는 V2만 적용한다. 두 경로가 같은
+    /// 파일을 쓰므로 스키마 정의가 갈라지지 않는다.
+    private static func loadMigrationStep(
+        bundle: Bundle,
+        resource: String,
+        marker: String
     ) throws -> MigrationResource {
         guard let url = bundle.url(
-            forResource: "SyncV2StoreSchemaV1",
+            forResource: resource,
             withExtension: "sql"
         ) else {
             throw ResourceError.missing
@@ -5290,12 +5321,12 @@ actor SyncV2Store:
         let checksum = SHA256.hash(data: data)
             .map { String(format: "%02x", $0) }
             .joined()
-        guard template.contains("'design-fixture-v1'") else {
+        guard template.contains("'\(marker)'") else {
             throw ResourceError.markerMissing
         }
         return MigrationResource(
             executableSQL: template.replacingOccurrences(
-                of: "'design-fixture-v1'",
+                of: "'\(marker)'",
                 with: "'\(checksum)'"
             ),
             checksum: checksum
@@ -6320,6 +6351,12 @@ private enum DocumentOperationDisposition {
 private struct MigrationResource {
     let executableSQL: String
     let checksum: String
+}
+
+/// 새 저장소는 base부터, 기존 저장소는 head만 적용한다.
+private struct MigrationPlan {
+    let base: MigrationResource
+    let head: MigrationResource
 }
 
 private struct StorePreparationFailure: Error {

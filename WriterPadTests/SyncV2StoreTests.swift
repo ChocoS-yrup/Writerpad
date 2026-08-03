@@ -11,7 +11,7 @@ final class SyncV2StoreTests: XCTestCase {
 
         let version = try await store.schemaVersion()
         let journalMode = try await store.journalMode()
-        XCTAssertEqual(version, 1)
+        XCTAssertEqual(version, SyncV2Store.currentSchemaVersion)
         XCTAssertEqual(journalMode.lowercased(), "wal")
         await store.close()
 
@@ -61,7 +61,7 @@ final class SyncV2StoreTests: XCTestCase {
         await reopened.close()
     }
 
-    func testEmptyVersionZeroDatabaseMigratesForwardToV1() async throws {
+    func testEmptyVersionZeroDatabaseMigratesForwardToLatest() async throws {
         let url = try databaseURL()
         let raw = try RawSQLite(url: url)
         try raw.execute("PRAGMA user_version = 0;")
@@ -70,22 +70,26 @@ final class SyncV2StoreTests: XCTestCase {
         let store = try await openStore(at: url)
 
         let version = try await store.schemaVersion()
-        XCTAssertEqual(version, 1)
+        XCTAssertEqual(version, SyncV2Store.currentSchemaVersion)
         await store.close()
     }
 
     func testHigherSchemaVersionIsPreservedAndRejected() async throws {
         let url = try databaseURL()
         let raw = try RawSQLite(url: url)
-        try raw.execute("PRAGMA user_version = 2;")
+        let tooNew = SyncV2Store.currentSchemaVersion + 1
+        try raw.execute("PRAGMA user_version = \(tooNew);")
         raw.close()
 
         let diagnostic = await unavailableDiagnostic(at: url)
 
         XCTAssertEqual(diagnostic.reason, .schemaTooNew)
-        XCTAssertEqual(diagnostic.schemaVersion, 2)
+        XCTAssertEqual(diagnostic.schemaVersion, tooNew)
         let check = try RawSQLite(url: url)
-        XCTAssertEqual(try check.scalarInt("PRAGMA user_version;"), 2)
+        XCTAssertEqual(
+            try check.scalarInt("PRAGMA user_version;"),
+            tooNew
+        )
     }
 
     func testVersionZeroWithUnknownTableIsPreservedAndRejected()
