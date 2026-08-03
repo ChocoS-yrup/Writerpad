@@ -162,3 +162,7 @@ struct LocalSaveStatusPresentation: Equatable, Sendable {
     let systemImage: String
     let allowsRetry: Bool
 }
+
+/// 통계 갱신의 debounce·최대 지연 계산에 쓰는 시각 공급자다. 실제 시계를 쓰면
+/// 몇 번 계산될지가 밀리초 단위 흔들림에 좌우되어 테스트가 불안정해진다.
+typealias StatisticsNow = @Sendable () -> ContinuousClock.Instant

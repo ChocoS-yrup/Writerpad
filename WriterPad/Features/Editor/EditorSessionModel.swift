@@ -218,6 +218,8 @@ final class EditorSessionModel: ObservableObject {
     private var statisticsGeneration: UInt64 = 0
     private var statisticsTask: Task<Void, Never>?
     private var statisticsBurstStartedAt: ContinuousClock.Instant?
+    private let statisticsNow: StatisticsNow
+    private let statisticsSleep: AutosaveSleep
     private var leaseTrackedDocumentID: DocumentID?
     private var isEditLeaseStartScheduled = false
     private var hasStartedEditLeaseConnectivityMonitor = false
@@ -241,8 +243,17 @@ final class EditorSessionModel: ObservableObject {
         autosaveDelay: Duration = AutosaveDebouncer.defaultDelay,
         autosaveSleep: @escaping AutosaveSleep = { duration in
             try await ContinuousClock().sleep(for: duration)
+        },
+        // 통계 갱신은 debounce와 최대 지연이 실제 시각에 걸려 있어, 실제 시계로는
+        // 몇 번 계산될지가 밀리초 단위 흔들림에 좌우된다. 시각과 대기를 주입해
+        // 테스트가 시간을 직접 돌릴 수 있게 한다.
+        statisticsNow: @escaping StatisticsNow = { ContinuousClock().now },
+        statisticsSleep: @escaping AutosaveSleep = { duration in
+            try await ContinuousClock().sleep(for: duration)
         }
     ) {
+        self.statisticsNow = statisticsNow
+        self.statisticsSleep = statisticsSleep
         self.documentRepository = documentRepository
         self.documentStore = documentStore
         self.workspaceStateRepository = workspaceStateRepository
@@ -1299,8 +1310,7 @@ final class EditorSessionModel: ObservableObject {
         statisticsTask?.cancel()
         statisticsGeneration &+= 1
         let generation = statisticsGeneration
-        let clock = ContinuousClock()
-        let now = clock.now
+        let now = statisticsNow()
         let burstStartedAt = statisticsBurstStartedAt ?? now
         statisticsBurstStartedAt = burstStartedAt
         let elapsed = burstStartedAt.duration(to: now)
@@ -1309,9 +1319,10 @@ final class EditorSessionModel: ObservableObject {
         let delay = elapsed >= maximumLatency
             ? Duration.zero
             : min(debounceDelay, maximumLatency - elapsed)
+        let sleep = statisticsSleep
         statisticsTask = Task { [weak self] in
             do {
-                try await clock.sleep(for: delay)
+                try await sleep(delay)
                 try Task.checkCancellation()
                 let calculated = await Task.detached(priority: .utility) {
                     ManuscriptStatistics(text: snapshot)
