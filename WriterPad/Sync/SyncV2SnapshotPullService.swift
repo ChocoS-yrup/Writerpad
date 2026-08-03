@@ -34,6 +34,7 @@ actor SyncV2SnapshotPullService: SyncV2SnapshotPulling {
     private let client: any SyncV2SnapshotClienting
     private let stateStore: any SyncV2SnapshotStateStoring
     private let localApplier: any SyncV2LocalSnapshotApplying
+    private let folderApplier: (any SyncV2RemoteFolderApplying)?
     private let mergeStore: any SyncV2SnapshotMergeStoring
     private let mutationGate: SyncV2DocumentMutationGate
 
@@ -42,12 +43,14 @@ actor SyncV2SnapshotPullService: SyncV2SnapshotPulling {
         stateStore: any SyncV2SnapshotStateStoring,
         localApplier: any SyncV2LocalSnapshotApplying,
         mergeStore: any SyncV2SnapshotMergeStoring,
+        folderApplier: (any SyncV2RemoteFolderApplying)? = nil,
         mutationGate: SyncV2DocumentMutationGate =
             SyncV2DocumentMutationGate()
     ) {
         self.client = client
         self.stateStore = stateStore
         self.localApplier = localApplier
+        self.folderApplier = folderApplier
         self.mergeStore = mergeStore
         self.mutationGate = mutationGate
     }
@@ -74,6 +77,22 @@ actor SyncV2SnapshotPullService: SyncV2SnapshotPulling {
                     .map(\.relativePath)
             )
         )
+        // 폴더를 문서보다 먼저 제자리에 놓는다. 이름이 바뀐 폴더에 문서가 먼저
+        // 도착하면 옛 경로에 자리를 잡아, 뒤이은 폴더 이동이 목적지 충돌로
+        // 막힌다.
+        var folderRejections: [SyncV2RejectedStructureName] = []
+        if let folderApplier {
+            let folders = try await client.fetchFolders(
+                projectID: serverProjectID
+            )
+            let report = await folderApplier.applyRemoteFolders(
+                localProjectID: localProjectID,
+                remote: folders,
+                blockedFolderIDs: []
+            )
+            folderRejections = report.rejectedNames
+        }
+
         let orderedSnapshots = snapshots.filter {
             $0.relativePath == syncV2TrashPurgePath
         }
@@ -84,7 +103,7 @@ actor SyncV2SnapshotPullService: SyncV2SnapshotPulling {
         }
         var outcomes: [SyncV2SnapshotPullOutcome] = []
         var appliedSnapshots: [SyncV2RemoteDocumentSnapshot] = []
-        var rejectedStructureNames: [SyncV2RejectedStructureName] = []
+        var rejectedStructureNames = folderRejections
         outcomes.reserveCapacity(snapshots.count)
 
         var effectivePurgeState = await localApplier.trashPurgeState(

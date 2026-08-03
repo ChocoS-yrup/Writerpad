@@ -32,6 +32,7 @@ final class SyncV2RemoteFolderPlannerTests: XCTestCase {
             [
                 .move(
                     folderID: folderID,
+                    parentID: rootID,
                     from: RelativeDocumentPath(rawValue: "메인/가 나 다"),
                     to: RelativeDocumentPath(rawValue: "메인/가 나 다 바")
                 )
@@ -214,7 +215,7 @@ final class SyncV2RemoteFolderPlannerTests: XCTestCase {
 
         // 부모를 옮기면 자식은 따라온다. 순서가 뒤집히면 자식이 옛 자리를 찾다
         // 실패한다.
-        guard case let .move(firstID, _, _) = plan.actions.first else {
+        guard case let .move(firstID, _, _, _) = plan.actions.first else {
             return XCTFail("Expected a move first, got \(plan.actions).")
         }
         XCTAssertEqual(firstID, parentID)
@@ -284,6 +285,7 @@ final class SyncV2RemoteFolderPlannerTests: XCTestCase {
             [
                 .move(
                     folderID: folderID,
+                    parentID: rootID,
                     from: RelativeDocumentPath(rawValue: "메인/옛 이름"),
                     to: RelativeDocumentPath(rawValue: "메인/새 이름")
                 )

@@ -22,6 +22,7 @@ enum SyncV2RemoteFolderPlanner {
         /// 기기에서 폴더가 둘이 된다.
         case move(
             folderID: DocumentID,
+            parentID: DocumentID?,
             from: RelativeDocumentPath,
             to: RelativeDocumentPath
         )
@@ -162,6 +163,9 @@ enum SyncV2RemoteFolderPlanner {
                 moves.append(
                     .move(
                         folderID: folderID,
+                        parentID: folder.parentFolderID.map(
+                            DocumentID.init(rawValue:)
+                        ),
                         from: local.relativePath,
                         to: RelativeDocumentPath(rawValue: path)
                     )
@@ -271,7 +275,7 @@ enum SyncV2RemoteFolderPlanner {
     private static func depth(of action: Action) -> Int {
         let path: String
         switch action {
-        case let .move(_, _, to):
+        case let .move(_, _, _, to):
             path = to.rawValue
         case let .create(_, _, created):
             path = created.rawValue
