@@ -250,6 +250,7 @@ enum SyncV2OperationKind: String, Codable, Equatable, Sendable {
     case documentCommit = "document_commit"
     case treeOrder = "tree_order"
     case trashPurge = "trash_purge"
+    case folderCommit = "folder_commit"
 }
 
 enum SyncV2OperationStatus: String, Codable, Equatable, Sendable {
@@ -279,15 +280,30 @@ struct SyncV2DocumentMutation: Equatable, Sendable {
     let isDeleted: Bool
 }
 
+/// 폴더는 본문이 없고 이름과 부모 연결만 바뀐다. 이름 변경·이동·삭제·복원이
+/// 모두 같은 folderID로 나가야 받는 기기가 같은 폴더임을 알 수 있다.
+struct SyncV2FolderMutation: Equatable, Sendable {
+    let operationID: UUID
+    let folderID: UUID
+    /// 최상위 폴더는 nil이다.
+    let parentFolderID: UUID?
+    let deviceID: UUID
+    let name: String
+    let isDeleted: Bool
+}
+
 enum SyncV2Mutation: Equatable, Sendable {
     case ensureProject(SyncV2EnsureProjectMutation)
     case document(SyncV2DocumentMutation)
+    case folder(SyncV2FolderMutation)
 
     var operationID: UUID {
         switch self {
         case .ensureProject(let mutation):
             mutation.operationID
         case .document(let mutation):
+            mutation.operationID
+        case .folder(let mutation):
             mutation.operationID
         }
     }
@@ -409,6 +425,25 @@ struct SyncV2DispatchOperation: Equatable, Sendable {
     }
 }
 
+/// 폴더는 서버 folders 행 하나에 대응하므로 문서 전송값과 겹치는 칸이 거의
+/// 없다. 문서 쪽 필수 칸(documentID, 본문, 경로)을 옵션으로 늘리는 대신 따로
+/// 둔다.
+struct SyncV2FolderDispatchOperation: Equatable, Sendable {
+    let operationID: UUID
+    let batchID: UUID
+    let localProjectID: ProjectID
+    let projectID: UUID
+    let folderID: UUID
+    let parentFolderID: UUID?
+    let deviceID: UUID
+    let folderSequence: Int
+    let name: String
+    let baseRevision: Int64
+    let isDeleted: Bool
+    /// 이번 claim을 포함한 누적 시도 횟수다.
+    let attempts: Int
+}
+
 struct SyncV2RebaseLocalSnapshot: Equatable, Sendable {
     let content: String
     let localPath: String
@@ -515,6 +550,13 @@ protocol SyncV2DispatchStoring: Sendable {
         limit: Int,
         now: Date
     ) async throws -> [SyncV2DispatchOperation]
+    /// 폴더 줄은 문서 줄과 나란히 흐른다. 폴더 대기열이 없는 구현은 기본값을
+    /// 그대로 쓴다.
+    func claimReadyFolderOperations(
+        localProjectID: ProjectID,
+        limit: Int,
+        now: Date
+    ) async throws -> [SyncV2FolderDispatchOperation]
     func complete(
         _ operation: SyncV2DispatchOperation,
         result: SyncV2CommitDocumentResult
@@ -572,6 +614,15 @@ protocol SyncV2DispatchStoring: Sendable {
 }
 
 extension SyncV2DispatchStoring {
+    func claimReadyFolderOperations(
+        localProjectID: ProjectID,
+        limit: Int,
+        now: Date
+    ) async throws -> [SyncV2FolderDispatchOperation] {
+        _ = (localProjectID, limit, now)
+        return []
+    }
+
     func recoverMissingRemoteDocument(
         _ operation: SyncV2DispatchOperation
     ) async throws {
@@ -635,9 +686,8 @@ actor SyncV2Store:
     SyncV2ConflictResolving,
     SyncV2DocumentRevisionProviding,
     SyncV2SnapshotStateStoring {
-    static let currentSchemaVersion = 2
-    static let migrationName = "SyncV2StoreSchemaV2"
-    static let baseMigrationName = "SyncV2StoreSchemaV1"
+    static let currentSchemaVersion = 3
+    static let migrationName = "SyncV2StoreSchemaV3"
     static let maximumContentByteCount = 10 * 1_024 * 1_024
     static let contentTooLargeErrorCode = "CONTENT_TOO_LARGE"
 
@@ -1263,6 +1313,13 @@ actor SyncV2Store:
                         if disposition == .noOp {
                             noOpOperationIDs.append(operation.operationID)
                         }
+                    case .folder(let payload):
+                        try insertFolderOperation(
+                            operation,
+                            batch: materialized,
+                            payload: payload,
+                            timestamp: materialized.timestamp
+                        )
                     }
                 }
                 let insertedIDs = try operationIDs(
@@ -1707,7 +1764,6 @@ actor SyncV2Store:
             SELECT o.local_project_id
             FROM sync_operations o
             WHERE o.local_project_id IS NOT NULL
-              AND o.document_id IS NOT NULL
               AND o.base_revision IS NOT NULL
               AND (
                   o.status = 'pending'
@@ -1719,12 +1775,33 @@ actor SyncV2Store:
                       )
                   )
               )
-              AND NOT EXISTS (
-                  SELECT 1
-                  FROM sync_operations earlier
-                  WHERE earlier.document_id = o.document_id
-                    AND earlier.document_sequence < o.document_sequence
-                    AND earlier.status NOT IN ('completed', 'cancelled')
+              AND (
+                  (
+                      o.document_id IS NOT NULL
+                      AND NOT EXISTS (
+                          SELECT 1
+                          FROM sync_operations earlier
+                          WHERE earlier.document_id = o.document_id
+                            AND earlier.document_sequence
+                                < o.document_sequence
+                            AND earlier.status NOT IN (
+                                'completed', 'cancelled'
+                            )
+                      )
+                  )
+                  OR (
+                      o.folder_id IS NOT NULL
+                      AND NOT EXISTS (
+                          SELECT 1
+                          FROM sync_operations earlier
+                          WHERE earlier.folder_id = o.folder_id
+                            AND earlier.document_sequence
+                                < o.document_sequence
+                            AND earlier.status NOT IN (
+                                'completed', 'cancelled'
+                            )
+                      )
+                  )
               )
             GROUP BY o.local_project_id
             ORDER BY MIN(o.queue_id);
@@ -1846,6 +1923,191 @@ actor SyncV2Store:
             throw error
         } catch {
             throw error
+        }
+    }
+
+    func claimReadyFolderOperations(
+        limit: Int,
+        now: Date
+    ) throws -> [SyncV2FolderDispatchOperation] {
+        try claimReadyFolderOperations(
+            localProjectID: nil,
+            limit: limit,
+            now: now
+        )
+    }
+
+    func claimReadyFolderOperations(
+        localProjectID: ProjectID,
+        limit: Int,
+        now: Date
+    ) throws -> [SyncV2FolderDispatchOperation] {
+        try claimReadyFolderOperations(
+            localProjectID: Optional(localProjectID),
+            limit: limit,
+            now: now
+        )
+    }
+
+    /// 폴더 대기열은 문서와 나란히 흐른다. 서로 다른 줄이므로 한쪽이 막혀도
+    /// 다른 쪽은 계속 나간다. 같은 폴더 안에서는 순번대로만 나간다.
+    private func claimReadyFolderOperations(
+        localProjectID: ProjectID?,
+        limit: Int,
+        now: Date
+    ) throws -> [SyncV2FolderDispatchOperation] {
+        guard availability() == .available else {
+            throw SyncV2DispatchStoreError.unavailable
+        }
+        guard limit > 0 else { return [] }
+        let nowValue = Self.timestamp(now)
+        return try transaction {
+            let candidates = try folderDispatchCandidates(
+                localProjectID: localProjectID,
+                limit: limit,
+                nowValue: nowValue
+            )
+            for operation in candidates {
+                try withStatement(
+                    """
+                    UPDATE sync_operations
+                    SET status = 'inflight',
+                        attempts = attempts + 1,
+                        next_attempt_at = NULL,
+                        updated_at = ?
+                    WHERE operation_id = ?
+                      AND status IN ('pending', 'retry_wait');
+                    """
+                ) { statement in
+                    try bind(nowValue, at: 1, to: statement)
+                    try bind(
+                        operation.operationID.uuidString.lowercased(),
+                        at: 2,
+                        to: statement
+                    )
+                    try stepDone(statement)
+                    guard sqlite3_changes(connection.handle) == 1 else {
+                        throw SyncV2DispatchStoreError.operationStateChanged
+                    }
+                }
+                try withStatement(
+                    """
+                    UPDATE sync_batches
+                    SET status = 'processing', updated_at = ?
+                    WHERE batch_id = ?;
+                    """
+                ) { statement in
+                    try bind(nowValue, at: 1, to: statement)
+                    try bind(
+                        operation.batchID.uuidString.lowercased(),
+                        at: 2,
+                        to: statement
+                    )
+                    try stepDone(statement)
+                }
+            }
+            return candidates
+        }
+    }
+
+    private func folderDispatchCandidates(
+        localProjectID: ProjectID?,
+        limit: Int,
+        nowValue: String
+    ) throws -> [SyncV2FolderDispatchOperation] {
+        try withStatement(
+            """
+            SELECT o.operation_id, o.batch_id, o.local_project_id,
+                   o.project_id, o.folder_id, o.parent_folder_id,
+                   o.device_id, o.document_sequence, o.folder_name,
+                   o.base_revision, o.is_deleted, o.attempts
+            FROM sync_operations o
+            WHERE o.folder_id IS NOT NULL
+              AND o.base_revision IS NOT NULL
+              AND (? IS NULL OR o.local_project_id = ?)
+              AND (
+                  o.status = 'pending'
+                  OR (
+                      o.status = 'retry_wait'
+                      AND (
+                          o.next_attempt_at IS NULL
+                          OR o.next_attempt_at <= ?
+                      )
+                  )
+              )
+              AND NOT EXISTS (
+                  SELECT 1
+                  FROM sync_operations earlier
+                  WHERE earlier.folder_id = o.folder_id
+                    AND earlier.document_sequence < o.document_sequence
+                    AND earlier.status NOT IN ('completed', 'cancelled')
+              )
+            ORDER BY o.queue_id
+            """
+        ) { statement in
+            let projectValue =
+                localProjectID?.rawValue.uuidString.lowercased()
+            try bind(projectValue, at: 1, to: statement)
+            try bind(projectValue, at: 2, to: statement)
+            try bind(nowValue, at: 3, to: statement)
+            var candidates: [SyncV2FolderDispatchOperation] = []
+            while true {
+                let status = sqlite3_step(statement)
+                if status == SQLITE_DONE {
+                    return candidates
+                }
+                guard
+                    status == SQLITE_ROW,
+                    let operationValue = columnText(statement, at: 0),
+                    let operationID = UUID(uuidString: operationValue),
+                    let batchValue = columnText(statement, at: 1),
+                    let batchID = UUID(uuidString: batchValue),
+                    let localProjectValue = columnText(statement, at: 2),
+                    let localProjectID = UUID(uuidString: localProjectValue),
+                    let projectValue = columnText(statement, at: 3),
+                    let projectID = UUID(uuidString: projectValue),
+                    let folderValue = columnText(statement, at: 4),
+                    let folderID = UUID(uuidString: folderValue),
+                    let deviceValue = columnText(statement, at: 6),
+                    let deviceID = UUID(uuidString: deviceValue),
+                    let name = columnText(statement, at: 8)
+                else {
+                    throw SyncV2DispatchStoreError.integrityFailure
+                }
+                let parentFolderID: UUID?
+                if sqlite3_column_type(statement, 5) == SQLITE_NULL {
+                    parentFolderID = nil
+                } else {
+                    guard
+                        let parentValue = columnText(statement, at: 5),
+                        let parsed = UUID(uuidString: parentValue)
+                    else {
+                        throw SyncV2DispatchStoreError.integrityFailure
+                    }
+                    parentFolderID = parsed
+                }
+                candidates.append(
+                    SyncV2FolderDispatchOperation(
+                        operationID: operationID,
+                        batchID: batchID,
+                        localProjectID: ProjectID(rawValue: localProjectID),
+                        projectID: projectID,
+                        folderID: folderID,
+                        parentFolderID: parentFolderID,
+                        deviceID: deviceID,
+                        folderSequence: Int(
+                            sqlite3_column_int64(statement, 7)
+                        ),
+                        name: name,
+                        baseRevision: sqlite3_column_int64(statement, 9),
+                        isDeleted: sqlite3_column_int(statement, 10) == 1,
+                        attempts: Int(sqlite3_column_int(statement, 11)) + 1
+                    )
+                )
+                if candidates.count == limit {
+                    return candidates
+                }
+            }
         }
     }
 
@@ -3959,6 +4221,26 @@ actor SyncV2Store:
                         )
                     )
                 )
+            case .folder(let folder):
+                guard validFolderName(folder.name),
+                      folder.parentFolderID != folder.folderID
+                else {
+                    throw SyncV2EnqueueError.invalidMutation
+                }
+                operations.append(
+                    MaterializedOperation(
+                        operationID: folder.operationID,
+                        payload: .folder(
+                            MaterializedFolder(
+                                folderID: folder.folderID,
+                                parentFolderID: folder.parentFolderID,
+                                deviceID: folder.deviceID,
+                                name: folder.name,
+                                isDeleted: folder.isDeleted
+                            )
+                        )
+                    )
+                )
             }
         }
 
@@ -3997,6 +4279,21 @@ actor SyncV2Store:
 
     private func validLocalPath(_ path: String) -> Bool {
         !path.isEmpty && !path.contains("\\")
+    }
+
+    /// 폴더 이름은 경로 한 칸이다. 구분자가 들어오면 부모 사슬이 아니라
+    /// 이름으로 위치를 표현하려는 것이라 받지 않는다. 앞뒤 공백 정리는 저장
+    /// 전에 이미 끝나 있어야 하므로 여기서 조용히 고치지 않고 되돌려보낸다.
+    private func validFolderName(_ name: String) -> Bool {
+        guard !name.isEmpty,
+              !name.contains("/"),
+              !name.contains("\\"),
+              name != ".",
+              name != ".."
+        else {
+            return false
+        }
+        return name == name.trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
     private func validRelativePath(_ path: String) -> Bool {
@@ -4700,6 +4997,291 @@ actor SyncV2Store:
         )
     }
 
+    /// 폴더 작업을 문서와 같은 대기열에 세운다. 폴더에는 본문도 경로도 없고
+    /// 이름과 부모 연결만 있으므로 문서보다 훨씬 짧다.
+    private func insertFolderOperation(
+        _ operation: MaterializedOperation,
+        batch: MaterializedBatch,
+        payload: MaterializedFolder,
+        timestamp: String
+    ) throws {
+        guard try !folderCycleWouldForm(
+            folderID: payload.folderID,
+            parentFolderID: payload.parentFolderID
+        ) else {
+            throw SyncV2EnqueueError.invalidMutation
+        }
+        let existingState = try folderState(folderID: payload.folderID)
+        let state = try existingState ?? insertFolder(
+            batch: batch,
+            payload: payload,
+            timestamp: timestamp
+        )
+        guard
+            state.localProjectID == batch.localProjectID,
+            state.serverProjectID == batch.serverProjectID
+        else {
+            throw SyncV2EnqueueError.invalidMutation
+        }
+
+        // 앞선 작업이 아직 남아 있으면 그 작업이 서버에서 받아올 revision을
+        // 알 수 없다. 문서와 같이 비워 두고, 앞 작업이 끝날 때 채운다.
+        let hasEarlierOperation = try hasActiveFolderOperation(
+            folderID: payload.folderID
+        )
+        let baseRevision = hasEarlierOperation ? nil : state.serverRevision
+
+        try withStatement(
+            """
+            INSERT INTO sync_operations(
+                operation_id, batch_id, local_project_id, project_id,
+                owner_subject, folder_id, parent_folder_id, folder_name,
+                device_id, document_sequence, operation_kind, base_revision,
+                is_deleted, status, attempts, created_at, updated_at
+            ) VALUES (
+                ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'folder_commit', ?, ?,
+                'pending', 0, ?, ?
+            );
+            """
+        ) { statement in
+            try bind(
+                operation.operationID.uuidString.lowercased(),
+                at: 1,
+                to: statement
+            )
+            try bind(
+                batch.batchID.uuidString.lowercased(),
+                at: 2,
+                to: statement
+            )
+            try bind(
+                batch.localProjectID.uuidString.lowercased(),
+                at: 3,
+                to: statement
+            )
+            try bind(
+                batch.serverProjectID.uuidString.lowercased(),
+                at: 4,
+                to: statement
+            )
+            try bind(
+                batch.ownerSubject.uuidString.lowercased(),
+                at: 5,
+                to: statement
+            )
+            try bind(
+                payload.folderID.uuidString.lowercased(),
+                at: 6,
+                to: statement
+            )
+            try bind(
+                payload.parentFolderID?.uuidString.lowercased(),
+                at: 7,
+                to: statement
+            )
+            try bind(payload.name, at: 8, to: statement)
+            try bind(
+                payload.deviceID.uuidString.lowercased(),
+                at: 9,
+                to: statement
+            )
+            try bind(state.nextSequence, at: 10, to: statement)
+            try bind(baseRevision, at: 11, to: statement)
+            try bind(payload.isDeleted ? 1 : 0, at: 12, to: statement)
+            try bind(timestamp, at: 13, to: statement)
+            try bind(timestamp, at: 14, to: statement)
+            try stepDone(statement)
+        }
+
+        try withStatement(
+            """
+            UPDATE sync_folders
+            SET parent_folder_id = ?,
+                name = ?,
+                next_folder_sequence = ?,
+                sync_state = 'pending',
+                last_error_code = NULL,
+                updated_at = ?
+            WHERE folder_id = ?;
+            """
+        ) { statement in
+            try bind(
+                payload.parentFolderID?.uuidString.lowercased(),
+                at: 1,
+                to: statement
+            )
+            try bind(payload.name, at: 2, to: statement)
+            try bind(state.nextSequence + 1, at: 3, to: statement)
+            try bind(timestamp, at: 4, to: statement)
+            try bind(
+                payload.folderID.uuidString.lowercased(),
+                at: 5,
+                to: statement
+            )
+            try stepDone(statement)
+        }
+    }
+
+    /// 옮기려는 부모가 자기 자신이나 자기 자손이면 사슬이 고리가 되어 경로를
+    /// 만들 수 없다. 제안된 부모에서 위로 거슬러 올라가며 확인한다.
+    private func folderCycleWouldForm(
+        folderID: UUID,
+        parentFolderID: UUID?
+    ) throws -> Bool {
+        guard var current = parentFolderID else { return false }
+        var visited: Set<UUID> = [folderID]
+        while true {
+            guard visited.insert(current).inserted else {
+                // 자기 자신에 닿았거나 기존 사슬이 이미 고리다. 어느 쪽이든
+                // 이 이동을 받아 주면 안 된다.
+                return true
+            }
+            guard let next = try folderParentID(folderID: current) else {
+                return false
+            }
+            current = next
+        }
+    }
+
+    private func folderParentID(folderID: UUID) throws -> UUID? {
+        try withStatement(
+            """
+            SELECT parent_folder_id FROM sync_folders
+            WHERE folder_id = ?
+            LIMIT 1;
+            """
+        ) { statement in
+            try bind(
+                folderID.uuidString.lowercased(),
+                at: 1,
+                to: statement
+            )
+            let status = sqlite3_step(statement)
+            if status == SQLITE_DONE {
+                return nil
+            }
+            guard status == SQLITE_ROW else {
+                throw SyncV2EnqueueError.integrityFailure
+            }
+            if sqlite3_column_type(statement, 0) == SQLITE_NULL {
+                return nil
+            }
+            guard
+                let value = columnText(statement, at: 0),
+                let parentID = UUID(uuidString: value)
+            else {
+                throw SyncV2EnqueueError.integrityFailure
+            }
+            return parentID
+        }
+    }
+
+    private func hasActiveFolderOperation(folderID: UUID) throws -> Bool {
+        try withStatement(
+            """
+            SELECT COUNT(*) FROM sync_operations
+            WHERE folder_id = ?
+              AND status NOT IN ('completed', 'cancelled');
+            """
+        ) { statement in
+            try bind(
+                folderID.uuidString.lowercased(),
+                at: 1,
+                to: statement
+            )
+            guard sqlite3_step(statement) == SQLITE_ROW else {
+                throw SyncV2EnqueueError.integrityFailure
+            }
+            return sqlite3_column_int64(statement, 0) > 0
+        }
+    }
+
+    private func folderState(folderID: UUID) throws -> FolderState? {
+        try withStatement(
+            """
+            SELECT local_project_id, project_id, server_revision,
+                   is_deleted, next_folder_sequence
+            FROM sync_folders
+            WHERE folder_id = ?
+            LIMIT 1;
+            """
+        ) { statement in
+            try bind(
+                folderID.uuidString.lowercased(),
+                at: 1,
+                to: statement
+            )
+            let status = sqlite3_step(statement)
+            if status == SQLITE_DONE {
+                return nil
+            }
+            guard
+                status == SQLITE_ROW,
+                let localValue = columnText(statement, at: 0),
+                let localProjectID = UUID(uuidString: localValue),
+                let serverValue = columnText(statement, at: 1),
+                let serverProjectID = UUID(uuidString: serverValue)
+            else {
+                throw SyncV2EnqueueError.integrityFailure
+            }
+            return FolderState(
+                localProjectID: localProjectID,
+                serverProjectID: serverProjectID,
+                serverRevision: Int(sqlite3_column_int64(statement, 2)),
+                isDeleted: sqlite3_column_int(statement, 3) == 1,
+                nextSequence: Int(sqlite3_column_int64(statement, 4))
+            )
+        }
+    }
+
+    private func insertFolder(
+        batch: MaterializedBatch,
+        payload: MaterializedFolder,
+        timestamp: String
+    ) throws -> FolderState {
+        try withStatement(
+            """
+            INSERT INTO sync_folders(
+                folder_id, local_project_id, project_id, parent_folder_id,
+                name, server_revision, is_deleted, sync_state,
+                next_folder_sequence, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, 0, 0, 'local', 1, ?, ?);
+            """
+        ) { statement in
+            try bind(
+                payload.folderID.uuidString.lowercased(),
+                at: 1,
+                to: statement
+            )
+            try bind(
+                batch.localProjectID.uuidString.lowercased(),
+                at: 2,
+                to: statement
+            )
+            try bind(
+                batch.serverProjectID.uuidString.lowercased(),
+                at: 3,
+                to: statement
+            )
+            try bind(
+                payload.parentFolderID?.uuidString.lowercased(),
+                at: 4,
+                to: statement
+            )
+            try bind(payload.name, at: 5, to: statement)
+            try bind(timestamp, at: 6, to: statement)
+            try bind(timestamp, at: 7, to: statement)
+            try stepDone(statement)
+        }
+        return FolderState(
+            localProjectID: batch.localProjectID,
+            serverProjectID: batch.serverProjectID,
+            serverRevision: 0,
+            isDeleted: false,
+            nextSequence: 1
+        )
+    }
+
     private func queuedOperation(
         from statement: OpaquePointer
     ) throws -> SyncV2QueuedOperation {
@@ -4808,8 +5390,9 @@ actor SyncV2Store:
                 )
             }
             do {
-                try execute(migration.base.executableSQL)
-                try execute(migration.head.executableSQL)
+                for step in migration.steps {
+                    try execute(step.executableSQL)
+                }
             } catch {
                 throw preparationFailure(
                     .migrationFailed,
@@ -4826,7 +5409,9 @@ actor SyncV2Store:
             // 이미 열려 있던 저장소는 남은 단계만 이어서 적용한다. 대기 중인
             // 작업을 그대로 옮기므로 미전송 저장이 사라지지 않는다.
             do {
-                try execute(migration.head.executableSQL)
+                for step in migration.steps(after: version) {
+                    try execute(step.executableSQL)
+                }
             } catch {
                 throw preparationFailure(
                     .migrationFailed,
@@ -4930,6 +5515,7 @@ actor SyncV2Store:
             "schema_migrations",
             "sync_projects",
             "sync_documents",
+            "sync_folders",
             "sync_batches",
             "sync_operations",
             "sync_conflicts",
@@ -5014,11 +5600,19 @@ actor SyncV2Store:
         )
         try verifyUUIDColumns(
             """
+            SELECT folder_id, local_project_id, project_id, parent_folder_id
+            FROM sync_folders;
+            """,
+            nullableColumns: [3]
+        )
+        try verifyUUIDColumns(
+            """
             SELECT operation_id, batch_id, local_project_id, project_id,
-                   owner_subject, document_id, device_id
+                   owner_subject, document_id, device_id, folder_id,
+                   parent_folder_id
             FROM sync_operations;
             """,
-            nullableColumns: [5, 6]
+            nullableColumns: [5, 6, 7, 8]
         )
         try verifyUUIDColumns(
             """
@@ -5286,30 +5880,24 @@ actor SyncV2Store:
     private static func loadMigrationResource(
         bundle: Bundle
     ) throws -> MigrationPlan {
-        MigrationPlan(
-            base: try loadMigrationStep(
-                bundle: bundle,
-                resource: "SyncV2StoreSchemaV1",
-                marker: "design-fixture-v1"
-            ),
-            head: try loadMigrationStep(
-                bundle: bundle,
-                resource: "SyncV2StoreSchemaV2",
-                marker: "design-fixture-v2"
-            )
-        )
+        let steps = try (1...currentSchemaVersion).map { version in
+            try loadMigrationStep(bundle: bundle, version: version)
+        }
+        guard let head = steps.last else {
+            throw ResourceError.missing
+        }
+        return MigrationPlan(steps: steps, head: head)
     }
 
-    /// 버전별 SQL을 각각 읽는다. 새로 만드는 저장소는 V1을 올린 뒤 V2를
-    /// 이어서 적용하고, 이미 V1인 저장소는 V2만 적용한다. 두 경로가 같은
-    /// 파일을 쓰므로 스키마 정의가 갈라지지 않는다.
+    /// 버전별 SQL을 각각 읽는다. 새로 만드는 저장소는 V1부터 차례로 올리고,
+    /// 이미 열려 있던 저장소는 자기 버전보다 높은 단계만 적용한다. 두 경로가
+    /// 같은 파일을 쓰므로 스키마 정의가 갈라지지 않는다.
     private static func loadMigrationStep(
         bundle: Bundle,
-        resource: String,
-        marker: String
+        version: Int
     ) throws -> MigrationResource {
         guard let url = bundle.url(
-            forResource: resource,
+            forResource: "SyncV2StoreSchemaV\(version)",
             withExtension: "sql"
         ) else {
             throw ResourceError.missing
@@ -5321,10 +5909,12 @@ actor SyncV2Store:
         let checksum = SHA256.hash(data: data)
             .map { String(format: "%02x", $0) }
             .joined()
+        let marker = "design-fixture-v\(version)"
         guard template.contains("'\(marker)'") else {
             throw ResourceError.markerMissing
         }
         return MigrationResource(
+            version: version,
             executableSQL: template.replacingOccurrences(
                 of: "'\(marker)'",
                 with: "'\(checksum)'"
@@ -5699,6 +6289,21 @@ actor LazySyncV2ProjectBindingStore:
             throw SyncV2DispatchStoreError.unavailable
         }
         return try await store.claimReadyOperations(
+            localProjectID: localProjectID,
+            limit: limit,
+            now: now
+        )
+    }
+
+    func claimReadyFolderOperations(
+        localProjectID: ProjectID,
+        limit: Int,
+        now: Date
+    ) async throws -> [SyncV2FolderDispatchOperation] {
+        guard let store = await resolvedStore() else {
+            throw SyncV2DispatchStoreError.unavailable
+        }
+        return try await store.claimReadyFolderOperations(
             localProjectID: localProjectID,
             limit: limit,
             now: now
@@ -6227,6 +6832,28 @@ private struct MaterializedOperation {
                 contentHash: document.contentHash,
                 isDeleted: document.isDeleted
             )
+        case .folder(let folder):
+            return CanonicalOperation(
+                operationID: operationID.uuidString.lowercased(),
+                localProjectID: localProjectID.uuidString.lowercased(),
+                serverProjectID: serverProjectID.uuidString.lowercased(),
+                ownerSubject: ownerSubject.uuidString.lowercased(),
+                documentID: nil,
+                deviceID: folder.deviceID.uuidString.lowercased(),
+                localSaveGeneration: nil,
+                kind: .folderCommit,
+                projectName: nil,
+                folderID: folder.folderID.uuidString.lowercased(),
+                parentFolderID: folder.parentFolderID?
+                    .uuidString.lowercased(),
+                folderName: folder.name,
+                localPath: "",
+                relativePath: "",
+                content: "",
+                contentByteCount: 0,
+                contentHash: "",
+                isDeleted: folder.isDeleted
+            )
         }
     }
 }
@@ -6234,6 +6861,7 @@ private struct MaterializedOperation {
 private enum MaterializedOperationPayload {
     case ensureProject(MaterializedEnsureProject)
     case document(MaterializedDocument)
+    case folder(MaterializedFolder)
 }
 
 private struct MaterializedEnsureProject {
@@ -6250,6 +6878,14 @@ private struct MaterializedDocument {
     let content: String
     let contentByteCount: Int
     let contentHash: String
+    let isDeleted: Bool
+}
+
+private struct MaterializedFolder {
+    let folderID: UUID
+    let parentFolderID: UUID?
+    let deviceID: UUID
+    let name: String
     let isDeleted: Bool
 }
 
@@ -6274,6 +6910,11 @@ private struct CanonicalOperation: Encodable {
     let localSaveGeneration: Int?
     let kind: SyncV2OperationKind
     let projectName: String?
+    /// 폴더 작업만 채운다. nil인 칸은 인코딩에서 빠지므로 이 칸이 생기기 전에
+    /// 만들어진 문서 batch의 payload 해시는 그대로 유지된다.
+    var folderID: String? = nil
+    var parentFolderID: String? = nil
+    var folderName: String? = nil
     let localPath: String
     let relativePath: String
     let content: String
@@ -6326,6 +6967,14 @@ private struct DocumentState {
     let nextSequence: Int
 }
 
+private struct FolderState {
+    let localProjectID: UUID
+    let serverProjectID: UUID
+    let serverRevision: Int
+    let isDeleted: Bool
+    let nextSequence: Int
+}
+
 private struct ActiveDocumentLifecycle {
     let isDeleted: Bool
     let relativePath: String
@@ -6349,14 +6998,20 @@ private enum DocumentOperationDisposition {
 }
 
 private struct MigrationResource {
+    let version: Int
     let executableSQL: String
     let checksum: String
 }
 
-/// 새 저장소는 base부터, 기존 저장소는 head만 적용한다.
+/// 새 저장소는 모든 단계를, 기존 저장소는 자기 버전보다 높은 단계만 적용한다.
 private struct MigrationPlan {
-    let base: MigrationResource
+    /// 버전 오름차순이다.
+    let steps: [MigrationResource]
     let head: MigrationResource
+
+    func steps(after version: Int) -> [MigrationResource] {
+        steps.filter { $0.version > version }
+    }
 }
 
 private struct StorePreparationFailure: Error {

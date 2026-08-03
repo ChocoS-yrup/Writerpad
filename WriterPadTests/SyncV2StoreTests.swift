@@ -3740,6 +3740,402 @@ final class SyncV2StoreTests: XCTestCase {
         await store.close()
     }
 
+    func testFolderCommitQueuesFolderLaneWithBaseRevisionZero()
+        async throws {
+        let url = try databaseURL()
+        let context = QueueAPIContext()
+        let store = try await connectedStore(at: url, context: context)
+        let operationID = UUID()
+
+        _ = try await store.enqueue(
+            context.batch(
+                kind: .structureChange,
+                mutations: [
+                    context.folderMutation(
+                        operationID: operationID,
+                        name: "가 나 다"
+                    )
+                ]
+            )
+        )
+        let ready = try await store.claimReadyFolderOperations(
+            limit: 10,
+            now: Date(timeIntervalSince1970: 10)
+        )
+
+        let claimed = try XCTUnwrap(ready.first)
+        XCTAssertEqual(ready.count, 1)
+        XCTAssertEqual(claimed.operationID, operationID)
+        XCTAssertEqual(claimed.folderID, context.folderID)
+        XCTAssertNil(claimed.parentFolderID)
+        XCTAssertEqual(claimed.name, "가 나 다")
+        XCTAssertEqual(claimed.baseRevision, 0)
+        XCTAssertEqual(claimed.folderSequence, 1)
+        XCTAssertFalse(claimed.isDeleted)
+        XCTAssertEqual(claimed.attempts, 1)
+        await store.close()
+    }
+
+    func testFolderRenameKeepsFolderIDAndWaitsForUnknownRevision()
+        async throws {
+        let url = try databaseURL()
+        let context = QueueAPIContext()
+        let store = try await connectedStore(at: url, context: context)
+        let createID = UUID()
+        let renameID = UUID()
+
+        _ = try await store.enqueue(
+            context.batch(
+                kind: .structureChange,
+                mutations: [
+                    context.folderMutation(
+                        operationID: createID,
+                        name: "가 나 다"
+                    )
+                ]
+            )
+        )
+        _ = try await store.enqueue(
+            context.batch(
+                kind: .structureChange,
+                mutations: [
+                    context.folderMutation(
+                        operationID: renameID,
+                        name: "가 나 다 바"
+                    )
+                ]
+            )
+        )
+        let ready = try await store.claimReadyFolderOperations(
+            limit: 10,
+            now: Date(timeIntervalSince1970: 10)
+        )
+
+        // 이름 변경은 생성이 받아올 revision을 알기 전에는 나갈 수 없다.
+        XCTAssertEqual(ready.map(\.operationID), [createID])
+        await store.close()
+
+        let raw = try RawSQLite(url: url)
+        XCTAssertEqual(
+            try raw.scalarInt(
+                """
+                SELECT COUNT(DISTINCT folder_id) FROM sync_operations
+                WHERE operation_kind = 'folder_commit';
+                """
+            ),
+            1
+        )
+        XCTAssertEqual(
+            try raw.scalarText(
+                """
+                SELECT group_concat(document_sequence, ',')
+                FROM (
+                    SELECT document_sequence FROM sync_operations
+                    WHERE operation_kind = 'folder_commit'
+                    ORDER BY queue_id
+                );
+                """
+            ),
+            "1,2"
+        )
+        // 앞 작업이 받아올 revision을 아직 모르므로 비어 있어야 한다.
+        XCTAssertEqual(
+            try raw.scalarInt(
+                """
+                SELECT COUNT(*) FROM sync_operations
+                WHERE operation_id = '\(renameID.uuidString.lowercased())'
+                  AND base_revision IS NULL;
+                """
+            ),
+            1
+        )
+    }
+
+    func testSameFolderNeverHasTwoOperationsInFlightAtOnce() async throws {
+        let url = try databaseURL()
+        let context = QueueAPIContext()
+        let store = try await connectedStore(at: url, context: context)
+        let createID = UUID()
+        let renameID = UUID()
+
+        _ = try await store.enqueue(
+            context.batch(
+                kind: .structureChange,
+                mutations: [
+                    context.folderMutation(
+                        operationID: createID,
+                        name: "가 나 다"
+                    )
+                ]
+            )
+        )
+        _ = try await store.enqueue(
+            context.batch(
+                kind: .structureChange,
+                mutations: [
+                    context.folderMutation(
+                        operationID: renameID,
+                        name: "가 나 다 바"
+                    )
+                ]
+            )
+        )
+        await store.close()
+
+        // 뒤 작업의 revision이 이미 채워진 상태를 만든다. 앞 작업이 아직 끝나지
+        // 않았는데 둘 다 나가면 서버에 같은 폴더의 두 판이 동시에 도착한다.
+        let raw = try RawSQLite(url: url)
+        try raw.execute(
+            """
+            UPDATE sync_operations SET base_revision = 0
+            WHERE operation_id = '\(renameID.uuidString.lowercased())';
+            """
+        )
+        raw.close()
+
+        let reopened = try await openStore(at: url)
+        let ready = try await reopened.claimReadyFolderOperations(
+            limit: 10,
+            now: Date(timeIntervalSince1970: 10)
+        )
+
+        XCTAssertEqual(ready.map(\.operationID), [createID])
+        await reopened.close()
+    }
+
+    func testPendingFolderOperationSurvivesCloseAndReopen() async throws {
+        let url = try databaseURL()
+        let context = QueueAPIContext()
+        let store = try await connectedStore(at: url, context: context)
+        let operationID = UUID()
+
+        _ = try await store.enqueue(
+            context.batch(
+                kind: .structureChange,
+                mutations: [
+                    context.folderMutation(
+                        operationID: operationID,
+                        name: "가 나 다"
+                    )
+                ]
+            )
+        )
+        await store.close()
+
+        let reopened = try await openStore(at: url)
+        let ready = try await reopened.claimReadyFolderOperations(
+            limit: 10,
+            now: Date(timeIntervalSince1970: 10)
+        )
+
+        XCTAssertEqual(ready.map(\.operationID), [operationID])
+        XCTAssertEqual(ready.map(\.folderID), [context.folderID])
+        await reopened.close()
+    }
+
+    func testVersion2DatabaseGainsFolderTableKeepingPendingOperations()
+        async throws {
+        let url = try databaseURL()
+        let context = QueueAPIContext()
+        let store = try await connectedStore(at: url, context: context)
+        let operationID = UUID()
+        _ = try await store.enqueue(
+            context.batch(
+                mutations: [
+                    context.documentMutation(
+                        operationID: operationID,
+                        content: "아직 못 보낸 저장"
+                    )
+                ]
+            )
+        )
+        await store.close()
+
+        // 폴더 표가 생기기 전 설치를 흉내 낸다. 미전송 저장이 그대로 있는
+        // 상태에서 스키마만 뒤로 돌린다.
+        let downgrade = try RawSQLite(url: url)
+        try downgrade.execute(
+            """
+            DROP TABLE sync_folders;
+            DELETE FROM schema_migrations WHERE version = 3;
+            PRAGMA user_version = 2;
+            """
+        )
+        downgrade.close()
+
+        let reopened = try await openStore(at: url)
+
+        let version = try await reopened.schemaVersion()
+        let queued = try await reopened.queuedOperations(
+            documentID: context.documentID
+        )
+        XCTAssertEqual(version, SyncV2Store.currentSchemaVersion)
+        XCTAssertEqual(queued.map(\.operationID), [operationID])
+        XCTAssertEqual(queued.map(\.content), ["아직 못 보낸 저장"])
+        await reopened.close()
+
+        let raw = try RawSQLite(url: url)
+        XCTAssertEqual(
+            try raw.scalarInt(
+                """
+                SELECT COUNT(*) FROM sqlite_master
+                WHERE type = 'table' AND name = 'sync_folders';
+                """
+            ),
+            1
+        )
+    }
+
+    func testFolderNameWithPathSeparatorIsRejected() async throws {
+        let url = try databaseURL()
+        let context = QueueAPIContext()
+        let store = try await connectedStore(at: url, context: context)
+
+        do {
+            _ = try await store.enqueue(
+                context.batch(
+                    kind: .structureChange,
+                    mutations: [
+                        context.folderMutation(
+                            operationID: UUID(),
+                            name: "가 나/다"
+                        )
+                    ]
+                )
+            )
+            XCTFail("A folder name with a separator must fail.")
+        } catch {
+            XCTAssertEqual(
+                error as? SyncV2EnqueueError,
+                .invalidMutation
+            )
+        }
+        let operationCount = try await store.operationCount()
+        XCTAssertEqual(operationCount, 0)
+        await store.close()
+    }
+
+    func testFolderMoveIntoOwnDescendantIsRejected() async throws {
+        let url = try databaseURL()
+        let context = QueueAPIContext()
+        let store = try await connectedStore(at: url, context: context)
+        let childID = UUID()
+
+        _ = try await store.enqueue(
+            context.batch(
+                kind: .structureChange,
+                mutations: [
+                    context.folderMutation(
+                        operationID: UUID(),
+                        name: "부모"
+                    ),
+                    context.folderMutation(
+                        operationID: UUID(),
+                        folderID: childID,
+                        parentFolderID: context.folderID,
+                        name: "자식"
+                    ),
+                ]
+            )
+        )
+
+        do {
+            _ = try await store.enqueue(
+                context.batch(
+                    kind: .structureChange,
+                    mutations: [
+                        context.folderMutation(
+                            operationID: UUID(),
+                            parentFolderID: childID,
+                            name: "부모"
+                        )
+                    ]
+                )
+            )
+            XCTFail("Moving a folder into its own child must fail.")
+        } catch {
+            XCTAssertEqual(
+                error as? SyncV2EnqueueError,
+                .invalidMutation
+            )
+        }
+        let operationCount = try await store.operationCount()
+        XCTAssertEqual(operationCount, 2)
+        await store.close()
+    }
+
+    func testFolderLaneAndDocumentLaneAdvanceIndependently()
+        async throws {
+        let url = try databaseURL()
+        let context = QueueAPIContext()
+        let store = try await connectedStore(at: url, context: context)
+        let folderOperationID = UUID()
+        let documentOperationID = UUID()
+
+        _ = try await store.enqueue(
+            context.batch(
+                kind: .structureChange,
+                mutations: [
+                    context.folderMutation(
+                        operationID: folderOperationID,
+                        name: "가 나 다"
+                    )
+                ]
+            )
+        )
+        _ = try await store.enqueue(
+            context.batch(
+                mutations: [
+                    context.documentMutation(
+                        operationID: documentOperationID
+                    )
+                ]
+            )
+        )
+
+        // 폴더를 먼저 붙잡아 두어도 문서 줄은 그대로 나가야 한다.
+        let folders = try await store.claimReadyFolderOperations(
+            limit: 10,
+            now: Date(timeIntervalSince1970: 10)
+        )
+        let documents = try await store.claimReadyOperations(
+            limit: 10,
+            now: Date(timeIntervalSince1970: 10)
+        )
+
+        XCTAssertEqual(folders.map(\.operationID), [folderOperationID])
+        XCTAssertEqual(
+            documents.map(\.operationID),
+            [documentOperationID]
+        )
+        await store.close()
+    }
+
+    func testProjectWithOnlyFolderWorkIsReportedAsReady() async throws {
+        let url = try databaseURL()
+        let context = QueueAPIContext()
+        let store = try await connectedStore(at: url, context: context)
+
+        _ = try await store.enqueue(
+            context.batch(
+                kind: .structureChange,
+                mutations: [
+                    context.folderMutation(
+                        operationID: UUID(),
+                        name: "가 나 다"
+                    )
+                ]
+            )
+        )
+        let ready = try await store.readyLocalProjectIDs(
+            now: Date(timeIntervalSince1970: 10)
+        )
+
+        // 폴더 작업만 있는 작품이 빠지면 디스패처가 그 줄을 아예 열지 않는다.
+        XCTAssertEqual(ready, [context.localProjectID])
+        await store.close()
+    }
+
     private func commitResult(
         for operation: SyncV2DispatchOperation
     ) -> SyncV2CommitDocumentResult {
@@ -3888,6 +4284,7 @@ private struct QueueAPIContext {
     let ownerSubject = UUID()
     let deviceID = UUID()
     let documentID = UUID()
+    let folderID = UUID()
 
     var binding: ProjectSyncBinding {
         .connected(
@@ -3932,6 +4329,25 @@ private struct QueueAPIContext {
                 localPath: "/fixture/\(relativePath)",
                 relativePath: relativePath,
                 content: content,
+                isDeleted: isDeleted
+            )
+        )
+    }
+
+    func folderMutation(
+        operationID: UUID,
+        folderID: UUID? = nil,
+        parentFolderID: UUID? = nil,
+        name: String = "가 나 다",
+        isDeleted: Bool = false
+    ) -> SyncV2Mutation {
+        .folder(
+            SyncV2FolderMutation(
+                operationID: operationID,
+                folderID: folderID ?? self.folderID,
+                parentFolderID: parentFolderID,
+                deviceID: deviceID,
+                name: name,
                 isDeleted: isDeleted
             )
         )
