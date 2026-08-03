@@ -14,6 +14,11 @@ enum SyncV2RemoteErrorCode: String, Codable, Error, CaseIterable, Sendable {
     case leaseConflict = "LEASE_CONFLICT"
     case leaseExpired = "LEASE_EXPIRED"
     case pathConflict = "PATH_CONFLICT"
+    case folderNotFound = "FOLDER_NOT_FOUND"
+    case folderAlreadyExists = "FOLDER_ALREADY_EXISTS"
+    /// 내용이 있는 폴더는 바로 지울 수 없다. 문서와 하위 폴더를 먼저 보내고
+    /// 부모를 마지막에 보내야 한다.
+    case folderNotEmpty = "FOLDER_NOT_EMPTY"
 }
 
 struct SyncV2RemoteRejection: Equatable, Sendable {
@@ -86,6 +91,43 @@ struct SyncV2CommitDocumentParameters: Encodable, Equatable, Sendable {
         try values.encode(content, forKey: .content)
         try values.encode(isDeleted, forKey: .isDeleted)
         try values.encode(leaseToken, forKey: .leaseToken)
+    }
+}
+
+struct SyncV2CommitFolderParameters: Encodable, Equatable, Sendable {
+    let folderID: UUID
+    let projectID: UUID
+    let baseServerRevision: Int64
+    let operationID: UUID
+    let deviceID: UUID
+    /// 최상위 폴더는 nil이다.
+    let parentFolderID: UUID?
+    let name: String
+    let isDeleted: Bool
+
+    enum CodingKeys: String, CodingKey {
+        case folderID = "p_folder_id"
+        case projectID = "p_project_id"
+        case baseServerRevision = "p_base_revision"
+        case operationID = "p_operation_id"
+        case deviceID = "p_device_id"
+        case parentFolderID = "p_parent_folder_id"
+        case name = "p_name"
+        case isDeleted = "p_is_deleted"
+    }
+
+    /// 최상위 폴더라도 p_parent_folder_id를 빼지 않고 null로 보낸다. PostgREST는
+    /// 넘긴 인자 이름으로 함수를 고르므로, 빼면 서명이 달라져 함수를 못 찾는다.
+    func encode(to encoder: Encoder) throws {
+        var values = encoder.container(keyedBy: CodingKeys.self)
+        try values.encode(folderID, forKey: .folderID)
+        try values.encode(projectID, forKey: .projectID)
+        try values.encode(baseServerRevision, forKey: .baseServerRevision)
+        try values.encode(operationID, forKey: .operationID)
+        try values.encode(deviceID, forKey: .deviceID)
+        try values.encode(parentFolderID, forKey: .parentFolderID)
+        try values.encode(name, forKey: .name)
+        try values.encode(isDeleted, forKey: .isDeleted)
     }
 }
 
@@ -191,6 +233,111 @@ struct SyncV2CommitDocumentResult: Decodable, Equatable, Sendable {
     }
 }
 
+/// 서버 commit_folder의 응답이다.
+///
+/// 키 이름은 commit_document를 그대로 본떴다. 두 함수의 p_ 인자 이름이 똑같이
+/// 지어져 있어 같은 틀로 만들어졌다고 보았지만, 마이그레이션 SQL이 저장소에
+/// 없어 실제 응답으로 확인하지는 못했다. 서버가 다른 이름을 쓴다면 아래
+/// CodingKeys 한 곳만 고치면 된다. 실기기 검증에서 가장 먼저 볼 것.
+///
+/// 대기열이 돌아가는 데 반드시 필요한 값만 필수로 읽는다. version_id처럼 없어도
+/// 진행할 수 있는 값은 비어 있어도 통째로 해석에 실패하지 않게 둔다.
+struct SyncV2CommitFolderResult: Decodable, Equatable, Sendable {
+    let status: SyncV2CommitStatus
+    let folderID: UUID
+    let versionID: UUID?
+    let operationID: UUID
+    let operationKind: SyncV2RemoteOperationKind?
+    let serverRevision: Int64
+    let parentFolderID: UUID?
+    let name: String?
+    let isDeleted: Bool
+    let committedAt: Date
+
+    enum CodingKeys: String, CodingKey {
+        case status
+        case folderID = "folder_id"
+        case versionID = "version_id"
+        case operationID = "operation_id"
+        case operationKind = "operation_kind"
+        case serverRevision = "revision"
+        case parentFolderID = "parent_folder_id"
+        case name
+        case isDeleted = "is_deleted"
+        case committedAt = "committed_at"
+    }
+
+    init(
+        status: SyncV2CommitStatus,
+        folderID: UUID,
+        versionID: UUID? = nil,
+        operationID: UUID,
+        operationKind: SyncV2RemoteOperationKind? = nil,
+        serverRevision: Int64,
+        parentFolderID: UUID?,
+        name: String?,
+        isDeleted: Bool,
+        committedAt: Date
+    ) {
+        self.status = status
+        self.folderID = folderID
+        self.versionID = versionID
+        self.operationID = operationID
+        self.operationKind = operationKind
+        self.serverRevision = serverRevision
+        self.parentFolderID = parentFolderID
+        self.name = name
+        self.isDeleted = isDeleted
+        self.committedAt = committedAt
+    }
+
+    init(from decoder: Decoder) throws {
+        let values = try decoder.container(keyedBy: CodingKeys.self)
+        status = try values.decode(SyncV2CommitStatus.self, forKey: .status)
+        folderID = try values.decode(UUID.self, forKey: .folderID)
+        versionID = try values.decodeIfPresent(UUID.self, forKey: .versionID)
+        operationID = try values.decode(UUID.self, forKey: .operationID)
+        operationKind = try values.decodeIfPresent(
+            SyncV2RemoteOperationKind.self,
+            forKey: .operationKind
+        )
+        serverRevision = try values.decode(
+            Int64.self,
+            forKey: .serverRevision
+        )
+        parentFolderID = try values.decodeIfPresent(
+            UUID.self,
+            forKey: .parentFolderID
+        )
+        name = try values.decodeIfPresent(String.self, forKey: .name)
+        isDeleted = try values.decode(Bool.self, forKey: .isDeleted)
+        let timestamp = try values.decode(String.self, forKey: .committedAt)
+        guard let date = SyncV2CommitFolderResult
+            .decodeTimestamp(timestamp) else {
+            throw DecodingError.dataCorruptedError(
+                forKey: .committedAt,
+                in: values,
+                debugDescription: "Invalid committed_at timestamp."
+            )
+        }
+        committedAt = date
+    }
+
+    private static func decodeTimestamp(_ value: String) -> Date? {
+        let fractional = ISO8601DateFormatter()
+        fractional.formatOptions = [
+            .withInternetDateTime,
+            .withFractionalSeconds,
+        ]
+        if let date = fractional.date(from: value) {
+            return date
+        }
+        let seconds = ISO8601DateFormatter()
+        seconds.formatOptions = [.withInternetDateTime]
+        return seconds.date(from: value)
+    }
+}
+
 enum SyncV2CommitTransportError: Error, Equatable, Sendable {
     case postgrest(
         message: String,
@@ -206,12 +353,18 @@ protocol SyncV2CommitTransporting: Sendable {
     func commitDocument(
         parameters: SyncV2CommitDocumentParameters
     ) async throws -> SyncV2CommitDocumentResult
+    func commitFolder(
+        parameters: SyncV2CommitFolderParameters
+    ) async throws -> SyncV2CommitFolderResult
 }
 
 protocol SyncV2CommitClienting: Sendable {
     func commitDocument(
         _ parameters: SyncV2CommitDocumentParameters
     ) async throws -> SyncV2CommitDocumentResult
+    func commitFolder(
+        _ parameters: SyncV2CommitFolderParameters
+    ) async throws -> SyncV2CommitFolderResult
 }
 
 actor LiveSyncV2CommitTransport: SyncV2CommitTransporting {
@@ -228,6 +381,38 @@ actor LiveSyncV2CommitTransport: SyncV2CommitTransporting {
             let response: PostgrestResponse<SyncV2CommitDocumentResult> =
                 try await client
                     .rpc("commit_document", params: parameters)
+                    .execute()
+            return response.value
+        } catch let error as PostgrestError {
+            throw SyncV2CommitTransportError.postgrest(
+                message: error.message,
+                postgresCode: error.code,
+                detail: error.detail
+            )
+        } catch let error as URLError {
+            throw SyncV2CommitTransportError.url(code: error.code)
+        } catch is DecodingError {
+            throw SyncV2CommitTransportError.invalidResponse
+        } catch {
+            let nsError = error as NSError
+            if nsError.domain == NSURLErrorDomain {
+                throw SyncV2CommitTransportError.url(
+                    code: URLError.Code(rawValue: nsError.code)
+                )
+            }
+            throw SyncV2CommitTransportError.unknown(
+                message: error.localizedDescription
+            )
+        }
+    }
+
+    func commitFolder(
+        parameters: SyncV2CommitFolderParameters
+    ) async throws -> SyncV2CommitFolderResult {
+        do {
+            let response: PostgrestResponse<SyncV2CommitFolderResult> =
+                try await client
+                    .rpc("commit_folder", params: parameters)
                     .execute()
             return response.value
         } catch let error as PostgrestError {
@@ -272,6 +457,38 @@ actor SyncV2Client: SyncV2CommitClienting {
         }
         do {
             let response = try await transport.commitDocument(
+                parameters: parameters
+            )
+            guard Self.isValid(response, for: parameters) else {
+                throw SyncV2ClientError.invalidResponse
+            }
+            return response
+        } catch let error as SyncV2ClientError {
+            throw error
+        } catch let error as SyncV2CommitTransportError {
+            throw Self.classify(error)
+        } catch {
+            throw SyncV2ClientError.serverRejected(
+                SyncV2RemoteRejection(
+                    postgresCode: nil,
+                    message: error.localizedDescription,
+                    detail: nil
+                )
+            )
+        }
+    }
+
+    func commitFolder(
+        _ parameters: SyncV2CommitFolderParameters
+    ) async throws -> SyncV2CommitFolderResult {
+        guard Self.isValid(parameters) else {
+            throw SyncV2ClientError.remote(
+                code: .invalidArgument,
+                detail: nil
+            )
+        }
+        do {
+            let response = try await transport.commitFolder(
                 parameters: parameters
             )
             guard Self.isValid(response, for: parameters) else {
@@ -348,6 +565,56 @@ actor SyncV2Client: SyncV2CommitClienting {
             return !parameters.isDeleted && parameters.leaseToken == nil
         }
         return parameters.leaseToken != nil
+    }
+
+    private static func isValid(
+        _ parameters: SyncV2CommitFolderParameters
+    ) -> Bool {
+        guard parameters.baseServerRevision >= 0,
+              parameters.baseServerRevision < Int64.max,
+              parameters.parentFolderID != parameters.folderID,
+              isValidFolderName(parameters.name)
+        else { return false }
+        // 처음 만드는 폴더를 지운 상태로 보내면 서버에 무덤만 생긴다.
+        if parameters.baseServerRevision == 0 {
+            return !parameters.isDeleted
+        }
+        return true
+    }
+
+    static func isValidFolderName(_ name: String) -> Bool {
+        guard !name.isEmpty,
+              name == name.trimmingCharacters(in: .whitespacesAndNewlines),
+              name.unicodeScalars.count <= 1_024,
+              !name.contains("/"),
+              !name.contains("\\")
+        else { return false }
+        return name != "." && name != ".."
+    }
+
+    private static func isValid(
+        _ response: SyncV2CommitFolderResult,
+        for parameters: SyncV2CommitFolderParameters
+    ) -> Bool {
+        guard response.folderID == parameters.folderID,
+              response.operationID == parameters.operationID,
+              response.isDeleted == parameters.isDeleted,
+              response.serverRevision == parameters.baseServerRevision + 1
+        else { return false }
+        // 서버가 이름이나 부모를 돌려주면 보낸 값과 같아야 한다. 알려 주지
+        // 않은 값은 판단할 근거가 없으므로 따지지 않는다.
+        if let name = response.name, name != parameters.name {
+            return false
+        }
+        if let parentFolderID = response.parentFolderID,
+           parentFolderID != parameters.parentFolderID {
+            return false
+        }
+        guard let kind = response.operationKind else { return true }
+        if parameters.baseServerRevision == 0 {
+            return kind == .create
+        }
+        return kind != .create
     }
 
     static func isValidServerPath(_ path: String) -> Bool {

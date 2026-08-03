@@ -988,7 +988,10 @@ actor SyncV2Dispatcher {
             return true
         case .documentNotFound, .operationIDReused, .pathConflict,
              .authRequired, .leaseRequired, .leaseConflict,
-             .leaseExpired, .forbidden, .invalidArgument:
+             .leaseExpired, .forbidden, .invalidArgument,
+             .folderNotFound, .folderAlreadyExists, .folderNotEmpty:
+            // 자동 rebase는 본문을 3-way로 합치는 일이다. 폴더는 합칠 본문이
+            // 없으므로 여기로 오지 않는다.
             return false
         }
     }
@@ -1019,7 +1022,10 @@ actor SyncV2Dispatcher {
                 return .blocked(code: code.rawValue, detail: detail)
             case .documentNotFound, .documentAlreadyExists,
                  .revisionConflict, .operationIDReused,
-                 .pathConflict:
+                 .pathConflict, .folderNotFound, .folderAlreadyExists,
+                 .folderNotEmpty:
+                // FOLDER_NOT_EMPTY는 순서를 잘못 잡았다는 뜻이라 그대로 다시
+                // 보내면 계속 거절당한다. 자동 재시도로 돌리지 않고 세워 둔다.
                 return .conflict(code: code.rawValue, detail: detail)
             }
         }

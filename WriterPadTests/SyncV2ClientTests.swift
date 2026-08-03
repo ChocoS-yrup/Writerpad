@@ -1282,6 +1282,15 @@ private actor SyncV2CommitTransportStub: SyncV2CommitTransporting {
         return try result.get()
     }
 
+    func commitFolder(
+        parameters: SyncV2CommitFolderParameters
+    ) throws -> SyncV2CommitFolderResult {
+        _ = parameters
+        throw SyncV2CommitTransportError.unknown(
+            message: "This stub only serves documents."
+        )
+    }
+
     func callCount() -> Int {
         calls
     }
@@ -1307,8 +1316,357 @@ private actor SyncV2CommitSequenceTransport: SyncV2CommitTransporting {
         return results.removeFirst()
     }
 
+
+    func commitFolder(
+        parameters: SyncV2CommitFolderParameters
+    ) throws -> SyncV2CommitFolderResult {
+        _ = parameters
+        throw SyncV2CommitTransportError.unknown(
+            message: "This stub only serves documents."
+        )
+    }
+
     func requests() -> [SyncV2CommitDocumentParameters] {
         received
+    }
+}
+
+private actor SyncV2CommitFolderTransportStub: SyncV2CommitTransporting {
+    private let result: Result<
+        SyncV2CommitFolderResult,
+        SyncV2CommitTransportError
+    >
+    private var received: [SyncV2CommitFolderParameters] = []
+
+    init(
+        result: Result<
+            SyncV2CommitFolderResult,
+            SyncV2CommitTransportError
+        >
+    ) {
+        self.result = result
+    }
+
+    func commitDocument(
+        parameters: SyncV2CommitDocumentParameters
+    ) throws -> SyncV2CommitDocumentResult {
+        _ = parameters
+        throw SyncV2CommitTransportError.unknown(
+            message: "This stub only serves folders."
+        )
+    }
+
+    func commitFolder(
+        parameters: SyncV2CommitFolderParameters
+    ) throws -> SyncV2CommitFolderResult {
+        received.append(parameters)
+        return try result.get()
+    }
+
+    func requests() -> [SyncV2CommitFolderParameters] {
+        received
+    }
+}
+
+final class SyncV2CommitFolderClientTests: XCTestCase {
+    func testTopLevelFolderSendsParentAsExplicitNull() async throws {
+        let folderID = UUID()
+        let operationID = UUID()
+        let transport = SyncV2CommitFolderTransportStub(
+            result: .success(
+                folderResult(
+                    folderID: folderID,
+                    operationID: operationID,
+                    revision: 1,
+                    parentFolderID: nil,
+                    name: "가 나 다"
+                )
+            )
+        )
+        let client = SyncV2Client(transport: transport)
+        let parameters = folderParameters(
+            folderID: folderID,
+            operationID: operationID,
+            baseRevision: 0,
+            parentFolderID: nil,
+            name: "가 나 다"
+        )
+
+        _ = try await client.commitFolder(parameters)
+
+        // PostgREST는 넘긴 인자 이름으로 함수를 고른다. 최상위 폴더라고
+        // p_parent_folder_id를 빼면 서명이 달라져 함수를 못 찾는다.
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.sortedKeys]
+        let json = try XCTUnwrap(
+            String(data: try encoder.encode(parameters), encoding: .utf8)
+        )
+        XCTAssertTrue(json.contains("\"p_parent_folder_id\":null"))
+        XCTAssertTrue(json.contains("\"p_name\":\"가 나 다\""))
+        let requests = await transport.requests()
+        XCTAssertEqual(requests.count, 1)
+    }
+
+    func testRenameKeepsFolderIDAndCarriesCurrentRevision() async throws {
+        let folderID = UUID()
+        let operationID = UUID()
+        let parentID = UUID()
+        let transport = SyncV2CommitFolderTransportStub(
+            result: .success(
+                folderResult(
+                    folderID: folderID,
+                    operationID: operationID,
+                    revision: 4,
+                    parentFolderID: parentID,
+                    name: "가 나 다 바"
+                )
+            )
+        )
+        let client = SyncV2Client(transport: transport)
+
+        let result = try await client.commitFolder(
+            folderParameters(
+                folderID: folderID,
+                operationID: operationID,
+                baseRevision: 3,
+                parentFolderID: parentID,
+                name: "가 나 다 바"
+            )
+        )
+
+        let requests = await transport.requests()
+        XCTAssertEqual(requests.first?.folderID, folderID)
+        XCTAssertEqual(requests.first?.baseServerRevision, 3)
+        XCTAssertEqual(result.serverRevision, 4)
+        XCTAssertEqual(result.status, .committed)
+    }
+
+    func testResponseForAnotherFolderIsRejected() async throws {
+        let operationID = UUID()
+        let transport = SyncV2CommitFolderTransportStub(
+            result: .success(
+                folderResult(
+                    folderID: UUID(),
+                    operationID: operationID,
+                    revision: 1,
+                    parentFolderID: nil,
+                    name: "가 나 다"
+                )
+            )
+        )
+        let client = SyncV2Client(transport: transport)
+
+        do {
+            _ = try await client.commitFolder(
+                folderParameters(
+                    folderID: UUID(),
+                    operationID: operationID,
+                    baseRevision: 0,
+                    parentFolderID: nil,
+                    name: "가 나 다"
+                )
+            )
+            XCTFail("A response for another folder must be rejected.")
+        } catch {
+            XCTAssertEqual(
+                error as? SyncV2ClientError,
+                .invalidResponse
+            )
+        }
+    }
+
+    func testUnexpectedRevisionJumpIsRejected() async throws {
+        let folderID = UUID()
+        let operationID = UUID()
+        let transport = SyncV2CommitFolderTransportStub(
+            result: .success(
+                folderResult(
+                    folderID: folderID,
+                    operationID: operationID,
+                    revision: 9,
+                    parentFolderID: nil,
+                    name: "가 나 다"
+                )
+            )
+        )
+        let client = SyncV2Client(transport: transport)
+
+        do {
+            _ = try await client.commitFolder(
+                folderParameters(
+                    folderID: folderID,
+                    operationID: operationID,
+                    baseRevision: 3,
+                    parentFolderID: nil,
+                    name: "가 나 다"
+                )
+            )
+            XCTFail("A revision that is not base + 1 must be rejected.")
+        } catch {
+            XCTAssertEqual(
+                error as? SyncV2ClientError,
+                .invalidResponse
+            )
+        }
+    }
+
+    func testFolderNotEmptyIsReportedAsItsOwnCode() async throws {
+        let transport = SyncV2CommitFolderTransportStub(
+            result: .failure(
+                .postgrest(
+                    message: "FOLDER_NOT_EMPTY",
+                    postgresCode: "P0001",
+                    detail: "3 children"
+                )
+            )
+        )
+        let client = SyncV2Client(transport: transport)
+
+        do {
+            _ = try await client.commitFolder(
+                folderParameters(
+                    folderID: UUID(),
+                    operationID: UUID(),
+                    baseRevision: 2,
+                    parentFolderID: nil,
+                    name: "가 나 다",
+                    isDeleted: true
+                )
+            )
+            XCTFail("FOLDER_NOT_EMPTY must surface as a remote code.")
+        } catch {
+            // 재귀 삭제 순서를 고치려면 이 거절을 다른 실패와 구분해야 한다.
+            XCTAssertEqual(
+                error as? SyncV2ClientError,
+                .remote(code: .folderNotEmpty, detail: "3 children")
+            )
+        }
+    }
+
+    func testCreatingAnAlreadyDeletedFolderNeverReachesTheServer()
+        async throws {
+        let transport = SyncV2CommitFolderTransportStub(
+            result: .failure(.invalidResponse)
+        )
+        let client = SyncV2Client(transport: transport)
+
+        do {
+            _ = try await client.commitFolder(
+                folderParameters(
+                    folderID: UUID(),
+                    operationID: UUID(),
+                    baseRevision: 0,
+                    parentFolderID: nil,
+                    name: "가 나 다",
+                    isDeleted: true
+                )
+            )
+            XCTFail("Creating a tombstone must be rejected locally.")
+        } catch {
+            XCTAssertEqual(
+                error as? SyncV2ClientError,
+                .remote(code: .invalidArgument, detail: nil)
+            )
+        }
+        let requests = await transport.requests()
+        XCTAssertTrue(requests.isEmpty)
+    }
+
+    func testFolderNameWithSeparatorNeverReachesTheServer() async throws {
+        let transport = SyncV2CommitFolderTransportStub(
+            result: .failure(.invalidResponse)
+        )
+        let client = SyncV2Client(transport: transport)
+
+        do {
+            _ = try await client.commitFolder(
+                folderParameters(
+                    folderID: UUID(),
+                    operationID: UUID(),
+                    baseRevision: 0,
+                    parentFolderID: nil,
+                    name: "가 나/다"
+                )
+            )
+            XCTFail("A folder name with a separator must be rejected.")
+        } catch {
+            XCTAssertEqual(
+                error as? SyncV2ClientError,
+                .remote(code: .invalidArgument, detail: nil)
+            )
+        }
+        let requests = await transport.requests()
+        XCTAssertTrue(requests.isEmpty)
+    }
+
+    func testResponseWithoutOptionalFieldsStillDecodes() throws {
+        // 서버가 version_id·operation_kind·name을 안 돌려주더라도 대기열을
+        // 이어가는 데 필요한 값만 있으면 진행할 수 있어야 한다.
+        let folderID = UUID()
+        let operationID = UUID()
+        let json = """
+        {
+          "status": "committed",
+          "folder_id": "\(folderID.uuidString.lowercased())",
+          "operation_id": "\(operationID.uuidString.lowercased())",
+          "revision": 1,
+          "is_deleted": false,
+          "committed_at": "2026-08-03T12:00:00Z"
+        }
+        """
+
+        let result = try JSONDecoder().decode(
+            SyncV2CommitFolderResult.self,
+            from: Data(json.utf8)
+        )
+
+        XCTAssertEqual(result.folderID, folderID)
+        XCTAssertEqual(result.serverRevision, 1)
+        XCTAssertNil(result.versionID)
+        XCTAssertNil(result.operationKind)
+        XCTAssertNil(result.name)
+    }
+
+    private func folderParameters(
+        folderID: UUID,
+        operationID: UUID,
+        baseRevision: Int64,
+        parentFolderID: UUID?,
+        name: String,
+        isDeleted: Bool = false
+    ) -> SyncV2CommitFolderParameters {
+        SyncV2CommitFolderParameters(
+            folderID: folderID,
+            projectID: UUID(),
+            baseServerRevision: baseRevision,
+            operationID: operationID,
+            deviceID: UUID(),
+            parentFolderID: parentFolderID,
+            name: name,
+            isDeleted: isDeleted
+        )
+    }
+
+    private func folderResult(
+        folderID: UUID,
+        operationID: UUID,
+        revision: Int64,
+        parentFolderID: UUID?,
+        name: String,
+        isDeleted: Bool = false
+    ) -> SyncV2CommitFolderResult {
+        SyncV2CommitFolderResult(
+            status: .committed,
+            folderID: folderID,
+            versionID: UUID(),
+            operationID: operationID,
+            operationKind: revision == 1 ? .create : .update,
+            serverRevision: revision,
+            parentFolderID: parentFolderID,
+            name: name,
+            isDeleted: isDeleted,
+            committedAt: Date(timeIntervalSince1970: 1_800_000_001)
+        )
     }
 }
 
@@ -3013,6 +3371,16 @@ private actor DispatcherClientStub: SyncV2CommitClienting {
 
     func receivedRequests() -> [SyncV2CommitDocumentParameters] {
         requests
+    }
+
+    func commitFolder(
+        _ parameters: SyncV2CommitFolderParameters
+    ) async throws -> SyncV2CommitFolderResult {
+        _ = parameters
+        throw SyncV2ClientError.remote(
+            code: .invalidArgument,
+            detail: "This stub only serves documents."
+        )
     }
 }
 
