@@ -742,8 +742,16 @@ actor SyncV2Dispatcher {
     ) async -> Bool {
         while !Task.isCancelled {
             let operations: [SyncV2DispatchOperation]
+            let folderOperations: [SyncV2FolderDispatchOperation]
             do {
                 operations = try await store.claimReadyOperations(
+                    localProjectID: localProjectID,
+                    limit: limit,
+                    now: now()
+                )
+                // 폴더는 sync_documents에 행이 없어 문서 줄을 탈 수 없다. 같은
+                // 한 바퀴에서 나란히 비워야 한쪽이 막혀도 다른 쪽이 멈추지 않는다.
+                folderOperations = try await store.claimReadyFolderOperations(
                     localProjectID: localProjectID,
                     limit: limit,
                     now: now()
@@ -751,7 +759,9 @@ actor SyncV2Dispatcher {
             } catch {
                 return false
             }
-            guard !operations.isEmpty else { return true }
+            guard !operations.isEmpty || !folderOperations.isEmpty else {
+                return true
+            }
 
             await withTaskGroup(of: Void.self) { group in
                 for operation in operations {
@@ -766,6 +776,18 @@ actor SyncV2Dispatcher {
                             projectRecoveryTransport:
                                 projectRecoveryTransport,
                             automaticRebaser: automaticRebaser,
+                            now: now()
+                        )
+                    }
+                }
+                for operation in folderOperations {
+                    group.addTask {
+                        await Self.dispatchFolder(
+                            operation,
+                            store: store,
+                            client: client,
+                            retryPolicy: retryPolicy,
+                            randomUnit: randomUnit,
                             now: now()
                         )
                     }
@@ -964,6 +986,78 @@ actor SyncV2Dispatcher {
             } catch {
                 // 서버 성공/실패와 SQLite 반영 사이의 중단은 inflight recovery가
                 // 같은 operation_id를 다시 보내도록 그대로 둔다.
+            }
+        } catch {
+            let delay = retryPolicy.delay(
+                attempt: operation.attempts,
+                randomUnit: randomUnit()
+            )
+            try? await store.deferRetry(
+                operation,
+                errorCode: "UNKNOWN_CLIENT_ERROR",
+                detail: error.localizedDescription,
+                nextAttemptAt: now.addingTimeInterval(delay)
+            )
+        }
+    }
+
+    /// 폴더는 본문도 편집 점유도 없어 문서 쪽의 rebase·lease 처리가 통째로
+    /// 빠진다. 남는 것은 보내고, 결과에 따라 revision을 남기거나 세우는 일뿐이다.
+    private static func dispatchFolder(
+        _ operation: SyncV2FolderDispatchOperation,
+        store: any SyncV2DispatchStoring,
+        client: any SyncV2CommitClienting,
+        retryPolicy: SyncV2RetryPolicy,
+        randomUnit: @Sendable () -> Double,
+        now: Date
+    ) async {
+        do {
+            // operation_id는 대기열 줄에 적힌 값을 그대로 쓴다. 재시도해도 새로
+            // 만들지 않아야 서버가 같은 작업임을 알아보고 두 번 반영하지 않는다.
+            let result = try await client.commitFolder(
+                SyncV2CommitFolderParameters(
+                    folderID: operation.folderID,
+                    projectID: operation.projectID,
+                    baseServerRevision: operation.baseRevision,
+                    operationID: operation.operationID,
+                    deviceID: operation.deviceID,
+                    parentFolderID: operation.parentFolderID,
+                    name: operation.name,
+                    isDeleted: operation.isDeleted
+                )
+            )
+            try await store.complete(operation, result: result)
+        } catch let error as SyncV2ClientError {
+            do {
+                switch handling(for: error) {
+                case let .retry(code, detail):
+                    let delay = retryPolicy.delay(
+                        errorCode: code,
+                        attempt: operation.attempts,
+                        randomUnit: randomUnit()
+                    )
+                    try await store.deferRetry(
+                        operation,
+                        errorCode: code,
+                        detail: detail,
+                        nextAttemptAt: now.addingTimeInterval(delay)
+                    )
+                case let .conflict(code, detail):
+                    try await store.markConflict(
+                        operation,
+                        errorCode: code,
+                        detail: detail
+                    )
+                case let .blocked(code, detail):
+                    try await store.markBlocked(
+                        operation,
+                        errorCode: code,
+                        detail: detail
+                    )
+                }
+            } catch {
+                // 서버 응답과 SQLite 반영 사이에서 끊기면 inflight 복구가 같은
+                // operation_id로 다시 보낸다. 여기서 손대지 않는다.
             }
         } catch {
             let delay = retryPolicy.delay(

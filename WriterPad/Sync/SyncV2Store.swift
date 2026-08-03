@@ -558,6 +558,26 @@ protocol SyncV2DispatchStoring: Sendable {
         now: Date
     ) async throws -> [SyncV2FolderDispatchOperation]
     func complete(
+        _ operation: SyncV2FolderDispatchOperation,
+        result: SyncV2CommitFolderResult
+    ) async throws
+    func deferRetry(
+        _ operation: SyncV2FolderDispatchOperation,
+        errorCode: String,
+        detail: String?,
+        nextAttemptAt: Date
+    ) async throws
+    func markConflict(
+        _ operation: SyncV2FolderDispatchOperation,
+        errorCode: String,
+        detail: String?
+    ) async throws
+    func markBlocked(
+        _ operation: SyncV2FolderDispatchOperation,
+        errorCode: String,
+        detail: String?
+    ) async throws
+    func complete(
         _ operation: SyncV2DispatchOperation,
         result: SyncV2CommitDocumentResult
     ) async throws
@@ -621,6 +641,44 @@ extension SyncV2DispatchStoring {
     ) async throws -> [SyncV2FolderDispatchOperation] {
         _ = (localProjectID, limit, now)
         return []
+    }
+
+    // 폴더 대기열이 없는 구현은 폴더 작업을 claim하지 못하므로 아래 넷은
+    // 호출될 일이 없다. 조용히 성공한 척하지 않고 막는다.
+    func complete(
+        _ operation: SyncV2FolderDispatchOperation,
+        result: SyncV2CommitFolderResult
+    ) async throws {
+        _ = (operation, result)
+        throw SyncV2DispatchStoreError.unavailable
+    }
+
+    func deferRetry(
+        _ operation: SyncV2FolderDispatchOperation,
+        errorCode: String,
+        detail: String?,
+        nextAttemptAt: Date
+    ) async throws {
+        _ = (operation, errorCode, detail, nextAttemptAt)
+        throw SyncV2DispatchStoreError.unavailable
+    }
+
+    func markConflict(
+        _ operation: SyncV2FolderDispatchOperation,
+        errorCode: String,
+        detail: String?
+    ) async throws {
+        _ = (operation, errorCode, detail)
+        throw SyncV2DispatchStoreError.unavailable
+    }
+
+    func markBlocked(
+        _ operation: SyncV2FolderDispatchOperation,
+        errorCode: String,
+        detail: String?
+    ) async throws {
+        _ = (operation, errorCode, detail)
+        throw SyncV2DispatchStoreError.unavailable
     }
 
     func recoverMissingRemoteDocument(
@@ -2225,6 +2283,198 @@ actor SyncV2Store:
             throw error
         } catch {
             throw error
+        }
+    }
+
+    /// 서버가 준 revision을 폴더에 남기고, 같은 폴더의 다음 작업이 그 값을
+    /// 기준선으로 삼게 이어 준다. 문서 쪽과 같은 사슬이다.
+    func complete(
+        _ operation: SyncV2FolderDispatchOperation,
+        result: SyncV2CommitFolderResult
+    ) throws {
+        guard
+            result.operationID == operation.operationID,
+            result.folderID == operation.folderID,
+            result.serverRevision == operation.baseRevision + 1,
+            result.isDeleted == operation.isDeleted
+        else {
+            throw SyncV2DispatchStoreError.integrityFailure
+        }
+        let timestamp = Self.timestamp()
+        try transaction {
+            try transitionInflightOperation(
+                operationID: operation.operationID,
+                attempts: operation.attempts,
+                status: .completed,
+                errorCode: nil,
+                detail: nil,
+                nextAttemptAt: nil,
+                timestamp: timestamp
+            )
+            try withStatement(
+                """
+                UPDATE sync_folders
+                SET server_revision = ?,
+                    is_deleted = ?,
+                    server_updated_at = ?,
+                    sync_state = CASE
+                        WHEN EXISTS (
+                            SELECT 1
+                            FROM sync_operations pending
+                            WHERE pending.folder_id = ?
+                              AND pending.status NOT IN (
+                                  'completed', 'cancelled'
+                              )
+                        ) THEN 'pending'
+                        ELSE 'synced'
+                    END,
+                    last_error_code = NULL,
+                    last_applied_operation_id = ?,
+                    updated_at = ?
+                WHERE folder_id = ?;
+                """
+            ) { statement in
+                let folderValue = operation.folderID.uuidString.lowercased()
+                try bind(result.serverRevision, at: 1, to: statement)
+                try bind(result.isDeleted ? 1 : 0, at: 2, to: statement)
+                try bind(
+                    Self.timestamp(result.committedAt),
+                    at: 3,
+                    to: statement
+                )
+                try bind(folderValue, at: 4, to: statement)
+                try bind(
+                    operation.operationID.uuidString.lowercased(),
+                    at: 5,
+                    to: statement
+                )
+                try bind(timestamp, at: 6, to: statement)
+                try bind(folderValue, at: 7, to: statement)
+                try stepDone(statement)
+                guard sqlite3_changes(connection.handle) == 1 else {
+                    throw SyncV2DispatchStoreError.integrityFailure
+                }
+            }
+            try withStatement(
+                """
+                UPDATE sync_operations
+                SET base_revision = ?,
+                    updated_at = ?
+                WHERE folder_id = ?
+                  AND document_sequence = ?
+                  AND status IN ('pending', 'retry_wait')
+                  AND base_revision IS NULL;
+                """
+            ) { statement in
+                try bind(result.serverRevision, at: 1, to: statement)
+                try bind(timestamp, at: 2, to: statement)
+                try bind(
+                    operation.folderID.uuidString.lowercased(),
+                    at: 3,
+                    to: statement
+                )
+                try bind(
+                    operation.folderSequence + 1,
+                    at: 4,
+                    to: statement
+                )
+                try stepDone(statement)
+            }
+            try refreshBatchState(
+                batchID: operation.batchID,
+                timestamp: timestamp
+            )
+        }
+    }
+
+    func deferRetry(
+        _ operation: SyncV2FolderDispatchOperation,
+        errorCode: String,
+        detail: String?,
+        nextAttemptAt: Date
+    ) throws {
+        try recordFolderDispatchFailure(
+            operation,
+            status: .retryWait,
+            errorCode: errorCode,
+            detail: detail,
+            nextAttemptAt: nextAttemptAt
+        )
+    }
+
+    func markConflict(
+        _ operation: SyncV2FolderDispatchOperation,
+        errorCode: String,
+        detail: String?
+    ) throws {
+        try recordFolderDispatchFailure(
+            operation,
+            status: .conflict,
+            errorCode: errorCode,
+            detail: detail,
+            nextAttemptAt: nil
+        )
+    }
+
+    func markBlocked(
+        _ operation: SyncV2FolderDispatchOperation,
+        errorCode: String,
+        detail: String?
+    ) throws {
+        try recordFolderDispatchFailure(
+            operation,
+            status: .blocked,
+            errorCode: errorCode,
+            detail: detail,
+            nextAttemptAt: nil
+        )
+    }
+
+    private func recordFolderDispatchFailure(
+        _ operation: SyncV2FolderDispatchOperation,
+        status: SyncV2OperationStatus,
+        errorCode: String,
+        detail: String?,
+        nextAttemptAt: Date?
+    ) throws {
+        let timestamp = Self.timestamp()
+        try transaction {
+            try transitionInflightOperation(
+                operationID: operation.operationID,
+                attempts: operation.attempts,
+                status: status,
+                errorCode: errorCode,
+                detail: detail,
+                nextAttemptAt: nextAttemptAt,
+                timestamp: timestamp
+            )
+            try withStatement(
+                """
+                UPDATE sync_folders
+                SET sync_state = ?,
+                    last_error_code = ?,
+                    updated_at = ?
+                WHERE folder_id = ?;
+                """
+            ) { statement in
+                let folderState =
+                    status == .conflict ? "conflict"
+                    : status == .blocked ? "blocked"
+                    : "pending"
+                try bind(folderState, at: 1, to: statement)
+                try bind(errorCode, at: 2, to: statement)
+                try bind(timestamp, at: 3, to: statement)
+                try bind(
+                    operation.folderID.uuidString.lowercased(),
+                    at: 4,
+                    to: statement
+                )
+                try stepDone(statement)
+            }
+            try refreshBatchState(
+                batchID: operation.batchID,
+                timestamp: timestamp
+            )
         }
     }
 
@@ -4089,6 +4339,28 @@ actor SyncV2Store:
         nextAttemptAt: Date?,
         timestamp: String
     ) throws {
+        try transitionInflightOperation(
+            operationID: operation.operationID,
+            attempts: operation.attempts,
+            status: status,
+            errorCode: errorCode,
+            detail: detail,
+            nextAttemptAt: nextAttemptAt,
+            timestamp: timestamp
+        )
+    }
+
+    /// 문서와 폴더가 같은 표를 쓰므로 상태 전이도 같다. 시도 횟수를 조건에 넣어
+    /// 이미 다른 흐름이 건드린 줄은 바꾸지 않는다.
+    private func transitionInflightOperation(
+        operationID: UUID,
+        attempts: Int,
+        status: SyncV2OperationStatus,
+        errorCode: String?,
+        detail: String?,
+        nextAttemptAt: Date?,
+        timestamp: String
+    ) throws {
         try withStatement(
             """
             UPDATE sync_operations
@@ -4108,11 +4380,11 @@ actor SyncV2Store:
             try bind(nextAttemptAt.map(Self.timestamp), at: 4, to: statement)
             try bind(timestamp, at: 5, to: statement)
             try bind(
-                operation.operationID.uuidString.lowercased(),
+                operationID.uuidString.lowercased(),
                 at: 6,
                 to: statement
             )
-            try bind(operation.attempts, at: 7, to: statement)
+            try bind(attempts, at: 7, to: statement)
             try stepDone(statement)
             guard sqlite3_changes(connection.handle) == 1 else {
                 throw SyncV2DispatchStoreError.operationStateChanged
@@ -6307,6 +6579,63 @@ actor LazySyncV2ProjectBindingStore:
             localProjectID: localProjectID,
             limit: limit,
             now: now
+        )
+    }
+
+    func complete(
+        _ operation: SyncV2FolderDispatchOperation,
+        result: SyncV2CommitFolderResult
+    ) async throws {
+        guard let store = await resolvedStore() else {
+            throw SyncV2DispatchStoreError.unavailable
+        }
+        try await store.complete(operation, result: result)
+    }
+
+    func deferRetry(
+        _ operation: SyncV2FolderDispatchOperation,
+        errorCode: String,
+        detail: String?,
+        nextAttemptAt: Date
+    ) async throws {
+        guard let store = await resolvedStore() else {
+            throw SyncV2DispatchStoreError.unavailable
+        }
+        try await store.deferRetry(
+            operation,
+            errorCode: errorCode,
+            detail: detail,
+            nextAttemptAt: nextAttemptAt
+        )
+    }
+
+    func markConflict(
+        _ operation: SyncV2FolderDispatchOperation,
+        errorCode: String,
+        detail: String?
+    ) async throws {
+        guard let store = await resolvedStore() else {
+            throw SyncV2DispatchStoreError.unavailable
+        }
+        try await store.markConflict(
+            operation,
+            errorCode: errorCode,
+            detail: detail
+        )
+    }
+
+    func markBlocked(
+        _ operation: SyncV2FolderDispatchOperation,
+        errorCode: String,
+        detail: String?
+    ) async throws {
+        guard let store = await resolvedStore() else {
+            throw SyncV2DispatchStoreError.unavailable
+        }
+        try await store.markBlocked(
+            operation,
+            errorCode: errorCode,
+            detail: detail
         )
     }
 

@@ -1670,6 +1670,323 @@ final class SyncV2CommitFolderClientTests: XCTestCase {
     }
 }
 
+/// 폴더 작업만 골라 응답을 짜 주는 client다. 문서 요청도 받아 두 줄이 같이
+/// 흐르는지 볼 수 있게 한다.
+private actor FolderDispatchClientStub: SyncV2CommitClienting {
+    private var scriptedFolderErrors: [UUID: [SyncV2ClientError]]
+    private var folderRequests: [SyncV2CommitFolderParameters] = []
+    private var documentRequests: [SyncV2CommitDocumentParameters] = []
+
+    init(scriptedFolderErrors: [UUID: [SyncV2ClientError]] = [:]) {
+        self.scriptedFolderErrors = scriptedFolderErrors
+    }
+
+    func commitDocument(
+        _ parameters: SyncV2CommitDocumentParameters
+    ) async throws -> SyncV2CommitDocumentResult {
+        documentRequests.append(parameters)
+        return SyncV2CommitDocumentResult(
+            status: .committed,
+            documentID: parameters.documentID,
+            versionID: UUID(),
+            operationID: parameters.operationID,
+            operationKind: parameters.baseServerRevision == 0
+                ? .create
+                : .update,
+            serverRevision: parameters.baseServerRevision + 1,
+            relativePath: parameters.relativePath,
+            isDeleted: parameters.isDeleted,
+            contentHash: SHA256ContentHasher()
+                .sha256(for: Data(parameters.content.utf8))
+                .rawValue,
+            committedAt: Date(timeIntervalSince1970: 1_800_000_001)
+        )
+    }
+
+    func commitFolder(
+        _ parameters: SyncV2CommitFolderParameters
+    ) async throws -> SyncV2CommitFolderResult {
+        folderRequests.append(parameters)
+        if var pending = scriptedFolderErrors[parameters.operationID],
+           !pending.isEmpty {
+            let error = pending.removeFirst()
+            scriptedFolderErrors[parameters.operationID] = pending
+            throw error
+        }
+        return SyncV2CommitFolderResult(
+            status: .committed,
+            folderID: parameters.folderID,
+            versionID: UUID(),
+            operationID: parameters.operationID,
+            operationKind: parameters.baseServerRevision == 0
+                ? .create
+                : .update,
+            serverRevision: parameters.baseServerRevision + 1,
+            parentFolderID: parameters.parentFolderID,
+            name: parameters.name,
+            isDeleted: parameters.isDeleted,
+            committedAt: Date(timeIntervalSince1970: 1_800_000_001)
+        )
+    }
+
+    func folderCalls() -> [SyncV2CommitFolderParameters] {
+        folderRequests
+    }
+
+    func documentCalls() -> [SyncV2CommitDocumentParameters] {
+        documentRequests
+    }
+}
+
+final class SyncV2FolderDispatchTests: XCTestCase {
+    func testCommittedRevisionUnblocksTheNextFolderOperation()
+        async throws {
+        let fixture = try await FolderDispatchFixture()
+        let createID = UUID()
+        let renameID = UUID()
+        try await fixture.enqueueFolder(operationID: createID, name: "가 나 다")
+        try await fixture.enqueueFolder(
+            operationID: renameID,
+            name: "가 나 다 바"
+        )
+        let client = FolderDispatchClientStub()
+        let dispatcher = SyncV2Dispatcher(
+            store: fixture.store,
+            client: client
+        )
+
+        await dispatcher.dispatchReadyOperations(
+            now: Date(timeIntervalSince1970: 10)
+        )
+        await dispatcher.dispatchReadyOperations(
+            now: Date(timeIntervalSince1970: 20)
+        )
+
+        let calls = await client.folderCalls()
+        XCTAssertEqual(calls.map(\.operationID), [createID, renameID])
+        // 생성이 받아온 revision 위에서 이름 변경이 이어져야 한다. 0으로 다시
+        // 보내면 서버가 이미 있는 폴더라며 거절한다.
+        XCTAssertEqual(calls.map(\.baseServerRevision), [0, 1])
+        XCTAssertEqual(calls.map(\.name), ["가 나 다", "가 나 다 바"])
+        let renameStatus = try await fixture.store.operationStatus(
+            operationID: renameID
+        )
+        XCTAssertEqual(
+            renameStatus,
+            SyncV2OperationStatus.completed.rawValue
+        )
+        await fixture.close()
+    }
+
+    func testRetryReusesTheSameOperationID() async throws {
+        let fixture = try await FolderDispatchFixture()
+        let operationID = UUID()
+        try await fixture.enqueueFolder(
+            operationID: operationID,
+            name: "가 나 다"
+        )
+        let client = FolderDispatchClientStub(
+            scriptedFolderErrors: [operationID: [.networkUnavailable]]
+        )
+        let dispatcher = SyncV2Dispatcher(
+            store: fixture.store,
+            client: client
+        )
+
+        await dispatcher.dispatchReadyOperations(
+            now: Date(timeIntervalSince1970: 10)
+        )
+        // 재시도 대기가 풀릴 만큼 시간을 넘긴다.
+        await dispatcher.dispatchReadyOperations(
+            now: Date(timeIntervalSince1970: 10_000)
+        )
+
+        let calls = await client.folderCalls()
+        // 끊겼다 이어져도 새 operation_id를 만들면 서버가 다른 작업으로 보고
+        // 폴더를 한 번 더 만든다.
+        XCTAssertEqual(calls.count, 2)
+        XCTAssertEqual(calls.map(\.operationID), [operationID, operationID])
+        let status = try await fixture.store.operationStatus(
+            operationID: operationID
+        )
+        XCTAssertEqual(status, SyncV2OperationStatus.completed.rawValue)
+        await fixture.close()
+    }
+
+    func testFolderNotEmptyStopsTheLaneInsteadOfRetrying() async throws {
+        let fixture = try await FolderDispatchFixture()
+        let operationID = UUID()
+        try await fixture.enqueueFolder(
+            operationID: operationID,
+            name: "가 나 다",
+            isDeleted: true
+        )
+        let client = FolderDispatchClientStub(
+            scriptedFolderErrors: [
+                operationID: [
+                    .remote(code: .folderNotEmpty, detail: "2 children"),
+                    .remote(code: .folderNotEmpty, detail: "2 children"),
+                ]
+            ]
+        )
+        let dispatcher = SyncV2Dispatcher(
+            store: fixture.store,
+            client: client
+        )
+
+        await dispatcher.dispatchReadyOperations(
+            now: Date(timeIntervalSince1970: 10)
+        )
+        await dispatcher.dispatchReadyOperations(
+            now: Date(timeIntervalSince1970: 10_000)
+        )
+
+        let calls = await client.folderCalls()
+        // 순서를 잘못 잡았다는 뜻이라 그대로 다시 보내면 계속 거절당한다.
+        XCTAssertEqual(calls.count, 1)
+        let status = try await fixture.store.operationStatus(
+            operationID: operationID
+        )
+        XCTAssertEqual(status, SyncV2OperationStatus.conflict.rawValue)
+        await fixture.close()
+    }
+
+    func testFolderAndDocumentLanesDrainInTheSameCycle() async throws {
+        let fixture = try await FolderDispatchFixture()
+        let folderOperationID = UUID()
+        let documentOperationID = UUID()
+        try await fixture.enqueueFolder(
+            operationID: folderOperationID,
+            name: "가 나 다"
+        )
+        try await fixture.enqueueDocument(operationID: documentOperationID)
+        let client = FolderDispatchClientStub()
+        let dispatcher = SyncV2Dispatcher(
+            store: fixture.store,
+            client: client
+        )
+
+        await dispatcher.dispatchReadyOperations(
+            now: Date(timeIntervalSince1970: 10)
+        )
+
+        let folderCalls = await client.folderCalls()
+        let documentCalls = await client.documentCalls()
+        XCTAssertEqual(
+            folderCalls.map(\.operationID),
+            [folderOperationID]
+        )
+        XCTAssertEqual(
+            documentCalls.map(\.operationID),
+            [documentOperationID]
+        )
+        await fixture.close()
+    }
+}
+
+/// 폴더 dispatch는 실제 저장소에 revision을 남기는 일이 핵심이라 stub 대신
+/// 진짜 SyncV2Store를 쓴다.
+private struct FolderDispatchFixture {
+    let store: SyncV2Store
+    let localProjectID = ProjectID(rawValue: UUID())
+    let serverProjectID = UUID()
+    let ownerSubject = UUID()
+    let deviceID = UUID()
+    let folderID = UUID()
+    let documentID = UUID()
+    private let directory: URL
+
+    init() async throws {
+        directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent(
+                "WriterPad-folder-dispatch-\(UUID().uuidString)",
+                isDirectory: true
+            )
+        try FileManager.default.createDirectory(
+            at: directory,
+            withIntermediateDirectories: true
+        )
+        let url = directory.appendingPathComponent("sync-v2.sqlite3")
+        switch await SyncV2Store.open(at: url) {
+        case .available(let opened):
+            store = opened
+        case .unavailable(let diagnostic):
+            throw FolderDispatchFixtureError.openFailed(diagnostic)
+        }
+        try await store.save(
+            .connected(
+                localProjectID: localProjectID,
+                serverProjectID: serverProjectID,
+                kind: .newServerProject,
+                projectName: "폴더 dispatch fixture",
+                ownerSubject: ownerSubject
+            )
+        )
+    }
+
+    func enqueueFolder(
+        operationID: UUID,
+        name: String,
+        isDeleted: Bool = false
+    ) async throws {
+        _ = try await store.enqueue(
+            SyncV2EnqueueBatch(
+                batchID: UUID(),
+                localProjectID: localProjectID,
+                localTransactionID: UUID(),
+                kind: .structureChange,
+                mutations: [
+                    .folder(
+                        SyncV2FolderMutation(
+                            operationID: operationID,
+                            folderID: folderID,
+                            parentFolderID: nil,
+                            deviceID: deviceID,
+                            name: name,
+                            isDeleted: isDeleted
+                        )
+                    )
+                ]
+            )
+        )
+    }
+
+    func enqueueDocument(operationID: UUID) async throws {
+        _ = try await store.enqueue(
+            SyncV2EnqueueBatch(
+                batchID: UUID(),
+                localProjectID: localProjectID,
+                localTransactionID: UUID(),
+                kind: .documentSave,
+                mutations: [
+                    .document(
+                        SyncV2DocumentMutation(
+                            operationID: operationID,
+                            documentID: documentID,
+                            deviceID: deviceID,
+                            localSaveGeneration: 1,
+                            kind: .documentCommit,
+                            localPath: "/fixture/원고/001화.txt",
+                            relativePath: "원고/001화.txt",
+                            content: "본문",
+                            isDeleted: false
+                        )
+                    )
+                ]
+            )
+        )
+    }
+
+    func close() async {
+        await store.close()
+        try? FileManager.default.removeItem(at: directory)
+    }
+}
+
+private enum FolderDispatchFixtureError: Error {
+    case openFailed(SyncV2StoreDiagnostic)
+}
+
 final class SyncV2DispatcherTests: XCTestCase {
     func testRetryPolicyIsExponentialCappedAndJittered() {
         let policy = SyncV2RetryPolicy(
