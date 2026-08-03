@@ -13,6 +13,64 @@ protocol SyncV2FolderMigrationMarking: Sendable {
     ) async throws -> Set<UUID>
 }
 
+/// tree_order로 받은 폴더 변경을 폴더 기록에도 올린다.
+///
+/// Windows는 아직 `folders` 표를 모르고 `tree_order`만 쓴다. 그쪽에서 온 이름
+/// 변경을 여기서 올려 주지 않으면 서버 폴더 행이 옛 이름으로 남고, 그 낡은 행이
+/// 다른 아이패드에서 최종 권위로 쓰여 방금 바뀐 이름을 되돌린다. 아이패드가 두
+/// 방식 사이의 다리가 되어야 한다.
+protocol SyncV2FolderIdentityPublishing: Sendable {
+    func publishFolder(
+        localProjectID: ProjectID,
+        folderID: DocumentID,
+        parentFolderID: DocumentID?,
+        name: String
+    ) async
+}
+
+struct DurableSyncV2FolderIdentityPublisher: SyncV2FolderIdentityPublishing {
+    let changeRecorder: any DurableLocalChangeRecording
+    let uuidGenerator: any UUIDGenerating
+
+    init(
+        changeRecorder: any DurableLocalChangeRecording,
+        uuidGenerator: any UUIDGenerating = SystemUUIDGenerator()
+    ) {
+        self.changeRecorder = changeRecorder
+        self.uuidGenerator = uuidGenerator
+    }
+
+    func publishFolder(
+        localProjectID: ProjectID,
+        folderID: DocumentID,
+        parentFolderID: DocumentID?,
+        name: String
+    ) async {
+        guard await changeRecorder.requirement(for: localProjectID)
+            == .durableQueue
+        else {
+            return
+        }
+        _ = await changeRecorder.record(
+            LocalMutationBatch(
+                batchID: uuidGenerator.makeUUID(),
+                projectID: localProjectID,
+                localTransactionID: uuidGenerator.makeUUID(),
+                kind: .structureChange,
+                mutations: [
+                    .folderSnapshot(
+                        operationID: uuidGenerator.makeUUID(),
+                        folderID: folderID,
+                        parentFolderID: parentFolderID,
+                        name: name,
+                        isDeleted: false
+                    )
+                ]
+            )
+        )
+    }
+}
+
 enum SyncV2FolderMigrationResult: Equatable, Sendable {
     /// 이 작품은 이미 이관됐다. 다시 하지 않는다.
     case alreadyCompleted

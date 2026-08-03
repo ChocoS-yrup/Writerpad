@@ -1153,8 +1153,18 @@ final class LocalBinderCommandServiceTests: XCTestCase {
         XCTAssertEqual(batches.count, 1)
         XCTAssertEqual(batches[0].kind, .structureChange)
         XCTAssertNotNil(batches[0].localTransactionID)
-        XCTAssertEqual(batches[0].mutations.count, 1)
-        guard case let .treeOrder(_, content, _) = batches[0].mutations[0]
+        // 폴더 작업과 tree_order가 함께 나간다. tree_order는 Windows 호환을
+        // 위해 유지하고, 폴더 작업이 같은 폴더의 정체를 서버에 알린다.
+        XCTAssertEqual(batches[0].mutations.count, 2)
+        guard case let .folderSnapshot(_, folderID, parentFolderID, name, isDeleted) =
+                batches[0].mutations[0] else {
+            return XCTFail("빈 폴더의 폴더 작업이 없습니다.")
+        }
+        XCTAssertEqual(folderID, created.affectedDocumentID)
+        XCTAssertEqual(parentFolderID, notes.id)
+        XCTAssertEqual(name, "서버 빈 폴더")
+        XCTAssertFalse(isDeleted)
+        guard case let .treeOrder(_, content, _) = batches[0].mutations[1]
         else {
             return XCTFail("빈 폴더 tree-order가 없습니다.")
         }

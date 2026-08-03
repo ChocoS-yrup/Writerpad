@@ -146,10 +146,6 @@ final class AppEnvironment: ObservableObject {
             clock: clock
         )
         let syncMutationGate = SyncV2DocumentMutationGate()
-        let localSnapshotApplier = LocalSyncV2SnapshotApplier(
-            documentRepository: repository,
-            workspaceLocator: workspaceLocator
-        )
         let futureChangeNotifier = NoOpFutureChangeNotifier()
         let supabaseClientProvider: any SupabaseClientProviding
         if isStoredInMemoryOnly {
@@ -181,6 +177,9 @@ final class AppEnvironment: ObservableObject {
         let conflictResolutionService: (any SyncV2ConflictResolving)?
         let snapshotStateStore: (any SyncV2SnapshotStateStoring)?
         let folderMigrationMarker: (any SyncV2FolderMigrationMarking)?
+        // 이관을 마친 폴더는 서버와 공유하는 UUID를 갖는다. tree_order로만 온
+        // 이름 변경을 폴더 기록에도 올려야 그 기록이 낡지 않는다.
+        let localSnapshotApplier: LocalSyncV2SnapshotApplier
         let editLeaseManager: EditLeaseManager?
         if isStoredInMemoryOnly {
             projectBindingStore = InMemoryProjectBindingStore()
@@ -190,6 +189,10 @@ final class AppEnvironment: ObservableObject {
             conflictResolutionService = nil
             snapshotStateStore = nil
             folderMigrationMarker = nil
+            localSnapshotApplier = LocalSyncV2SnapshotApplier(
+                documentRepository: repository,
+                workspaceLocator: workspaceLocator
+            )
             editLeaseManager = nil
         } else {
             let dispatchWakeup = SyncV2DispatchWakeup()
@@ -204,6 +207,14 @@ final class AppEnvironment: ObservableObject {
             conflictResolutionService = syncV2Store
             snapshotStateStore = syncV2Store
             folderMigrationMarker = syncV2Store
+            localSnapshotApplier = LocalSyncV2SnapshotApplier(
+                documentRepository: repository,
+                workspaceLocator: workspaceLocator,
+                folderIdentityPublisher:
+                    DurableSyncV2FolderIdentityPublisher(
+                        changeRecorder: syncV2Store
+                    )
+            )
             editLeaseManager = supabaseClientProvider
                 .makeEditLeaseClient()
                 .map {

@@ -725,14 +725,6 @@ extension LocalBinderCommandService {
     func folderMutations(
         for journal: BinderCommandJournal
     ) -> [DurableLocalMutation] {
-        guard folderSyncGate.isFolderSyncEnabled(for: journal.projectID)
-        else {
-            // 꺼져 있으면 기존 tree_order 동작만 남는다. Windows가 폴더 UUID를
-            // 모르는 동안 폴더 기록이 최종 권위가 되면, Windows가 바꾼 이름을
-            // 낡은 서버 행을 근거로 되돌리게 된다.
-            return []
-        }
-
         switch journal.kind {
         case .reorder:
             // 순서만 바뀐다. 이름도 부모도 그대로라 보낼 것이 없다.

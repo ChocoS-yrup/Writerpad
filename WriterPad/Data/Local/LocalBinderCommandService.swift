@@ -76,8 +76,6 @@ actor LocalBinderCommandService: BinderCommanding {
     let futureChangeNotifier: any FutureChangeNotifying
     let durableChangeRecorder: any DurableLocalChangeRecording
     let syncMutationGate: SyncV2DocumentMutationGate
-    /// 폴더 UUID 동기화를 켠 작품에서만 폴더 작업을 대기열에 넣는다.
-    let folderSyncGate: any SyncV2FolderSyncGating
     let backupStore: (any BackupStoring)?
     let backupPolicyStore: (any BackupPolicyStoring)?
     let faultPlan: BinderCommandFaultPlan?
@@ -101,8 +99,6 @@ actor LocalBinderCommandService: BinderCommanding {
             NoOpDurableLocalChangeRecorder(),
         syncMutationGate: SyncV2DocumentMutationGate =
             SyncV2DocumentMutationGate(),
-        folderSyncGate: any SyncV2FolderSyncGating =
-            StoredSyncV2FolderSyncGate(),
         backupStore: (any BackupStoring)? = nil,
         backupPolicyStore: (any BackupPolicyStoring)? = nil,
         faultPlan: BinderCommandFaultPlan? = nil
@@ -120,7 +116,6 @@ actor LocalBinderCommandService: BinderCommanding {
         self.futureChangeNotifier = futureChangeNotifier
         self.durableChangeRecorder = durableChangeRecorder
         self.syncMutationGate = syncMutationGate
-        self.folderSyncGate = folderSyncGate
         self.backupStore = backupStore
         self.backupPolicyStore = backupPolicyStore
         self.faultPlan = faultPlan

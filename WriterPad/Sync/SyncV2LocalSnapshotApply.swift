@@ -256,18 +256,22 @@ actor LocalSyncV2SnapshotApplier: SyncV2LocalSnapshotApplying {
     private let writer = POSIXAtomicFileWriter()
     private let hasher: any ContentHashing
     private let pathPolicy = PathPolicy()
+    /// tree_order로 받은 폴더 이름 변경을 폴더 기록에도 올린다.
+    private let folderIdentityPublisher: (any SyncV2FolderIdentityPublishing)?
     private var remoteLiveDocumentPaths: [ProjectID: Set<String>] = [:]
 
     init(
         documentRepository: any DocumentRepository,
         workspaceLocator: any ProjectWorkspaceLocating,
         fileManager: FileManager = .default,
-        hasher: any ContentHashing = SHA256ContentHasher()
+        hasher: any ContentHashing = SHA256ContentHasher(),
+        folderIdentityPublisher: (any SyncV2FolderIdentityPublishing)? = nil
     ) {
         self.documentRepository = documentRepository
         self.workspaceLocator = workspaceLocator
         self.fileManager = fileManager
         self.hasher = hasher
+        self.folderIdentityPublisher = folderIdentityPublisher
     }
 
     func preparePull(
@@ -1204,14 +1208,14 @@ actor LocalSyncV2SnapshotApplier: SyncV2LocalSnapshotApplying {
             let children = documents.filter {
                 $0.parentID == parent.id && isActive($0)
             }
+            // 식별자가 어떻게 만들어졌는지는 따지지 않는다. 이관을 마친 폴더는
+            // 서버와 공유하는 UUID를 갖게 되어 경로에서 계산한 값과 더는 같지
+            // 않다. 그 조건을 남겨 두면 이관한 작품에서 이름 변경 처리가 통째로
+            // 꺼져, Windows가 바꾼 이름이 새 폴더로 따로 생긴다.
             let vanished = children.filter { child in
                 child.kind == .folder
                     && !remoteKeys.contains(
                         pathPolicy.collisionKey(for: storedName(of: child))
-                    )
-                    && child.id == syncedFolderIdentifier(
-                        localProjectID: localProjectID,
-                        path: child.relativePath.rawValue
                     )
                     && !documents.contains { candidate in
                         isActive(candidate)
@@ -1268,11 +1272,10 @@ actor LocalSyncV2SnapshotApplier: SyncV2LocalSnapshotApplying {
                     withIntermediateDirectories: false
                 )
             }
+            // 식별자를 그대로 들고 옮긴다. 새로 계산하면 같은 폴더가 다른
+            // 폴더가 되어, 서버 폴더 기록과 짝이 끊기고 받는 기기에 둘로 보인다.
             let moved = DocumentNode(
-                id: syncedFolderIdentifier(
-                    localProjectID: localProjectID,
-                    path: destinationValue
-                ),
+                id: source.id,
                 projectID: source.projectID,
                 kind: .folder,
                 parentID: source.parentID,
@@ -1281,10 +1284,17 @@ actor LocalSyncV2SnapshotApplier: SyncV2LocalSnapshotApplying {
                 modifiedAt: source.modifiedAt,
                 contentHash: nil
             )
-            try await documentRepository.removeMetadata(id: source.id)
             try await documentRepository.save(moved)
             documents.removeAll { $0.id == source.id }
             documents.append(moved)
+            // tree_order로만 온 변경이라 서버 폴더 행은 아직 옛 이름이다.
+            // 올려 두지 않으면 그 낡은 행이 다음 pull에서 이 이름을 되돌린다.
+            await folderIdentityPublisher?.publishFolder(
+                localProjectID: localProjectID,
+                folderID: moved.id,
+                parentFolderID: moved.parentID,
+                name: newName
+            )
         }
         return documents
     }

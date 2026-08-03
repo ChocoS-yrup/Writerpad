@@ -152,26 +152,6 @@ final class LocalBinderFolderSyncTests: XCTestCase {
         XCTAssertEqual(restored.parentFolderID, parent.id)
     }
 
-    /// Windows가 아직 폴더 UUID를 모르는 동안 기본값은 꺼짐이어야 한다.
-    func testFolderWorkIsNotQueuedWhileTheProjectIsNotOptedIn()
-        async throws {
-        let harness = try await makeHarness(isFolderSyncEnabled: false)
-        let parent = try await fixedRoot(.notes, harness: harness)
-
-        _ = try await harness.commands.create(
-            kind: .folder,
-            named: "가 나 다",
-            in: parent.id,
-            projectID: harness.project.id
-        )
-
-        let folders = await harness.recorder.folderMutations()
-        let treeOrders = await harness.recorder.treeOrderCount()
-        XCTAssertTrue(folders.isEmpty)
-        // 기존 tree_order 동작은 그대로 남아야 한다.
-        XCTAssertEqual(treeOrders, 1)
-    }
-
     /// 같은 batch가 저널에 적혀 재시도에 그대로 다시 쓰이므로 operation_id가
     /// 유지된다. 새로 만들면 서버가 다른 작업으로 보고 폴더를 한 번 더 만든다.
     func testRetriedHandoffKeepsTheSameFolderOperationID() async throws {
@@ -217,7 +197,6 @@ final class LocalBinderFolderSyncTests: XCTestCase {
     }
 
     private func makeHarness(
-        isFolderSyncEnabled: Bool = true,
         firstRecordFails: Bool = false
     ) async throws -> Harness {
         let root = FileManager.default.temporaryDirectory
@@ -263,10 +242,7 @@ final class LocalBinderFolderSyncTests: XCTestCase {
             workspaceLocator: locator,
             pathPolicy: resolver.policy,
             clock: clock,
-            durableChangeRecorder: recorder,
-            folderSyncGate: FixedFolderSyncGate(
-                isEnabled: isFolderSyncEnabled
-            )
+            durableChangeRecorder: recorder
         )
         _ = try await binder.rootNodes(in: project.id)
         return Harness(
@@ -286,15 +262,6 @@ final class LocalBinderFolderSyncTests: XCTestCase {
     ) async throws -> BinderNode {
         let roots = try await harness.binder.rootNodes(in: harness.project.id)
         return try XCTUnwrap(roots.first { $0.fixedCategory == category })
-    }
-}
-
-private struct FixedFolderSyncGate: SyncV2FolderSyncGating {
-    let isEnabled: Bool
-
-    func isFolderSyncEnabled(for projectID: ProjectID) -> Bool {
-        _ = projectID
-        return isEnabled
     }
 }
 

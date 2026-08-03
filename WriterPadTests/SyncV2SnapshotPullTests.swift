@@ -1846,10 +1846,10 @@ final class SyncV2SnapshotPullTests: XCTestCase {
                 atPath: root.appendingPathComponent("메인/새 폴 더").path
             )
         )
-        XCTAssertNotEqual(
+        XCTAssertEqual(
             before.id,
             folders.first?.id,
-            "폴더 UUID는 경로에서 파생하므로 새 경로 값으로 바뀐다."
+            "같은 폴더가 옮겨진 것이므로 식별자는 그대로여야 한다. 새로 계산하면 서버 폴더 기록과 짝이 끊겨 받는 기기에 둘로 보인다."
         )
     }
 
@@ -6371,8 +6371,7 @@ final class SyncV2PullFolderWiringTests: XCTestCase {
                 changeRecorder: FolderWiringRecorderStub()
             ),
             folderMarker: marker,
-            folderDocuments: FolderWiringRepositoryStub(order: order),
-            folderSyncGate: FolderWiringGate(isEnabled: true)
+            folderDocuments: FolderWiringRepositoryStub(order: order)
         )
 
         _ = try await service.pull(
@@ -6383,44 +6382,6 @@ final class SyncV2PullFolderWiringTests: XCTestCase {
         let steps = await order.steps()
         XCTAssertEqual(steps.first, "migration")
         XCTAssertEqual(steps.last, "apply")
-    }
-
-    /// Windows가 아직 폴더 UUID를 모르는 동안 기본값은 꺼짐이어야 한다. 켜지
-    /// 않은 작품에서 폴더 기록을 앞세우면 Windows가 바꾼 이름을 낡은 서버 행을
-    /// 근거로 되돌리게 된다.
-    func testRemoteFoldersAreNotAppliedWhileTheProjectIsNotOptedIn()
-        async throws {
-        let order = FolderWiringOrderRecorder()
-        let applier = FolderWiringApplierSpy(order: order)
-        let service = SyncV2SnapshotPullService(
-            client: SnapshotClientStub(
-                snapshots: [],
-                folders: [
-                    SyncV2RemoteFolder(
-                        folderID: UUID(),
-                        parentFolderID: nil,
-                        name: "메인",
-                        revision: 1,
-                        isDeleted: false,
-                        updatedAt: Date(timeIntervalSince1970: 10)
-                    )
-                ]
-            ),
-            stateStore: SnapshotStateStoreStub(states: [:]),
-            localApplier: SnapshotApplierSpy(),
-            mergeStore: SnapshotMergeStoreSpy(),
-            folderApplier: applier,
-            folderMarker: FolderWiringMarkerStub(pendingFolderIDs: []),
-            folderSyncGate: FolderWiringGate(isEnabled: false)
-        )
-
-        _ = try await service.pull(
-            localProjectID: ProjectID(rawValue: UUID()),
-            serverProjectID: UUID()
-        )
-
-        let steps = await order.steps()
-        XCTAssertTrue(steps.isEmpty)
     }
 
     func testFolderWithUnsentWorkIsHandedToTheApplierAsBlocked()
@@ -6447,8 +6408,7 @@ final class SyncV2PullFolderWiringTests: XCTestCase {
             localApplier: SnapshotApplierSpy(),
             mergeStore: SnapshotMergeStoreSpy(),
             folderApplier: applier,
-            folderMarker: marker,
-            folderSyncGate: FolderWiringGate(isEnabled: true)
+            folderMarker: marker
         )
 
         _ = try await service.pull(
@@ -6460,15 +6420,6 @@ final class SyncV2PullFolderWiringTests: XCTestCase {
         // 값으로 덮인다.
         let blocked = await applier.blockedFolderIDs()
         XCTAssertEqual(blocked, [DocumentID(rawValue: blockedID)])
-    }
-}
-
-private struct FolderWiringGate: SyncV2FolderSyncGating {
-    let isEnabled: Bool
-
-    func isFolderSyncEnabled(for projectID: ProjectID) -> Bool {
-        _ = projectID
-        return isEnabled
     }
 }
 
@@ -6553,4 +6504,128 @@ private actor FolderWiringRecorderStub: DurableLocalChangeRecording {
     func record(_ batch: LocalMutationBatch) async -> DurableRecordResult {
         .queued(operationIDs: [])
     }
+}
+
+/// Windows는 아직 folders 표를 모르고 tree_order만 쓴다. 그쪽에서 온 이름
+/// 변경을 아이패드가 폴더 기록에도 올려 주지 않으면, 낡은 서버 행이 다음
+/// pull에서 방금 바뀐 이름을 되돌린다.
+final class SyncV2TreeOrderFolderBridgeTests: XCTestCase {
+    func testTreeOrderRenameKeepsTheFolderIdentifierAndPublishesIt()
+        async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("WriterPad-Bridge-\(UUID())")
+        defer { try? FileManager.default.removeItem(at: root) }
+        try FileManager.default.createDirectory(
+            at: root.appendingPathComponent("메인/옛 이름"),
+            withIntermediateDirectories: true
+        )
+        let projectID = ProjectID(rawValue: UUID())
+        let mainID = DocumentID(rawValue: UUID())
+        // 이관을 마친 폴더다. 식별자가 경로에서 계산한 값과 다르다.
+        let migratedID = DocumentID(rawValue: UUID())
+        let repository = SnapshotDocumentRepository(
+            documents: [
+                bridgeFolder(
+                    id: mainID,
+                    projectID: projectID,
+                    path: "메인",
+                    parent: nil
+                ),
+                bridgeFolder(
+                    id: migratedID,
+                    projectID: projectID,
+                    path: "메인/옛 이름",
+                    parent: mainID
+                ),
+            ]
+        )
+        let publisher = FolderIdentityPublisherSpy()
+        let applier = LocalSyncV2SnapshotApplier(
+            documentRepository: repository,
+            workspaceLocator: SnapshotWorkspaceLocator(root: root),
+            folderIdentityPublisher: publisher
+        )
+
+        try await applier.apply(
+            localProjectID: projectID,
+            snapshot: makeBridgeSnapshot(
+                content:
+                    "{\"tree_order\":{\"<root>\":[\"새 이름\"]},\"version\":1}"
+            )
+        )
+
+        let documents = try await repository.documents(in: projectID)
+        let folders = documents.filter {
+            $0.kind == .folder && $0.parentID == mainID
+        }
+        // 폴더가 하나만 남고, 식별자가 그대로여야 서버 폴더 기록과 짝이 이어진다.
+        XCTAssertEqual(folders.count, 1)
+        XCTAssertEqual(folders.first?.id, migratedID)
+        XCTAssertEqual(folders.first?.relativePath.rawValue, "메인/새 이름")
+
+        let published = await publisher.published()
+        XCTAssertEqual(published.count, 1)
+        XCTAssertEqual(published.first?.folderID, migratedID)
+        XCTAssertEqual(published.first?.name, "새 이름")
+        XCTAssertEqual(published.first?.parentFolderID, mainID)
+    }
+
+    private func bridgeFolder(
+        id: DocumentID,
+        projectID: ProjectID,
+        path: String,
+        parent: DocumentID?
+    ) -> DocumentNode {
+        DocumentNode(
+            id: id,
+            projectID: projectID,
+            kind: .folder,
+            parentID: parent,
+            relativePath: RelativeDocumentPath(rawValue: path),
+            userOrder: 0,
+            modifiedAt: .distantPast,
+            contentHash: nil
+        )
+    }
+
+    private func makeBridgeSnapshot(
+        content: String
+    ) -> SyncV2RemoteDocumentSnapshot {
+        SyncV2RemoteDocumentSnapshot(
+            documentID: UUID(),
+            relativePath: syncV2TreeOrderPath,
+            content: content,
+            revision: 1,
+            isDeleted: false,
+            deletedAt: nil,
+            updatedAt: Date(timeIntervalSince1970: 100)
+        )
+    }
+}
+
+private struct PublishedFolder: Equatable {
+    let folderID: DocumentID
+    let parentFolderID: DocumentID?
+    let name: String
+}
+
+private actor FolderIdentityPublisherSpy: SyncV2FolderIdentityPublishing {
+    private var recorded: [PublishedFolder] = []
+
+    func publishFolder(
+        localProjectID: ProjectID,
+        folderID: DocumentID,
+        parentFolderID: DocumentID?,
+        name: String
+    ) async {
+        recorded.append(
+            PublishedFolder(
+                folderID: folderID,
+                parentFolderID: parentFolderID,
+                name: name
+            )
+        )
+    }
+
+    func published() -> [PublishedFolder] { recorded }
 }
