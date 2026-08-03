@@ -3403,7 +3403,7 @@ final class SyncV2SnapshotPullTests: XCTestCase {
                 .invalidLocalHierarchy,
                 SyncV2WorkspaceState(
                     lastResult: .structuralConflict(
-                        detail: "서버 문서의 제목 또는 폴더 위치를 현재 로컬 바인더에 안전하게 적용할 수 없습니다. 로컬 TXT는 덮어쓰지 않았습니다."
+                        detail: "서버의 폴더나 문서 제목 중 iPad에서 쓸 수 없는 이름이 있어 구조를 적용하지 못했습니다. 이름 끝의 공백과 마침표를 지우고 < > : \" / \\ | ? * 문자를 뺀 뒤 다시 동기화해 주세요. 로컬 TXT는 덮어쓰지 않았습니다."
                     )
                 )
             ),

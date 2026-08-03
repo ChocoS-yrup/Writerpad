@@ -1336,11 +1336,24 @@ actor LocalSyncV2SnapshotApplier: SyncV2LocalSnapshotApplying {
                 do {
                     try pathPolicy.validateName(name)
                 } catch {
+                    // 어떤 이름이 왜 막혔는지 남기지 않으면 사용자는 무엇을
+                    // 고쳐야 할지 알 수 없다. 구조 동기화는 여기서 멈춘다.
+                    SyncV2Diagnostics.rejectedStructureName(
+                        name,
+                        parent: parentValue,
+                        reason: (error as? PathPolicyError)?.errorDescription
+                            ?? "\(error)"
+                    )
                     throw SyncV2LocalSnapshotApplyError.unsafePath
                 }
                 guard childKeys.insert(
                     pathPolicy.collisionKey(for: name)
                 ).inserted else {
+                    SyncV2Diagnostics.rejectedStructureName(
+                        name,
+                        parent: parentValue,
+                        reason: "정규화 후 같은 이름이 둘 이상입니다."
+                    )
                     throw SyncV2LocalSnapshotApplyError.invalidHierarchy
                 }
                 let childValue = parentValue + "/" + name

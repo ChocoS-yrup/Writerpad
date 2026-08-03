@@ -29,6 +29,19 @@ enum SyncV2Diagnostics {
         )
     }
 
+    /// 구조 동기화가 막히면 사용자에게는 "적용할 수 없습니다"만 보인다. 어떤
+    /// 이름이 왜 거부됐는지는 여기서만 알 수 있으므로 이름을 그대로 남긴다.
+    /// 폴더 이름은 작품 내용이 아니라 구조 정보다.
+    static func rejectedStructureName(
+        _ name: String,
+        parent: String,
+        reason: String
+    ) {
+        syncV2Logger.error(
+            "event=rejectedStructureName name=\(name, privacy: .public) parent=\(parent, privacy: .public) reason=\(reason, privacy: .public)"
+        )
+    }
+
     static func task(
         scope: String,
         localProjectID: ProjectID? = nil,
