@@ -118,6 +118,15 @@ enum DurableLocalMutation: Codable, Equatable, Sendable {
         content: String,
         generation: UUID
     )
+    /// 폴더 자체를 서버에 알린다. 문서와 달리 본문도 경로도 없고, 위치는
+    /// parentFolderID 사슬로만 나타낸다. 최상위 폴더는 nil이다.
+    case folderSnapshot(
+        operationID: UUID,
+        folderID: DocumentID,
+        parentFolderID: DocumentID?,
+        name: String,
+        isDeleted: Bool
+    )
 }
 
 enum DurableRecordResult: Equatable, Sendable {

@@ -743,9 +743,10 @@ actor SyncV2Store:
     SyncV2DispatchStoring,
     SyncV2ConflictResolving,
     SyncV2DocumentRevisionProviding,
+    SyncV2FolderMigrationMarking,
     SyncV2SnapshotStateStoring {
-    static let currentSchemaVersion = 3
-    static let migrationName = "SyncV2StoreSchemaV3"
+    static let currentSchemaVersion = 4
+    static let migrationName = "SyncV2StoreSchemaV4"
     static let maximumContentByteCount = 10 * 1_024 * 1_024
     static let contentTooLargeErrorCode = "CONTENT_TOO_LARGE"
 
@@ -1253,6 +1254,67 @@ actor SyncV2Store:
             throw ProjectBindingStoreError.invalidBinding
         } catch {
             throw ProjectBindingStoreError.unavailable
+        }
+    }
+
+    /// 폴더 UUID 이관이 이 작품에서 이미 끝났는지 본다.
+    ///
+    /// 경로로는 판단할 수 없다. 이관된 폴더의 이름이 바뀌면 경로와 UUID가
+    /// 어긋나므로 다시 계산하면 같은 폴더를 또 이관하게 된다.
+    func isFolderMigrationCompleted(
+        localProjectID: ProjectID
+    ) throws -> Bool {
+        guard availability() == .available else {
+            throw SyncV2StoreError.invalidStoredData
+        }
+        return try withStatement(
+            """
+            SELECT folder_migration_completed_at IS NOT NULL
+            FROM sync_projects
+            WHERE local_project_id = ?
+            LIMIT 1;
+            """
+        ) { statement in
+            try bind(
+                localProjectID.rawValue.uuidString.lowercased(),
+                at: 1,
+                to: statement
+            )
+            let status = sqlite3_step(statement)
+            if status == SQLITE_DONE {
+                return false
+            }
+            guard status == SQLITE_ROW else {
+                throw SyncV2StoreError.invalidStoredData
+            }
+            return sqlite3_column_int(statement, 0) == 1
+        }
+    }
+
+    func markFolderMigrationCompleted(
+        localProjectID: ProjectID
+    ) throws {
+        guard availability() == .available else {
+            throw SyncV2StoreError.invalidStoredData
+        }
+        let timestamp = Self.timestamp()
+        try withStatement(
+            """
+            UPDATE sync_projects
+            SET folder_migration_completed_at = ?,
+                updated_at = ?
+            WHERE local_project_id = ?
+              AND folder_migration_completed_at IS NULL;
+            """
+        ) { statement in
+            try bind(timestamp, at: 1, to: statement)
+            try bind(timestamp, at: 2, to: statement)
+            try bind(
+                localProjectID.rawValue.uuidString.lowercased(),
+                at: 3,
+                to: statement
+            )
+            try stepDone(statement)
         }
     }
 
@@ -6243,6 +6305,7 @@ actor LazySyncV2ProjectBindingStore:
     SyncV2DispatchStoring,
     SyncV2ConflictResolving,
     SyncV2DocumentRevisionProviding,
+    SyncV2FolderMigrationMarking,
     SyncV2SnapshotStateStoring {
     private let databaseURL: URL?
     private let deviceIdentityProvider: (any DeviceIdentityProviding)?
@@ -6455,6 +6518,25 @@ actor LazySyncV2ProjectBindingStore:
                         )
                     )
                 )
+            case let .folderSnapshot(
+                operationID,
+                folderID,
+                parentFolderID,
+                name,
+                isDeleted
+            ):
+                syncMutations.append(
+                    .folder(
+                        SyncV2FolderMutation(
+                            operationID: operationID,
+                            folderID: folderID.rawValue,
+                            parentFolderID: parentFolderID?.rawValue,
+                            deviceID: deviceID,
+                            name: name,
+                            isDeleted: isDeleted
+                        )
+                    )
+                )
             }
         }
 
@@ -6636,6 +6718,30 @@ actor LazySyncV2ProjectBindingStore:
             operation,
             errorCode: errorCode,
             detail: detail
+        )
+    }
+
+    /// 저장소를 열 수 없으면 이관이 끝난 것으로 보지 않는다. 표식을 확인하지
+    /// 못한 채 끝났다고 하면 이관 자체를 건너뛰게 된다.
+    func isFolderMigrationCompleted(
+        localProjectID: ProjectID
+    ) async throws -> Bool {
+        guard let store = await resolvedStore() else {
+            throw SyncV2StoreError.invalidStoredData
+        }
+        return try await store.isFolderMigrationCompleted(
+            localProjectID: localProjectID
+        )
+    }
+
+    func markFolderMigrationCompleted(
+        localProjectID: ProjectID
+    ) async throws {
+        guard let store = await resolvedStore() else {
+            throw SyncV2StoreError.invalidStoredData
+        }
+        try await store.markFolderMigrationCompleted(
+            localProjectID: localProjectID
         )
     }
 

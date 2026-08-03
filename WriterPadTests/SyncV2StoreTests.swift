@@ -3952,12 +3952,14 @@ final class SyncV2StoreTests: XCTestCase {
         await store.close()
 
         // 폴더 표가 생기기 전 설치를 흉내 낸다. 미전송 저장이 그대로 있는
-        // 상태에서 스키마만 뒤로 돌린다.
+        // 상태에서 V3 이후가 더한 것을 모두 걷어내고 버전만 뒤로 돌린다.
         let downgrade = try RawSQLite(url: url)
         try downgrade.execute(
             """
             DROP TABLE sync_folders;
-            DELETE FROM schema_migrations WHERE version = 3;
+            ALTER TABLE sync_projects
+                DROP COLUMN folder_migration_completed_at;
+            DELETE FROM schema_migrations WHERE version >= 3;
             PRAGMA user_version = 2;
             """
         )

@@ -47,19 +47,30 @@ enum SyncV2FolderIdentity {
     ///
     /// 고정 루트도 실제 저장 경로 이름으로 계산해 안정적인 값을 갖는다.
     /// 휴지통 안의 폴더는 되살아날 때 원래 경로로 돌아가므로 함께 이관한다.
+    ///
+    /// 서버에 이미 같은 경로의 폴더가 있으면 계산값 대신 그 UUID를 쓴다. 먼저
+    /// 이관한 기기가 정한 값이 있는데 각자 계산한 값을 고집하면, 같은 폴더가
+    /// 기기마다 다른 식별자를 갖게 된다.
     static func migrationPlan(
         documents: [DocumentNode],
-        serverProjectID: UUID
+        serverProjectID: UUID,
+        serverFolderIDsByPath: [String: DocumentID] = [:]
     ) -> MigrationPlan {
+        let serverIDs = Dictionary(
+            serverFolderIDsByPath.map { (canonicalPath($0.key), $0.value) },
+            uniquingKeysWith: { first, _ in first }
+        )
         let folders = documents.filter { $0.kind == .folder }
         var replacements: [DocumentID: DocumentID] = [:]
         for folder in folders {
-            let derivedID = derived(
+            let targetID = serverIDs[
+                canonicalPath(folder.relativePath.rawValue)
+            ] ?? derived(
                 serverProjectID: serverProjectID,
                 relativePath: folder.relativePath.rawValue
             )
-            guard derivedID != folder.id else { continue }
-            replacements[folder.id] = derivedID
+            guard targetID != folder.id else { continue }
+            replacements[folder.id] = targetID
         }
         guard !replacements.isEmpty else {
             return MigrationPlan(upserts: [], removedFolderIDs: [])
