@@ -1853,6 +1853,68 @@ final class SyncV2SnapshotPullTests: XCTestCase {
         )
     }
 
+    /// iPad 경로 정책은 공백이나 마침표로 끝나는 이름을 거부한다. Windows가 그런
+    /// 이름을 보내도 그 폴더 하나만 보류되어야 하고 pull 전체가 죽으면 안 된다.
+    /// pull은 SyncV2LocalSnapshotApplyError만 보류로 바꾸므로, 다른 오류가 새면
+    /// 원고를 포함한 모든 동기화가 멈춘다.
+    func testTreeOrderRejectsUnsafeFolderNameAsApplyErrorNotRawPolicyError()
+        async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("WriterPad-TreeOrder-\(UUID())")
+        defer { try? FileManager.default.removeItem(at: root) }
+        try FileManager.default.createDirectory(
+            at: root.appendingPathComponent("메인"),
+            withIntermediateDirectories: true
+        )
+        let projectID = ProjectID(rawValue: UUID())
+        let main = DocumentNode(
+            id: DocumentID(rawValue: UUID()),
+            projectID: projectID,
+            kind: .folder,
+            parentID: nil,
+            relativePath: RelativeDocumentPath(rawValue: "메인"),
+            userOrder: -1,
+            modifiedAt: .distantPast,
+            contentHash: nil
+        )
+        let repository = SnapshotDocumentRepository(documents: [main])
+        let applier = LocalSyncV2SnapshotApplier(
+            documentRepository: repository,
+            workspaceLocator: SnapshotWorkspaceLocator(root: root)
+        )
+        try await applier.apply(
+            localProjectID: projectID,
+            snapshot: makeSnapshot(
+                path: syncV2TreeOrderPath,
+                content:
+                    "{\"tree_order\":{\"<root>\":[\"가 나 다\"]},\"version\":1}",
+                revision: 1
+            )
+        )
+
+        do {
+            try await applier.apply(
+                localProjectID: projectID,
+                snapshot: makeSnapshot(
+                    path: syncV2TreeOrderPath,
+                    content:
+                        "{\"tree_order\":{\"<root>\":[\"가 나 다 라 \"]},\"version\":1}",
+                    revision: 2
+                )
+            )
+            XCTFail("공백으로 끝나는 이름은 거부되어야 한다.")
+        } catch let error as SyncV2LocalSnapshotApplyError {
+            XCTAssertEqual(error, .unsafePath)
+        } catch {
+            XCTFail(
+                """
+                pull이 보류로 바꿀 수 있는 오류여야 한다. \
+                실제로 나온 오류: \(error)
+                """
+            )
+        }
+    }
+
     /// 이름이 여럿 바뀌면 어느 것이 어느 것인지 짝지을 수 없다. 이때는 지금처럼
     /// 새 이름만 만들고 옛 폴더는 그대로 둔다. 잘못 옮기는 것보다 낫다.
     func testTreeOrderKeepsBothWhenRenamePairingIsAmbiguous() async throws {

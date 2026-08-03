@@ -1237,7 +1237,17 @@ actor LocalSyncV2SnapshotApplier: SyncV2LocalSnapshotApplying {
             let destinationPath = RelativeDocumentPath(
                 rawValue: destinationValue
             )
-            try pathPolicy.validateRelativePath(destinationPath)
+            // iPad 경로 정책이 거부하는 이름이면 옮기지 않고 넘어간다. 여기서
+            // PathPolicyError를 그대로 던지면 pull이 잡는 오류 종류가 아니어서
+            // 그 폴더 하나가 아니라 동기화 전체가 멈춘다. 이름 검증은 뒤이은
+            // planTreeOrderFolders가 unsafePath로 보고하고, pull은 그 문서만
+            // 보류로 돌린다.
+            do {
+                try pathPolicy.validateName(newName)
+                try pathPolicy.validateRelativePath(destinationPath)
+            } catch {
+                continue
+            }
             let sourceURL = root.appendingPathComponent(
                 source.relativePath.rawValue
             ).standardizedFileURL
