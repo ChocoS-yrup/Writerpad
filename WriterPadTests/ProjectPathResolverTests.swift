@@ -80,6 +80,66 @@ final class ProjectPathResolverTests: XCTestCase {
         }
     }
 
+    /// Windows 탐색기는 이름 끝 공백을 조용히 잘라낸다. 앱이 그대로 두면 두
+    /// 기기의 이름이 갈라지고, 실기기에서는 서버에 끝 공백 이름이 박혀 구조
+    /// 동기화가 멈추기까지 했다. 저장 전에 잘라내야 한다.
+    func testSanitizedNameTrimsTrailingSpacesAndNormalizesToNFC() throws {
+        let policy = PathPolicy()
+
+        XCTAssertEqual(try policy.sanitizedName("가 나 다 라 "), "가 나 다 라")
+        XCTAssertEqual(try policy.sanitizedName("메모   "), "메모")
+
+        let decomposed = "가나다".decomposedStringWithCanonicalMapping
+        let sanitized = try policy.sanitizedName(decomposed)
+        XCTAssertTrue(
+            sanitized.utf8.elementsEqual("가나다".utf8),
+            "NFC로 맞춰야 Windows가 보내는 이름과 바이트가 같아진다."
+        )
+    }
+
+    func testSanitizedNameRejectsUnsupportedNames() throws {
+        let policy = PathPolicy()
+
+        XCTAssertThrowsError(try policy.sanitizedName("   ")) { error in
+            XCTAssertEqual(error as? PathPolicyError, .emptyName)
+        }
+        XCTAssertThrowsError(try policy.sanitizedName("메모.")) { error in
+            XCTAssertEqual(
+                error as? PathPolicyError,
+                .trailingSpaceOrPeriod
+            )
+        }
+        for name in ["CON", "PRN", "AUX", "NUL", "CLOCK$", "COM1", "LPT9"] {
+            XCTAssertThrowsError(
+                try policy.sanitizedName(name),
+                "Windows 예약 이름 \(name)은 거부해야 한다."
+            )
+        }
+        for character in ["<", ">", ":", "\"", "/", "\\", "|", "?", "*"] {
+            XCTAssertThrowsError(
+                try policy.sanitizedName("메모\(character)"),
+                "금지 문자 \(character)는 거부해야 한다."
+            )
+        }
+    }
+
+    /// 확장자 앞에 공백이 남으면 `이름 .txt`가 되어 Windows와 갈라진다.
+    func testTextFileNameTrimsBeforeAppendingExtension() throws {
+        let policy = PathPolicy()
+
+        XCTAssertEqual(
+            try policy.textFileName(forDisplayName: "첫 화 "),
+            "첫 화.txt"
+        )
+        XCTAssertEqual(
+            try policy.textFileName(forDisplayName: "첫 화 .txt"),
+            "첫 화.txt"
+        )
+        XCTAssertThrowsError(
+            try policy.textFileName(forDisplayName: "   ")
+        )
+    }
+
     func testStandardizedPathCannotEscapeWorkspaceRoot() throws {
         try withTemporaryDirectory { root in
             let resolver = ProjectPathResolver(projectsRootURL: root)

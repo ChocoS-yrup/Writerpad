@@ -429,10 +429,19 @@ final class BinderViewModel: ObservableObject {
         }
     }
 
+    /// 이름 자체가 정책에 맞지 않아 거부된 경우다. 이때는 파일 시스템도 서버도
+    /// 건드리지 않았고 바인더에는 이전 이름이 그대로 남아 있다. 사유가 여러
+    /// 가지라 한 문장으로 묶어 보여준다. 표시 후 2초 뒤 자동으로 사라진다.
+    static let unsupportedNameMessage = "지원하지 않는 파일명 입니다."
+
     private func simplifiedCollisionMessage(
         for error: Error,
         kind: DocumentKind?
     ) -> String {
+        if let policyError = error as? PathPolicyError,
+           Self.isUnsupportedName(policyError) {
+            return Self.unsupportedNameMessage
+        }
         let message = error.localizedDescription
         let isNameCollision = message.contains("같은 이름")
             || message.contains("동일한 이름")
@@ -441,6 +450,20 @@ final class BinderViewModel: ObservableObject {
         return kind == .folder
             ? "같은 이름의 폴더가 존재합니다."
             : "같은 이름의 파일이 존재합니다."
+    }
+
+    /// 같은 이름 충돌은 사용자가 다른 이름을 고르면 되는 별개 사유라 제외한다.
+    /// 경로 길이·루트 이탈처럼 이름 입력과 무관한 것도 원래 문구를 유지한다.
+    private static func isUnsupportedName(_ error: PathPolicyError) -> Bool {
+        switch error {
+        case .emptyName, .forbiddenCharacter, .controlCharacter,
+             .trailingSpaceOrPeriod, .dotPathSegment,
+             .reservedWindowsName, .nameTooLong:
+            return true
+        case .relativePathTooLong, .absolutePath, .pathEscapesRoot,
+             .nameCollision:
+            return false
+        }
     }
 
     private func updateExpansion(id: DocumentID, isExpanded: Bool) {

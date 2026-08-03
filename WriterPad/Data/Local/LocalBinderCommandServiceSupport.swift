@@ -1144,8 +1144,9 @@ extension LocalBinderCommandService {
         if kind == .text {
             return try pathPolicy.textFileName(forDisplayName: displayName)
         }
-        try pathPolicy.validateName(displayName)
-        return displayName
+        // 폴더 이름도 파일과 같은 관문을 지난다. 정리에 실패하면 던져서
+        // 파일 시스템과 서버를 건드리지 않는다.
+        return try pathPolicy.sanitizedName(displayName)
     }
 
     func safeAlternativeName(

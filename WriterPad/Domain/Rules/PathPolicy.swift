@@ -56,6 +56,23 @@ struct PathPolicy: Sendable {
         self.limits = limits
     }
 
+    /// 저장·동기화 전에 이름을 확정한다. 끝 공백은 Windows 탐색기가 조용히
+    /// 잘라내는 반면 앱이 그대로 두면 두 기기의 이름이 갈라지므로 여기서
+    /// 없앤다. NFC로 맞추는 것도 같은 이유다. 잘라낸 뒤 남는 이름이 정책을
+    /// 통과하지 못하면 그대로 던져서 파일 시스템과 서버를 건드리지 않는다.
+    func sanitizedName(_ raw: String) throws -> String {
+        let normalized = raw.precomposedStringWithCanonicalMapping
+        var trimmed = normalized
+        while let last = trimmed.last, last.isWhitespace {
+            trimmed.removeLast()
+        }
+        guard !trimmed.isEmpty else {
+            throw PathPolicyError.emptyName
+        }
+        try validateName(trimmed)
+        return trimmed
+    }
+
     /// 프로젝트명, 폴더명 또는 파일명 한 구성 요소를 검사한다.
     func validateName(_ name: String) throws {
         guard !name.isEmpty else {
@@ -152,16 +169,24 @@ struct PathPolicy: Sendable {
 
     /// 화면 이름을 실제 UTF-8 TXT 파일명으로 바꾼다.
     func textFileName(forDisplayName displayName: String) throws -> String {
+        // 확장자를 붙이기 전에 정리한다. `이름 .txt`처럼 확장자 앞에 공백이
+        // 남으면 Windows와 이름이 갈라진다.
+        let normalized = displayName.precomposedStringWithCanonicalMapping
         let baseName: String
-        if displayName.lowercased(with: Locale(identifier: "en_US_POSIX")).hasSuffix(".txt") {
-            baseName = String(displayName.dropLast(4))
+        if normalized.lowercased(with: Locale(identifier: "en_US_POSIX"))
+            .hasSuffix(".txt") {
+            baseName = String(normalized.dropLast(4))
         } else {
-            baseName = displayName
+            baseName = normalized
         }
-        guard !baseName.isEmpty else {
+        var trimmed = baseName
+        while let last = trimmed.last, last.isWhitespace {
+            trimmed.removeLast()
+        }
+        guard !trimmed.isEmpty else {
             throw PathPolicyError.emptyName
         }
-        let storedName = baseName + ".txt"
+        let storedName = trimmed + ".txt"
         try validateName(storedName)
         return storedName
     }
@@ -188,7 +213,7 @@ struct PathPolicy: Sendable {
     }
 
     private static let reservedWindowsNames: Set<String> = {
-        var names: Set<String> = ["CON", "PRN", "AUX", "NUL"]
+        var names: Set<String> = ["CON", "PRN", "AUX", "NUL", "CLOCK$"]
         for number in 1...9 {
             names.insert("COM\(number)")
             names.insert("LPT\(number)")

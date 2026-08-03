@@ -35,6 +35,85 @@ final class LocalBinderCommandServiceTests: XCTestCase {
         XCTAssertEqual(storedText?.parentID, folderResult.affectedDocumentID)
     }
 
+    /// Windows 탐색기는 끝 공백을 조용히 잘라내므로 앱이 그대로 두면 두 기기의
+    /// 이름이 갈라진다. 실기기에서는 서버에 끝 공백 이름이 박혀 구조 동기화가
+    /// 멈추기까지 했다. 디스크와 메타데이터 모두 잘라낸 이름으로 남아야 한다.
+    func testTrailingSpaceIsTrimmedBeforeDiskAndMetadata() async throws {
+        let harness = try await makeHarness()
+        let notes = try await fixedRoot(.notes, harness: harness)
+
+        let folder = try await harness.commands.create(
+            kind: .folder,
+            named: "가 나 다 라 ",
+            in: notes.id,
+            projectID: harness.project.id
+        )
+
+        XCTAssertEqual(
+            folder.relativePath.rawValue,
+            "메인/메모장/가 나 다 라"
+        )
+        XCTAssertTrue(
+            fileExists("메인/메모장/가 나 다 라", harness: harness)
+        )
+        XCTAssertFalse(
+            fileExists("메인/메모장/가 나 다 라 ", harness: harness)
+        )
+
+        let renamed = try await harness.commands.rename(
+            documentID: folder.affectedDocumentID,
+            to: "가 나 다 마  ",
+            projectID: harness.project.id
+        )
+
+        XCTAssertEqual(
+            renamed.relativePath.rawValue,
+            "메인/메모장/가 나 다 마"
+        )
+        XCTAssertEqual(
+            renamed.affectedDocumentID,
+            folder.affectedDocumentID,
+            "이름을 바꿔도 폴더 식별자는 그대로여야 한다."
+        )
+    }
+
+    /// 지원하지 않는 이름이면 파일 시스템도 메타데이터도 건드리지 않아야 한다.
+    func testUnsupportedNameChangesNeitherDiskNorMetadata() async throws {
+        let harness = try await makeHarness()
+        let notes = try await fixedRoot(.notes, harness: harness)
+        let folder = try await harness.commands.create(
+            kind: .folder,
+            named: "원래이름",
+            in: notes.id,
+            projectID: harness.project.id
+        )
+
+        for rejected in ["   ", "메모.", "CON", "CLOCK$", "메모?", "메모|"] {
+            await XCTAssertThrowsErrorAsync {
+                _ = try await harness.commands.rename(
+                    documentID: folder.affectedDocumentID,
+                    to: rejected,
+                    projectID: harness.project.id
+                )
+            }
+        }
+
+        let stored = try await harness.repository.document(
+            id: folder.affectedDocumentID
+        )
+        XCTAssertEqual(stored?.relativePath.rawValue, "메인/메모장/원래이름")
+        XCTAssertTrue(fileExists("메인/메모장/원래이름", harness: harness))
+    }
+
+    /// 화면에는 사유별 문구 대신 한 문장으로 보여준다. 표시 후 2초 뒤 자동으로
+    /// 사라지는 것은 BinderPanel의 기존 처리와 같다.
+    func testUnsupportedNameUsesSingleUserFacingMessage() {
+        XCTAssertEqual(
+            BinderViewModel.unsupportedNameMessage,
+            "지원하지 않는 파일명 입니다."
+        )
+    }
+
     func testCreateAutomaticallyNumbersDuplicateTextAndFolderNames() async throws {
         let harness = try await makeHarness()
         let notes = try await fixedRoot(.notes, harness: harness)
