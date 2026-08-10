@@ -21,6 +21,8 @@ git switch -c codex/ipad-<주제> origin/main
 ```
 
 Windows에서도 Git Bash, PowerShell, 터미널에서 같은 Git 명령을 사용할 수 있다.
+Python 실행 명령은 플랫폼별로 다를 수 있으므로 Windows에서는 `py -3.12` 또는
+`python`을 사용하고, Microsoft Store alias일 수 있는 `python3`에 의존하지 않는다.
 
 ## 2. 단계별 완료 조건
 
@@ -77,7 +79,25 @@ git fetch origin
 git show --stat <commit_sha>
 git diff <base_main_sha>..<commit_sha> --
 git switch --detach <commit_sha>
-python3 sync-contract/scripts/verify_contract.py
+git rev-parse HEAD
+```
+
+Windows PowerShell에서는 저장소 밖의 임시 가상환경으로 다음과 같이 검증한다.
+
+```powershell
+$contractEnv = Join-Path $env:TEMP "writerpad-contract-review"
+py -3.12 -m venv $contractEnv
+& "$contractEnv\Scripts\python.exe" -m pip install -r sync-contract\requirements-validation.txt
+& "$contractEnv\Scripts\python.exe" sync-contract\scripts\verify_contract.py
+```
+
+macOS/Linux에서는 다음과 같이 실행한다.
+
+```bash
+contract_env="${TMPDIR:-/tmp}/writerpad-contract-review"
+python3 -m venv "$contract_env"
+"$contract_env/bin/python" -m pip install -r sync-contract/requirements-validation.txt
+"$contract_env/bin/python" sync-contract/scripts/verify_contract.py
 ```
 
 검토자는 다음을 확인한다.
@@ -91,6 +111,15 @@ python3 sync-contract/scripts/verify_contract.py
 
 검토가 끝난 뒤 원래 작업 브랜치로 돌아간다. detached HEAD에서 구현 커밋을 만들지
 않는다.
+
+GitHub Actions는 모든 PR에서 다음 검증을 서로 다른 check로 실행한다.
+
+- PR head의 정확한 SHA: Ubuntu와 Windows에서 각각 검증
+- `main`과 PR head의 합성 merge SHA: Ubuntu에서 통합 검증
+
+각 check는 예상 SHA와 실제 `git rev-parse HEAD`를 로그에 남기고 다르면 실패한다.
+따라서 merge-result 성공을 exact-head 검토로 대신하거나 그 반대로 대신하지 않는다.
+Windows/iPad 코드만 바뀐 Sync PR도 공통 계약 검증을 생략하지 않는다.
 
 ## 5. 계약 변경 규칙
 

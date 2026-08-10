@@ -25,7 +25,9 @@
 
 - Commands:
 - Results:
-- Contract verifier passed: `yes | no | not-applicable`
+- Contract verifier passed: `yes | no` for every Sync PR; `not-applicable` only for an unrelated non-Sync PR
+- Exact-head CI result (Ubuntu / Windows):
+- PR merge-result CI result:
 - Relevant test vectors:
 
 ## Cross-platform handoff
@@ -39,6 +41,7 @@
 
 - [ ] This PR contains no unrelated local changes.
 - [ ] Shared tests use the exact commits listed above.
+- [ ] Every Sync PR reports `Contract verifier passed: yes`; `not-applicable` is used only for an unrelated non-Sync PR.
 - [ ] Contract changes include schemas, vectors, lock digest, and changelog updates.
 - [ ] Incident evidence and implementation changes are not mixed.
 - [ ] No user document, credential, token, or raw private database is committed.

@@ -80,6 +80,11 @@ def main() -> None:
         validate_instance(vector, schemas["transition-vector.schema.json"], str(path.name))
         if not isinstance(vector, dict) or not isinstance(vector.get("vector_id"), str):
             raise SystemExit(f"{path.name}: missing vector_id")
+        if vector.get("contract_version") != protocol["contract_version"]:
+            raise SystemExit(
+                f"{path.name}: contract_version differs from protocol.json: "
+                f"expected {protocol['contract_version']}, got {vector.get('contract_version')}"
+            )
         if vector["vector_id"] in vector_ids:
             raise SystemExit(f"duplicate vector_id: {vector['vector_id']}")
         vector_ids.add(vector["vector_id"])

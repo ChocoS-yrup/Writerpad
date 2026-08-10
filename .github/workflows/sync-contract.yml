@@ -1,10 +1,9 @@
 name: Validate Sync Contract
 
 on:
+  # Every pull request, including Windows/iPad implementation-only changes,
+  # must prove that it still consumes a valid shared contract.
   pull_request:
-    paths:
-      - "sync-contract/**"
-      - ".github/workflows/sync-contract.yml"
   push:
     branches:
       - main
@@ -17,17 +16,66 @@ permissions:
   contents: read
 
 jobs:
-  validate:
-    runs-on: ubuntu-latest
+  validate-head:
+    name: Validate exact head (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - ubuntu-latest
+          - windows-latest
+    runs-on: ${{ matrix.os }}
+    env:
+      EXPECTED_CHECKOUT_SHA: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
     steps:
-      - name: Check out exact commit
-        uses: actions/checkout@v4
+      - name: Check out exact head commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ env.EXPECTED_CHECKOUT_SHA }}
+          persist-credentials: false
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: "3.12"
           cache: pip
           cache-dependency-path: sync-contract/requirements-validation.txt
+      - name: Confirm exact checkout SHA
+        run: >-
+          python -c "import os, subprocess;
+          actual = subprocess.check_output(['git', 'rev-parse', 'HEAD'], text=True).strip();
+          expected = os.environ['EXPECTED_CHECKOUT_SHA'];
+          print(f'Expected HEAD: {expected}'); print(f'Actual HEAD:   {actual}');
+          raise SystemExit(0 if actual == expected else 1)"
+      - name: Install pinned validator dependencies
+        run: python -m pip install -r sync-contract/requirements-validation.txt
+      - name: Validate schemas, vectors, and canonical digest
+        run: python sync-contract/scripts/verify_contract.py
+
+  validate-pr-merge:
+    name: Validate PR merge result (ubuntu-latest)
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    env:
+      EXPECTED_CHECKOUT_SHA: ${{ github.sha }}
+    steps:
+      - name: Check out synthetic PR merge commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ env.EXPECTED_CHECKOUT_SHA }}
+          persist-credentials: false
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: sync-contract/requirements-validation.txt
+      - name: Confirm merge checkout SHA
+        run: >-
+          python -c "import os, subprocess;
+          actual = subprocess.check_output(['git', 'rev-parse', 'HEAD'], text=True).strip();
+          expected = os.environ['EXPECTED_CHECKOUT_SHA'];
+          print(f'Expected HEAD: {expected}'); print(f'Actual HEAD:   {actual}');
+          raise SystemExit(0 if actual == expected else 1)"
       - name: Install pinned validator dependencies
         run: python -m pip install -r sync-contract/requirements-validation.txt
       - name: Validate schemas, vectors, and canonical digest
