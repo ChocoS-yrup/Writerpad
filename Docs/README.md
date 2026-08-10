@@ -41,6 +41,7 @@
 
 ## 문서 목록
 
+- `CrossPlatformSyncGitWorkflow.md`: Windows–iPad 단계별 커밋·인계·검토·병합 규칙
 - `RequirementsTraceability.md`: 요구사항과 단계·검증 연결
 - `Architecture.md`: 목표 아키텍처와 데이터 흐름
 - `ModuleDependencies.md`: 모듈 의존 규칙

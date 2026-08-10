@@ -7,9 +7,10 @@ client implementation code.
 
 The draft was created in the iPad repository because it contains
 `Docs/SyncV2Contract.md`. The Windows evidence commit
-`77c57b8d39ce726f6aad0a565a0397b7a5a98fc3` is not present in this local Git
-object database, so this directory is treated as an independent package draft.
-No remote repository or package release was created.
+`77c57b8d39ce726f6aad0a565a0397b7a5a98fc3` was not present in the iPad Git
+object database when this package was authored, so this directory remains an
+implementation-independent package. It is now published in the shared
+WriterPad repository; it is not yet a deployed or server-allowlisted release.
 
 ## Status
 
@@ -35,6 +36,9 @@ in the server allowlist.
 | `snapshot.schema.json` | Server snapshot interchange format |
 | `transition-vector.schema.json` | State transition and fault-injection vector format |
 | `test_vectors/*.json` | Ten minimum cross-client transition vectors |
+| `contract-lock.json` | Expected contract version, canonical byte length, and digest |
+| `scripts/verify_contract.py` | Shared schema, vector, and RFC 8785 digest verifier |
+| `requirements-validation.txt` | Pinned verifier dependencies for local use and CI |
 | `CHANGELOG.md` | Contract-only change history |
 
 ## Authority and compatibility
@@ -78,8 +82,26 @@ contract_git_commit
 canonical_contract_sha256
 ```
 
-This uncommitted package draft has no `contract_git_commit` yet. A release
-process must set it to the commit containing the exact validated package.
+The baseline package commit is
+`fb882d7312f803266a18ea9c07a226f23c1a88a5`. Implementations must still pin
+the exact commit they consumed because later commits may change the package.
+
+## Reproducible validation
+
+From the repository root, install the pinned validation dependencies in an
+isolated Python environment and run:
+
+```text
+python sync-contract/scripts/verify_contract.py
+```
+
+GitHub Actions runs the same command whenever contract files change. The
+validator checks all Draft 2020-12 schemas, validates the protocol and ten
+required vectors, canonicalizes `protocol.json` with RFC 8785, and compares
+the byte length and SHA-256 with `contract-lock.json`.
+
+The repository handoff and branch policy is documented in
+`Docs/CrossPlatformSyncGitWorkflow.md`.
 
 ## Test vectors
 

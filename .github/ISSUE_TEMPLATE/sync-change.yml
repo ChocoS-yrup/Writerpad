@@ -1,0 +1,66 @@
+name: Sync contract or implementation stage
+description: Track one bounded contract, iPad, Windows, or server stage.
+title: "[Sync stage] "
+labels:
+  - sync-change
+body:
+  - type: dropdown
+    id: platform
+    attributes:
+      label: Responsible area
+      options:
+        - contract
+        - iPad
+        - Windows
+        - server
+        - evidence normalization
+    validations:
+      required: true
+  - type: input
+    id: stage_id
+    attributes:
+      label: Stage ID
+    validations:
+      required: true
+  - type: input
+    id: base_main_sha
+    attributes:
+      label: Base main SHA
+    validations:
+      required: true
+  - type: input
+    id: contract_identity
+    attributes:
+      label: Contract version, commit, and canonical SHA-256
+    validations:
+      required: true
+  - type: textarea
+    id: allowed_scope
+    attributes:
+      label: Allowed files and behavior
+    validations:
+      required: true
+  - type: textarea
+    id: forbidden_scope
+    attributes:
+      label: Explicitly forbidden or deferred work
+    validations:
+      required: true
+  - type: textarea
+    id: completion
+    attributes:
+      label: Completion checks
+    validations:
+      required: true
+  - type: dropdown
+    id: counterpart
+    attributes:
+      label: Counterpart reviewer
+      options:
+        - iPad
+        - Windows
+        - server
+        - contract
+        - none
+    validations:
+      required: true
