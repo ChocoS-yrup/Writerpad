@@ -1,0 +1,9 @@
+{
+  "contract_version": "0.1.0-draft.1",
+  "protocol_path": "protocol.json",
+  "canonicalization": "RFC 8785",
+  "digest_algorithm": "SHA-256",
+  "canonical_byte_length": 11640,
+  "canonical_contract_sha256": "d64bccd8ecbd2566a5d0bb9cec74fc2866cafd0cc7b8ebeea68e16be8bc8872e",
+  "baseline_contract_git_commit": "fb882d7312f803266a18ea9c07a226f23c1a88a5"
+}

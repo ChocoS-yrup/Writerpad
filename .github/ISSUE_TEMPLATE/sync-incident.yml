@@ -1,0 +1,76 @@
+name: Sync incident
+description: Preserve and classify one cross-platform synchronization incident.
+title: "[Sync incident] "
+labels:
+  - sync-incident
+body:
+  - type: markdown
+    attributes:
+      value: >-
+        Do not attach credentials, user documents, or an unredacted private database.
+        Preserve raw evidence outside this public repository and attach only approved,
+        normalized artifacts.
+  - type: input
+    id: test_run_id
+    attributes:
+      label: Test run ID
+      placeholder: 2026-08-10T050600+0900-fast-six-renames
+    validations:
+      required: true
+  - type: input
+    id: server_project_id
+    attributes:
+      label: Server project ID
+      placeholder: UUID
+    validations:
+      required: true
+  - type: input
+    id: contract_identity
+    attributes:
+      label: Contract version, commit, and canonical SHA-256
+    validations:
+      required: true
+  - type: input
+    id: ipad_identity
+    attributes:
+      label: iPad commit and build identity
+    validations:
+      required: true
+  - type: input
+    id: windows_identity
+    attributes:
+      label: Windows commit and build identity
+    validations:
+      required: true
+  - type: textarea
+    id: exact_steps
+    attributes:
+      label: Exact ordered steps and observed times
+    validations:
+      required: true
+  - type: textarea
+    id: revisions
+    attributes:
+      label: Entity IDs, base revisions, result revisions, and queue states
+    validations:
+      required: true
+  - type: textarea
+    id: evidence
+    attributes:
+      label: Evidence paths, artifact hashes, and redaction status
+    validations:
+      required: true
+  - type: textarea
+    id: classification
+    attributes:
+      label: Per-operation classification and direct evidence
+      description: Leave this empty until read-only preservation is complete.
+  - type: checkboxes
+    id: preservation
+    attributes:
+      label: Preservation
+      options:
+        - label: Original evidence is preserved read-only with SHA-256 hashes.
+          required: true
+        - label: No retry, queue mutation, or server mutation was used during preservation.
+          required: true
