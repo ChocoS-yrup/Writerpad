@@ -1,0 +1,136 @@
+{
+  "$schema": "../transition-vector.schema.json",
+  "vector_id": "TV-007",
+  "title": "Client termination and durable queue recovery",
+  "contract_version": "0.1.0-draft.1",
+  "minimum_protocol_version": 3,
+  "tags": [
+    "durability",
+    "pending-recovery",
+    "restart"
+  ],
+  "initial_server_state": {
+    "project_id": "00000000-0000-4000-8000-000000000007",
+    "project_sync_mode": "ID_BASED",
+    "migration_epoch": 2,
+    "entities": [
+      {
+        "entity_id": "30000000-0000-4000-8000-000000000007",
+        "entity_kind": "folder",
+        "revision": 1,
+        "is_deleted": false,
+        "name": "이전 이름"
+      }
+    ],
+    "tree_order": {
+      "root": [
+        "30000000-0000-4000-8000-000000000007"
+      ]
+    }
+  },
+  "initial_client_states": [
+    {
+      "client_id": "ipad-v3",
+      "platform": "ipad",
+      "protocol_version": 3,
+      "capabilities": [
+        "folders_authoritative",
+        "tree_order_ids",
+        "tombstones",
+        "immutable_batch_contract_metadata",
+        "operation_attempt_history"
+      ],
+      "local_entities": [],
+      "queue": [
+        {
+          "operation_id": "20000000-0000-4000-8000-000000000041",
+          "batch_id": "10000000-0000-4000-8000-000000000041",
+          "entity_id": "30000000-0000-4000-8000-000000000007",
+          "intent_kind": "rename",
+          "base_revision": 1,
+          "state": "pending",
+          "attempt_count": 0
+        }
+      ]
+    }
+  ],
+  "ordered_actions": [
+    {
+      "action_id": "A01",
+      "actor": "ipad-v3",
+      "kind": "commit_batch",
+      "input": {
+        "operation_id": "20000000-0000-4000-8000-000000000041"
+      },
+      "expected_outcome": "operation becomes inflight before transport completion"
+    },
+    {
+      "action_id": "A02",
+      "actor": "ipad-v3",
+      "kind": "restart_client",
+      "input": {
+        "recover_inflight": true
+      },
+      "expected_outcome": "the same immutable operation returns to pending or is replayed"
+    },
+    {
+      "action_id": "A03",
+      "actor": "ipad-v3",
+      "kind": "retry_operation",
+      "input": {
+        "operation_id": "20000000-0000-4000-8000-000000000041"
+      },
+      "expected_outcome": "rename completes without a new operation identity"
+    }
+  ],
+  "fault_injections": [
+    {
+      "after_action_id": "A01",
+      "type": "terminate_client",
+      "parameters": {
+        "phase": "after_inflight_before_local_completion"
+      }
+    }
+  ],
+  "expected_server_state": {
+    "project_sync_mode": "ID_BASED",
+    "migration_epoch": 2,
+    "entity_assertions": [
+      "folder name is 새 이름 at revision 2",
+      "at most one server version exists for the operation_id"
+    ],
+    "tree_order_assertions": [
+      "tree still references the same folder_id"
+    ]
+  },
+  "expected_client_states": [
+    {
+      "client_id": "ipad-v3",
+      "assertions": [
+        "startup recovery does not generate a replacement operation_id",
+        "the completed operation remains linked to its original batch"
+      ]
+    }
+  ],
+  "expected_queue_states": [
+    {
+      "operation_id": "20000000-0000-4000-8000-000000000041",
+      "state": "completed",
+      "attempt_count": 2,
+      "assertions": [
+        "the interrupted attempt is retained",
+        "the retry is committed or replayed"
+      ]
+    }
+  ],
+  "invariants": [
+    {
+      "id": "INV-002",
+      "assert": "restart recovery preserves idempotent identity"
+    },
+    {
+      "id": "INV-009",
+      "assert": "batch metadata is unchanged across restart"
+    }
+  ]
+}

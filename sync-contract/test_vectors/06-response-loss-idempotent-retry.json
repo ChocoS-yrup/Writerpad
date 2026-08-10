@@ -1,0 +1,121 @@
+{
+  "$schema": "../transition-vector.schema.json",
+  "vector_id": "TV-006",
+  "title": "Lost success response and idempotent retry",
+  "contract_version": "0.1.0-draft.1",
+  "minimum_protocol_version": 2,
+  "tags": [
+    "idempotency",
+    "operation-id",
+    "response-loss"
+  ],
+  "initial_server_state": {
+    "project_id": "00000000-0000-4000-8000-000000000006",
+    "project_sync_mode": "LEGACY",
+    "migration_epoch": 0,
+    "entities": [
+      {
+        "entity_id": "40000000-0000-4000-8000-000000000006",
+        "entity_kind": "document",
+        "revision": 1,
+        "is_deleted": false,
+        "content": "before"
+      }
+    ],
+    "tree_order": {}
+  },
+  "initial_client_states": [
+    {
+      "client_id": "windows-v2",
+      "platform": "windows",
+      "protocol_version": 2,
+      "capabilities": [
+        "folders_authoritative",
+        "tombstones",
+        "operation_attempt_history"
+      ],
+      "local_entities": [],
+      "queue": [
+        {
+          "operation_id": "20000000-0000-4000-8000-000000000031",
+          "batch_id": "10000000-0000-4000-8000-000000000031",
+          "entity_id": "40000000-0000-4000-8000-000000000006",
+          "intent_kind": "update",
+          "base_revision": 1,
+          "state": "pending",
+          "attempt_count": 0
+        }
+      ]
+    }
+  ],
+  "ordered_actions": [
+    {
+      "action_id": "A01",
+      "actor": "windows-v2",
+      "kind": "commit_batch",
+      "input": {
+        "operation_id": "20000000-0000-4000-8000-000000000031",
+        "content": "after"
+      },
+      "expected_outcome": "server commits revision 2 but the response does not reach the client"
+    },
+    {
+      "action_id": "A02",
+      "actor": "windows-v2",
+      "kind": "retry_operation",
+      "input": {
+        "operation_id": "20000000-0000-4000-8000-000000000031",
+        "reuse_identical_payload": true
+      },
+      "expected_outcome": "server returns replayed with the original revision 2 result"
+    }
+  ],
+  "fault_injections": [
+    {
+      "after_action_id": "A01",
+      "type": "drop_response",
+      "parameters": {
+        "preserve_server_commit": true
+      }
+    }
+  ],
+  "expected_server_state": {
+    "project_sync_mode": "LEGACY",
+    "migration_epoch": 0,
+    "entity_assertions": [
+      "document revision is 2 rather than 3",
+      "exactly one immutable version exists for the operation_id"
+    ],
+    "tree_order_assertions": []
+  },
+  "expected_client_states": [
+    {
+      "client_id": "windows-v2",
+      "assertions": [
+        "the baseline advances to revision 2",
+        "both transport_unknown and replayed attempts remain visible"
+      ]
+    }
+  ],
+  "expected_queue_states": [
+    {
+      "operation_id": "20000000-0000-4000-8000-000000000031",
+      "state": "completed",
+      "attempt_count": 2,
+      "assertions": [
+        "operation_id and payload digest are identical on retry",
+        "the second outcome is replayed"
+      ]
+    }
+  ],
+  "invariants": [
+    {
+      "id": "INV-002",
+      "assert": "an identical retry returns the original commit result"
+    },
+    {
+      "id": "INV-001",
+      "assert": "a replay does not increment revision"
+    }
+  ]
+}

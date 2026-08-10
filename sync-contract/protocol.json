@@ -1,0 +1,488 @@
+{
+  "$schema": "./protocol.schema.json",
+  "contract_version": "0.1.0-draft.1",
+  "contract_status": "draft",
+  "canonicalization": {
+    "standard": "RFC 8785",
+    "media_type": "application/json",
+    "digest_algorithm": "SHA-256",
+    "digest_encoding": "lowercase-hex",
+    "digest_target": "the UTF-8 bytes of the RFC 8785 canonicalized protocol.json document",
+    "self_reference_rule": "canonical_contract_sha256 is batch metadata and is not stored inside protocol.json",
+    "verification_rule": "servers and clients MUST reject a batch when the received digest differs from the allowlisted canonical digest"
+  },
+  "supported_protocol_versions": [
+    {
+      "version": 1,
+      "name": "legacy-tree-projection",
+      "write_project_modes": [
+        "LEGACY"
+      ],
+      "required_client_capabilities": [
+        "legacy_tree_folder_projection"
+      ],
+      "description": "Folder existence may be projected from name-based tree_order and live document paths. Folder identity is not authoritative."
+    },
+    {
+      "version": 2,
+      "name": "authoritative-folders",
+      "write_project_modes": [
+        "LEGACY",
+        "MIGRATING"
+      ],
+      "required_client_capabilities": [
+        "folders_authoritative",
+        "tombstones"
+      ],
+      "description": "folders is authoritative for folder existence and identity; name-based tree_order is ordering-only."
+    },
+    {
+      "version": 3,
+      "name": "id-tree-atomic-structure",
+      "write_project_modes": [
+        "MIGRATING",
+        "ID_BASED"
+      ],
+      "required_client_capabilities": [
+        "folders_authoritative",
+        "tree_order_ids",
+        "tombstones",
+        "immutable_batch_contract_metadata"
+      ],
+      "description": "Folder and document IDs are authoritative and tree ordering references IDs. Structural writes use a server-validated atomic structure boundary when available."
+    }
+  ],
+  "client_capabilities": {
+    "folders_authoritative": {
+      "since_protocol": 2,
+      "scope": "structure",
+      "meaning": "The client creates, renames, moves, restores, and tombstones folders through stable folder_id rows."
+    },
+    "tree_order_ids": {
+      "since_protocol": 3,
+      "scope": "structure",
+      "meaning": "tree_order child entries reference folder_id or document_id instead of names."
+    },
+    "tombstones": {
+      "since_protocol": 2,
+      "scope": "structure_and_documents",
+      "meaning": "The client preserves deletion identity and revision instead of inferring deletion from absence."
+    },
+    "legacy_tree_folder_projection": {
+      "since_protocol": 1,
+      "scope": "legacy_read_write",
+      "meaning": "The client can reconstruct non-authoritative folders from name-based tree_order for LEGACY projects only."
+    },
+    "immutable_batch_contract_metadata": {
+      "since_protocol": 3,
+      "scope": "queue",
+      "meaning": "Every operation references immutable, server-verifiable contract metadata stored on its batch."
+    },
+    "operation_attempt_history": {
+      "since_protocol": 3,
+      "scope": "diagnostics",
+      "meaning": "Attempt outcomes are appended without erasing the last failure when the operation later succeeds."
+    }
+  },
+  "server_capabilities": {
+    "atomic_structure_commit": {
+      "since_protocol": 3,
+      "meaning": "The server can validate and commit a structure batch transactionally, including folders, document paths, tombstones, and tree ordering."
+    },
+    "contract_allowlist_validation": {
+      "since_protocol": 3,
+      "meaning": "The server maps canonical contract digests to permitted protocol versions and capabilities."
+    },
+    "project_mode_migration_lock": {
+      "since_protocol": 3,
+      "meaning": "The server serializes migration epochs and rejects concurrent or stale migration writers."
+    },
+    "folder_tombstones": {
+      "since_protocol": 2,
+      "meaning": "The server retains folder_id, parent_folder_id, revision, and deletion state."
+    },
+    "id_tree_validation": {
+      "since_protocol": 3,
+      "meaning": "The server rejects tree references to missing, deleted, cross-project, or duplicate entities."
+    }
+  },
+  "immutable_batch_metadata": {
+    "immutable_after_create": true,
+    "fields": [
+      {
+        "name": "batch_id",
+        "type": "uuid",
+        "required": true
+      },
+      {
+        "name": "writer_device_id",
+        "type": "uuid",
+        "required": true
+      },
+      {
+        "name": "client_build_id",
+        "type": "string",
+        "required": true
+      },
+      {
+        "name": "sync_protocol_version",
+        "type": "positive-integer",
+        "required": true
+      },
+      {
+        "name": "contract_version",
+        "type": "semver-or-draft-semver",
+        "required": true
+      },
+      {
+        "name": "canonical_contract_sha256",
+        "type": "sha256-lowercase-hex",
+        "required": true
+      },
+      {
+        "name": "client_capabilities",
+        "type": "set-of-capability-identifiers",
+        "required": true
+      }
+    ],
+    "server_rules": [
+      "An operation MUST reference exactly one existing batch.",
+      "The authenticated writer and writer_device_id MUST be bound to the batch when it is created.",
+      "The server MUST reject later mutation of contract metadata.",
+      "Retries MUST reuse the same batch_id and operation_id."
+    ]
+  },
+  "operation_model": {
+    "intent": {
+      "immutable_after_create": true,
+      "required_fields": [
+        "operation_id",
+        "batch_id",
+        "entity_kind",
+        "entity_id",
+        "intent_kind",
+        "base_revision",
+        "payload_sha256"
+      ],
+      "entity_kinds": [
+        "project",
+        "folder",
+        "document",
+        "tree_order",
+        "trash_purge"
+      ],
+      "intent_kinds": [
+        "ensure",
+        "create",
+        "update",
+        "rename",
+        "move",
+        "delete",
+        "restore",
+        "reorder",
+        "migrate"
+      ]
+    },
+    "attempt": {
+      "append_only": true,
+      "required_fields": [
+        "attempt_id",
+        "operation_id",
+        "attempt_number",
+        "started_at",
+        "finished_at",
+        "rpc_name",
+        "outcome"
+      ],
+      "optional_fields": [
+        "request_sha256",
+        "response_sha256",
+        "http_status",
+        "error_code",
+        "error_detail",
+        "result_revision"
+      ],
+      "outcomes": [
+        "committed",
+        "replayed",
+        "retryable_error",
+        "conflict",
+        "blocked",
+        "transport_unknown"
+      ]
+    },
+    "state": {
+      "mutable_projection": true,
+      "states": [
+        "pending",
+        "inflight",
+        "retry_wait",
+        "blocked",
+        "conflict",
+        "completed",
+        "cancelled"
+      ],
+      "terminal_states": [
+        "completed",
+        "cancelled"
+      ],
+      "required_fields": [
+        "operation_id",
+        "state",
+        "attempt_count",
+        "updated_at"
+      ],
+      "rules": [
+        "Current state MUST be derivable from immutable intent and append-only attempts.",
+        "Successful completion MUST NOT delete prior attempt errors.",
+        "blocked and conflict states MUST expose the blocking operation_id or stable error code when one exists."
+      ]
+    }
+  },
+  "project_sync_mode": {
+    "states": [
+      "LEGACY",
+      "MIGRATING",
+      "ID_BASED"
+    ],
+    "initial_state": "LEGACY",
+    "allowed_transitions": [
+      {
+        "from": "LEGACY",
+        "to": "MIGRATING"
+      },
+      {
+        "from": "MIGRATING",
+        "to": "ID_BASED"
+      }
+    ],
+    "automatic_downgrade": false,
+    "migration_epoch": {
+      "type": "monotonic-positive-integer",
+      "increment_on": "LEGACY_to_MIGRATING",
+      "stale_epoch_behavior": "reject",
+      "audit_fields": [
+        "migration_epoch",
+        "started_at",
+        "started_by_device_id",
+        "source_contract_sha256",
+        "target_contract_sha256",
+        "validation_result",
+        "completed_at"
+      ]
+    },
+    "server_lock": {
+      "scope": "project_id",
+      "required_during": "MIGRATING",
+      "owner_fields": [
+        "migration_epoch",
+        "writer_device_id"
+      ],
+      "concurrent_writer_behavior": "reject_with_MIGRATION_LOCKED"
+    },
+    "migration_validation": [
+      "Every live folder has a unique folder_id in the project.",
+      "Every live document has a unique document_id in the project.",
+      "Every parent_folder_id resolves to a live folder in the same project or is null.",
+      "Folder parent relationships are acyclic.",
+      "Every tombstone retains entity identity and a monotonic revision.",
+      "Every ID-based tree reference resolves exactly once.",
+      "No live siblings share the same normalized storage name."
+    ]
+  },
+  "minimum_write_protocol": {
+    "LEGACY": {
+      "content": 1,
+      "structure": 1
+    },
+    "MIGRATING": {
+      "content": 1,
+      "structure": 2
+    },
+    "ID_BASED": {
+      "content": 1,
+      "structure": 3
+    }
+  },
+  "structure_write_matrix": [
+    {
+      "project_mode": "LEGACY",
+      "protocol_version": 1,
+      "allowed": true,
+      "required_capabilities": [
+        "legacy_tree_folder_projection"
+      ],
+      "server_behavior": "Accept legacy name projection and normalize it into the current LEGACY representation."
+    },
+    {
+      "project_mode": "LEGACY",
+      "protocol_version": 2,
+      "allowed": true,
+      "required_capabilities": [
+        "folders_authoritative",
+        "tombstones"
+      ],
+      "server_behavior": "Accept stable IDs while the project remains readable by legacy clients; do not claim ID_BASED invariants yet."
+    },
+    {
+      "project_mode": "MIGRATING",
+      "protocol_version": 1,
+      "allowed": false,
+      "required_capabilities": [],
+      "server_behavior": "Reject with PROJECT_MIGRATING."
+    },
+    {
+      "project_mode": "MIGRATING",
+      "protocol_version": 2,
+      "allowed": true,
+      "required_capabilities": [
+        "folders_authoritative",
+        "tombstones"
+      ],
+      "server_behavior": "Accept only when the request carries the active migration_epoch and lock ownership permits it."
+    },
+    {
+      "project_mode": "MIGRATING",
+      "protocol_version": 3,
+      "allowed": true,
+      "required_capabilities": [
+        "folders_authoritative",
+        "tree_order_ids",
+        "tombstones",
+        "immutable_batch_contract_metadata"
+      ],
+      "server_behavior": "Validate against the target ID-based representation under the migration lock."
+    },
+    {
+      "project_mode": "ID_BASED",
+      "protocol_version": 1,
+      "allowed": false,
+      "required_capabilities": [],
+      "server_behavior": "Reject structural writes with PROTOCOL_TOO_OLD."
+    },
+    {
+      "project_mode": "ID_BASED",
+      "protocol_version": 2,
+      "allowed": false,
+      "required_capabilities": [],
+      "server_behavior": "Reject structural writes with CAPABILITY_MISMATCH because ID tree references are required."
+    },
+    {
+      "project_mode": "ID_BASED",
+      "protocol_version": 3,
+      "allowed": true,
+      "required_capabilities": [
+        "folders_authoritative",
+        "tree_order_ids",
+        "tombstones",
+        "immutable_batch_contract_metadata"
+      ],
+      "server_behavior": "Validate and atomically apply the structure intent or reject the complete structure transaction."
+    }
+  ],
+  "standard_error_codes": [
+    "AUTH_REQUIRED",
+    "FORBIDDEN",
+    "INVALID_ARGUMENT",
+    "CONTRACT_NOT_ALLOWED",
+    "CONTRACT_DIGEST_MISMATCH",
+    "PROTOCOL_TOO_OLD",
+    "CAPABILITY_MISMATCH",
+    "PROJECT_MIGRATING",
+    "MIGRATION_LOCKED",
+    "STALE_MIGRATION_EPOCH",
+    "INVARIANT_VIOLATION",
+    "DOCUMENT_NOT_FOUND",
+    "DOCUMENT_ALREADY_EXISTS",
+    "REVISION_CONFLICT",
+    "OPERATION_ID_REUSED",
+    "LEASE_REQUIRED",
+    "LEASE_CONFLICT",
+    "LEASE_EXPIRED",
+    "PATH_CONFLICT",
+    "FOLDER_NOT_FOUND",
+    "FOLDER_ALREADY_EXISTS",
+    "FOLDER_NOT_EMPTY",
+    "TREE_REFERENCE_NOT_FOUND",
+    "TREE_REFERENCE_DUPLICATED",
+    "PARENT_CYCLE"
+  ],
+  "server_invariants": [
+    {
+      "id": "INV-001",
+      "rule": "Revisions are positive and strictly increase per entity after create."
+    },
+    {
+      "id": "INV-002",
+      "rule": "operation_id is globally idempotent: an identical replay returns the original result and a different payload is OPERATION_ID_REUSED."
+    },
+    {
+      "id": "INV-003",
+      "rule": "A live relative path is owned by at most one document_id within a project."
+    },
+    {
+      "id": "INV-004",
+      "rule": "In authoritative folder modes, folder existence and identity come only from folders, never from tree_order."
+    },
+    {
+      "id": "INV-005",
+      "rule": "In ID_BASED, tree_order controls order only and every reference resolves to a live entity in the same project."
+    },
+    {
+      "id": "INV-006",
+      "rule": "Deletion is represented by a tombstone; absence alone is not deletion."
+    },
+    {
+      "id": "INV-007",
+      "rule": "A project sync mode never automatically moves backward."
+    },
+    {
+      "id": "INV-008",
+      "rule": "A structure transaction is all-or-nothing at its declared atomic boundary."
+    },
+    {
+      "id": "INV-009",
+      "rule": "Batch contract metadata is immutable and every operation remains traceable to its writer and canonical contract digest."
+    },
+    {
+      "id": "INV-010",
+      "rule": "Folder parent relationships remain within one project and contain no cycle."
+    }
+  ],
+  "contract_allowlist": {
+    "authority": "server",
+    "key": "canonical_contract_sha256",
+    "allowlist_entry_fields": [
+      "canonical_contract_sha256",
+      "contract_version",
+      "allowed_protocol_versions",
+      "allowed_client_capabilities",
+      "minimum_client_builds",
+      "valid_from",
+      "revoked_at"
+    ],
+    "validation_order": [
+      "Resolve canonical_contract_sha256 in the server allowlist.",
+      "Verify contract_version and sync_protocol_version match that entry.",
+      "Verify declared capabilities are a subset of the allowlisted capabilities for the client build.",
+      "Verify project_sync_mode and minimum_write_protocol permit the requested intent.",
+      "Validate entity revisions and server invariants.",
+      "Apply or reject the complete atomic boundary."
+    ],
+    "unknown_digest_behavior": "reject_with_CONTRACT_NOT_ALLOWED",
+    "digest_mismatch_behavior": "reject_with_CONTRACT_DIGEST_MISMATCH",
+    "client_declarations_are_authoritative": false
+  },
+  "legacy_content_editing_in_id_based": {
+    "allowed": true,
+    "minimum_protocol_version": 1,
+    "conditions": [
+      "The document_id already exists and is live.",
+      "The relative path and parent folder assignment are unchanged.",
+      "The request does not create, rename, move, restore, delete, or reorder any entity.",
+      "Normal revision, operation_id, content hash, authorization, and edit lease checks pass."
+    ],
+    "legacy_structure_writes_allowed": false,
+    "rejection_code": "PROTOCOL_TOO_OLD"
+  }
+}

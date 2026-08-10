@@ -1,0 +1,135 @@
+{
+  "$schema": "../transition-vector.schema.json",
+  "vector_id": "TV-005",
+  "title": "Revision conflict followed by rebase",
+  "contract_version": "0.1.0-draft.1",
+  "minimum_protocol_version": 2,
+  "tags": [
+    "rebase",
+    "revision-conflict"
+  ],
+  "initial_server_state": {
+    "project_id": "00000000-0000-4000-8000-000000000005",
+    "project_sync_mode": "LEGACY",
+    "migration_epoch": 0,
+    "entities": [
+      {
+        "entity_id": "40000000-0000-4000-8000-000000000005",
+        "entity_kind": "document",
+        "revision": 3,
+        "is_deleted": false,
+        "content": "remote-3"
+      }
+    ],
+    "tree_order": {}
+  },
+  "initial_client_states": [
+    {
+      "client_id": "ipad-v2",
+      "platform": "ipad",
+      "protocol_version": 2,
+      "capabilities": [
+        "folders_authoritative",
+        "tombstones"
+      ],
+      "local_entities": [
+        {
+          "entity_id": "40000000-0000-4000-8000-000000000005",
+          "entity_kind": "document",
+          "revision": 2,
+          "is_deleted": false,
+          "content": "local-change"
+        }
+      ],
+      "queue": [
+        {
+          "operation_id": "20000000-0000-4000-8000-000000000021",
+          "batch_id": "10000000-0000-4000-8000-000000000021",
+          "entity_id": "40000000-0000-4000-8000-000000000005",
+          "intent_kind": "update",
+          "base_revision": 2,
+          "state": "pending",
+          "attempt_count": 0
+        }
+      ]
+    }
+  ],
+  "ordered_actions": [
+    {
+      "action_id": "A01",
+      "actor": "ipad-v2",
+      "kind": "commit_batch",
+      "input": {
+        "operation_id": "20000000-0000-4000-8000-000000000021"
+      },
+      "expected_outcome": "server returns REVISION_CONFLICT with current revision 3"
+    },
+    {
+      "action_id": "A02",
+      "actor": "ipad-v2",
+      "kind": "rebase_operation",
+      "input": {
+        "base_revision": 3,
+        "merge_policy": "three-way-no-overlap"
+      },
+      "expected_outcome": "the same operation_id is rebased without losing local intent"
+    },
+    {
+      "action_id": "A03",
+      "actor": "ipad-v2",
+      "kind": "retry_operation",
+      "input": {
+        "operation_id": "20000000-0000-4000-8000-000000000021"
+      },
+      "expected_outcome": "revision 4 is committed"
+    }
+  ],
+  "fault_injections": [
+    {
+      "after_action_id": "A01",
+      "type": "inject_revision_conflict",
+      "parameters": {
+        "current_revision": 3
+      }
+    }
+  ],
+  "expected_server_state": {
+    "project_sync_mode": "LEGACY",
+    "migration_epoch": 0,
+    "entity_assertions": [
+      "document revision is 4",
+      "merged content contains both non-overlapping changes"
+    ],
+    "tree_order_assertions": []
+  },
+  "expected_client_states": [
+    {
+      "client_id": "ipad-v2",
+      "assertions": [
+        "the document baseline advances to revision 4",
+        "the first REVISION_CONFLICT attempt remains in history"
+      ]
+    }
+  ],
+  "expected_queue_states": [
+    {
+      "operation_id": "20000000-0000-4000-8000-000000000021",
+      "state": "completed",
+      "attempt_count": 2,
+      "assertions": [
+        "the operation_id is unchanged across rebase",
+        "result revision is 4"
+      ]
+    }
+  ],
+  "invariants": [
+    {
+      "id": "INV-001",
+      "assert": "server revision increases from 3 to 4"
+    },
+    {
+      "id": "INV-002",
+      "assert": "rebase does not replace the durable operation identity"
+    }
+  ]
+}

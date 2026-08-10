@@ -1,0 +1,102 @@
+{
+  "$schema": "../transition-vector.schema.json",
+  "vector_id": "TV-001",
+  "title": "ID-based empty folder creation",
+  "contract_version": "0.1.0-draft.1",
+  "minimum_protocol_version": 3,
+  "tags": [
+    "empty-folder",
+    "folders-authoritative",
+    "id-based"
+  ],
+  "initial_server_state": {
+    "project_id": "00000000-0000-4000-8000-000000000001",
+    "project_sync_mode": "ID_BASED",
+    "migration_epoch": 1,
+    "entities": [],
+    "tree_order": {
+      "root": []
+    }
+  },
+  "initial_client_states": [
+    {
+      "client_id": "ipad-v3",
+      "platform": "ipad",
+      "protocol_version": 3,
+      "capabilities": [
+        "folders_authoritative",
+        "tree_order_ids",
+        "tombstones",
+        "immutable_batch_contract_metadata"
+      ],
+      "local_entities": [],
+      "queue": []
+    }
+  ],
+  "ordered_actions": [
+    {
+      "action_id": "A01",
+      "actor": "ipad-v3",
+      "kind": "create_folder",
+      "input": {
+        "batch_id": "10000000-0000-4000-8000-000000000001",
+        "operation_id": "20000000-0000-4000-8000-000000000001",
+        "folder_id": "30000000-0000-4000-8000-000000000001",
+        "parent_folder_id": null,
+        "name": "빈 폴더"
+      },
+      "expected_outcome": "folder revision 1 is committed before ID tree ordering references it"
+    },
+    {
+      "action_id": "A02",
+      "actor": "ipad-v3",
+      "kind": "commit_batch",
+      "input": {
+        "batch_id": "10000000-0000-4000-8000-000000000001"
+      },
+      "expected_outcome": "the atomic structure boundary completes"
+    }
+  ],
+  "fault_injections": [],
+  "expected_server_state": {
+    "project_sync_mode": "ID_BASED",
+    "migration_epoch": 1,
+    "entity_assertions": [
+      "folder 30000000-0000-4000-8000-000000000001 exists at revision 1 and is not deleted",
+      "no document is synthesized for the empty folder"
+    ],
+    "tree_order_assertions": [
+      "root contains folder ID 30000000-0000-4000-8000-000000000001 exactly once"
+    ]
+  },
+  "expected_client_states": [
+    {
+      "client_id": "ipad-v3",
+      "assertions": [
+        "the local folder keeps the same folder_id",
+        "the folder is synced without a placeholder document"
+      ]
+    }
+  ],
+  "expected_queue_states": [
+    {
+      "operation_id": "20000000-0000-4000-8000-000000000001",
+      "state": "completed",
+      "attempt_count": 1,
+      "assertions": [
+        "result revision is 1",
+        "batch contract metadata remains immutable"
+      ]
+    }
+  ],
+  "invariants": [
+    {
+      "id": "INV-004",
+      "assert": "folder existence comes from folders rather than tree_order"
+    },
+    {
+      "id": "INV-009",
+      "assert": "the folder operation remains traceable to its immutable batch"
+    }
+  ]
+}

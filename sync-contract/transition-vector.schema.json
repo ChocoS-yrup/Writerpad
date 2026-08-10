@@ -1,0 +1,472 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:writerpad:sync-contract:transition-vector-schema:0.1.0-draft.1",
+  "title": "WriterPad Sync State Transition Test Vector",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "$schema",
+    "vector_id",
+    "title",
+    "contract_version",
+    "minimum_protocol_version",
+    "tags",
+    "initial_server_state",
+    "initial_client_states",
+    "ordered_actions",
+    "fault_injections",
+    "expected_server_state",
+    "expected_client_states",
+    "expected_queue_states",
+    "invariants"
+  ],
+  "properties": {
+    "$schema": {
+      "const": "../transition-vector.schema.json"
+    },
+    "vector_id": {
+      "type": "string",
+      "pattern": "^TV-[0-9]{3}$"
+    },
+    "title": {
+      "type": "string",
+      "minLength": 1
+    },
+    "contract_version": {
+      "type": "string",
+      "minLength": 1
+    },
+    "minimum_protocol_version": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "tags": {
+      "type": "array",
+      "minItems": 1,
+      "uniqueItems": true,
+      "items": {
+        "type": "string",
+        "pattern": "^[a-z][a-z0-9_-]*$"
+      }
+    },
+    "initial_server_state": {
+      "$ref": "#/$defs/state"
+    },
+    "initial_client_states": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "$ref": "#/$defs/clientState"
+      }
+    },
+    "ordered_actions": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "$ref": "#/$defs/action"
+      }
+    },
+    "fault_injections": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/fault"
+      }
+    },
+    "expected_server_state": {
+      "$ref": "#/$defs/stateExpectation"
+    },
+    "expected_client_states": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "$ref": "#/$defs/clientExpectation"
+      }
+    },
+    "expected_queue_states": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "$ref": "#/$defs/queueExpectation"
+      }
+    },
+    "invariants": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "id",
+          "assert"
+        ],
+        "properties": {
+          "id": {
+            "type": "string",
+            "pattern": "^(INV-[0-9]{3}|TV-[0-9]{3}-INV-[0-9]{2})$"
+          },
+          "assert": {
+            "type": "string",
+            "minLength": 1
+          }
+        }
+      }
+    }
+  },
+  "$defs": {
+    "uuid": {
+      "type": "string",
+      "format": "uuid"
+    },
+    "sha256": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "mode": {
+      "enum": [
+        "LEGACY",
+        "MIGRATING",
+        "ID_BASED"
+      ]
+    },
+    "entity": {
+      "type": "object",
+      "additionalProperties": true,
+      "required": [
+        "entity_id",
+        "revision",
+        "is_deleted"
+      ],
+      "properties": {
+        "entity_id": {
+          "$ref": "#/$defs/uuid"
+        },
+        "entity_kind": {
+          "enum": [
+            "folder",
+            "document",
+            "tree_order",
+            "project"
+          ]
+        },
+        "revision": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "is_deleted": {
+          "type": "boolean"
+        }
+      }
+    },
+    "state": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "project_id",
+        "project_sync_mode",
+        "migration_epoch",
+        "entities",
+        "tree_order"
+      ],
+      "properties": {
+        "project_id": {
+          "$ref": "#/$defs/uuid"
+        },
+        "project_sync_mode": {
+          "$ref": "#/$defs/mode"
+        },
+        "migration_epoch": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "entities": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/entity"
+          }
+        },
+        "tree_order": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "minLength": 1
+            }
+          }
+        }
+      }
+    },
+    "clientState": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "client_id",
+        "platform",
+        "protocol_version",
+        "capabilities",
+        "local_entities",
+        "queue"
+      ],
+      "properties": {
+        "client_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "platform": {
+          "enum": [
+            "windows",
+            "ipad"
+          ]
+        },
+        "protocol_version": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "capabilities": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "type": "string",
+            "minLength": 1
+          }
+        },
+        "local_entities": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/entity"
+          }
+        },
+        "queue": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/queueItem"
+          }
+        }
+      }
+    },
+    "queueItem": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "operation_id",
+        "batch_id",
+        "entity_id",
+        "intent_kind",
+        "base_revision",
+        "state",
+        "attempt_count"
+      ],
+      "properties": {
+        "operation_id": {
+          "$ref": "#/$defs/uuid"
+        },
+        "batch_id": {
+          "$ref": "#/$defs/uuid"
+        },
+        "entity_id": {
+          "$ref": "#/$defs/uuid"
+        },
+        "intent_kind": {
+          "type": "string",
+          "minLength": 1
+        },
+        "base_revision": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "state": {
+          "enum": [
+            "pending",
+            "inflight",
+            "retry_wait",
+            "blocked",
+            "conflict",
+            "completed",
+            "cancelled"
+          ]
+        },
+        "attempt_count": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "error_code": {
+          "type": "string"
+        }
+      }
+    },
+    "action": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "action_id",
+        "actor",
+        "kind",
+        "input",
+        "expected_outcome"
+      ],
+      "properties": {
+        "action_id": {
+          "type": "string",
+          "pattern": "^A[0-9]{2}$"
+        },
+        "actor": {
+          "type": "string",
+          "minLength": 1
+        },
+        "kind": {
+          "enum": [
+            "create_folder",
+            "create_document",
+            "rename_folder",
+            "rename_document",
+            "delete_folder",
+            "delete_document",
+            "connect_legacy_client",
+            "commit_batch",
+            "retry_operation",
+            "restart_client",
+            "pull_snapshot",
+            "rebase_operation",
+            "begin_migration",
+            "complete_migration",
+            "legacy_structure_write"
+          ]
+        },
+        "input": {
+          "type": "object"
+        },
+        "expected_outcome": {
+          "type": "string",
+          "minLength": 1
+        }
+      }
+    },
+    "fault": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "after_action_id",
+        "type",
+        "parameters"
+      ],
+      "properties": {
+        "after_action_id": {
+          "type": "string",
+          "pattern": "^A[0-9]{2}$"
+        },
+        "type": {
+          "enum": [
+            "drop_response",
+            "terminate_client",
+            "delay_rpc",
+            "inject_revision_conflict",
+            "reorder_delivery",
+            "hold_edit_lease"
+          ]
+        },
+        "parameters": {
+          "type": "object"
+        }
+      }
+    },
+    "stateExpectation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "project_sync_mode",
+        "migration_epoch",
+        "entity_assertions",
+        "tree_order_assertions"
+      ],
+      "properties": {
+        "project_sync_mode": {
+          "$ref": "#/$defs/mode"
+        },
+        "migration_epoch": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "entity_assertions": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1
+          }
+        },
+        "tree_order_assertions": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1
+          }
+        },
+        "error_code": {
+          "type": "string"
+        }
+      }
+    },
+    "clientExpectation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "client_id",
+        "assertions"
+      ],
+      "properties": {
+        "client_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "assertions": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "string",
+            "minLength": 1
+          }
+        }
+      }
+    },
+    "queueExpectation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "operation_id",
+        "state",
+        "attempt_count",
+        "assertions"
+      ],
+      "properties": {
+        "operation_id": {
+          "$ref": "#/$defs/uuid"
+        },
+        "state": {
+          "enum": [
+            "pending",
+            "inflight",
+            "retry_wait",
+            "blocked",
+            "conflict",
+            "completed",
+            "cancelled"
+          ]
+        },
+        "attempt_count": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "error_code": {
+          "type": "string"
+        },
+        "assertions": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "string",
+            "minLength": 1
+          }
+        }
+      }
+    }
+  }
+}

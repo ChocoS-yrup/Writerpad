@@ -1,0 +1,279 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:writerpad:sync-contract:snapshot-schema:0.1.0-draft.1",
+  "title": "WriterPad Sync Server Snapshot",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "snapshot_version",
+    "captured_at",
+    "server_project_id",
+    "project_name",
+    "project_sync_mode",
+    "migration_epoch",
+    "folders",
+    "documents",
+    "tree_order"
+  ],
+  "properties": {
+    "snapshot_version": {
+      "const": "0.1.0-draft.1"
+    },
+    "captured_at": {
+      "$ref": "#/$defs/timestamp"
+    },
+    "server_project_id": {
+      "$ref": "#/$defs/uuid"
+    },
+    "project_name": {
+      "type": "string",
+      "minLength": 1
+    },
+    "project_sync_mode": {
+      "$ref": "#/$defs/mode"
+    },
+    "migration_epoch": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "minimum_write_protocol": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "contract_version": {
+      "type": "string",
+      "minLength": 1
+    },
+    "canonical_contract_sha256": {
+      "$ref": "#/$defs/sha256"
+    },
+    "last_successful_operation_id": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/uuid"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "folders": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/folder"
+      }
+    },
+    "documents": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/document"
+      }
+    },
+    "tree_order": {
+      "$ref": "#/$defs/treeOrder"
+    },
+    "server_capabilities": {
+      "type": "array",
+      "uniqueItems": true,
+      "items": {
+        "type": "string",
+        "minLength": 1
+      }
+    },
+    "limitations": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "minLength": 1
+      }
+    }
+  },
+  "$defs": {
+    "uuid": {
+      "type": "string",
+      "format": "uuid"
+    },
+    "sha256": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "timestamp": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "mode": {
+      "enum": [
+        "LEGACY",
+        "MIGRATING",
+        "ID_BASED"
+      ]
+    },
+    "folder": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "folder_id",
+        "parent_folder_id",
+        "name",
+        "revision",
+        "is_deleted",
+        "updated_at"
+      ],
+      "properties": {
+        "folder_id": {
+          "$ref": "#/$defs/uuid"
+        },
+        "parent_folder_id": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/uuid"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "name": {
+          "type": "string",
+          "minLength": 1
+        },
+        "revision": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "is_deleted": {
+          "type": "boolean"
+        },
+        "updated_at": {
+          "$ref": "#/$defs/timestamp"
+        },
+        "last_operation_id": {
+          "$ref": "#/$defs/uuid"
+        }
+      }
+    },
+    "document": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "document_id",
+        "folder_id",
+        "relative_path",
+        "revision",
+        "is_deleted",
+        "content_sha256",
+        "updated_at"
+      ],
+      "properties": {
+        "document_id": {
+          "$ref": "#/$defs/uuid"
+        },
+        "folder_id": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/uuid"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "relative_path": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 1024
+        },
+        "revision": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "is_deleted": {
+          "type": "boolean"
+        },
+        "deleted_at": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/timestamp"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "content": {
+          "type": "string"
+        },
+        "content_sha256": {
+          "$ref": "#/$defs/sha256"
+        },
+        "updated_at": {
+          "$ref": "#/$defs/timestamp"
+        },
+        "last_operation_id": {
+          "$ref": "#/$defs/uuid"
+        }
+      }
+    },
+    "treeOrder": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "document_id",
+        "revision",
+        "representation",
+        "entries",
+        "updated_at"
+      ],
+      "properties": {
+        "document_id": {
+          "$ref": "#/$defs/uuid"
+        },
+        "revision": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "representation": {
+          "enum": [
+            "names",
+            "ids"
+          ]
+        },
+        "entries": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "array",
+            "uniqueItems": true,
+            "items": {
+              "type": "string",
+              "minLength": 1
+            }
+          }
+        },
+        "folder_paths": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "type": "string",
+            "minLength": 1
+          }
+        },
+        "payload_sha256": {
+          "$ref": "#/$defs/sha256"
+        },
+        "updated_at": {
+          "$ref": "#/$defs/timestamp"
+        },
+        "last_operation_id": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/uuid"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      }
+    }
+  }
+}

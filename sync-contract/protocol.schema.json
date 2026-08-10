@@ -1,0 +1,568 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:writerpad:sync-contract:protocol-schema:0.1.0-draft.1",
+  "title": "WriterPad Sync Contract Protocol",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "$schema",
+    "contract_version",
+    "contract_status",
+    "canonicalization",
+    "supported_protocol_versions",
+    "client_capabilities",
+    "server_capabilities",
+    "immutable_batch_metadata",
+    "operation_model",
+    "project_sync_mode",
+    "minimum_write_protocol",
+    "structure_write_matrix",
+    "standard_error_codes",
+    "server_invariants",
+    "contract_allowlist",
+    "legacy_content_editing_in_id_based"
+  ],
+  "properties": {
+    "$schema": {
+      "type": "string",
+      "const": "./protocol.schema.json"
+    },
+    "contract_version": {
+      "$ref": "#/$defs/nonEmptyString"
+    },
+    "contract_status": {
+      "enum": [
+        "draft",
+        "released",
+        "deprecated"
+      ]
+    },
+    "canonicalization": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "standard",
+        "media_type",
+        "digest_algorithm",
+        "digest_encoding",
+        "digest_target",
+        "self_reference_rule",
+        "verification_rule"
+      ],
+      "properties": {
+        "standard": {
+          "const": "RFC 8785"
+        },
+        "media_type": {
+          "const": "application/json"
+        },
+        "digest_algorithm": {
+          "const": "SHA-256"
+        },
+        "digest_encoding": {
+          "const": "lowercase-hex"
+        },
+        "digest_target": {
+          "$ref": "#/$defs/nonEmptyString"
+        },
+        "self_reference_rule": {
+          "$ref": "#/$defs/nonEmptyString"
+        },
+        "verification_rule": {
+          "$ref": "#/$defs/nonEmptyString"
+        }
+      }
+    },
+    "supported_protocol_versions": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "version",
+          "name",
+          "write_project_modes",
+          "required_client_capabilities",
+          "description"
+        ],
+        "properties": {
+          "version": {
+            "type": "integer",
+            "minimum": 1
+          },
+          "name": {
+            "$ref": "#/$defs/identifier"
+          },
+          "write_project_modes": {
+            "$ref": "#/$defs/modeArray"
+          },
+          "required_client_capabilities": {
+            "$ref": "#/$defs/stringSet"
+          },
+          "description": {
+            "$ref": "#/$defs/nonEmptyString"
+          }
+        }
+      }
+    },
+    "client_capabilities": {
+      "$ref": "#/$defs/capabilityMap"
+    },
+    "server_capabilities": {
+      "$ref": "#/$defs/capabilityMap"
+    },
+    "immutable_batch_metadata": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "immutable_after_create",
+        "fields",
+        "server_rules"
+      ],
+      "properties": {
+        "immutable_after_create": {
+          "const": true
+        },
+        "fields": {
+          "type": "array",
+          "minItems": 7,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "name",
+              "type",
+              "required"
+            ],
+            "properties": {
+              "name": {
+                "$ref": "#/$defs/identifier"
+              },
+              "type": {
+                "$ref": "#/$defs/nonEmptyString"
+              },
+              "required": {
+                "type": "boolean"
+              }
+            }
+          }
+        },
+        "server_rules": {
+          "$ref": "#/$defs/nonEmptyStringArray"
+        }
+      }
+    },
+    "operation_model": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "intent",
+        "attempt",
+        "state"
+      ],
+      "properties": {
+        "intent": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "immutable_after_create",
+            "required_fields",
+            "entity_kinds",
+            "intent_kinds"
+          ],
+          "properties": {
+            "immutable_after_create": {
+              "const": true
+            },
+            "required_fields": {
+              "$ref": "#/$defs/stringSet"
+            },
+            "entity_kinds": {
+              "$ref": "#/$defs/stringSet"
+            },
+            "intent_kinds": {
+              "$ref": "#/$defs/stringSet"
+            }
+          }
+        },
+        "attempt": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "append_only",
+            "required_fields",
+            "optional_fields",
+            "outcomes"
+          ],
+          "properties": {
+            "append_only": {
+              "const": true
+            },
+            "required_fields": {
+              "$ref": "#/$defs/stringSet"
+            },
+            "optional_fields": {
+              "$ref": "#/$defs/stringSet"
+            },
+            "outcomes": {
+              "$ref": "#/$defs/stringSet"
+            }
+          }
+        },
+        "state": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "mutable_projection",
+            "states",
+            "terminal_states",
+            "required_fields",
+            "rules"
+          ],
+          "properties": {
+            "mutable_projection": {
+              "const": true
+            },
+            "states": {
+              "$ref": "#/$defs/stringSet"
+            },
+            "terminal_states": {
+              "$ref": "#/$defs/stringSet"
+            },
+            "required_fields": {
+              "$ref": "#/$defs/stringSet"
+            },
+            "rules": {
+              "$ref": "#/$defs/nonEmptyStringArray"
+            }
+          }
+        }
+      }
+    },
+    "project_sync_mode": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "states",
+        "initial_state",
+        "allowed_transitions",
+        "automatic_downgrade",
+        "migration_epoch",
+        "server_lock",
+        "migration_validation"
+      ],
+      "properties": {
+        "states": {
+          "$ref": "#/$defs/modeArray"
+        },
+        "initial_state": {
+          "const": "LEGACY"
+        },
+        "allowed_transitions": {
+          "type": "array",
+          "minItems": 2,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "from",
+              "to"
+            ],
+            "properties": {
+              "from": {
+                "$ref": "#/$defs/mode"
+              },
+              "to": {
+                "$ref": "#/$defs/mode"
+              }
+            }
+          }
+        },
+        "automatic_downgrade": {
+          "const": false
+        },
+        "migration_epoch": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "type",
+            "increment_on",
+            "stale_epoch_behavior",
+            "audit_fields"
+          ],
+          "properties": {
+            "type": {
+              "$ref": "#/$defs/nonEmptyString"
+            },
+            "increment_on": {
+              "$ref": "#/$defs/nonEmptyString"
+            },
+            "stale_epoch_behavior": {
+              "const": "reject"
+            },
+            "audit_fields": {
+              "$ref": "#/$defs/stringSet"
+            }
+          }
+        },
+        "server_lock": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "scope",
+            "required_during",
+            "owner_fields",
+            "concurrent_writer_behavior"
+          ],
+          "properties": {
+            "scope": {
+              "const": "project_id"
+            },
+            "required_during": {
+              "const": "MIGRATING"
+            },
+            "owner_fields": {
+              "$ref": "#/$defs/stringSet"
+            },
+            "concurrent_writer_behavior": {
+              "$ref": "#/$defs/nonEmptyString"
+            }
+          }
+        },
+        "migration_validation": {
+          "$ref": "#/$defs/nonEmptyStringArray"
+        }
+      }
+    },
+    "minimum_write_protocol": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "LEGACY",
+        "MIGRATING",
+        "ID_BASED"
+      ],
+      "properties": {
+        "LEGACY": {
+          "$ref": "#/$defs/minimumWrite"
+        },
+        "MIGRATING": {
+          "$ref": "#/$defs/minimumWrite"
+        },
+        "ID_BASED": {
+          "$ref": "#/$defs/minimumWrite"
+        }
+      }
+    },
+    "structure_write_matrix": {
+      "type": "array",
+      "minItems": 8,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "project_mode",
+          "protocol_version",
+          "allowed",
+          "required_capabilities",
+          "server_behavior"
+        ],
+        "properties": {
+          "project_mode": {
+            "$ref": "#/$defs/mode"
+          },
+          "protocol_version": {
+            "type": "integer",
+            "minimum": 1
+          },
+          "allowed": {
+            "type": "boolean"
+          },
+          "required_capabilities": {
+            "$ref": "#/$defs/stringSet"
+          },
+          "server_behavior": {
+            "$ref": "#/$defs/nonEmptyString"
+          }
+        }
+      }
+    },
+    "standard_error_codes": {
+      "type": "array",
+      "minItems": 20,
+      "uniqueItems": true,
+      "items": {
+        "type": "string",
+        "pattern": "^[A-Z][A-Z0-9_]+$"
+      }
+    },
+    "server_invariants": {
+      "type": "array",
+      "minItems": 8,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "id",
+          "rule"
+        ],
+        "properties": {
+          "id": {
+            "type": "string",
+            "pattern": "^INV-[0-9]{3}$"
+          },
+          "rule": {
+            "$ref": "#/$defs/nonEmptyString"
+          }
+        }
+      }
+    },
+    "contract_allowlist": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "authority",
+        "key",
+        "allowlist_entry_fields",
+        "validation_order",
+        "unknown_digest_behavior",
+        "digest_mismatch_behavior",
+        "client_declarations_are_authoritative"
+      ],
+      "properties": {
+        "authority": {
+          "const": "server"
+        },
+        "key": {
+          "const": "canonical_contract_sha256"
+        },
+        "allowlist_entry_fields": {
+          "$ref": "#/$defs/stringSet"
+        },
+        "validation_order": {
+          "$ref": "#/$defs/nonEmptyStringArray"
+        },
+        "unknown_digest_behavior": {
+          "$ref": "#/$defs/nonEmptyString"
+        },
+        "digest_mismatch_behavior": {
+          "$ref": "#/$defs/nonEmptyString"
+        },
+        "client_declarations_are_authoritative": {
+          "const": false
+        }
+      }
+    },
+    "legacy_content_editing_in_id_based": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "allowed",
+        "minimum_protocol_version",
+        "conditions",
+        "legacy_structure_writes_allowed",
+        "rejection_code"
+      ],
+      "properties": {
+        "allowed": {
+          "const": true
+        },
+        "minimum_protocol_version": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "conditions": {
+          "$ref": "#/$defs/nonEmptyStringArray"
+        },
+        "legacy_structure_writes_allowed": {
+          "const": false
+        },
+        "rejection_code": {
+          "const": "PROTOCOL_TOO_OLD"
+        }
+      }
+    }
+  },
+  "$defs": {
+    "nonEmptyString": {
+      "type": "string",
+      "minLength": 1
+    },
+    "identifier": {
+      "type": "string",
+      "pattern": "^[a-z][a-z0-9_-]*$"
+    },
+    "stringSet": {
+      "type": "array",
+      "uniqueItems": true,
+      "items": {
+        "$ref": "#/$defs/nonEmptyString"
+      }
+    },
+    "nonEmptyStringArray": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "$ref": "#/$defs/nonEmptyString"
+      }
+    },
+    "mode": {
+      "enum": [
+        "LEGACY",
+        "MIGRATING",
+        "ID_BASED"
+      ]
+    },
+    "modeArray": {
+      "type": "array",
+      "minItems": 1,
+      "uniqueItems": true,
+      "items": {
+        "$ref": "#/$defs/mode"
+      }
+    },
+    "capabilityMap": {
+      "type": "object",
+      "minProperties": 1,
+      "additionalProperties": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "since_protocol",
+          "meaning"
+        ],
+        "properties": {
+          "since_protocol": {
+            "type": "integer",
+            "minimum": 1
+          },
+          "scope": {
+            "$ref": "#/$defs/identifier"
+          },
+          "meaning": {
+            "$ref": "#/$defs/nonEmptyString"
+          }
+        }
+      }
+    },
+    "minimumWrite": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "content",
+        "structure"
+      ],
+      "properties": {
+        "content": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "structure": {
+          "type": "integer",
+          "minimum": 1
+        }
+      }
+    }
+  }
+}

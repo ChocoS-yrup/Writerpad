@@ -1,0 +1,150 @@
+{
+  "$schema": "../transition-vector.schema.json",
+  "vector_id": "TV-008",
+  "title": "Concurrent rename and delete conflict",
+  "contract_version": "0.1.0-draft.1",
+  "minimum_protocol_version": 3,
+  "tags": [
+    "conflict",
+    "rename",
+    "tombstone"
+  ],
+  "initial_server_state": {
+    "project_id": "00000000-0000-4000-8000-000000000008",
+    "project_sync_mode": "ID_BASED",
+    "migration_epoch": 1,
+    "entities": [
+      {
+        "entity_id": "30000000-0000-4000-8000-000000000008",
+        "entity_kind": "folder",
+        "revision": 4,
+        "is_deleted": false,
+        "name": "원래 이름"
+      }
+    ],
+    "tree_order": {
+      "root": [
+        "30000000-0000-4000-8000-000000000008"
+      ]
+    }
+  },
+  "initial_client_states": [
+    {
+      "client_id": "windows-v3",
+      "platform": "windows",
+      "protocol_version": 3,
+      "capabilities": [
+        "folders_authoritative",
+        "tree_order_ids",
+        "tombstones",
+        "immutable_batch_contract_metadata"
+      ],
+      "local_entities": [],
+      "queue": []
+    },
+    {
+      "client_id": "ipad-v3",
+      "platform": "ipad",
+      "protocol_version": 3,
+      "capabilities": [
+        "folders_authoritative",
+        "tree_order_ids",
+        "tombstones",
+        "immutable_batch_contract_metadata"
+      ],
+      "local_entities": [],
+      "queue": []
+    }
+  ],
+  "ordered_actions": [
+    {
+      "action_id": "A01",
+      "actor": "windows-v3",
+      "kind": "delete_folder",
+      "input": {
+        "operation_id": "20000000-0000-4000-8000-000000000051",
+        "entity_id": "30000000-0000-4000-8000-000000000008",
+        "base_revision": 4
+      },
+      "expected_outcome": "folder tombstone is committed at revision 5"
+    },
+    {
+      "action_id": "A02",
+      "actor": "ipad-v3",
+      "kind": "rename_folder",
+      "input": {
+        "operation_id": "20000000-0000-4000-8000-000000000052",
+        "entity_id": "30000000-0000-4000-8000-000000000008",
+        "base_revision": 4,
+        "name": "새 이름"
+      },
+      "expected_outcome": "server rejects rename against deleted revision 5"
+    }
+  ],
+  "fault_injections": [
+    {
+      "after_action_id": "A01",
+      "type": "reorder_delivery",
+      "parameters": {
+        "deliver_delete_before_rename": true
+      }
+    }
+  ],
+  "expected_server_state": {
+    "project_sync_mode": "ID_BASED",
+    "migration_epoch": 1,
+    "entity_assertions": [
+      "folder remains a tombstone at revision 5",
+      "rename does not resurrect the folder implicitly"
+    ],
+    "tree_order_assertions": [
+      "the deleted folder_id is absent from the live order"
+    ],
+    "error_code": "REVISION_CONFLICT"
+  },
+  "expected_client_states": [
+    {
+      "client_id": "windows-v3",
+      "assertions": [
+        "delete is synced"
+      ]
+    },
+    {
+      "client_id": "ipad-v3",
+      "assertions": [
+        "rename intent is preserved as a visible conflict",
+        "the client does not union the deleted name back into the tree"
+      ]
+    }
+  ],
+  "expected_queue_states": [
+    {
+      "operation_id": "20000000-0000-4000-8000-000000000051",
+      "state": "completed",
+      "attempt_count": 1,
+      "assertions": [
+        "result revision is 5"
+      ]
+    },
+    {
+      "operation_id": "20000000-0000-4000-8000-000000000052",
+      "state": "conflict",
+      "attempt_count": 1,
+      "error_code": "REVISION_CONFLICT",
+      "assertions": [
+        "local target name remains recoverable",
+        "no implicit restore is attempted"
+      ]
+    }
+  ],
+  "invariants": [
+    {
+      "id": "INV-006",
+      "assert": "the deletion tombstone is authoritative"
+    },
+    {
+      "id": "INV-007",
+      "assert": "a name union cannot undo a deletion"
+    }
+  ]
+}

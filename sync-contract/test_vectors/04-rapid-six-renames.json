@@ -1,0 +1,230 @@
+{
+  "$schema": "../transition-vector.schema.json",
+  "vector_id": "TV-004",
+  "title": "Six rapid structural renames",
+  "contract_version": "0.1.0-draft.1",
+  "minimum_protocol_version": 3,
+  "tags": [
+    "fifo",
+    "rapid-rename",
+    "tree-order"
+  ],
+  "initial_server_state": {
+    "project_id": "00000000-0000-4000-8000-000000000004",
+    "project_sync_mode": "ID_BASED",
+    "migration_epoch": 1,
+    "entities": [
+      {
+        "entity_id": "30000000-0000-4000-8000-000000000011",
+        "entity_kind": "folder",
+        "revision": 1,
+        "is_deleted": false,
+        "name": "F1"
+      },
+      {
+        "entity_id": "30000000-0000-4000-8000-000000000012",
+        "entity_kind": "folder",
+        "revision": 1,
+        "is_deleted": false,
+        "name": "F2"
+      },
+      {
+        "entity_id": "30000000-0000-4000-8000-000000000013",
+        "entity_kind": "folder",
+        "revision": 1,
+        "is_deleted": false,
+        "name": "F3"
+      },
+      {
+        "entity_id": "30000000-0000-4000-8000-000000000014",
+        "entity_kind": "folder",
+        "revision": 1,
+        "is_deleted": false,
+        "name": "F4"
+      },
+      {
+        "entity_id": "30000000-0000-4000-8000-000000000015",
+        "entity_kind": "folder",
+        "revision": 1,
+        "is_deleted": false,
+        "name": "F5"
+      },
+      {
+        "entity_id": "30000000-0000-4000-8000-000000000016",
+        "entity_kind": "document",
+        "revision": 1,
+        "is_deleted": false,
+        "name": "D6.txt"
+      }
+    ],
+    "tree_order": {
+      "root": [
+        "30000000-0000-4000-8000-000000000011",
+        "30000000-0000-4000-8000-000000000012",
+        "30000000-0000-4000-8000-000000000013",
+        "30000000-0000-4000-8000-000000000014",
+        "30000000-0000-4000-8000-000000000015",
+        "30000000-0000-4000-8000-000000000016"
+      ]
+    }
+  },
+  "initial_client_states": [
+    {
+      "client_id": "ipad-v3",
+      "platform": "ipad",
+      "protocol_version": 3,
+      "capabilities": [
+        "folders_authoritative",
+        "tree_order_ids",
+        "tombstones",
+        "immutable_batch_contract_metadata",
+        "operation_attempt_history"
+      ],
+      "local_entities": [],
+      "queue": []
+    }
+  ],
+  "ordered_actions": [
+    {
+      "action_id": "A01",
+      "actor": "ipad-v3",
+      "kind": "rename_folder",
+      "input": {
+        "entity_id": "30000000-0000-4000-8000-000000000011",
+        "name": "R1"
+      },
+      "expected_outcome": "queued in its own entity FIFO lane"
+    },
+    {
+      "action_id": "A02",
+      "actor": "ipad-v3",
+      "kind": "rename_folder",
+      "input": {
+        "entity_id": "30000000-0000-4000-8000-000000000012",
+        "name": "R2"
+      },
+      "expected_outcome": "queued without cancelling unrelated entity intent"
+    },
+    {
+      "action_id": "A03",
+      "actor": "ipad-v3",
+      "kind": "rename_folder",
+      "input": {
+        "entity_id": "30000000-0000-4000-8000-000000000013",
+        "name": "R3"
+      },
+      "expected_outcome": "queued"
+    },
+    {
+      "action_id": "A04",
+      "actor": "ipad-v3",
+      "kind": "rename_folder",
+      "input": {
+        "entity_id": "30000000-0000-4000-8000-000000000014",
+        "name": "R4"
+      },
+      "expected_outcome": "queued"
+    },
+    {
+      "action_id": "A05",
+      "actor": "ipad-v3",
+      "kind": "rename_folder",
+      "input": {
+        "entity_id": "30000000-0000-4000-8000-000000000015",
+        "name": "R5"
+      },
+      "expected_outcome": "queued"
+    },
+    {
+      "action_id": "A06",
+      "actor": "ipad-v3",
+      "kind": "rename_document",
+      "input": {
+        "entity_id": "30000000-0000-4000-8000-000000000016",
+        "name": "R6.txt"
+      },
+      "expected_outcome": "queued after its required document-path predecessor"
+    },
+    {
+      "action_id": "A07",
+      "actor": "ipad-v3",
+      "kind": "commit_batch",
+      "input": {
+        "tree_checkpoint": "final-only"
+      },
+      "expected_outcome": "all six entity revisions commit before the final tree checkpoint"
+    }
+  ],
+  "fault_injections": [
+    {
+      "after_action_id": "A03",
+      "type": "delay_rpc",
+      "parameters": {
+        "entity_id": "30000000-0000-4000-8000-000000000013",
+        "milliseconds": 500
+      }
+    }
+  ],
+  "expected_server_state": {
+    "project_sync_mode": "ID_BASED",
+    "migration_epoch": 1,
+    "entity_assertions": [
+      "all six IDs remain unchanged",
+      "all six names equal R1 through R6.txt",
+      "each entity revision is exactly 2"
+    ],
+    "tree_order_assertions": [
+      "one final tree checkpoint references all six stable IDs",
+      "no intermediate checkpoint omits a successful rename"
+    ]
+  },
+  "expected_client_states": [
+    {
+      "client_id": "ipad-v3",
+      "assertions": [
+        "no rename remains generically pending",
+        "each completed operation retains its attempt history"
+      ]
+    }
+  ],
+  "expected_queue_states": [
+    {
+      "operation_id": "20000000-0000-4000-8000-000000000011",
+      "state": "completed",
+      "attempt_count": 1,
+      "assertions": [
+        "first rename completes"
+      ]
+    },
+    {
+      "operation_id": "20000000-0000-4000-8000-000000000016",
+      "state": "completed",
+      "attempt_count": 1,
+      "assertions": [
+        "sixth rename completes after its predecessor"
+      ]
+    },
+    {
+      "operation_id": "20000000-0000-4000-8000-000000000017",
+      "state": "completed",
+      "attempt_count": 1,
+      "assertions": [
+        "final tree checkpoint completes last"
+      ]
+    }
+  ],
+  "invariants": [
+    {
+      "id": "INV-001",
+      "assert": "each entity revision increases exactly once"
+    },
+    {
+      "id": "INV-008",
+      "assert": "the final structure boundary is not partially visible"
+    },
+    {
+      "id": "TV-004-INV-01",
+      "assert": "a blocked document lane cannot starve unrelated folder lanes"
+    }
+  ]
+}

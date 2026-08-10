@@ -1,0 +1,462 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:writerpad:sync-contract:incident-schema:0.1.0-draft.1",
+  "title": "WriterPad Sync Incident Evidence",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "incident_schema_version",
+    "incident_id",
+    "test_run_id",
+    "captured_at",
+    "capture_timezone",
+    "server_project_id",
+    "project_name",
+    "evidence_phase",
+    "source_devices",
+    "evidence_files",
+    "batches",
+    "operations",
+    "limitations",
+    "source_mutations_performed"
+  ],
+  "properties": {
+    "incident_schema_version": {
+      "const": "0.1.0-draft.1"
+    },
+    "incident_id": {
+      "$ref": "#/$defs/uuid"
+    },
+    "test_run_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "captured_at": {
+      "$ref": "#/$defs/timestamp"
+    },
+    "capture_timezone": {
+      "type": "string",
+      "minLength": 1
+    },
+    "server_project_id": {
+      "$ref": "#/$defs/uuid"
+    },
+    "project_name": {
+      "type": "string",
+      "minLength": 1
+    },
+    "evidence_phase": {
+      "enum": [
+        "pre_incident",
+        "during_incident",
+        "post_incident",
+        "mixed_with_timeline"
+      ]
+    },
+    "source_devices": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "$ref": "#/$defs/device"
+      }
+    },
+    "evidence_files": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "$ref": "#/$defs/evidenceFile"
+      }
+    },
+    "timeline": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/timelineEvent"
+      }
+    },
+    "batches": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/batch"
+      }
+    },
+    "operations": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/operation"
+      }
+    },
+    "server_snapshot": {
+      "$ref": "./snapshot.schema.json"
+    },
+    "limitations": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "minLength": 1
+      }
+    },
+    "source_mutations_performed": {
+      "const": false
+    }
+  },
+  "$defs": {
+    "uuid": {
+      "type": "string",
+      "format": "uuid"
+    },
+    "sha256": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "timestamp": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "device": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "platform",
+        "device_id",
+        "client_build_id",
+        "sync_protocol_version",
+        "contract_version",
+        "canonical_contract_sha256",
+        "client_capabilities"
+      ],
+      "properties": {
+        "platform": {
+          "enum": [
+            "windows",
+            "ipad",
+            "server"
+          ]
+        },
+        "device_id": {
+          "$ref": "#/$defs/uuid"
+        },
+        "device_name": {
+          "type": "string"
+        },
+        "client_build_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "client_build_sha256": {
+          "$ref": "#/$defs/sha256"
+        },
+        "git_commit": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{40}$"
+        },
+        "sync_protocol_version": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "contract_version": {
+          "type": "string",
+          "minLength": 1
+        },
+        "canonical_contract_sha256": {
+          "$ref": "#/$defs/sha256"
+        },
+        "client_capabilities": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "type": "string",
+            "minLength": 1
+          }
+        }
+      }
+    },
+    "evidenceFile": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "path",
+        "sha256",
+        "size_bytes",
+        "source",
+        "immutable_copy"
+      ],
+      "properties": {
+        "path": {
+          "type": "string",
+          "minLength": 1
+        },
+        "sha256": {
+          "$ref": "#/$defs/sha256"
+        },
+        "size_bytes": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "source": {
+          "type": "string",
+          "minLength": 1
+        },
+        "immutable_copy": {
+          "type": "boolean"
+        },
+        "captured_at": {
+          "$ref": "#/$defs/timestamp"
+        }
+      }
+    },
+    "timelineEvent": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "at",
+        "kind",
+        "detail"
+      ],
+      "properties": {
+        "at": {
+          "$ref": "#/$defs/timestamp"
+        },
+        "kind": {
+          "type": "string",
+          "minLength": 1
+        },
+        "detail": {
+          "type": "string",
+          "minLength": 1
+        },
+        "source": {
+          "type": "string"
+        }
+      }
+    },
+    "batch": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "batch_id",
+        "writer_device_id",
+        "client_build_id",
+        "sync_protocol_version",
+        "contract_version",
+        "canonical_contract_sha256",
+        "client_capabilities",
+        "status",
+        "created_at"
+      ],
+      "properties": {
+        "batch_id": {
+          "$ref": "#/$defs/uuid"
+        },
+        "writer_device_id": {
+          "$ref": "#/$defs/uuid"
+        },
+        "client_build_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "sync_protocol_version": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "contract_version": {
+          "type": "string",
+          "minLength": 1
+        },
+        "canonical_contract_sha256": {
+          "$ref": "#/$defs/sha256"
+        },
+        "client_capabilities": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "type": "string",
+            "minLength": 1
+          }
+        },
+        "status": {
+          "$ref": "#/$defs/state"
+        },
+        "created_at": {
+          "$ref": "#/$defs/timestamp"
+        },
+        "updated_at": {
+          "$ref": "#/$defs/timestamp"
+        }
+      }
+    },
+    "operation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "operation_id",
+        "batch_id",
+        "entity_kind",
+        "entity_id",
+        "intent_kind",
+        "base_revision",
+        "state",
+        "attempt_count",
+        "attempts",
+        "created_at",
+        "updated_at"
+      ],
+      "properties": {
+        "operation_id": {
+          "$ref": "#/$defs/uuid"
+        },
+        "batch_id": {
+          "$ref": "#/$defs/uuid"
+        },
+        "entity_kind": {
+          "enum": [
+            "project",
+            "folder",
+            "document",
+            "tree_order",
+            "trash_purge"
+          ]
+        },
+        "entity_id": {
+          "$ref": "#/$defs/uuid"
+        },
+        "intent_kind": {
+          "type": "string",
+          "minLength": 1
+        },
+        "source_name": {
+          "type": "string"
+        },
+        "target_name": {
+          "type": "string"
+        },
+        "base_revision": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "result_revision": {
+          "anyOf": [
+            {
+              "type": "integer",
+              "minimum": 1
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "predecessor_operation_id": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/uuid"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "state": {
+          "$ref": "#/$defs/state"
+        },
+        "attempt_count": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "last_error_code": {
+          "anyOf": [
+            {
+              "type": "string",
+              "minLength": 1
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "last_error_detail": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "attempts": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/attempt"
+          }
+        },
+        "created_at": {
+          "$ref": "#/$defs/timestamp"
+        },
+        "updated_at": {
+          "$ref": "#/$defs/timestamp"
+        }
+      }
+    },
+    "attempt": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "attempt_id",
+        "attempt_number",
+        "started_at",
+        "finished_at",
+        "rpc_name",
+        "outcome"
+      ],
+      "properties": {
+        "attempt_id": {
+          "$ref": "#/$defs/uuid"
+        },
+        "attempt_number": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "started_at": {
+          "$ref": "#/$defs/timestamp"
+        },
+        "finished_at": {
+          "$ref": "#/$defs/timestamp"
+        },
+        "rpc_name": {
+          "type": "string",
+          "minLength": 1
+        },
+        "outcome": {
+          "enum": [
+            "committed",
+            "replayed",
+            "retryable_error",
+            "conflict",
+            "blocked",
+            "transport_unknown"
+          ]
+        },
+        "error_code": {
+          "type": "string"
+        },
+        "error_detail": {
+          "type": "string"
+        },
+        "result_revision": {
+          "type": "integer",
+          "minimum": 1
+        }
+      }
+    },
+    "state": {
+      "enum": [
+        "pending",
+        "inflight",
+        "retry_wait",
+        "blocked",
+        "conflict",
+        "completed",
+        "cancelled"
+      ]
+    }
+  }
+}

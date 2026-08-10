@@ -1,0 +1,139 @@
+{
+  "$schema": "../transition-vector.schema.json",
+  "vector_id": "TV-010",
+  "title": "Legacy structural write rejected after ID-based promotion",
+  "contract_version": "0.1.0-draft.1",
+  "minimum_protocol_version": 1,
+  "tags": [
+    "id-based",
+    "legacy-client",
+    "protocol-gate"
+  ],
+  "initial_server_state": {
+    "project_id": "00000000-0000-4000-8000-000000000010",
+    "project_sync_mode": "ID_BASED",
+    "migration_epoch": 4,
+    "entities": [
+      {
+        "entity_id": "30000000-0000-4000-8000-000000000101",
+        "entity_kind": "folder",
+        "revision": 7,
+        "is_deleted": false,
+        "name": "정식 폴더"
+      },
+      {
+        "entity_id": "40000000-0000-4000-8000-000000000101",
+        "entity_kind": "document",
+        "revision": 3,
+        "is_deleted": false,
+        "name": "본문.txt"
+      }
+    ],
+    "tree_order": {
+      "root": [
+        "30000000-0000-4000-8000-000000000101"
+      ],
+      "30000000-0000-4000-8000-000000000101": [
+        "40000000-0000-4000-8000-000000000101"
+      ]
+    }
+  },
+  "initial_client_states": [
+    {
+      "client_id": "windows-v1",
+      "platform": "windows",
+      "protocol_version": 1,
+      "capabilities": [
+        "legacy_tree_folder_projection"
+      ],
+      "local_entities": [],
+      "queue": [
+        {
+          "operation_id": "20000000-0000-4000-8000-000000000071",
+          "batch_id": "10000000-0000-4000-8000-000000000071",
+          "entity_id": "30000000-0000-4000-8000-000000000101",
+          "intent_kind": "rename",
+          "base_revision": 7,
+          "state": "pending",
+          "attempt_count": 0
+        }
+      ]
+    }
+  ],
+  "ordered_actions": [
+    {
+      "action_id": "A01",
+      "actor": "windows-v1",
+      "kind": "legacy_structure_write",
+      "input": {
+        "operation_id": "20000000-0000-4000-8000-000000000071",
+        "tree_order": {
+          "root": [
+            "구형 이름"
+          ]
+        }
+      },
+      "expected_outcome": "server rejects the structural write with PROTOCOL_TOO_OLD"
+    },
+    {
+      "action_id": "A02",
+      "actor": "windows-v1",
+      "kind": "commit_batch",
+      "input": {
+        "content_only": true,
+        "document_id": "40000000-0000-4000-8000-000000000101",
+        "relative_path_unchanged": true,
+        "parent_unchanged": true
+      },
+      "expected_outcome": "content-only edit remains eligible for normal revision and lease validation"
+    }
+  ],
+  "fault_injections": [],
+  "expected_server_state": {
+    "project_sync_mode": "ID_BASED",
+    "migration_epoch": 4,
+    "entity_assertions": [
+      "folder name remains 정식 폴더 at revision 7",
+      "content-only document edit may advance independently when normal checks pass"
+    ],
+    "tree_order_assertions": [
+      "ID-based tree references remain unchanged"
+    ],
+    "error_code": "PROTOCOL_TOO_OLD"
+  },
+  "expected_client_states": [
+    {
+      "client_id": "windows-v1",
+      "assertions": [
+        "the structural intent is visibly blocked with an update-required reason",
+        "the rejected name is not projected into local authoritative state"
+      ]
+    }
+  ],
+  "expected_queue_states": [
+    {
+      "operation_id": "20000000-0000-4000-8000-000000000071",
+      "state": "blocked",
+      "attempt_count": 1,
+      "error_code": "PROTOCOL_TOO_OLD",
+      "assertions": [
+        "the operation is not automatically downgraded or rewritten",
+        "server state is unchanged"
+      ]
+    }
+  ],
+  "invariants": [
+    {
+      "id": "INV-005",
+      "assert": "a name-based payload cannot modify an ID-based tree"
+    },
+    {
+      "id": "INV-007",
+      "assert": "the project does not downgrade to LEGACY"
+    },
+    {
+      "id": "TV-010-INV-01",
+      "assert": "legacy content-only editing is distinct from a structural write"
+    }
+  ]
+}

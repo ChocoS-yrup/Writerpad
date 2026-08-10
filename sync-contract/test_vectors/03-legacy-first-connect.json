@@ -1,0 +1,119 @@
+{
+  "$schema": "../transition-vector.schema.json",
+  "vector_id": "TV-003",
+  "title": "Legacy client first connection",
+  "contract_version": "0.1.0-draft.1",
+  "minimum_protocol_version": 1,
+  "tags": [
+    "bootstrap",
+    "legacy",
+    "tree-projection"
+  ],
+  "initial_server_state": {
+    "project_id": "00000000-0000-4000-8000-000000000003",
+    "project_sync_mode": "LEGACY",
+    "migration_epoch": 0,
+    "entities": [],
+    "tree_order": {}
+  },
+  "initial_client_states": [
+    {
+      "client_id": "windows-v1",
+      "platform": "windows",
+      "protocol_version": 1,
+      "capabilities": [
+        "legacy_tree_folder_projection"
+      ],
+      "local_entities": [
+        {
+          "entity_id": "30000000-0000-4000-8000-000000000003",
+          "entity_kind": "folder",
+          "revision": 0,
+          "is_deleted": false,
+          "name": "빈 폴더"
+        }
+      ],
+      "queue": []
+    },
+    {
+      "client_id": "ipad-v2",
+      "platform": "ipad",
+      "protocol_version": 2,
+      "capabilities": [
+        "folders_authoritative",
+        "legacy_tree_folder_projection",
+        "tombstones"
+      ],
+      "local_entities": [],
+      "queue": []
+    }
+  ],
+  "ordered_actions": [
+    {
+      "action_id": "A01",
+      "actor": "windows-v1",
+      "kind": "connect_legacy_client",
+      "input": {
+        "tree_order": {
+          "root": [
+            "빈 폴더"
+          ],
+          "빈 폴더": []
+        }
+      },
+      "expected_outcome": "legacy name projection is accepted because the project is LEGACY"
+    },
+    {
+      "action_id": "A02",
+      "actor": "ipad-v2",
+      "kind": "pull_snapshot",
+      "input": {},
+      "expected_outcome": "the compatibility adapter materializes a non-authoritative placeholder folder without claiming server identity"
+    }
+  ],
+  "fault_injections": [],
+  "expected_server_state": {
+    "project_sync_mode": "LEGACY",
+    "migration_epoch": 0,
+    "entity_assertions": [
+      "legacy projection is retained without pretending that its local folder UUID is authoritative"
+    ],
+    "tree_order_assertions": [
+      "name-based root ordering contains 빈 폴더"
+    ]
+  },
+  "expected_client_states": [
+    {
+      "client_id": "windows-v1",
+      "assertions": [
+        "the original folder remains visible"
+      ]
+    },
+    {
+      "client_id": "ipad-v2",
+      "assertions": [
+        "legacy projection is explicitly marked non-authoritative"
+      ]
+    }
+  ],
+  "expected_queue_states": [
+    {
+      "operation_id": "20000000-0000-4000-8000-000000000004",
+      "state": "completed",
+      "attempt_count": 1,
+      "assertions": [
+        "the tree projection commit is traceable to the legacy writer"
+      ]
+    }
+  ],
+  "invariants": [
+    {
+      "id": "TV-003-INV-01",
+      "assert": "legacy projection is enabled only while project_sync_mode is LEGACY"
+    },
+    {
+      "id": "INV-007",
+      "assert": "the project mode does not change merely because a newer reader connects"
+    }
+  ]
+}

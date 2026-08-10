@@ -1,0 +1,137 @@
+{
+  "$schema": "../transition-vector.schema.json",
+  "vector_id": "TV-009",
+  "title": "Same folder name with different identities",
+  "contract_version": "0.1.0-draft.1",
+  "minimum_protocol_version": 3,
+  "tags": [
+    "folder-id",
+    "identity",
+    "name-collision"
+  ],
+  "initial_server_state": {
+    "project_id": "00000000-0000-4000-8000-000000000009",
+    "project_sync_mode": "ID_BASED",
+    "migration_epoch": 3,
+    "entities": [
+      {
+        "entity_id": "30000000-0000-4000-8000-000000000091",
+        "entity_kind": "folder",
+        "revision": 1,
+        "is_deleted": false,
+        "name": "부모 A"
+      },
+      {
+        "entity_id": "30000000-0000-4000-8000-000000000092",
+        "entity_kind": "folder",
+        "revision": 1,
+        "is_deleted": false,
+        "name": "부모 B"
+      }
+    ],
+    "tree_order": {
+      "root": [
+        "30000000-0000-4000-8000-000000000091",
+        "30000000-0000-4000-8000-000000000092"
+      ]
+    }
+  },
+  "initial_client_states": [
+    {
+      "client_id": "windows-v3",
+      "platform": "windows",
+      "protocol_version": 3,
+      "capabilities": [
+        "folders_authoritative",
+        "tree_order_ids",
+        "tombstones",
+        "immutable_batch_contract_metadata"
+      ],
+      "local_entities": [],
+      "queue": []
+    }
+  ],
+  "ordered_actions": [
+    {
+      "action_id": "A01",
+      "actor": "windows-v3",
+      "kind": "create_folder",
+      "input": {
+        "operation_id": "20000000-0000-4000-8000-000000000061",
+        "folder_id": "30000000-0000-4000-8000-000000000093",
+        "parent_folder_id": "30000000-0000-4000-8000-000000000091",
+        "name": "자료"
+      },
+      "expected_outcome": "first 자료 folder is committed"
+    },
+    {
+      "action_id": "A02",
+      "actor": "windows-v3",
+      "kind": "create_folder",
+      "input": {
+        "operation_id": "20000000-0000-4000-8000-000000000062",
+        "folder_id": "30000000-0000-4000-8000-000000000094",
+        "parent_folder_id": "30000000-0000-4000-8000-000000000092",
+        "name": "자료"
+      },
+      "expected_outcome": "second 자료 folder is committed as a different ID under a different parent"
+    },
+    {
+      "action_id": "A03",
+      "actor": "windows-v3",
+      "kind": "pull_snapshot",
+      "input": {},
+      "expected_outcome": "both identities remain distinct"
+    }
+  ],
+  "fault_injections": [],
+  "expected_server_state": {
+    "project_sync_mode": "ID_BASED",
+    "migration_epoch": 3,
+    "entity_assertions": [
+      "both 자료 folders exist with different folder_id values",
+      "each folder keeps its declared parent_folder_id"
+    ],
+    "tree_order_assertions": [
+      "each parent order references its own child folder_id",
+      "names are never used as identity keys"
+    ]
+  },
+  "expected_client_states": [
+    {
+      "client_id": "windows-v3",
+      "assertions": [
+        "both 자료 folders are visible under different parents",
+        "no deduplication by display name occurs"
+      ]
+    }
+  ],
+  "expected_queue_states": [
+    {
+      "operation_id": "20000000-0000-4000-8000-000000000061",
+      "state": "completed",
+      "attempt_count": 1,
+      "assertions": [
+        "first folder result revision is 1"
+      ]
+    },
+    {
+      "operation_id": "20000000-0000-4000-8000-000000000062",
+      "state": "completed",
+      "attempt_count": 1,
+      "assertions": [
+        "second folder result revision is 1"
+      ]
+    }
+  ],
+  "invariants": [
+    {
+      "id": "INV-004",
+      "assert": "stable folder IDs rather than names determine identity"
+    },
+    {
+      "id": "INV-010",
+      "assert": "both parent relationships remain valid and acyclic"
+    }
+  ]
+}

@@ -1,0 +1,120 @@
+{
+  "$schema": "../transition-vector.schema.json",
+  "vector_id": "TV-002",
+  "title": "Folder and child document creation",
+  "contract_version": "0.1.0-draft.1",
+  "minimum_protocol_version": 3,
+  "tags": [
+    "document",
+    "folder",
+    "structure-order"
+  ],
+  "initial_server_state": {
+    "project_id": "00000000-0000-4000-8000-000000000002",
+    "project_sync_mode": "ID_BASED",
+    "migration_epoch": 1,
+    "entities": [],
+    "tree_order": {
+      "root": []
+    }
+  },
+  "initial_client_states": [
+    {
+      "client_id": "windows-v3",
+      "platform": "windows",
+      "protocol_version": 3,
+      "capabilities": [
+        "folders_authoritative",
+        "tree_order_ids",
+        "tombstones",
+        "immutable_batch_contract_metadata"
+      ],
+      "local_entities": [],
+      "queue": []
+    }
+  ],
+  "ordered_actions": [
+    {
+      "action_id": "A01",
+      "actor": "windows-v3",
+      "kind": "create_folder",
+      "input": {
+        "batch_id": "10000000-0000-4000-8000-000000000002",
+        "operation_id": "20000000-0000-4000-8000-000000000002",
+        "folder_id": "30000000-0000-4000-8000-000000000002",
+        "name": "자료"
+      },
+      "expected_outcome": "folder create is accepted"
+    },
+    {
+      "action_id": "A02",
+      "actor": "windows-v3",
+      "kind": "create_document",
+      "input": {
+        "batch_id": "10000000-0000-4000-8000-000000000002",
+        "operation_id": "20000000-0000-4000-8000-000000000003",
+        "document_id": "40000000-0000-4000-8000-000000000002",
+        "folder_id": "30000000-0000-4000-8000-000000000002",
+        "name": "문서.txt"
+      },
+      "expected_outcome": "document create is accepted only with the valid parent folder"
+    },
+    {
+      "action_id": "A03",
+      "actor": "windows-v3",
+      "kind": "commit_batch",
+      "input": {
+        "batch_id": "10000000-0000-4000-8000-000000000002"
+      },
+      "expected_outcome": "folder, document, and ID ordering become visible atomically"
+    }
+  ],
+  "fault_injections": [],
+  "expected_server_state": {
+    "project_sync_mode": "ID_BASED",
+    "migration_epoch": 1,
+    "entity_assertions": [
+      "folder and document both exist at revision 1",
+      "document parent is folder 30000000-0000-4000-8000-000000000002"
+    ],
+    "tree_order_assertions": [
+      "root references the folder ID and the folder references the document ID"
+    ]
+  },
+  "expected_client_states": [
+    {
+      "client_id": "windows-v3",
+      "assertions": [
+        "folder and document are synced with stable IDs"
+      ]
+    }
+  ],
+  "expected_queue_states": [
+    {
+      "operation_id": "20000000-0000-4000-8000-000000000002",
+      "state": "completed",
+      "attempt_count": 1,
+      "assertions": [
+        "folder create precedes document validation inside the atomic boundary"
+      ]
+    },
+    {
+      "operation_id": "20000000-0000-4000-8000-000000000003",
+      "state": "completed",
+      "attempt_count": 1,
+      "assertions": [
+        "document result revision is 1"
+      ]
+    }
+  ],
+  "invariants": [
+    {
+      "id": "INV-005",
+      "assert": "all ID tree references resolve exactly once"
+    },
+    {
+      "id": "INV-008",
+      "assert": "no observer sees a document whose parent folder is absent"
+    }
+  ]
+}
