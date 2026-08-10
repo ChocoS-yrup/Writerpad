@@ -91,11 +91,14 @@ py -3.12 -m venv $contractEnv
 & "$contractEnv\Scripts\python.exe" sync-contract\scripts\verify_contract.py
 ```
 
-macOS/Linux에서는 다음과 같이 실행한다.
+macOS/Linux에서는 Python 3.12를 먼저 설치하고, `python3.12`가 실제로 3.12를
+가리키는지 확인한 뒤 실행한다. macOS 기본 `python3`에 의존하지 않는다.
 
 ```bash
-contract_env="${TMPDIR:-/tmp}/writerpad-contract-review"
-python3 -m venv "$contract_env"
+command -v python3.12
+python3.12 --version
+contract_env="${TMPDIR:-/tmp}/writerpad-contract-review-py312"
+python3.12 -m venv "$contract_env"
 "$contract_env/bin/python" -m pip install -r sync-contract/requirements-validation.txt
 "$contract_env/bin/python" sync-contract/scripts/verify_contract.py
 ```
