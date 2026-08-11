@@ -67,6 +67,9 @@ jobs:
           expected_catalog="on|6c71ff36a90993dc327557b4a1a64c0dfb27b347134ed89e7f126dae76c6ff9a|49540"
           echo "actual_catalog=$actual_catalog"
           echo "expected_catalog=$expected_catalog"
+          if [ "$actual_catalog" != "$expected_catalog" ]; then
+            psql -v ON_ERROR_STOP=1 -f supabase/tests/operational_v2_catalog_diagnostics.sql
+          fi
           test "$actual_catalog" = "$expected_catalog"
       - name: Verify snapshot guard and failed-apply rollback
         shell: bash
