@@ -2483,14 +2483,14 @@ begin
       v_assigned_buffer := v_assigned_buffer || v_character;
     else
       if v_assigned_buffer <> '' then
-        v_result := v_result || pg_catalog.normalize(v_assigned_buffer, NFKC);
+        v_result := v_result || normalize(v_assigned_buffer, NFKC);
         v_assigned_buffer := '';
       end if;
       v_result := v_result || v_character;
     end if;
   end loop;
   if v_assigned_buffer <> '' then
-    v_result := v_result || pg_catalog.normalize(v_assigned_buffer, NFKC);
+    v_result := v_result || normalize(v_assigned_buffer, NFKC);
   end if;
   return v_result;
 end;

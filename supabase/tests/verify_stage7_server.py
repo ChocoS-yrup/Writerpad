@@ -99,6 +99,10 @@ def main() -> None:
             "append-only ledgers need mutation triggers")
     require("supersedes_operation_id" in sql,
             "immutable rebase relationship is missing")
+    require("pg_catalog.normalize(" not in sql,
+            "NORMALIZE special syntax must not be schema-qualified")
+    require(sql.count("normalize(v_assigned_buffer, NFKC)") == 2,
+            "Unicode 15 NFKC normalization calls are missing or malformed")
 
     generator = ROOT / "supabase" / "scripts" / "generate_casefold_sql.py"
     generator_sha = hashlib.sha256(generator.read_bytes()).hexdigest()
