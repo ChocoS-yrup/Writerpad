@@ -260,7 +260,7 @@ returns jsonb
 language plpgsql
 security definer
 set search_path = ''
-as $
+as $$
 declare
   v_user_id uuid := auth.uid();
   v_owner_id uuid;
@@ -307,7 +307,7 @@ begin
     'name', pg_catalog.btrim(p_name)
   );
 end;
-$;
+$$;
 
 create or replace function public.acquire_edit_lease(
   p_document_id uuid,
