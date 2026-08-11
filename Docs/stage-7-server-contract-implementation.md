@@ -7,8 +7,9 @@
 - operational v2 squashed baseline snapshot: 작성 및 catalog exact-match 완료
 - PostgreSQL 17.6 blank-DB chain 검증: 통과
 - PR #4 상태: ready, mergeable, checks passed, 미병합
-- Stage 7 판정: `AWAITING_STAGING_FUNCTIONAL_TEST_APPROVAL`
+- Stage 7 판정: `BLOCKED_TEST_EXPECTATION_CONTRACT_CONFLICT`
 - staging migration: 승인된 3개 정식 적용 및 metadata 검증 완료
+- staging 기능 테스트: 첫 항목에서 contract와 테스트 기대 충돌 확인 후 중단
 - 운영 쓰기 및 ledger reconciliation: 수행하지 않음
 - allowlist 활성화 및 project 승격: 수행하지 않음
 - client 앱 변경: 없음
@@ -146,9 +147,27 @@ migration ledger가 없었다. 당시 foundation을 먼저 실행한 시도는
 비밀값이 제거된 상세 적용 증거는
 `Docs/stage-7-staging-migration-apply-2026-08-11.md`에 기록했다.
 
-다음 별도 승인 대상은 테스트 사용자와 데이터가 필요한 실제 staging 기능 검증이다.
-`document_commit`/`atomic_structure_commit` 왕복, replay/rollback/cancellation 및
-restart/response-loss 검증 전에는 PR #4를 병합하거나 Stage 8을 시작하지 않는다.
+이 migration 적용 확인 시점에는 기능 검증이 별도 승인 대상으로 남아 있었다. 아래는
+그 후 승인된 첫 기능 probe의 결과다.
+
+## staging 기능 테스트 중단 결과
+
+별도 승인 후 합성 사용자 2명과 `ensure_project`로 전용 project 1개를 만들었다.
+project는 `project_sync_settings` row가 없는 정직한 `LEGACY/epoch 0`이었다.
+
+첫 필수 항목은 LEGACY에서 protocol 3 structure request가 거부되는지 확인하는
+것이었다. 실제 `atomic_structure_commit`은 요청을 `committed/applied=true`로
+처리하고 folder 1개를 생성했다. allowlist는 같은 transaction에서 즉시
+`enabled=false`로 복구했으며 나머지 테스트는 실행하지 않았다.
+
+이 결과는 released contract `0.2.0`과 일치한다. `protocol.json`은 protocol 3의
+write mode에 LEGACY를 포함하고 structure matrix에서 `LEGACY + protocol 3`을
+`allowed=true`, `CONTRACT_BATCH`로 정의한다. 따라서 승인된 테스트 기대와 canonical
+contract가 충돌한다.
+
+상세 fixture ID, response, append-only event/attempt 및 최종 row count는
+`Docs/stage-7-staging-functional-test-2026-08-11.md`에 기록했다. contract 유지 또는
+Stage 6 재개정 결정 전에는 allowlist 활성화, PR #4 병합 및 Stage 8 시작을 금지한다.
 
 ## rollback 및 복구
 
@@ -180,7 +199,12 @@ staging_endpoint: https://mhpnszcorfzrvhyondxr.supabase.co
 migration_ledger_verified: three_versions_present_after_formal_apply
 staging_apply: succeeded_2026-08-11
 staging_catalog_verification: required_relations_rls_realtime_and_rpc_signatures_passed
-staging_data_counts: auth_users_projects_documents_folders_and_sync_ledgers_all_zero
+pre_functional_staging_data_counts: auth_users_projects_documents_folders_and_sync_ledgers_all_zero
+staging_functional_test: stopped_after_first_case
+staging_functional_result: legacy_protocol_3_committed_as_contract_0_2_0_allows
+test_expectation_conflict: expected_rejection_but_contract_structure_matrix_allowed_true
+staging_fixture_project_id: 71000000-0000-4000-8000-000000000001
+staging_fixture_counts: users_2_projects_1_folders_1_batches_1_operations_1_attempts_1_events_3
 operational_provenance_classification: PARTIAL_OR_LATER_SCHEMA
 operational_catalog_snapshot_resolution: source_only_exact_match_passed
 protocol_3_document_rpc: implemented_and_postgresql_17_6_ci_passed
@@ -191,7 +215,8 @@ production_changes: none
 allowlist_enabled: false_actual_read
 legacy_project_promotions: none
 unverified_items:
-  - staging document_commit and atomic_structure_commit round trip
+  - resolution of LEGACY protocol 3 test expectation versus contract 0.2.0
+  - remaining staging atomic structure scenarios and all document_commit round trips
   - staging replay, rollback, cancellation and server restart
   - staging snapshot restore procedure
   - existing-production exact-match ledger reconciliation design and approval
