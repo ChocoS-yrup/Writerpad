@@ -3,12 +3,29 @@
 ## 상태
 
 - 구현 범위: Server/Supabase only
-- 구현 상태: 로컬 및 GitHub PostgreSQL 16 CI 검증 완료, staging/운영 미적용
+- 구현 상태: structure/server 기반 구현과 CI는 통과했으나 protocol 3 문서 commit wire의 계약 공백으로 시작 게이트 차단
+- Stage 7 판정: `BLOCKED_CONTRACT_AMENDMENT_REQUIRED`
 - 운영 쓰기: 수행하지 않음
+- staging 쓰기: 수행하지 않음
 - client 앱 변경: 없음
 - 구현 브랜치: `codex/stage-7-server-contract-implementation`
 - 구현 커밋: `1fbc31bee3e36d46e86e8723936b5c2c7b71081f`
 - 검증된 server build SHA: `3111faa589a302404aa57ae88b9eee347a961dc8`
+
+## Protocol 3 문서 commit 계약 게이트
+
+Released contract `0.1.0`은 `document` entity와 protocol 3 batch provenance를
+정의하지만 문서 본문 commit의 규범적 request/response schema, RPC 경계,
+본문 payload, replay 응답 및 오류 shape를 정의하지 않는다.
+
+- 규범 wire schema는 `atomic-structure-commit.schema.json`뿐이며 structure batch 전용이다.
+- `protocol.json`의 `atomic_structure_commit`도 structure write에만 적용된다.
+- `Docs/SyncV2Contract.md`의 `commit_document(...)`는 기존 protocol 2/legacy 구현 문서이며 released contract package의 규범 wire가 아니다.
+- 따라서 `commit_document_contract` 같은 새 RPC를 Stage 7에서 임의로 설계하면 platform별 구현이 서로 다른 wire를 선택할 수 있고 canonical digest가 해당 동작을 보호하지 못한다.
+
+지시에 따라 protocol 3 문서 RPC를 추가하거나 staging migration을 적용하지 않았다.
+계약 개정 요구사항과 재개 조건은
+`Docs/stage-6-document-commit-contract-amendment-required.md`에 기록했다.
 
 ## 계약 pin
 
@@ -71,7 +88,8 @@ contract_version: 0.1.0
 canonical_contract_sha256: fae86b4e6385ee37fbeb99f9256194ec319b64bfda92974ce90a3eb70d2e7a46
 ```
 
-Stage 8은 위의 `UNVERIFIED` 항목을 실제 staging 증거로 교체하고, PR CI와 staging conformance가 모두 통과한 뒤에만 시작해야 한다.
+Stage 8은 먼저 문서 commit 계약 개정과 Stage 7 재검증/병합을 기다려야 한다.
+현재 값은 구현 참고값일 뿐 다음 단계의 최종 pin으로 사용할 수 없다.
 
 ## 미적용 운영 작업
 
