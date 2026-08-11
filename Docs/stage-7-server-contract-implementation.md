@@ -3,11 +3,12 @@
 ## 상태
 
 - 구현 범위: Server/Supabase only
-- 구현 상태: 로컬 정적 검증 완료, staging/운영 미적용
+- 구현 상태: 로컬 및 GitHub PostgreSQL 16 CI 검증 완료, staging/운영 미적용
 - 운영 쓰기: 수행하지 않음
 - client 앱 변경: 없음
 - 구현 브랜치: `codex/stage-7-server-contract-implementation`
 - 구현 커밋: `1fbc31bee3e36d46e86e8723936b5c2c7b71081f`
+- 검증된 server build SHA: `3111faa589a302404aa57ae88b9eee347a961dc8`
 
 ## 계약 pin
 
@@ -41,7 +42,7 @@ canonical_contract_sha256: fae86b4e6385ee37fbeb99f9256194ec319b64bfda92974ce90a3
 - PostgreSQL parser 검사: 두 migration 모두 parse 성공
 - whitespace 검사: passed
 - secret scan: 발견 없음
-- PostgreSQL 16 통합 검증: PR CI에서 실행하도록 구성, 이 문서 작성 시점에는 결과 미확정
+- PostgreSQL 16 통합 검증: passed ([Actions run 31453547913](https://github.com/ChocoS-yrup/Writerpad/actions/runs/31453547913))
 
 CI는 reference v2 migration을 적용한 임시 PostgreSQL 16에서 Stage 7 migration과 SQL conformance test를 실행한다. 운영 또는 staging 데이터베이스를 사용하지 않는다.
 
@@ -65,7 +66,7 @@ staging_endpoint: UNVERIFIED
 migration_ids:
   - 20260811010000
   - 20260811020000
-server_build_sha: 1fbc31bee3e36d46e86e8723936b5c2c7b71081f
+server_build_sha: 3111faa589a302404aa57ae88b9eee347a961dc8
 contract_version: 0.1.0
 canonical_contract_sha256: fae86b4e6385ee37fbeb99f9256194ec319b64bfda92974ce90a3eb70d2e7a46
 ```
