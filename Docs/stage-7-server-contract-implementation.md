@@ -7,11 +7,12 @@
 - operational v2 squashed baseline snapshot: 작성 및 catalog exact-match 완료
 - PostgreSQL 17.6 blank-DB chain 검증: 통과
 - PR #4 상태: ready, mergeable, checks passed, 미병합
-- Stage 7 판정: `BLOCKED_TEST_EXPECTATION_CONTRACT_CONFLICT`
+- Stage 7 판정: `READY_FOR_REVIEW_WITH_MANAGED_SERVER_RESTART_UNVERIFIED`
 - staging migration: 승인된 3개 정식 적용 및 metadata 검증 완료
-- staging 기능 테스트: 첫 항목에서 contract와 테스트 기대 충돌 확인 후 중단
+- staging 기능 테스트: 수정된 contract 기대에 따라 전체 승인 범위 통과
 - 운영 쓰기 및 ledger reconciliation: 수행하지 않음
-- allowlist 활성화 및 project 승격: 수행하지 않음
+- allowlist: staging test 동안만 일시 활성화, 최종 `enabled=false`
+- project 승격: 합성 test fixture 1개만 명시적으로 ID_BASED/epoch 1 완료
 - client 앱 변경: 없음
 - PR: https://github.com/ChocoS-yrup/Writerpad/pull/4
 - server implementation commit: `5b218026d6b786dada2053e0a04761597d9083f8`
@@ -112,8 +113,8 @@ stage7_foundation_apply: passed
 stage7_rpc_apply: passed
 stage7_migration_rerun: passed
 atomic_replay_cancellation_migration_sql: stage7_server_contract_sql_passed
-github_actions_server_run: https://github.com/ChocoS-yrup/Writerpad/actions/runs/31465930836
-github_actions_contract_run: https://github.com/ChocoS-yrup/Writerpad/actions/runs/31465930851
+github_actions_server_run: https://github.com/ChocoS-yrup/Writerpad/actions/runs/31468365998
+github_actions_contract_run: https://github.com/ChocoS-yrup/Writerpad/actions/runs/31468366003
 ```
 
 최종 CI에서 Ubuntu exact head, Windows exact head, Ubuntu PR merge result 및
@@ -150,24 +151,37 @@ migration ledger가 없었다. 당시 foundation을 먼저 실행한 시도는
 이 migration 적용 확인 시점에는 기능 검증이 별도 승인 대상으로 남아 있었다. 아래는
 그 후 승인된 첫 기능 probe의 결과다.
 
-## staging 기능 테스트 중단 결과
+## staging 기능 테스트 결과
 
 별도 승인 후 합성 사용자 2명과 `ensure_project`로 전용 project 1개를 만들었다.
-project는 `project_sync_settings` row가 없는 정직한 `LEGACY/epoch 0`이었다.
+project는 `project_sync_settings` row가 없는 정직한 `LEGACY/epoch 0`이었다. 최초
+`LEGACY + protocol 3` commit은 Contract `0.2.0`에 따라 PASS로 재분류했으며 자동
+승격은 없었다.
 
-첫 필수 항목은 LEGACY에서 protocol 3 structure request가 거부되는지 확인하는
-것이었다. 실제 `atomic_structure_commit`은 요청을 `committed/applied=true`로
-처리하고 folder 1개를 생성했다. allowlist는 같은 transaction에서 즉시
-`enabled=false`로 복구했으며 나머지 테스트는 실행하지 않았다.
+정식 migration RPC로 합성 project만 `LEGACY → MIGRATING/epoch 1 → ID_BASED/epoch 1`
+전환했다. migration lock owner write는 허용되고 잘못된 device 및 stale epoch는 각각
+`MIGRATION_LOCKED`, `STALE_MIGRATION_EPOCH`으로 거부됐다. ID_BASED의 protocol 1·2는
+`PROTOCOL_TOO_OLD`였다.
 
-이 결과는 released contract `0.2.0`과 일치한다. `protocol.json`은 protocol 3의
-write mode에 LEGACY를 포함하고 structure matrix에서 `LEGACY + protocol 3`을
-`allowed=true`, `CONTRACT_BATCH`로 정의한다. 따라서 승인된 테스트 기대와 canonical
-contract가 충돌한다.
+실제 staging RPC에서 다음을 검증했다.
 
-상세 fixture ID, response, append-only event/attempt 및 최종 row count는
-`Docs/stage-7-staging-functional-test-2026-08-11.md`에 기록했다. contract 유지 또는
-Stage 6 재개정 결정 전에는 allowlist 활성화, PR #4 병합 및 Stage 8 시작을 금지한다.
+- multi-intent atomic success 및 중간 실패 전체 rollback
+- folder/document rename, move, delete, restore와 revision 경계
+- 일반 본문 및 의도적인 빈 본문 document commit
+- exact replay, changed-payload ID reuse 거부 및 새 연결 response-loss replay
+- cancellation, duplicate cancellation 및 terminal cancellation
+- 두 번째 합성 사용자의 RLS read/write 격리
+- storage-name vector 15/15 및 normalized collision
+- missing capability와 wrong contract digest fail-closed
+
+최종 fixture는 folder 3개, document 2개, immutable operation 18개, append-only event
+55개, attempt 18개다. allowlist는 `enabled=false`이며 전체 enabled row도 0개다.
+관리형 Supabase 자체 pause/restart는 승인 범위에서 금지되어 미검증으로 남겼고, 대신
+새 SQL 연결·새 auth context에서 동일 request replay가 중복 적용되지 않음을 확인했다.
+
+상세 request ID, response/error code, revision, RLS, vector, row count와 실패·재시험
+이력은 `Docs/stage-7-staging-functional-test-2026-08-11.md`에 기록했다. PR #4는 아직
+병합하지 않았고 Stage 8도 시작하지 않았다.
 
 ## rollback 및 복구
 
@@ -200,24 +214,24 @@ migration_ledger_verified: three_versions_present_after_formal_apply
 staging_apply: succeeded_2026-08-11
 staging_catalog_verification: required_relations_rls_realtime_and_rpc_signatures_passed
 pre_functional_staging_data_counts: auth_users_projects_documents_folders_and_sync_ledgers_all_zero
-staging_functional_test: stopped_after_first_case
-staging_functional_result: legacy_protocol_3_committed_as_contract_0_2_0_allows
-test_expectation_conflict: expected_rejection_but_contract_structure_matrix_allowed_true
+staging_functional_test: passed_approved_scope
+staging_functional_result: contract_0_2_0_structure_document_replay_rollback_cancellation_rls_and_unicode_passed
+legacy_protocol_3_result: allowed_committed_no_automatic_promotion_pass
 staging_fixture_project_id: 71000000-0000-4000-8000-000000000001
-staging_fixture_counts: users_2_projects_1_folders_1_batches_1_operations_1_attempts_1_events_3
+staging_fixture_migration_id: 936f0571-5fe3-4d37-affc-9cced9183d1c
+staging_fixture_mode: ID_BASED_epoch_1_explicitly_completed
+staging_fixture_counts: users_2_projects_1_folders_3_documents_2_batches_16_operations_18_attempts_18_events_55
 operational_provenance_classification: PARTIAL_OR_LATER_SCHEMA
 operational_catalog_snapshot_resolution: source_only_exact_match_passed
-protocol_3_document_rpc: implemented_and_postgresql_17_6_ci_passed
-atomic_structure_rpc: implemented_and_postgresql_17_6_ci_passed
-test_results: blank_chain_catalog_guard_rollback_rerun_and_rpc_conformance_passed
+protocol_3_document_rpc: implemented_ci_and_staging_round_trip_passed
+atomic_structure_rpc: implemented_ci_and_staging_atomic_rollback_passed
+test_results: blank_chain_catalog_guard_rollback_rerun_rpc_conformance_and_staging_functional_passed
 rollback_status: ci_and_prior_staging_failed_transactions_fully_rolled_back
 production_changes: none
-allowlist_enabled: false_actual_read
-legacy_project_promotions: none
+allowlist_enabled: false_actual_read_enabled_row_count_0
+legacy_project_promotions: synthetic_fixture_only_explicit_migration_no_automatic_promotion
 unverified_items:
-  - resolution of LEGACY protocol 3 test expectation versus contract 0.2.0
-  - remaining staging atomic structure scenarios and all document_commit round trips
-  - staging replay, rollback, cancellation and server restart
+  - managed Supabase physical server pause/restart
   - staging snapshot restore procedure
   - existing-production exact-match ledger reconciliation design and approval
 ```
