@@ -7,14 +7,15 @@
 - operational v2 squashed baseline snapshot: 작성 및 catalog exact-match 완료
 - PostgreSQL 17.6 blank-DB chain 검증: 통과
 - PR #4 상태: ready, mergeable, checks passed, 미병합
-- Stage 7 판정: `AWAITING_STAGING_APPLY_APPROVAL`
-- staging 쓰기: 새 baseline snapshot은 아직 미적용
+- Stage 7 판정: `AWAITING_STAGING_FUNCTIONAL_TEST_APPROVAL`
+- staging migration: 승인된 3개 정식 적용 및 metadata 검증 완료
 - 운영 쓰기 및 ledger reconciliation: 수행하지 않음
 - allowlist 활성화 및 project 승격: 수행하지 않음
 - client 앱 변경: 없음
 - PR: https://github.com/ChocoS-yrup/Writerpad/pull/4
 - server implementation commit: `5b218026d6b786dada2053e0a04761597d9083f8`
 - baseline verification candidate commit: `e716f3890b8e43ef699fc521f97ec2f75f0edda0`
+- staging applied source head: `3045417821371a0e5220c3be90d9b46353dbf711`
 
 ## 최종 계약 pin
 
@@ -122,17 +123,32 @@ delimiter, 분할 파일 경계의 중복 newline, locale 의존 catalog 정렬�
 모든 실패는 일회용 CI DB transaction 안에서 발생했으며 staging/운영에는 쓰지
 않았다. metadata-only 진단 SQL은 digest mismatch 때만 출력되도록 남겼다.
 
-## staging 상태와 다음 승인 대상
+## staging 적용 결과와 다음 승인 대상
 
 2026-08-11의 기존 staging preflight에서 `WriterPad Staging`
 (`mhpnszcorfzrvhyondxr`)은 PostgreSQL 17.6의 빈 프로젝트였고 baseline table과
 migration ledger가 없었다. 당시 foundation을 먼저 실행한 시도는
 `STAGE7_BASELINE_MISSING`으로 전체 rollback됐고 RPC migration은 실행하지 않았다.
 
-새 snapshot 및 뒤의 두 Stage 7 migration은 staging에 아직 적용하지 않았다.
-다음 별도 승인 대상은 정확히 위 세 파일을 WriterPad Staging에 순서대로 적용하는
-작업이다. 승인 후에는 ledger/catalog/RPC catalog, 실제 document/structure 왕복,
-replay/rollback/cancellation 및 restart/response-loss를 검증해야 한다.
+별도 승인 후 PR #4 head `3045417821371a0e5220c3be90d9b46353dbf711`에서
+세 migration의 SHA-256을 다시 확인하고 Supabase CLI `2.113.0`의 정식 linked
+`db push` 방식으로 순서대로 적용했다. remote ledger에 세 version이 모두 기록됐다.
+
+적용 후 `READ ONLY` transaction과 `ROLLBACK`으로 다음을 실제 DB에서 확인했다.
+
+- contract `0.2.0`, canonical digest와 bytes가 pin과 일치
+- allowlist 1행, `enabled=false`, revoked 아님
+- `document_commit(jsonb)`와 `atomic_structure_commit(jsonb)` signature 존재
+- 필수 public/private relation과 강제 RLS 및 documents/folders Realtime 존재
+- auth.users, project/document/folder 및 모든 sync operation table 정확히 0행
+- project mode 생성·승격 및 테스트 데이터 생성 없음
+
+비밀값이 제거된 상세 적용 증거는
+`Docs/stage-7-staging-migration-apply-2026-08-11.md`에 기록했다.
+
+다음 별도 승인 대상은 테스트 사용자와 데이터가 필요한 실제 staging 기능 검증이다.
+`document_commit`/`atomic_structure_commit` 왕복, replay/rollback/cancellation 및
+restart/response-loss 검증 전에는 PR #4를 병합하거나 Stage 8을 시작하지 않는다.
 
 ## rollback 및 복구
 
@@ -151,6 +167,7 @@ replay/rollback/cancellation 및 restart/response-loss를 검증해야 한다.
 contract_version: 0.2.0
 canonical_contract_sha256: 416c1b99edb9bda694731dee4b25688d9d82d1f32610aa23ddfda571ec3c7670
 server_merge_candidate_commit: e716f3890b8e43ef699fc521f97ec2f75f0edda0
+staging_applied_source_head: 3045417821371a0e5220c3be90d9b46353dbf711
 baseline_snapshot_id: 20260811000000
 baseline_snapshot_sha256: 323c6e092cd9afabb438eaf233b7e63abd0195d5e1a91a5f5fe3fe5940699198
 source_catalog_manifest_sha256: 6c71ff36a90993dc327557b4a1a64c0dfb27b347134ed89e7f126dae76c6ff9a
@@ -160,8 +177,10 @@ migration_ids:
   - 20260811020000
 staging_project_id: mhpnszcorfzrvhyondxr
 staging_endpoint: https://mhpnszcorfzrvhyondxr.supabase.co
-migration_ledger_verified: true_absent_at_preflight
-staging_apply: not_approved_not_run
+migration_ledger_verified: three_versions_present_after_formal_apply
+staging_apply: succeeded_2026-08-11
+staging_catalog_verification: required_relations_rls_realtime_and_rpc_signatures_passed
+staging_data_counts: auth_users_projects_documents_folders_and_sync_ledgers_all_zero
 operational_provenance_classification: PARTIAL_OR_LATER_SCHEMA
 operational_catalog_snapshot_resolution: source_only_exact_match_passed
 protocol_3_document_rpc: implemented_and_postgresql_17_6_ci_passed
@@ -169,10 +188,9 @@ atomic_structure_rpc: implemented_and_postgresql_17_6_ci_passed
 test_results: blank_chain_catalog_guard_rollback_rerun_and_rpc_conformance_passed
 rollback_status: ci_and_prior_staging_failed_transactions_fully_rolled_back
 production_changes: none
-allowlist_enabled: false
+allowlist_enabled: false_actual_read
 legacy_project_promotions: none
 unverified_items:
-  - staging three-migration apply and migration ledger
   - staging document_commit and atomic_structure_commit round trip
   - staging replay, rollback, cancellation and server restart
   - staging snapshot restore procedure

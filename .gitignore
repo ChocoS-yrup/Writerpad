@@ -13,6 +13,7 @@ Secrets.xcconfig
 *.swp
 __pycache__/
 *.pyc
+supabase/.temp/
 
 # Windows 참조 소스와 테스트 작품은 읽기 전용 참고 자료다.
 공유/
