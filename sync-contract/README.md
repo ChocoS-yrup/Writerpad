@@ -1,4 +1,4 @@
-# WriterPad Sync Contract 0.1.0
+# WriterPad Sync Contract 0.2.0
 
 This directory is the released, implementation-independent WriterPad sync
 contract. It defines wire behavior and conformance requirements; it does not
@@ -6,12 +6,12 @@ implement Windows, iPad, macOS, server, database, or migration code.
 
 ## Release identity
 
-- Contract version: `0.1.0`
+- Contract version: `0.2.0`
 - Status: released; deployment and server allowlisting are separate stage-7 actions
 - Canonicalization: RFC 8785
-- Canonical `protocol.json` byte length: `19473`
+- Canonical `protocol.json` byte length: `23256`
 - Canonical SHA-256:
-  `fae86b4e6385ee37fbeb99f9256194ec319b64bfda92974ce90a3eb70d2e7a46`
+  `416c1b99edb9bda694731dee4b25688d9d82d1f32610aa23ddfda571ec3c7670`
 
 The digest is SHA-256 over the exact UTF-8 bytes returned by RFC 8785
 canonicalization of `protocol.json`. It is not a source-file, pretty-print,
@@ -35,13 +35,14 @@ because a Git commit cannot contain its own SHA without changing that SHA.
 | `protocol.json` | Normative protocol, operation/event, mode, compatibility, normalization, migration, and evidence rules |
 | `protocol.schema.json` | Draft 2020-12 schema for the released protocol |
 | `atomic-structure-commit.schema.json` | Normative request/success/failure wire schema for atomic structure batches |
+| `document-commit.schema.json` | Normative request/success/failure wire schema for atomic document body commits |
 | `storage-name-vectors.schema.json` | Schema for platform-independent storage-name vectors |
 | `incident.schema.json` | Cross-platform incident evidence format |
 | `snapshot.schema.json` | Server snapshot interchange format |
 | `transition-vector.schema.json` | State transition and fault-injection vector format |
 | `test_vectors/*.json` | Twelve required cross-client transition vectors |
 | `conformance_vectors/*.json` | Atomic wire and storage-name conformance cases |
-| `TRACEABILITY.md` | C-01 through C-06 normative text → schema → vector → verifier mapping |
+| `TRACEABILITY.md` | C-01 through C-07 normative text → schema → vector → verifier mapping |
 | `contract-lock.json` | Expected release identity, counts, canonical length, and digest |
 | `scripts/verify_contract.py` | Schema, vector, digest, and cross-file semantic verifier |
 | `requirements-validation.txt` | Pinned verifier dependencies |
@@ -52,7 +53,7 @@ because a Git commit cannot contain its own SHA without changing that SHA.
 |---|---|---|---|---|
 | 1 | `LEGACY` only | `LEGACY_EPOCH_0` | forbidden | Name-based legacy projection through the server legacy adapter |
 | 2 | `LEGACY` only | `LEGACY_EPOCH_0` | forbidden | Stable folders and tombstones without claiming released-contract provenance |
-| 3 | `LEGACY`, `MIGRATING`, `ID_BASED` | `CONTRACT_BATCH` | required | Full capability set, append-only attempts/events, storage-name-v1, and atomic structural writes |
+| 3 | `LEGACY`, `MIGRATING`, `ID_BASED` | `CONTRACT_BATCH` | required | Full capability set, append-only attempts/events, storage-name-v1, atomic structure, and atomic document writes |
 
 `MIGRATING` and `ID_BASED` require protocol 3 for both content and structure.
 Protocol 1/2 clients are rejected with `PROTOCOL_TOO_OLD` after enforcement
@@ -80,8 +81,24 @@ that complete array, and `batch_id` is the idempotency key.
 
 Success covers every intent. Any validation or apply failure rolls back the
 complete transaction and returns an empty result list. An identical replay
-returns the original complete response; the same batch ID with changed bytes
-returns `BATCH_ID_REUSED`.
+returns `status=replayed` with the original result fields; the same batch ID
+with changed bytes returns `BATCH_ID_REUSED`.
+
+## Atomic document boundary
+
+Every protocol-3 document create, body update, delete, or restore is one
+`document_commit_request` containing exactly one immutable intent. The request
+binds the full UTF-8 content by byte count and SHA-256 and also binds the
+complete payload and batch using RFC 8785. An intentional empty document is a
+real write with byte count zero and the standard SHA-256 of empty bytes.
+
+Existing document commits cannot rename or move a document. They must name the
+current `structure_revision`; stale structure is rejected. Rename and move use
+`atomic_structure_commit`. Delete preserves the current body before writing a
+tombstone, and restore reuses the tombstoned body before any later edit.
+Identical retries replay the complete stored result after response loss or a
+server restart. Any mismatch or partial result is rejected and never applied by
+a client.
 
 ## Storage-name-v1
 
@@ -130,14 +147,16 @@ python3.12 -m venv .venv-contract
 
 The verifier checks:
 
-- all six Draft 2020-12 schemas;
-- released protocol `0.1.0` and twelve transition vectors;
+- all seven Draft 2020-12 schemas;
+- released protocol `0.2.0` and twelve transition vectors;
 - capability `since_protocol` and required capability declarations;
 - operation creation paths and immutable rebase identities;
 - protocol-specific batch/provenance obligations;
 - event-to-state derivation and cancellation cases;
 - fifteen Unicode 15.0.0 storage-name vectors and exact UTF-8 keys;
 - four atomic wire cases, including digest binding, replay, and full rollback;
+- seven document wire cases covering empty content, update, delete, restore,
+  replay, changed replay, and full rollback;
 - legacy epoch-0 defaults and manual enforcement boundary;
 - RFC 8785 canonical byte length and SHA-256 lock.
 

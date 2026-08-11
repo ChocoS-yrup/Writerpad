@@ -1,6 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "urn:writerpad:sync-contract:transition-vector-schema:0.1.0",
+  "$id": "urn:writerpad:sync-contract:transition-vector-schema:0.2.0",
   "title": "WriterPad Sync State Transition Test Vector",
   "type": "object",
   "additionalProperties": false,
@@ -33,7 +33,7 @@
       "minLength": 1
     },
     "contract_version": {
-      "const": "0.1.0"
+      "const": "0.2.0"
     },
     "minimum_protocol_version": {
       "type": "integer",

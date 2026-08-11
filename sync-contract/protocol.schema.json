@@ -1,6 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "urn:writerpad:sync-contract:protocol-schema:0.1.0",
+  "$id": "urn:writerpad:sync-contract:protocol-schema:0.2.0",
   "title": "WriterPad Sync Contract Protocol",
   "type": "object",
   "additionalProperties": false,
@@ -19,6 +19,7 @@
     "minimum_write_protocol",
     "structure_write_matrix",
     "atomic_structure_commit",
+    "document_commit",
     "storage_name_normalization",
     "legacy_migration",
     "standard_error_codes",
@@ -31,7 +32,7 @@
       "const": "./protocol.schema.json"
     },
     "contract_version": {
-      "const": "0.1.0"
+      "const": "0.2.0"
     },
     "contract_status": {
       "const": "released"
@@ -95,6 +96,9 @@
     "atomic_structure_commit": {
       "$ref": "#/$defs/atomicRule"
     },
+    "document_commit": {
+      "$ref": "#/$defs/documentRule"
+    },
     "storage_name_normalization": {
       "$ref": "#/$defs/storageNameRule"
     },
@@ -112,7 +116,7 @@
     },
     "server_invariants": {
       "type": "array",
-      "minItems": 12,
+      "minItems": 13,
       "items": {
         "$ref": "#/$defs/invariant"
       }
@@ -753,6 +757,66 @@
         "partial_apply_rule": {
           "$ref": "#/$defs/nonEmptyString"
         }
+      }
+    },
+    "documentRule": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "required_protocol",
+        "wire_schema",
+        "request_kind",
+        "response_kinds",
+        "idempotency_key",
+        "atomic_boundary",
+        "ordering_rule",
+        "payload_digest_rule",
+        "success_rule",
+        "failure_rule",
+        "replay_rule",
+        "partial_apply_rule",
+        "intent_rules",
+        "content_limit_bytes",
+        "structure_barrier_rule"
+      ],
+      "properties": {
+        "required_protocol": {
+          "const": 3
+        },
+        "wire_schema": {
+          "const": "document-commit.schema.json"
+        },
+        "request_kind": {
+          "const": "document_commit_request"
+        },
+        "response_kinds": {
+          "type": "array",
+          "prefixItems": [
+            { "const": "document_commit_success" },
+            { "const": "document_commit_failure" }
+          ],
+          "minItems": 2,
+          "maxItems": 2
+        },
+        "idempotency_key": {
+          "const": "batch_id"
+        },
+        "atomic_boundary": { "$ref": "#/$defs/nonEmptyString" },
+        "ordering_rule": { "$ref": "#/$defs/nonEmptyString" },
+        "payload_digest_rule": { "$ref": "#/$defs/nonEmptyString" },
+        "success_rule": { "$ref": "#/$defs/nonEmptyString" },
+        "failure_rule": { "$ref": "#/$defs/nonEmptyString" },
+        "replay_rule": { "$ref": "#/$defs/nonEmptyString" },
+        "partial_apply_rule": { "$ref": "#/$defs/nonEmptyString" },
+        "intent_rules": {
+          "type": "array",
+          "minItems": 6,
+          "items": { "$ref": "#/$defs/nonEmptyString" }
+        },
+        "content_limit_bytes": {
+          "const": 10485760
+        },
+        "structure_barrier_rule": { "$ref": "#/$defs/nonEmptyString" }
       }
     },
     "storageNameRule": {

@@ -1,0 +1,290 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:writerpad:sync-contract:document-commit:0.2.0",
+  "title": "WriterPad document_commit wire contract",
+  "oneOf": [
+    { "$ref": "#/$defs/request" },
+    { "$ref": "#/$defs/success" },
+    { "$ref": "#/$defs/failure" }
+  ],
+  "$defs": {
+    "uuid": {
+      "type": "string",
+      "format": "uuid"
+    },
+    "sha256": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "capabilitySet": {
+      "type": "array",
+      "uniqueItems": true,
+      "contains": { "const": "document_commit_v1" },
+      "minContains": 1,
+      "items": {
+        "type": "string",
+        "pattern": "^[a-z][a-z0-9_]*$"
+      }
+    },
+    "batchMetadata": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "batch_id",
+        "writer_device_id",
+        "client_build_id",
+        "sync_protocol_version",
+        "contract_version",
+        "canonical_contract_sha256",
+        "client_capabilities",
+        "batch_payload_sha256"
+      ],
+      "properties": {
+        "batch_id": { "$ref": "#/$defs/uuid" },
+        "writer_device_id": { "$ref": "#/$defs/uuid" },
+        "client_build_id": { "type": "string", "minLength": 1 },
+        "sync_protocol_version": { "const": 3 },
+        "contract_version": { "const": "0.2.0" },
+        "canonical_contract_sha256": { "$ref": "#/$defs/sha256" },
+        "client_capabilities": { "$ref": "#/$defs/capabilitySet" },
+        "batch_payload_sha256": { "$ref": "#/$defs/sha256" }
+      }
+    },
+    "documentPayload": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "parent_folder_id",
+        "name",
+        "content",
+        "content_sha256",
+        "content_byte_count",
+        "is_deleted",
+        "structure_revision"
+      ],
+      "properties": {
+        "parent_folder_id": {
+          "oneOf": [
+            { "$ref": "#/$defs/uuid" },
+            { "type": "null" }
+          ]
+        },
+        "name": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 255
+        },
+        "content": {
+          "type": "string",
+          "maxLength": 10485760
+        },
+        "content_sha256": { "$ref": "#/$defs/sha256" },
+        "content_byte_count": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 10485760
+        },
+        "is_deleted": { "type": "boolean" },
+        "structure_revision": {
+          "type": "integer",
+          "minimum": 1
+        }
+      }
+    },
+    "intent": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "sequence",
+        "operation_id",
+        "batch_id",
+        "entity_kind",
+        "document_id",
+        "intent_kind",
+        "base_revision",
+        "payload_sha256",
+        "payload"
+      ],
+      "properties": {
+        "sequence": { "const": 1 },
+        "operation_id": { "$ref": "#/$defs/uuid" },
+        "batch_id": { "$ref": "#/$defs/uuid" },
+        "entity_kind": { "const": "document" },
+        "document_id": { "$ref": "#/$defs/uuid" },
+        "intent_kind": {
+          "enum": ["create", "update", "delete", "restore"]
+        },
+        "base_revision": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "payload_sha256": { "$ref": "#/$defs/sha256" },
+        "supersedes_operation_id": { "$ref": "#/$defs/uuid" },
+        "payload": { "$ref": "#/$defs/documentPayload" }
+      },
+      "allOf": [
+        {
+          "if": { "properties": { "intent_kind": { "const": "create" } } },
+          "then": {
+            "properties": {
+              "base_revision": { "const": 0 },
+              "payload": {
+                "properties": { "is_deleted": { "const": false } }
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "intent_kind": { "enum": ["update", "delete", "restore"] }
+            }
+          },
+          "then": {
+            "properties": { "base_revision": { "minimum": 1 } }
+          }
+        },
+        {
+          "if": { "properties": { "intent_kind": { "const": "update" } } },
+          "then": {
+            "properties": {
+              "payload": {
+                "properties": { "is_deleted": { "const": false } }
+              }
+            }
+          }
+        },
+        {
+          "if": { "properties": { "intent_kind": { "const": "delete" } } },
+          "then": {
+            "properties": {
+              "payload": {
+                "properties": { "is_deleted": { "const": true } }
+              }
+            }
+          }
+        },
+        {
+          "if": { "properties": { "intent_kind": { "const": "restore" } } },
+          "then": {
+            "properties": {
+              "payload": {
+                "properties": { "is_deleted": { "const": false } }
+              }
+            }
+          }
+        }
+      ]
+    },
+    "request": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "kind",
+        "project_id",
+        "project_sync_mode",
+        "migration_epoch",
+        "batch",
+        "ordered_intents"
+      ],
+      "properties": {
+        "kind": { "const": "document_commit_request" },
+        "project_id": { "$ref": "#/$defs/uuid" },
+        "project_sync_mode": {
+          "enum": ["LEGACY", "MIGRATING", "ID_BASED"]
+        },
+        "migration_epoch": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "batch": { "$ref": "#/$defs/batchMetadata" },
+        "ordered_intents": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 1,
+          "items": { "$ref": "#/$defs/intent" }
+        }
+      }
+    },
+    "documentResult": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "sequence",
+        "operation_id",
+        "document_id",
+        "result_revision",
+        "structure_revision",
+        "parent_folder_id",
+        "name",
+        "content_sha256",
+        "content_byte_count",
+        "is_deleted"
+      ],
+      "properties": {
+        "sequence": { "const": 1 },
+        "operation_id": { "$ref": "#/$defs/uuid" },
+        "document_id": { "$ref": "#/$defs/uuid" },
+        "result_revision": { "type": "integer", "minimum": 1 },
+        "structure_revision": { "type": "integer", "minimum": 1 },
+        "parent_folder_id": {
+          "oneOf": [
+            { "$ref": "#/$defs/uuid" },
+            { "type": "null" }
+          ]
+        },
+        "name": { "type": "string", "minLength": 1, "maxLength": 255 },
+        "content_sha256": { "$ref": "#/$defs/sha256" },
+        "content_byte_count": { "type": "integer", "minimum": 0, "maximum": 10485760 },
+        "is_deleted": { "type": "boolean" }
+      }
+    },
+    "success": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "batch_id", "batch_payload_sha256", "status", "applied", "results"],
+      "properties": {
+        "kind": { "const": "document_commit_success" },
+        "batch_id": { "$ref": "#/$defs/uuid" },
+        "batch_payload_sha256": { "$ref": "#/$defs/sha256" },
+        "status": { "enum": ["committed", "replayed"] },
+        "applied": { "const": true },
+        "results": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 1,
+          "items": { "$ref": "#/$defs/documentResult" }
+        }
+      }
+    },
+    "error": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["code", "message", "failed_sequence"],
+      "properties": {
+        "code": { "type": "string", "pattern": "^[A-Z][A-Z0-9_]+$" },
+        "message": { "type": "string", "minLength": 1 },
+        "failed_sequence": {
+          "oneOf": [
+            { "const": 1 },
+            { "type": "null" }
+          ]
+        }
+      }
+    },
+    "failure": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "batch_id", "batch_payload_sha256", "status", "applied", "error", "results"],
+      "properties": {
+        "kind": { "const": "document_commit_failure" },
+        "batch_id": { "$ref": "#/$defs/uuid" },
+        "batch_payload_sha256": { "$ref": "#/$defs/sha256" },
+        "status": { "const": "rejected" },
+        "applied": { "const": false },
+        "error": { "$ref": "#/$defs/error" },
+        "results": { "type": "array", "maxItems": 0 }
+      }
+    }
+  }
+}
