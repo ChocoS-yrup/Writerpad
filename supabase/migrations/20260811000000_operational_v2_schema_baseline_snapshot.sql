@@ -196,7 +196,7 @@ AS $function$
           end
         )
     );
-$function$
+$function$;
 
 revoke all on function private.has_project_role(uuid, uuid, text) from public;
 revoke all on function private.is_valid_relative_path(text) from public;
