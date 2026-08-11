@@ -1,9 +1,9 @@
-# Sync Contract 0.1.0 blocker traceability
+# Sync Contract 0.2.0 blocker traceability
 
 This table is normative release traceability for the six blockers confirmed by the
-Windows feasibility review and the independent iPad/macOS review. A row is complete
-only when its normative text, machine-readable schema, conformance vector, and
-verifier rule agree.
+Windows feasibility review and the later protocol-3 document wire gate. A row is
+complete only when its normative text, machine-readable schema, conformance vector,
+and verifier rule agree.
 
 | Blocker | Normative text | Schema | Vector | Verifier |
 |---|---|---|---|---|
@@ -13,6 +13,7 @@ verifier rule agree.
 | C-04 atomic structure commit | `atomic_structure_commit`: one ordered request is the atomic/idempotent boundary; any failure rolls back all intents | `atomic-structure-commit.schema.json` request, success, and failure wire shapes | TV-012; ASC-001 through ASC-004 | `verify_atomic_vectors` checks sequence, intent/batch digests, exact replay, changed replay rejection, full success coverage, and empty failure results |
 | C-05 normalized storage name | `storage_name_normalization`: Unicode 15.0.0 NFKC_Casefold, deterministic rejection, trailing-space/dot policy, reserved basenames, exact UTF-8 comparison | `storage-name-vectors.schema.json` | SN-001 through SN-015 | `verify_storage_vectors` independently computes every normalized value, UTF-8 collision key, and error using pinned Unicode data |
 | C-06 historical provenance | `legacy_migration` and `project_sync_mode`: existing projects remain `LEGACY/epoch 0`; unavailable metadata stays unknown; enforcement begins only at a locked manual transition | Legacy migration/default/mode structures in `protocol.schema.json` | TV-003, TV-010 | `verify_legacy_boundary` rejects invented defaults, automatic mode changes, or post-enforcement protocol 1/2 writes |
+| C-07 atomic document body commit | `document_commit`: create/update/delete/restore use one immutable document intent, full UTF-8 content digest, structure revision barrier, all-or-nothing response, and deterministic replay | `document-commit.schema.json` request, success, and failure wire shapes | DC-001 through DC-007 | `verify_document_vectors` checks capability and contract pins, payload/batch/content digests, byte counts, result completeness, empty content, replay, rollback, delete, and restore |
 
 ## Evidence boundaries
 

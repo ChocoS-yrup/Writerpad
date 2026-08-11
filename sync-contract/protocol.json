@@ -1,6 +1,6 @@
 {
   "$schema": "./protocol.schema.json",
-  "contract_version": "0.1.0",
+  "contract_version": "0.2.0",
   "contract_status": "released",
   "canonicalization": {
     "standard": "RFC 8785",
@@ -61,7 +61,8 @@
         "immutable_batch_contract_metadata",
         "operation_attempt_history",
         "operation_state_events",
-        "storage_name_v1"
+        "storage_name_v1",
+        "document_commit_v1"
       ],
       "required_server_capabilities": [
         "atomic_structure_commit",
@@ -70,11 +71,12 @@
         "folder_tombstones",
         "id_tree_validation",
         "legacy_epoch_zero_adapter",
-        "storage_name_v1"
+        "storage_name_v1",
+        "document_commit_v1"
       ],
       "batch_requirement": "required",
       "provenance_kind": "CONTRACT_BATCH",
-      "description": "Every protocol 3 write uses an immutable contract batch. Every structural write uses the normative atomic_structure_commit wire boundary."
+      "description": "Every protocol 3 write uses an immutable contract batch. Structural writes use atomic_structure_commit and document body writes use document_commit."
     }
   ],
   "client_capabilities": {
@@ -117,6 +119,11 @@
       "since_protocol": 3,
       "scope": "structure",
       "meaning": "Storage-name collision keys use Unicode 15.0.0 NFKC_Casefold and the storage-name-v1 rejection rules."
+    },
+    "document_commit_v1": {
+      "since_protocol": 3,
+      "scope": "content",
+      "meaning": "Document create, body update, delete, and restore use the normative document_commit wire with one immutable intent per atomic batch."
     }
   },
   "server_capabilities": {
@@ -147,6 +154,10 @@
     "storage_name_v1": {
       "since_protocol": 3,
       "meaning": "The server computes and compares the same storage-name-v1 UTF-8 collision key as clients."
+    },
+    "document_commit_v1": {
+      "since_protocol": 3,
+      "meaning": "The server validates and commits one complete document snapshot in one transaction or applies nothing."
     }
   },
   "capability_version_rules": {
@@ -520,8 +531,35 @@
     "payload_digest_rule": "batch_payload_sha256 is SHA-256 of the RFC 8785 canonical UTF-8 bytes of ordered_intents.",
     "success_rule": "Success returns committed or replayed for the entire batch and one result per ordered intent.",
     "failure_rule": "Any validation or apply failure rolls back the transaction, returns applied=false, and returns no successful intent result.",
-    "replay_rule": "An identical batch_id and batch_payload_sha256 returns the original complete response; a different payload is BATCH_ID_REUSED.",
+    "replay_rule": "An identical batch_id and batch_payload_sha256 returns status=replayed with result fields identical to the original committed response; a different payload is BATCH_ID_REUSED.",
     "partial_apply_rule": "A partial apply MUST NOT be represented as success and MUST be rolled back."
+  },
+  "document_commit": {
+    "required_protocol": 3,
+    "wire_schema": "document-commit.schema.json",
+    "request_kind": "document_commit_request",
+    "response_kinds": [
+      "document_commit_success",
+      "document_commit_failure"
+    ],
+    "idempotency_key": "batch_id",
+    "atomic_boundary": "one request containing one immutable batch and exactly one document intent with sequence 1",
+    "ordering_rule": "ordered_intents contains exactly one item and its sequence is 1; document history order is the server-committed result_revision order.",
+    "payload_digest_rule": "payload_sha256 is SHA-256 of the RFC 8785 canonical UTF-8 bytes of payload; batch_payload_sha256 is SHA-256 of the RFC 8785 canonical UTF-8 bytes of ordered_intents; content_sha256 is SHA-256 of the exact UTF-8 content bytes and content_byte_count is their length.",
+    "success_rule": "Success returns committed or replayed for the entire batch and exactly one result matching the request operation_id and document_id. An empty content string is an intentional write with byte count 0 and SHA-256 e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855.",
+    "failure_rule": "Any authentication, capability, digest, name, revision, structure-barrier, or apply failure rolls back the transaction, returns applied=false, and returns no result.",
+    "replay_rule": "An identical batch_id and batch_payload_sha256 returns status=replayed with result fields identical to the original committed response after response loss or restart; a different payload is BATCH_ID_REUSED; a reused operation_id with different immutable intent is OPERATION_ID_REUSED.",
+    "partial_apply_rule": "A missing, extra, mismatched, or partial document result MUST NOT be represented as success and a client MUST NOT apply it.",
+    "intent_rules": [
+      "create requires base_revision 0, is_deleted false, and a document_id that does not exist; it creates identity, name, parent, structure revision 1, and the complete content snapshot atomically.",
+      "update requires base_revision greater than 0 and is_deleted false; name, parent_folder_id, and structure_revision must equal the live server row and only the content snapshot changes.",
+      "delete requires base_revision greater than 0 and is_deleted true; name, parent_folder_id, structure_revision, content, content digest, and content byte count must equal the live server row so deletion cannot silently alter content.",
+      "restore requires base_revision greater than 0 and is_deleted false; name, parent_folder_id, structure_revision, content, content digest, and content byte count must equal the tombstone; a later update performs any body edit.",
+      "Document rename and move use atomic_structure_commit and must complete before a later document update names their resulting structure_revision.",
+      "A tree_order removal must commit before document delete; document create or restore must commit before tree_order adds the document_id."
+    ],
+    "content_limit_bytes": 10485760,
+    "structure_barrier_rule": "Except for create, document_commit never changes name, parent_folder_id, or structure_revision. A stale structure_revision is rejected with STRUCTURE_REVISION_CONFLICT."
   },
   "storage_name_normalization": {
     "algorithm_id": "storage-name-v1",
@@ -583,6 +621,9 @@
     "PATH_CONFLICT",
     "STORAGE_NAME_INVALID",
     "STORAGE_NAME_RESERVED",
+    "CONTENT_DIGEST_MISMATCH",
+    "CONTENT_SIZE_MISMATCH",
+    "STRUCTURE_REVISION_CONFLICT",
     "FOLDER_NOT_FOUND",
     "FOLDER_ALREADY_EXISTS",
     "FOLDER_NOT_EMPTY",
@@ -638,6 +679,10 @@
     {
       "id": "INV-012",
       "rule": "Sibling storage-name collisions are decided only by exact storage-name-v1 UTF-8 collision-key equality."
+    },
+    {
+      "id": "INV-013",
+      "rule": "A protocol 3 document body write is all-or-nothing at the document_commit request boundary and never changes existing document structure."
     }
   ],
   "contract_allowlist": {

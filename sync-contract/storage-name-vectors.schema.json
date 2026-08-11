@@ -1,6 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "urn:writerpad:sync-contract:storage-name-vectors:0.1.0",
+  "$id": "urn:writerpad:sync-contract:storage-name-vectors:0.2.0",
   "title": "WriterPad storage-name-v1 conformance vectors",
   "type": "object",
   "additionalProperties": false,
@@ -16,7 +16,7 @@
       "const": "../storage-name-vectors.schema.json"
     },
     "contract_version": {
-      "const": "0.1.0"
+      "const": "0.2.0"
     },
     "algorithm_id": {
       "const": "storage-name-v1"

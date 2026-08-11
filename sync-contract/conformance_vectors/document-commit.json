@@ -1,0 +1,384 @@
+{
+  "contract_version": "0.2.0",
+  "wire_schema": "../document-commit.schema.json",
+  "cases": [
+    {
+      "case_id": "DC-001",
+      "title": "Intentional empty document create commits atomically",
+      "request": {
+        "kind": "document_commit_request",
+        "project_id": "00000000-0000-4000-8000-000000000301",
+        "project_sync_mode": "ID_BASED",
+        "migration_epoch": 1,
+        "batch": {
+          "batch_id": "10000000-0000-4000-8000-000000000301",
+          "writer_device_id": "60000000-0000-4000-8000-000000000301",
+          "client_build_id": "conformance-0.2.0",
+          "sync_protocol_version": 3,
+          "contract_version": "0.2.0",
+          "canonical_contract_sha256": "416c1b99edb9bda694731dee4b25688d9d82d1f32610aa23ddfda571ec3c7670",
+          "client_capabilities": [
+            "folders_authoritative",
+            "tree_order_ids",
+            "tombstones",
+            "immutable_batch_contract_metadata",
+            "operation_attempt_history",
+            "operation_state_events",
+            "storage_name_v1",
+            "document_commit_v1"
+          ],
+          "batch_payload_sha256": "e2571bcb8611ea13c058753470871eb61fb6117d8dd8adbd36688eac0cd5d34d"
+        },
+        "ordered_intents": [
+          {
+            "sequence": 1,
+            "operation_id": "20000000-0000-4000-8000-000000000301",
+            "batch_id": "10000000-0000-4000-8000-000000000301",
+            "entity_kind": "document",
+            "document_id": "30000000-0000-4000-8000-000000000301",
+            "intent_kind": "create",
+            "base_revision": 0,
+            "payload_sha256": "4d5cb940c384f2c3cec1acba872a149bc294e7383f37e6a5f805b575b29fca0e",
+            "payload": {
+              "parent_folder_id": null,
+              "name": "Empty.md",
+              "content": "",
+              "content_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+              "content_byte_count": 0,
+              "is_deleted": false,
+              "structure_revision": 1
+            }
+          }
+        ]
+      },
+      "response": {
+        "kind": "document_commit_success",
+        "batch_id": "10000000-0000-4000-8000-000000000301",
+        "batch_payload_sha256": "e2571bcb8611ea13c058753470871eb61fb6117d8dd8adbd36688eac0cd5d34d",
+        "status": "committed",
+        "applied": true,
+        "results": [
+          {
+            "sequence": 1,
+            "operation_id": "20000000-0000-4000-8000-000000000301",
+            "document_id": "30000000-0000-4000-8000-000000000301",
+            "result_revision": 1,
+            "structure_revision": 1,
+            "parent_folder_id": null,
+            "name": "Empty.md",
+            "content_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            "content_byte_count": 0,
+            "is_deleted": false
+          }
+        ]
+      },
+      "expected_semantics": "intentional_empty_committed"
+    },
+    {
+      "case_id": "DC-002",
+      "title": "Identical retry after response loss or restart replays the original result",
+      "replay_of": "DC-001",
+      "response": {
+        "kind": "document_commit_success",
+        "batch_id": "10000000-0000-4000-8000-000000000301",
+        "batch_payload_sha256": "e2571bcb8611ea13c058753470871eb61fb6117d8dd8adbd36688eac0cd5d34d",
+        "status": "replayed",
+        "applied": true,
+        "results": [
+          {
+            "sequence": 1,
+            "operation_id": "20000000-0000-4000-8000-000000000301",
+            "document_id": "30000000-0000-4000-8000-000000000301",
+            "result_revision": 1,
+            "structure_revision": 1,
+            "parent_folder_id": null,
+            "name": "Empty.md",
+            "content_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            "content_byte_count": 0,
+            "is_deleted": false
+          }
+        ]
+      },
+      "expected_semantics": "replayed"
+    },
+    {
+      "case_id": "DC-003",
+      "title": "Complete document body update commits",
+      "request": {
+        "kind": "document_commit_request",
+        "project_id": "00000000-0000-4000-8000-000000000301",
+        "project_sync_mode": "ID_BASED",
+        "migration_epoch": 1,
+        "batch": {
+          "batch_id": "10000000-0000-4000-8000-000000000302",
+          "writer_device_id": "60000000-0000-4000-8000-000000000301",
+          "client_build_id": "conformance-0.2.0",
+          "sync_protocol_version": 3,
+          "contract_version": "0.2.0",
+          "canonical_contract_sha256": "416c1b99edb9bda694731dee4b25688d9d82d1f32610aa23ddfda571ec3c7670",
+          "client_capabilities": [
+            "folders_authoritative", "tree_order_ids", "tombstones",
+            "immutable_batch_contract_metadata", "operation_attempt_history",
+            "operation_state_events", "storage_name_v1", "document_commit_v1"
+          ],
+          "batch_payload_sha256": "1a504f19755c396597622bbf4d86213e3fc12d720e648b217a44dcee1aed6b10"
+        },
+        "ordered_intents": [
+          {
+            "sequence": 1,
+            "operation_id": "20000000-0000-4000-8000-000000000302",
+            "batch_id": "10000000-0000-4000-8000-000000000302",
+            "entity_kind": "document",
+            "document_id": "30000000-0000-4000-8000-000000000301",
+            "intent_kind": "update",
+            "base_revision": 1,
+            "payload_sha256": "831f3ea6bcfe1619c880c70971ae243a4454f96ef856dfaccba1b10a560bd136",
+            "payload": {
+              "parent_folder_id": null,
+              "name": "Empty.md",
+              "content": "Hello, WriterPad!",
+              "content_sha256": "5cfb5baac9e67a92cd7ca95c74cb7a55ad83c87b6c3883995329967c81e1c1be",
+              "content_byte_count": 17,
+              "is_deleted": false,
+              "structure_revision": 1
+            }
+          }
+        ]
+      },
+      "response": {
+        "kind": "document_commit_success",
+        "batch_id": "10000000-0000-4000-8000-000000000302",
+        "batch_payload_sha256": "1a504f19755c396597622bbf4d86213e3fc12d720e648b217a44dcee1aed6b10",
+        "status": "committed",
+        "applied": true,
+        "results": [
+          {
+            "sequence": 1,
+            "operation_id": "20000000-0000-4000-8000-000000000302",
+            "document_id": "30000000-0000-4000-8000-000000000301",
+            "result_revision": 2,
+            "structure_revision": 1,
+            "parent_folder_id": null,
+            "name": "Empty.md",
+            "content_sha256": "5cfb5baac9e67a92cd7ca95c74cb7a55ad83c87b6c3883995329967c81e1c1be",
+            "content_byte_count": 17,
+            "is_deleted": false
+          }
+        ]
+      },
+      "expected_semantics": "committed"
+    },
+    {
+      "case_id": "DC-004",
+      "title": "Delete preserves the exact body snapshot and commits a tombstone",
+      "request": {
+        "kind": "document_commit_request",
+        "project_id": "00000000-0000-4000-8000-000000000301",
+        "project_sync_mode": "ID_BASED",
+        "migration_epoch": 1,
+        "batch": {
+          "batch_id": "10000000-0000-4000-8000-000000000303",
+          "writer_device_id": "60000000-0000-4000-8000-000000000301",
+          "client_build_id": "conformance-0.2.0",
+          "sync_protocol_version": 3,
+          "contract_version": "0.2.0",
+          "canonical_contract_sha256": "416c1b99edb9bda694731dee4b25688d9d82d1f32610aa23ddfda571ec3c7670",
+          "client_capabilities": [
+            "folders_authoritative", "tree_order_ids", "tombstones",
+            "immutable_batch_contract_metadata", "operation_attempt_history",
+            "operation_state_events", "storage_name_v1", "document_commit_v1"
+          ],
+          "batch_payload_sha256": "62d126e8bf19ccae4b126f8c7347e9d4c429064a018b5c5562e899236dc9ef6c"
+        },
+        "ordered_intents": [
+          {
+            "sequence": 1,
+            "operation_id": "20000000-0000-4000-8000-000000000303",
+            "batch_id": "10000000-0000-4000-8000-000000000303",
+            "entity_kind": "document",
+            "document_id": "30000000-0000-4000-8000-000000000301",
+            "intent_kind": "delete",
+            "base_revision": 2,
+            "payload_sha256": "e1b8090963a50138720a53f243e86eaf1e256e4955ebdd3b254e4532fbbdff78",
+            "payload": {
+              "parent_folder_id": null,
+              "name": "Empty.md",
+              "content": "Hello, WriterPad!",
+              "content_sha256": "5cfb5baac9e67a92cd7ca95c74cb7a55ad83c87b6c3883995329967c81e1c1be",
+              "content_byte_count": 17,
+              "is_deleted": true,
+              "structure_revision": 1
+            }
+          }
+        ]
+      },
+      "response": {
+        "kind": "document_commit_success",
+        "batch_id": "10000000-0000-4000-8000-000000000303",
+        "batch_payload_sha256": "62d126e8bf19ccae4b126f8c7347e9d4c429064a018b5c5562e899236dc9ef6c",
+        "status": "committed",
+        "applied": true,
+        "results": [
+          {
+            "sequence": 1,
+            "operation_id": "20000000-0000-4000-8000-000000000303",
+            "document_id": "30000000-0000-4000-8000-000000000301",
+            "result_revision": 3,
+            "structure_revision": 1,
+            "parent_folder_id": null,
+            "name": "Empty.md",
+            "content_sha256": "5cfb5baac9e67a92cd7ca95c74cb7a55ad83c87b6c3883995329967c81e1c1be",
+            "content_byte_count": 17,
+            "is_deleted": true
+          }
+        ]
+      },
+      "expected_semantics": "tombstone_committed"
+    },
+    {
+      "case_id": "DC-005",
+      "title": "Revision conflict returns no partial result",
+      "request_from": "DC-003",
+      "response": {
+        "kind": "document_commit_failure",
+        "batch_id": "10000000-0000-4000-8000-000000000302",
+        "batch_payload_sha256": "1a504f19755c396597622bbf4d86213e3fc12d720e648b217a44dcee1aed6b10",
+        "status": "rejected",
+        "applied": false,
+        "error": {
+          "code": "REVISION_CONFLICT",
+          "message": "document revision changed",
+          "failed_sequence": 1
+        },
+        "results": []
+      },
+      "expected_semantics": "rollback_all"
+    },
+    {
+      "case_id": "DC-006",
+      "title": "Same batch ID with changed document content is rejected",
+      "request": {
+        "kind": "document_commit_request",
+        "project_id": "00000000-0000-4000-8000-000000000301",
+        "project_sync_mode": "ID_BASED",
+        "migration_epoch": 1,
+        "batch": {
+          "batch_id": "10000000-0000-4000-8000-000000000302",
+          "writer_device_id": "60000000-0000-4000-8000-000000000301",
+          "client_build_id": "conformance-0.2.0",
+          "sync_protocol_version": 3,
+          "contract_version": "0.2.0",
+          "canonical_contract_sha256": "416c1b99edb9bda694731dee4b25688d9d82d1f32610aa23ddfda571ec3c7670",
+          "client_capabilities": [
+            "folders_authoritative", "tree_order_ids", "tombstones",
+            "immutable_batch_contract_metadata", "operation_attempt_history",
+            "operation_state_events", "storage_name_v1", "document_commit_v1"
+          ],
+          "batch_payload_sha256": "866d276e18c2b0bdc1a202650a213034e00e235bb33a683ac365f6a696615b78"
+        },
+        "ordered_intents": [
+          {
+            "sequence": 1,
+            "operation_id": "20000000-0000-4000-8000-000000000302",
+            "batch_id": "10000000-0000-4000-8000-000000000302",
+            "entity_kind": "document",
+            "document_id": "30000000-0000-4000-8000-000000000301",
+            "intent_kind": "update",
+            "base_revision": 1,
+            "payload_sha256": "47c764f929f89d0b5193128d445aa8f7aef157442fd5aaa4f098aa829cbfd3ce",
+            "payload": {
+              "parent_folder_id": null,
+              "name": "Empty.md",
+              "content": "Changed replay",
+              "content_sha256": "219916d3b34784b7f5fe49e3cf65d279d222f3713d97ab9a0ee9298312510fca",
+              "content_byte_count": 14,
+              "is_deleted": false,
+              "structure_revision": 1
+            }
+          }
+        ]
+      },
+      "response": {
+        "kind": "document_commit_failure",
+        "batch_id": "10000000-0000-4000-8000-000000000302",
+        "batch_payload_sha256": "866d276e18c2b0bdc1a202650a213034e00e235bb33a683ac365f6a696615b78",
+        "status": "rejected",
+        "applied": false,
+        "error": {
+          "code": "BATCH_ID_REUSED",
+          "message": "batch_id already belongs to a different payload",
+          "failed_sequence": null
+        },
+        "results": []
+      },
+      "expected_semantics": "batch_id_reused"
+    },
+    {
+      "case_id": "DC-007",
+      "title": "Restore reuses the exact tombstoned snapshot",
+      "request": {
+        "kind": "document_commit_request",
+        "project_id": "00000000-0000-4000-8000-000000000301",
+        "project_sync_mode": "ID_BASED",
+        "migration_epoch": 1,
+        "batch": {
+          "batch_id": "10000000-0000-4000-8000-000000000304",
+          "writer_device_id": "60000000-0000-4000-8000-000000000301",
+          "client_build_id": "conformance-0.2.0",
+          "sync_protocol_version": 3,
+          "contract_version": "0.2.0",
+          "canonical_contract_sha256": "416c1b99edb9bda694731dee4b25688d9d82d1f32610aa23ddfda571ec3c7670",
+          "client_capabilities": [
+            "folders_authoritative", "tree_order_ids", "tombstones",
+            "immutable_batch_contract_metadata", "operation_attempt_history",
+            "operation_state_events", "storage_name_v1", "document_commit_v1"
+          ],
+          "batch_payload_sha256": "630432041aa0e0d2d40762b3cd7ec1741b694e166b6e742cba1a9b99fde5c695"
+        },
+        "ordered_intents": [
+          {
+            "sequence": 1,
+            "operation_id": "20000000-0000-4000-8000-000000000304",
+            "batch_id": "10000000-0000-4000-8000-000000000304",
+            "entity_kind": "document",
+            "document_id": "30000000-0000-4000-8000-000000000301",
+            "intent_kind": "restore",
+            "base_revision": 3,
+            "payload_sha256": "831f3ea6bcfe1619c880c70971ae243a4454f96ef856dfaccba1b10a560bd136",
+            "payload": {
+              "parent_folder_id": null,
+              "name": "Empty.md",
+              "content": "Hello, WriterPad!",
+              "content_sha256": "5cfb5baac9e67a92cd7ca95c74cb7a55ad83c87b6c3883995329967c81e1c1be",
+              "content_byte_count": 17,
+              "is_deleted": false,
+              "structure_revision": 1
+            }
+          }
+        ]
+      },
+      "response": {
+        "kind": "document_commit_success",
+        "batch_id": "10000000-0000-4000-8000-000000000304",
+        "batch_payload_sha256": "630432041aa0e0d2d40762b3cd7ec1741b694e166b6e742cba1a9b99fde5c695",
+        "status": "committed",
+        "applied": true,
+        "results": [
+          {
+            "sequence": 1,
+            "operation_id": "20000000-0000-4000-8000-000000000304",
+            "document_id": "30000000-0000-4000-8000-000000000301",
+            "result_revision": 4,
+            "structure_revision": 1,
+            "parent_folder_id": null,
+            "name": "Empty.md",
+            "content_sha256": "5cfb5baac9e67a92cd7ca95c74cb7a55ad83c87b6c3883995329967c81e1c1be",
+            "content_byte_count": 17,
+            "is_deleted": false
+          }
+        ]
+      },
+      "expected_semantics": "restored"
+    }
+  ]
+}

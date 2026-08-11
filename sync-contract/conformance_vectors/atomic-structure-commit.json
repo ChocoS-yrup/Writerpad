@@ -1,5 +1,5 @@
 {
-  "contract_version": "0.1.0",
+  "contract_version": "0.2.0",
   "wire_schema": "../atomic-structure-commit.schema.json",
   "cases": [
     {
@@ -13,10 +13,10 @@
         "batch": {
           "batch_id": "10000000-0000-4000-8000-000000000201",
           "writer_device_id": "60000000-0000-4000-8000-000000000201",
-          "client_build_id": "conformance-0.1.0",
+          "client_build_id": "conformance-0.2.0",
           "sync_protocol_version": 3,
-          "contract_version": "0.1.0",
-          "canonical_contract_sha256": "fae86b4e6385ee37fbeb99f9256194ec319b64bfda92974ce90a3eb70d2e7a46",
+          "contract_version": "0.2.0",
+          "canonical_contract_sha256": "416c1b99edb9bda694731dee4b25688d9d82d1f32610aa23ddfda571ec3c7670",
           "client_capabilities": [
             "folders_authoritative",
             "tree_order_ids",
@@ -24,7 +24,8 @@
             "immutable_batch_contract_metadata",
             "operation_attempt_history",
             "operation_state_events",
-            "storage_name_v1"
+            "storage_name_v1",
+            "document_commit_v1"
           ],
           "batch_payload_sha256": "0fd7de3e5329659757e0a391f3cfed43faac11a750ad13698301bfda7499e62c"
         },
@@ -139,10 +140,10 @@
         "batch": {
           "batch_id": "10000000-0000-4000-8000-000000000201",
           "writer_device_id": "60000000-0000-4000-8000-000000000201",
-          "client_build_id": "conformance-0.1.0",
+          "client_build_id": "conformance-0.2.0",
           "sync_protocol_version": 3,
-          "contract_version": "0.1.0",
-          "canonical_contract_sha256": "fae86b4e6385ee37fbeb99f9256194ec319b64bfda92974ce90a3eb70d2e7a46",
+          "contract_version": "0.2.0",
+          "canonical_contract_sha256": "416c1b99edb9bda694731dee4b25688d9d82d1f32610aa23ddfda571ec3c7670",
           "client_capabilities": [
             "folders_authoritative",
             "tree_order_ids",
@@ -150,7 +151,8 @@
             "immutable_batch_contract_metadata",
             "operation_attempt_history",
             "operation_state_events",
-            "storage_name_v1"
+            "storage_name_v1",
+            "document_commit_v1"
           ],
           "batch_payload_sha256": "9f29a4a93b6362d7fea10351f78717d3a9b98614837b3359ea89e2fbbd3351aa"
         },

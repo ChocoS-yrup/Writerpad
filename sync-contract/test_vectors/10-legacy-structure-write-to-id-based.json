@@ -2,7 +2,7 @@
   "$schema": "../transition-vector.schema.json",
   "vector_id": "TV-010",
   "title": "Legacy writes rejected after manual ID-based promotion",
-  "contract_version": "0.1.0",
+  "contract_version": "0.2.0",
   "minimum_protocol_version": 1,
   "tags": [
     "id-based",

@@ -18,12 +18,14 @@ CONTRACT_DIR = Path(__file__).resolve().parents[1]
 EXPECTED_VECTOR_IDS = {f"TV-{index:03d}" for index in range(1, 13)}
 EXPECTED_STORAGE_VECTOR_IDS = {f"SN-{index:03d}" for index in range(1, 16)}
 EXPECTED_ATOMIC_CASE_IDS = {f"ASC-{index:03d}" for index in range(1, 5)}
+EXPECTED_DOCUMENT_CASE_IDS = {f"DC-{index:03d}" for index in range(1, 8)}
 REQUIRED_SCHEMAS = {
     "protocol.schema.json",
     "incident.schema.json",
     "snapshot.schema.json",
     "transition-vector.schema.json",
     "atomic-structure-commit.schema.json",
+    "document-commit.schema.json",
     "storage-name-vectors.schema.json",
 }
 REQUIRED_BATCH_FIELDS = {
@@ -307,6 +309,8 @@ def verify_atomic_vectors(
     cases = {item["case_id"]: item for item in suite.get("cases", [])}
     if set(cases) != EXPECTED_ATOMIC_CASE_IDS or len(cases) != len(suite.get("cases", [])):
         fail("atomic conformance case ID set mismatch")
+    protocol_three = next(item for item in protocol["supported_protocol_versions"] if item["version"] == 3)
+    required_caps = set(protocol_three["required_client_capabilities"])
     for case_id, case in cases.items():
         request = resolve_atomic_request(case, cases)
         response = case["response"]
@@ -316,6 +320,8 @@ def verify_atomic_vectors(
         intents = request["ordered_intents"]
         if batch["canonical_contract_sha256"] != canonical_digest:
             fail(f"{case_id}: request does not pin the lock digest")
+        if set(batch["client_capabilities"]) != required_caps:
+            fail(f"{case_id}: atomic request capability set differs from protocol 3")
         sequences = [intent["sequence"] for intent in intents]
         if sequences != list(range(1, len(intents) + 1)):
             fail(f"{case_id}: ordered intent sequence is not contiguous")
@@ -347,6 +353,97 @@ def verify_atomic_vectors(
     return len(cases)
 
 
+def verify_document_vectors(
+    protocol: dict[str, Any],
+    schema: dict[str, Any],
+    canonical_digest: str,
+    versions: dict[int, dict[str, Any]],
+) -> int:
+    suite = require_object(
+        load_json(CONTRACT_DIR / "conformance_vectors" / "document-commit.json"),
+        "document-commit.json",
+    )
+    if suite.get("contract_version") != protocol["contract_version"]:
+        fail("document conformance contract version differs from protocol")
+    cases = {item["case_id"]: item for item in suite.get("cases", [])}
+    if set(cases) != EXPECTED_DOCUMENT_CASE_IDS or len(cases) != len(suite.get("cases", [])):
+        fail("document conformance case ID set mismatch")
+
+    required_caps = set(versions[3]["required_client_capabilities"])
+    for case_id, case in cases.items():
+        request = resolve_atomic_request(case, cases)
+        response = case["response"]
+        validate_instance(request, schema, f"{case_id}/request")
+        validate_instance(response, schema, f"{case_id}/response")
+        batch = request["batch"]
+        intents = request["ordered_intents"]
+        intent = intents[0]
+        payload = intent["payload"]
+
+        if batch["canonical_contract_sha256"] != canonical_digest:
+            fail(f"{case_id}: document request does not pin the lock digest")
+        if set(batch["client_capabilities"]) != required_caps:
+            fail(f"{case_id}: document request capability set differs from protocol 3")
+        if intent["batch_id"] != batch["batch_id"]:
+            fail(f"{case_id}: document intent batch_id differs from request batch")
+        payload_digest = hashlib.sha256(rfc8785.dumps(payload)).hexdigest()
+        if payload_digest != intent["payload_sha256"]:
+            fail(f"{case_id}: document payload digest mismatch")
+        batch_digest = hashlib.sha256(rfc8785.dumps(intents)).hexdigest()
+        if batch_digest != batch["batch_payload_sha256"]:
+            fail(f"{case_id}: document batch payload digest mismatch")
+
+        content_bytes = payload["content"].encode("utf-8")
+        if len(content_bytes) != payload["content_byte_count"]:
+            fail(f"{case_id}: document content byte count mismatch")
+        if len(content_bytes) > protocol["document_commit"]["content_limit_bytes"]:
+            fail(f"{case_id}: document content exceeds the contract limit")
+        if hashlib.sha256(content_bytes).hexdigest() != payload["content_sha256"]:
+            fail(f"{case_id}: document content digest mismatch")
+        normalized, name_error = normalize_storage_name(payload["name"])
+        if name_error is not None or normalized is None:
+            fail(f"{case_id}: document name violates storage-name-v1: {name_error}")
+
+        if response["batch_id"] != batch["batch_id"]:
+            fail(f"{case_id}: document response batch_id mismatch")
+        if response["batch_payload_sha256"] != batch["batch_payload_sha256"]:
+            fail(f"{case_id}: document response batch digest mismatch")
+        if response["applied"]:
+            result = response["results"][0]
+            expected_result_fields = {
+                "sequence": intent["sequence"],
+                "operation_id": intent["operation_id"],
+                "document_id": intent["document_id"],
+                "structure_revision": payload["structure_revision"],
+                "parent_folder_id": payload["parent_folder_id"],
+                "name": payload["name"],
+                "content_sha256": payload["content_sha256"],
+                "content_byte_count": payload["content_byte_count"],
+                "is_deleted": payload["is_deleted"],
+            }
+            for key, expected in expected_result_fields.items():
+                if result[key] != expected:
+                    fail(f"{case_id}: document result {key} mismatch")
+        elif response["results"]:
+            fail(f"{case_id}: document failure contains a partial result")
+
+    if cases["DC-001"]["expected_semantics"] != "intentional_empty_committed":
+        fail("DC-001 must define intentional empty content")
+    if resolve_atomic_request(cases["DC-001"], cases)["ordered_intents"][0]["payload"]["content"] != "":
+        fail("DC-001 content must be exactly empty")
+    if cases["DC-002"]["response"]["status"] != "replayed":
+        fail("DC-002 must define identical replay after response loss or restart")
+    if cases["DC-005"]["expected_semantics"] != "rollback_all":
+        fail("DC-005 must define complete rollback")
+    if cases["DC-006"]["response"]["error"]["code"] != "BATCH_ID_REUSED":
+        fail("DC-006 must reject changed replay payload")
+    if resolve_atomic_request(cases["DC-004"], cases)["ordered_intents"][0]["intent_kind"] != "delete":
+        fail("DC-004 must define document deletion")
+    if resolve_atomic_request(cases["DC-007"], cases)["ordered_intents"][0]["intent_kind"] != "restore":
+        fail("DC-007 must define document restoration")
+    return len(cases)
+
+
 def verify_legacy_boundary(protocol: dict[str, Any]) -> None:
     modes = protocol["project_sync_mode"]
     if modes["automatic_promotion"] or modes["automatic_downgrade"]:
@@ -375,7 +472,7 @@ def verify_traceability() -> None:
     if not path.exists():
         fail("TRACEABILITY.md is required")
     text = path.read_text(encoding="utf-8")
-    for blocker in range(1, 7):
+    for blocker in range(1, 8):
         identifier = f"C-{blocker:02d}"
         if identifier not in text:
             fail(f"TRACEABILITY.md lacks {identifier}")
@@ -435,6 +532,9 @@ def main() -> None:
     atomic_count = verify_atomic_vectors(
         protocol, schemas["atomic-structure-commit.schema.json"], canonical_digest
     )
+    document_count = verify_document_vectors(
+        protocol, schemas["document-commit.schema.json"], canonical_digest, versions
+    )
     verify_traceability()
 
     expected_counts = {
@@ -442,6 +542,7 @@ def main() -> None:
         "transition_vector_count": len(vector_paths),
         "storage_name_vector_count": storage_count,
         "atomic_wire_case_count": atomic_count,
+        "document_wire_case_count": document_count,
     }
     for key, actual in expected_counts.items():
         if lock.get(key) != actual:
@@ -452,6 +553,7 @@ def main() -> None:
     print(f"Validated {len(vector_paths)} transition vectors with cross-file semantics.")
     print(f"Validated {storage_count} storage-name conformance vectors (Unicode {unicodedata.unidata_version}).")
     print(f"Validated {atomic_count} atomic wire conformance cases.")
+    print(f"Validated {document_count} document wire conformance cases.")
     print("Validated capability versions, operation creation, state derivation, batch provenance, immutable rebase, and legacy enforcement.")
     print(f"Canonical protocol bytes: {len(canonical_bytes)}")
     print(f"Canonical SHA-256: {canonical_digest}")

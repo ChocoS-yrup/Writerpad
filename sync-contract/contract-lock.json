@@ -1,15 +1,16 @@
 {
-  "contract_version": "0.1.0",
+  "contract_version": "0.2.0",
   "contract_status": "released",
   "protocol_path": "protocol.json",
   "canonicalization": "RFC 8785",
   "digest_algorithm": "SHA-256",
-  "canonical_byte_length": 19473,
-  "canonical_contract_sha256": "fae86b4e6385ee37fbeb99f9256194ec319b64bfda92974ce90a3eb70d2e7a46",
-  "schema_count": 6,
+  "canonical_byte_length": 23256,
+  "canonical_contract_sha256": "416c1b99edb9bda694731dee4b25688d9d82d1f32610aa23ddfda571ec3c7670",
+  "schema_count": 7,
   "transition_vector_count": 12,
   "storage_name_vector_count": 15,
   "atomic_wire_case_count": 4,
-  "previous_contract_git_commit": "fb882d7312f803266a18ea9c07a226f23c1a88a5",
+  "document_wire_case_count": 7,
+  "previous_contract_git_commit": "45d18cff62cc48e29d0e6efcfc634fec96150198",
   "contract_git_commit_binding": "The final Git commit is recorded externally in the stage handoff because a commit cannot contain its own SHA."
 }
