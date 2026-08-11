@@ -2,8 +2,8 @@
   "$schema": "../transition-vector.schema.json",
   "vector_id": "TV-006",
   "title": "Lost success response and idempotent retry",
-  "contract_version": "0.1.0-draft.1",
-  "minimum_protocol_version": 2,
+  "contract_version": "0.1.0",
+  "minimum_protocol_version": 3,
   "tags": [
     "idempotency",
     "operation-id",
@@ -26,22 +26,28 @@
   },
   "initial_client_states": [
     {
-      "client_id": "windows-v2",
+      "client_id": "windows-v3",
       "platform": "windows",
-      "protocol_version": 2,
+      "protocol_version": 3,
       "capabilities": [
         "folders_authoritative",
+        "tree_order_ids",
         "tombstones",
-        "operation_attempt_history"
+        "immutable_batch_contract_metadata",
+        "operation_attempt_history",
+        "operation_state_events",
+        "storage_name_v1"
       ],
       "local_entities": [],
       "queue": [
         {
           "operation_id": "20000000-0000-4000-8000-000000000031",
           "batch_id": "10000000-0000-4000-8000-000000000031",
+          "provenance_kind": "CONTRACT_BATCH",
           "entity_id": "40000000-0000-4000-8000-000000000006",
           "intent_kind": "update",
           "base_revision": 1,
+          "payload_sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
           "state": "pending",
           "attempt_count": 0
         }
@@ -51,7 +57,7 @@
   "ordered_actions": [
     {
       "action_id": "A01",
-      "actor": "windows-v2",
+      "actor": "windows-v3",
       "kind": "commit_batch",
       "input": {
         "operation_id": "20000000-0000-4000-8000-000000000031",
@@ -61,7 +67,7 @@
     },
     {
       "action_id": "A02",
-      "actor": "windows-v2",
+      "actor": "windows-v3",
       "kind": "retry_operation",
       "input": {
         "operation_id": "20000000-0000-4000-8000-000000000031",
@@ -90,7 +96,7 @@
   },
   "expected_client_states": [
     {
-      "client_id": "windows-v2",
+      "client_id": "windows-v3",
       "assertions": [
         "the baseline advances to revision 2",
         "both transport_unknown and replayed attempts remain visible"

@@ -1,0 +1,173 @@
+{
+  "$schema": "../transition-vector.schema.json",
+  "vector_id": "TV-011",
+  "title": "Cancellation is derived from append-only events",
+  "contract_version": "0.1.0",
+  "minimum_protocol_version": 3,
+  "tags": [
+    "cancellation",
+    "event-replay",
+    "idempotency"
+  ],
+  "initial_server_state": {
+    "project_id": "00000000-0000-4000-8000-000000000011",
+    "project_sync_mode": "LEGACY",
+    "migration_epoch": 0,
+    "entities": [
+      {
+        "entity_id": "40000000-0000-4000-8000-000000000111",
+        "entity_kind": "document",
+        "revision": 1,
+        "is_deleted": false
+      },
+      {
+        "entity_id": "40000000-0000-4000-8000-000000000112",
+        "entity_kind": "document",
+        "revision": 1,
+        "is_deleted": false
+      }
+    ],
+    "tree_order": {}
+  },
+  "initial_client_states": [
+    {
+      "client_id": "ipad-v3",
+      "platform": "ipad",
+      "protocol_version": 3,
+      "capabilities": [
+        "folders_authoritative",
+        "tree_order_ids",
+        "tombstones",
+        "immutable_batch_contract_metadata",
+        "operation_attempt_history",
+        "operation_state_events",
+        "storage_name_v1"
+      ],
+      "local_entities": [],
+      "queue": [
+        {
+          "operation_id": "20000000-0000-4000-8000-000000000081",
+          "batch_id": "10000000-0000-4000-8000-000000000081",
+          "provenance_kind": "CONTRACT_BATCH",
+          "entity_id": "40000000-0000-4000-8000-000000000111",
+          "intent_kind": "update",
+          "base_revision": 1,
+          "payload_sha256": "1111111111111111111111111111111111111111111111111111111111111111",
+          "state": "pending",
+          "attempt_count": 0
+        },
+        {
+          "operation_id": "20000000-0000-4000-8000-000000000082",
+          "batch_id": "10000000-0000-4000-8000-000000000082",
+          "provenance_kind": "CONTRACT_BATCH",
+          "entity_id": "40000000-0000-4000-8000-000000000112",
+          "intent_kind": "update",
+          "base_revision": 1,
+          "payload_sha256": "2222222222222222222222222222222222222222222222222222222222222222",
+          "state": "pending",
+          "attempt_count": 0
+        }
+      ]
+    }
+  ],
+  "ordered_actions": [
+    {
+      "action_id": "A01",
+      "actor": "ipad-v3",
+      "kind": "cancel_operation",
+      "input": {
+        "operation_id": "20000000-0000-4000-8000-000000000081",
+        "cancel_event_id": "70000000-0000-4000-8000-000000000081"
+      },
+      "expected_outcome": "one cancel_requested event is appended and state derives to cancelled"
+    },
+    {
+      "action_id": "A02",
+      "actor": "ipad-v3",
+      "kind": "cancel_operation",
+      "input": {
+        "operation_id": "20000000-0000-4000-8000-000000000081",
+        "cancel_event_id": "70000000-0000-4000-8000-000000000081"
+      },
+      "expected_outcome": "identical replay returns already_cancelled without a duplicate event"
+    },
+    {
+      "action_id": "A03",
+      "actor": "ipad-v3",
+      "kind": "cancel_operation",
+      "input": {
+        "operation_id": "20000000-0000-4000-8000-000000000081",
+        "cancel_event_id": "70000000-0000-4000-8000-000000000082"
+      },
+      "expected_outcome": "new cancellation request returns already_cancelled without a state-changing event"
+    },
+    {
+      "action_id": "A04",
+      "actor": "ipad-v3",
+      "kind": "commit_batch",
+      "input": {
+        "operation_id": "20000000-0000-4000-8000-000000000082"
+      },
+      "expected_outcome": "the second operation completes"
+    },
+    {
+      "action_id": "A05",
+      "actor": "ipad-v3",
+      "kind": "cancel_operation",
+      "input": {
+        "operation_id": "20000000-0000-4000-8000-000000000082",
+        "cancel_event_id": "70000000-0000-4000-8000-000000000083"
+      },
+      "expected_outcome": "completed operation rejects cancellation with OPERATION_TERMINAL"
+    }
+  ],
+  "fault_injections": [],
+  "expected_server_state": {
+    "project_sync_mode": "LEGACY",
+    "migration_epoch": 0,
+    "entity_assertions": [
+      "first document remains revision 1",
+      "second document advances to revision 2"
+    ],
+    "tree_order_assertions": []
+  },
+  "expected_client_states": [
+    {
+      "client_id": "ipad-v3",
+      "assertions": [
+        "one cancellation event exists for the first operation",
+        "the completed operation remains completed"
+      ]
+    }
+  ],
+  "expected_queue_states": [
+    {
+      "operation_id": "20000000-0000-4000-8000-000000000081",
+      "state": "cancelled",
+      "attempt_count": 0,
+      "assertions": [
+        "duplicate cancellation is idempotent",
+        "state is reproducible from events"
+      ]
+    },
+    {
+      "operation_id": "20000000-0000-4000-8000-000000000082",
+      "state": "completed",
+      "attempt_count": 1,
+      "error_code": "OPERATION_TERMINAL",
+      "assertions": [
+        "cancellation after completion does not change the terminal state"
+      ]
+    }
+  ],
+  "invariants": [
+    {
+      "id": "INV-002",
+      "assert": "event identity is idempotent"
+    },
+    {
+      "id": "INV-011",
+      "assert": "both terminal states are derived from append-only events"
+    }
+  ]
+}

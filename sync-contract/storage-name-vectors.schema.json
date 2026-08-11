@@ -1,0 +1,88 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:writerpad:sync-contract:storage-name-vectors:0.1.0",
+  "title": "WriterPad storage-name-v1 conformance vectors",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "$schema",
+    "contract_version",
+    "algorithm_id",
+    "unicode_version",
+    "vectors"
+  ],
+  "properties": {
+    "$schema": {
+      "const": "../storage-name-vectors.schema.json"
+    },
+    "contract_version": {
+      "const": "0.1.0"
+    },
+    "algorithm_id": {
+      "const": "storage-name-v1"
+    },
+    "unicode_version": {
+      "const": "15.0.0"
+    },
+    "vectors": {
+      "type": "array",
+      "minItems": 12,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "vector_id",
+          "input",
+          "valid"
+        ],
+        "properties": {
+          "vector_id": {
+            "type": "string",
+            "pattern": "^SN-[0-9]{3}$"
+          },
+          "input": {
+            "type": "string"
+          },
+          "valid": {
+            "type": "boolean"
+          },
+          "normalized": {
+            "type": "string"
+          },
+          "utf8_hex": {
+            "type": "string",
+            "pattern": "^(?:[0-9a-f]{2})+$"
+          },
+          "error_code": {
+            "enum": [
+              "STORAGE_NAME_INVALID",
+              "STORAGE_NAME_RESERVED"
+            ]
+          }
+        },
+        "allOf": [
+          {
+            "if": {
+              "properties": {
+                "valid": {
+                  "const": true
+                }
+              }
+            },
+            "then": {
+              "required": [
+                "normalized",
+                "utf8_hex"
+              ]
+            },
+            "else": {
+              "required": [
+                "error_code"
+              ]
+            }
+          }
+        ]
+      }
+    }
+  }
+}

@@ -1,7 +1,7 @@
 {
   "$schema": "./protocol.schema.json",
-  "contract_version": "0.1.0-draft.1",
-  "contract_status": "draft",
+  "contract_version": "0.1.0",
+  "contract_status": "released",
   "canonicalization": {
     "standard": "RFC 8785",
     "media_type": "application/json",
@@ -9,37 +9,48 @@
     "digest_encoding": "lowercase-hex",
     "digest_target": "the UTF-8 bytes of the RFC 8785 canonicalized protocol.json document",
     "self_reference_rule": "canonical_contract_sha256 is batch metadata and is not stored inside protocol.json",
-    "verification_rule": "servers and clients MUST reject a batch when the received digest differs from the allowlisted canonical digest"
+    "verification_rule": "servers and clients MUST reject a contract batch when the received digest differs from the allowlisted canonical digest"
   },
   "supported_protocol_versions": [
     {
       "version": 1,
-      "name": "legacy-tree-projection",
+      "name": "legacy_tree_projection",
       "write_project_modes": [
         "LEGACY"
       ],
       "required_client_capabilities": [
         "legacy_tree_folder_projection"
       ],
-      "description": "Folder existence may be projected from name-based tree_order and live document paths. Folder identity is not authoritative."
+      "required_server_capabilities": [
+        "legacy_epoch_zero_adapter"
+      ],
+      "batch_requirement": "forbidden",
+      "provenance_kind": "LEGACY_EPOCH_0",
+      "description": "Protocol 1 writes are accepted only through the LEGACY epoch-0 adapter. They do not invent contract batch metadata."
     },
     {
       "version": 2,
-      "name": "authoritative-folders",
+      "name": "authoritative_folders_legacy",
       "write_project_modes": [
-        "LEGACY",
-        "MIGRATING"
+        "LEGACY"
       ],
       "required_client_capabilities": [
         "folders_authoritative",
         "tombstones"
       ],
-      "description": "folders is authoritative for folder existence and identity; name-based tree_order is ordering-only."
+      "required_server_capabilities": [
+        "legacy_epoch_zero_adapter",
+        "folder_tombstones"
+      ],
+      "batch_requirement": "forbidden",
+      "provenance_kind": "LEGACY_EPOCH_0",
+      "description": "Protocol 2 may use stable folder identities while a project remains LEGACY, but it does not claim released contract provenance."
     },
     {
       "version": 3,
-      "name": "id-tree-atomic-structure",
+      "name": "contract_batch_id_tree",
       "write_project_modes": [
+        "LEGACY",
         "MIGRATING",
         "ID_BASED"
       ],
@@ -47,66 +58,108 @@
         "folders_authoritative",
         "tree_order_ids",
         "tombstones",
-        "immutable_batch_contract_metadata"
+        "immutable_batch_contract_metadata",
+        "operation_attempt_history",
+        "operation_state_events",
+        "storage_name_v1"
       ],
-      "description": "Folder and document IDs are authoritative and tree ordering references IDs. Structural writes use a server-validated atomic structure boundary when available."
+      "required_server_capabilities": [
+        "atomic_structure_commit",
+        "contract_allowlist_validation",
+        "project_mode_migration_lock",
+        "folder_tombstones",
+        "id_tree_validation",
+        "legacy_epoch_zero_adapter",
+        "storage_name_v1"
+      ],
+      "batch_requirement": "required",
+      "provenance_kind": "CONTRACT_BATCH",
+      "description": "Every protocol 3 write uses an immutable contract batch. Every structural write uses the normative atomic_structure_commit wire boundary."
     }
   ],
   "client_capabilities": {
     "folders_authoritative": {
       "since_protocol": 2,
       "scope": "structure",
-      "meaning": "The client creates, renames, moves, restores, and tombstones folders through stable folder_id rows."
+      "meaning": "Folder existence and identity are represented by stable folder_id rows."
     },
     "tree_order_ids": {
       "since_protocol": 3,
       "scope": "structure",
-      "meaning": "tree_order child entries reference folder_id or document_id instead of names."
+      "meaning": "tree_order child entries reference folder_id or document_id."
     },
     "tombstones": {
       "since_protocol": 2,
       "scope": "structure_and_documents",
-      "meaning": "The client preserves deletion identity and revision instead of inferring deletion from absence."
+      "meaning": "Deletion preserves identity and revision."
     },
     "legacy_tree_folder_projection": {
       "since_protocol": 1,
       "scope": "legacy_read_write",
-      "meaning": "The client can reconstruct non-authoritative folders from name-based tree_order for LEGACY projects only."
+      "meaning": "Name-based tree projection is permitted only in LEGACY epoch 0."
     },
     "immutable_batch_contract_metadata": {
       "since_protocol": 3,
       "scope": "queue",
-      "meaning": "Every operation references immutable, server-verifiable contract metadata stored on its batch."
+      "meaning": "Every contract-native operation references one immutable batch carrying complete released-contract metadata."
     },
     "operation_attempt_history": {
       "since_protocol": 3,
       "scope": "diagnostics",
-      "meaning": "Attempt outcomes are appended without erasing the last failure when the operation later succeeds."
+      "meaning": "Attempt outcomes are append-only."
+    },
+    "operation_state_events": {
+      "since_protocol": 3,
+      "scope": "queue",
+      "meaning": "Operation state is derived from an append-only event sequence."
+    },
+    "storage_name_v1": {
+      "since_protocol": 3,
+      "scope": "structure",
+      "meaning": "Storage-name collision keys use Unicode 15.0.0 NFKC_Casefold and the storage-name-v1 rejection rules."
     }
   },
   "server_capabilities": {
     "atomic_structure_commit": {
       "since_protocol": 3,
-      "meaning": "The server can validate and commit a structure batch transactionally, including folders, document paths, tombstones, and tree ordering."
+      "meaning": "The server validates and commits one ordered structure batch in one transaction or applies nothing."
     },
     "contract_allowlist_validation": {
       "since_protocol": 3,
-      "meaning": "The server maps canonical contract digests to permitted protocol versions and capabilities."
+      "meaning": "The server maps canonical contract digests to permitted protocol versions, capabilities, and builds."
     },
     "project_mode_migration_lock": {
       "since_protocol": 3,
-      "meaning": "The server serializes migration epochs and rejects concurrent or stale migration writers."
+      "meaning": "The server serializes migration epochs and rejects stale or concurrent migration writers."
     },
     "folder_tombstones": {
       "since_protocol": 2,
-      "meaning": "The server retains folder_id, parent_folder_id, revision, and deletion state."
+      "meaning": "The server retains folder identity, parent, revision, and deletion state."
     },
     "id_tree_validation": {
       "since_protocol": 3,
-      "meaning": "The server rejects tree references to missing, deleted, cross-project, or duplicate entities."
+      "meaning": "The server rejects missing, deleted, cross-project, cyclic, or duplicate ID tree references."
+    },
+    "legacy_epoch_zero_adapter": {
+      "since_protocol": 1,
+      "meaning": "The server records honest LEGACY_EPOCH_0 provenance without synthesizing unavailable contract metadata."
+    },
+    "storage_name_v1": {
+      "since_protocol": 3,
+      "meaning": "The server computes and compares the same storage-name-v1 UTF-8 collision key as clients."
     }
   },
+  "capability_version_rules": {
+    "declaration_rule": "A client MUST NOT declare a capability when sync_protocol_version is less than that capability's since_protocol.",
+    "required_rule": "A writer MUST declare every required client capability for its selected protocol version.",
+    "server_rule": "A server MUST advertise every required server capability before accepting writes for the selected protocol version.",
+    "unknown_capability_rule": "Unknown or not-yet-available capabilities are rejected with CAPABILITY_MISMATCH.",
+    "batch_rule": "Protocol 3 requires CONTRACT_BATCH provenance; protocols 1 and 2 require LEGACY_EPOCH_0 provenance and MUST NOT fabricate a batch_id."
+  },
   "immutable_batch_metadata": {
+    "applies_to_protocols": [
+      3
+    ],
     "immutable_after_create": true,
     "fields": [
       {
@@ -131,7 +184,7 @@
       },
       {
         "name": "contract_version",
-        "type": "semver-or-draft-semver",
+        "type": "semver",
         "required": true
       },
       {
@@ -143,13 +196,19 @@
         "name": "client_capabilities",
         "type": "set-of-capability-identifiers",
         "required": true
+      },
+      {
+        "name": "batch_payload_sha256",
+        "type": "sha256-lowercase-hex",
+        "required": true
       }
     ],
     "server_rules": [
-      "An operation MUST reference exactly one existing batch.",
-      "The authenticated writer and writer_device_id MUST be bound to the batch when it is created.",
-      "The server MUST reject later mutation of contract metadata.",
-      "Retries MUST reuse the same batch_id and operation_id."
+      "A CONTRACT_BATCH operation MUST reference exactly one existing batch.",
+      "The authenticated writer and writer_device_id MUST be bound when the batch is created.",
+      "Contract metadata and batch_payload_sha256 MUST NOT be mutated.",
+      "An identical transport retry MUST reuse batch_id and operation_id.",
+      "A rebase creates a new batch_id and operation_id because its base revision and payload digest differ."
     ]
   },
   "operation_model": {
@@ -157,12 +216,18 @@
       "immutable_after_create": true,
       "required_fields": [
         "operation_id",
-        "batch_id",
+        "provenance_kind",
         "entity_kind",
         "entity_id",
         "intent_kind",
         "base_revision",
         "payload_sha256"
+      ],
+      "contract_batch_required_fields": [
+        "batch_id"
+      ],
+      "optional_fields": [
+        "supersedes_operation_id"
       ],
       "entity_kinds": [
         "project",
@@ -181,6 +246,23 @@
         "restore",
         "reorder",
         "migrate"
+      ]
+    },
+    "rebase": {
+      "creates_new_intent": true,
+      "required_new_fields": [
+        "operation_id",
+        "batch_id",
+        "base_revision",
+        "payload_sha256",
+        "supersedes_operation_id"
+      ],
+      "rules": [
+        "The original intent and its attempts remain unchanged.",
+        "The rebased operation_id and batch_id MUST differ from the original values.",
+        "supersedes_operation_id MUST identify the conflicted original operation.",
+        "A superseded event is appended to the original after the new intent is durably created.",
+        "Replay processes the original event stream before the new intent and follows supersedes_operation_id exactly once."
       ]
     },
     "attempt": {
@@ -211,6 +293,29 @@
         "transport_unknown"
       ]
     },
+    "event": {
+      "append_only": true,
+      "required_fields": [
+        "event_id",
+        "operation_id",
+        "event_sequence",
+        "event_type",
+        "recorded_at"
+      ],
+      "event_types": [
+        "enqueued",
+        "dispatch_started",
+        "retry_scheduled",
+        "blocked",
+        "conflict_detected",
+        "committed",
+        "replayed",
+        "cancel_requested",
+        "superseded"
+      ],
+      "ordering_rule": "event_sequence starts at 1 and is contiguous and unique per operation_id.",
+      "idempotency_rule": "event_id is globally idempotent; an identical replay returns the existing event and a changed event is EVENT_ID_REUSED."
+    },
     "state": {
       "mutable_projection": true,
       "states": [
@@ -226,16 +331,59 @@
         "completed",
         "cancelled"
       ],
-      "required_fields": [
-        "operation_id",
-        "state",
-        "attempt_count",
-        "updated_at"
+      "derivation": [
+        {
+          "event_type": "enqueued",
+          "result_state": "pending"
+        },
+        {
+          "event_type": "dispatch_started",
+          "result_state": "inflight"
+        },
+        {
+          "event_type": "retry_scheduled",
+          "result_state": "retry_wait"
+        },
+        {
+          "event_type": "blocked",
+          "result_state": "blocked"
+        },
+        {
+          "event_type": "conflict_detected",
+          "result_state": "conflict"
+        },
+        {
+          "event_type": "committed",
+          "result_state": "completed"
+        },
+        {
+          "event_type": "replayed",
+          "result_state": "completed"
+        },
+        {
+          "event_type": "cancel_requested",
+          "result_state": "cancelled"
+        },
+        {
+          "event_type": "superseded",
+          "result_state": "cancelled"
+        }
       ],
       "rules": [
-        "Current state MUST be derivable from immutable intent and append-only attempts.",
-        "Successful completion MUST NOT delete prior attempt errors.",
-        "blocked and conflict states MUST expose the blocking operation_id or stable error code when one exists."
+        "Current state MUST be derived by folding contiguous events in event_sequence order over the immutable intent.",
+        "Attempt history MUST NOT be deleted when completion or cancellation occurs.",
+        "blocked and conflict events MUST carry a stable error code or blocking operation_id.",
+        "A terminal operation rejects later state-changing events with OPERATION_TERMINAL."
+      ]
+    },
+    "cancellation": {
+      "idempotency_key": "cancel_event_id",
+      "rules": [
+        "The first valid cancel_requested event makes a non-terminal operation cancelled.",
+        "An identical cancel_event_id replay returns already_cancelled without appending a second event.",
+        "Reusing cancel_event_id with different content is EVENT_ID_REUSED.",
+        "Cancellation after completed is rejected with OPERATION_TERMINAL and does not change state.",
+        "Cancellation of an already cancelled operation with a new event ID returns already_cancelled and does not append a state-changing event."
       ]
     }
   },
@@ -246,6 +394,7 @@
       "ID_BASED"
     ],
     "initial_state": "LEGACY",
+    "initial_epoch": 0,
     "allowed_transitions": [
       {
         "from": "LEGACY",
@@ -256,6 +405,7 @@
         "to": "ID_BASED"
       }
     ],
+    "automatic_promotion": false,
     "automatic_downgrade": false,
     "migration_epoch": {
       "type": "monotonic-positive-integer",
@@ -263,6 +413,7 @@
       "stale_epoch_behavior": "reject",
       "audit_fields": [
         "migration_epoch",
+        "contract_enforcement_started_at",
         "started_at",
         "started_by_device_id",
         "source_contract_sha256",
@@ -287,7 +438,7 @@
       "Folder parent relationships are acyclic.",
       "Every tombstone retains entity identity and a monotonic revision.",
       "Every ID-based tree reference resolves exactly once.",
-      "No live siblings share the same normalized storage name."
+      "No live siblings share the same storage-name-v1 UTF-8 collision key."
     ]
   },
   "minimum_write_protocol": {
@@ -296,11 +447,11 @@
       "structure": 1
     },
     "MIGRATING": {
-      "content": 1,
-      "structure": 2
+      "content": 3,
+      "structure": 3
     },
     "ID_BASED": {
-      "content": 1,
+      "content": 3,
       "structure": 3
     }
   },
@@ -309,77 +460,104 @@
       "project_mode": "LEGACY",
       "protocol_version": 1,
       "allowed": true,
-      "required_capabilities": [
-        "legacy_tree_folder_projection"
-      ],
-      "server_behavior": "Accept legacy name projection and normalize it into the current LEGACY representation."
+      "provenance_kind": "LEGACY_EPOCH_0",
+      "server_behavior": "Accept through the legacy adapter without batch metadata."
     },
     {
       "project_mode": "LEGACY",
       "protocol_version": 2,
       "allowed": true,
-      "required_capabilities": [
-        "folders_authoritative",
-        "tombstones"
-      ],
-      "server_behavior": "Accept stable IDs while the project remains readable by legacy clients; do not claim ID_BASED invariants yet."
+      "provenance_kind": "LEGACY_EPOCH_0",
+      "server_behavior": "Accept stable folder identities while retaining LEGACY epoch-0 provenance."
     },
     {
-      "project_mode": "MIGRATING",
-      "protocol_version": 1,
-      "allowed": false,
-      "required_capabilities": [],
-      "server_behavior": "Reject with PROJECT_MIGRATING."
-    },
-    {
-      "project_mode": "MIGRATING",
-      "protocol_version": 2,
+      "project_mode": "LEGACY",
+      "protocol_version": 3,
       "allowed": true,
-      "required_capabilities": [
-        "folders_authoritative",
-        "tombstones"
-      ],
-      "server_behavior": "Accept only when the request carries the active migration_epoch and lock ownership permits it."
+      "provenance_kind": "CONTRACT_BATCH",
+      "server_behavior": "Validate the released contract batch and use atomic_structure_commit."
     },
     {
       "project_mode": "MIGRATING",
       "protocol_version": 3,
       "allowed": true,
-      "required_capabilities": [
-        "folders_authoritative",
-        "tree_order_ids",
-        "tombstones",
-        "immutable_batch_contract_metadata"
-      ],
-      "server_behavior": "Validate against the target ID-based representation under the migration lock."
-    },
-    {
-      "project_mode": "ID_BASED",
-      "protocol_version": 1,
-      "allowed": false,
-      "required_capabilities": [],
-      "server_behavior": "Reject structural writes with PROTOCOL_TOO_OLD."
-    },
-    {
-      "project_mode": "ID_BASED",
-      "protocol_version": 2,
-      "allowed": false,
-      "required_capabilities": [],
-      "server_behavior": "Reject structural writes with CAPABILITY_MISMATCH because ID tree references are required."
+      "provenance_kind": "CONTRACT_BATCH",
+      "server_behavior": "Require the active migration epoch, lock ownership, and atomic_structure_commit."
     },
     {
       "project_mode": "ID_BASED",
       "protocol_version": 3,
       "allowed": true,
-      "required_capabilities": [
-        "folders_authoritative",
-        "tree_order_ids",
-        "tombstones",
-        "immutable_batch_contract_metadata"
-      ],
-      "server_behavior": "Validate and atomically apply the structure intent or reject the complete structure transaction."
+      "provenance_kind": "CONTRACT_BATCH",
+      "server_behavior": "Atomically apply the complete ordered structure batch or reject it."
+    },
+    {
+      "project_mode": "MIGRATING_OR_ID_BASED",
+      "protocol_version": 1,
+      "allowed": false,
+      "provenance_kind": "LEGACY_EPOCH_0",
+      "server_behavior": "Reject content and structure writes with PROTOCOL_TOO_OLD."
+    },
+    {
+      "project_mode": "MIGRATING_OR_ID_BASED",
+      "protocol_version": 2,
+      "allowed": false,
+      "provenance_kind": "LEGACY_EPOCH_0",
+      "server_behavior": "Reject content and structure writes with PROTOCOL_TOO_OLD."
     }
   ],
+  "atomic_structure_commit": {
+    "required_protocol": 3,
+    "wire_schema": "atomic-structure-commit.schema.json",
+    "request_kind": "atomic_structure_commit_request",
+    "response_kinds": [
+      "atomic_structure_commit_success",
+      "atomic_structure_commit_failure"
+    ],
+    "idempotency_key": "batch_id",
+    "atomic_boundary": "one request containing one immutable batch and its complete ordered_intents array",
+    "ordering_rule": "sequence starts at 1, is contiguous, and is the sole apply and replay order.",
+    "payload_digest_rule": "batch_payload_sha256 is SHA-256 of the RFC 8785 canonical UTF-8 bytes of ordered_intents.",
+    "success_rule": "Success returns committed or replayed for the entire batch and one result per ordered intent.",
+    "failure_rule": "Any validation or apply failure rolls back the transaction, returns applied=false, and returns no successful intent result.",
+    "replay_rule": "An identical batch_id and batch_payload_sha256 returns the original complete response; a different payload is BATCH_ID_REUSED.",
+    "partial_apply_rule": "A partial apply MUST NOT be represented as success and MUST be rolled back."
+  },
+  "storage_name_normalization": {
+    "algorithm_id": "storage-name-v1",
+    "unicode_version": "15.0.0",
+    "input_scope": "one folder or file name segment, never a path",
+    "steps": [
+      "Reject U+0000, U+0001 through U+001F, U+007F, slash, and backslash.",
+      "Apply Unicode Normalization Form KC using Unicode 15.0.0.",
+      "Apply Unicode 15.0.0 Default Case Folding without locale.",
+      "Apply Unicode Normalization Form KC again.",
+      "Remove every trailing U+0020 SPACE or U+002E FULL STOP.",
+      "Reject an empty result, dot, or dot-dot.",
+      "Take the substring before the first U+002E FULL STOP and reject Windows device basenames CON, PRN, AUX, NUL, COM1 through COM9, and LPT1 through LPT9.",
+      "Encode the remaining string as UTF-8; these exact bytes are the sibling collision key."
+    ],
+    "separator_policy": "Separators are rejected, not rewritten.",
+    "leading_space_policy": "Leading U+0020 is preserved.",
+    "internal_space_policy": "Internal Unicode whitespace is preserved subject to NFKC_Casefold.",
+    "comparison_policy": "Compare collision-key UTF-8 bytes for exact equality.",
+    "conformance_vectors": "conformance_vectors/storage-name-v1.json"
+  },
+  "legacy_migration": {
+    "legacy_provenance_kind": "LEGACY_EPOCH_0",
+    "contract_provenance_kind": "CONTRACT_BATCH",
+    "default_for_existing_projects": {
+      "project_sync_mode": "LEGACY",
+      "migration_epoch": 0,
+      "contract_enforcement_started_at": null
+    },
+    "unknown_metadata_policy": "Unknown historical build, protocol, digest, batch, or device values MUST remain null or absent with unknown_reason PRE_CONTRACT_HISTORY; implementations MUST NOT invent values.",
+    "history_policy": "Pre-contract rows remain in their existing ledger or an explicitly namespaced legacy ledger and are not rewritten into contract batches.",
+    "enforcement_boundary": "The successful server-locked LEGACY to MIGRATING transition creates migration_epoch 1 and contract_enforcement_started_at. Every later write requires protocol 3 CONTRACT_BATCH provenance.",
+    "promotion_rule": "Promotion is manual. Validation success permits an explicit MIGRATING to ID_BASED transition; it never causes automatic promotion.",
+    "failure_rule": "A failed migration remains MIGRATING with diagnostics and is not automatically downgraded.",
+    "legacy_invariant_scope": "Immutable batch invariants apply only to CONTRACT_BATCH operations. Legacy rows remain subject to identity, authorization, and data-integrity checks that can be proven from recorded fields."
+  },
   "standard_error_codes": [
     "AUTH_REQUIRED",
     "FORBIDDEN",
@@ -396,10 +574,15 @@
     "DOCUMENT_ALREADY_EXISTS",
     "REVISION_CONFLICT",
     "OPERATION_ID_REUSED",
+    "BATCH_ID_REUSED",
+    "EVENT_ID_REUSED",
+    "OPERATION_TERMINAL",
     "LEASE_REQUIRED",
     "LEASE_CONFLICT",
     "LEASE_EXPIRED",
     "PATH_CONFLICT",
+    "STORAGE_NAME_INVALID",
+    "STORAGE_NAME_RESERVED",
     "FOLDER_NOT_FOUND",
     "FOLDER_ALREADY_EXISTS",
     "FOLDER_NOT_EMPTY",
@@ -414,7 +597,7 @@
     },
     {
       "id": "INV-002",
-      "rule": "operation_id is globally idempotent: an identical replay returns the original result and a different payload is OPERATION_ID_REUSED."
+      "rule": "operation_id is globally idempotent: an identical replay returns the original result and a different immutable intent is OPERATION_ID_REUSED."
     },
     {
       "id": "INV-003",
@@ -422,7 +605,7 @@
     },
     {
       "id": "INV-004",
-      "rule": "In authoritative folder modes, folder existence and identity come only from folders, never from tree_order."
+      "rule": "In authoritative folder modes, folder identity comes only from folders."
     },
     {
       "id": "INV-005",
@@ -434,19 +617,27 @@
     },
     {
       "id": "INV-007",
-      "rule": "A project sync mode never automatically moves backward."
+      "rule": "A project sync mode never changes automatically."
     },
     {
       "id": "INV-008",
-      "rule": "A structure transaction is all-or-nothing at its declared atomic boundary."
+      "rule": "A protocol 3 structure batch is all-or-nothing at the atomic_structure_commit request boundary."
     },
     {
       "id": "INV-009",
-      "rule": "Batch contract metadata is immutable and every operation remains traceable to its writer and canonical contract digest."
+      "rule": "Every CONTRACT_BATCH operation is traceable to immutable writer, build, protocol, version, capability, payload, and canonical contract digest metadata."
     },
     {
       "id": "INV-010",
       "rule": "Folder parent relationships remain within one project and contain no cycle."
+    },
+    {
+      "id": "INV-011",
+      "rule": "Operation projections are reproducible from immutable intent plus contiguous append-only events and attempts."
+    },
+    {
+      "id": "INV-012",
+      "rule": "Sibling storage-name collisions are decided only by exact storage-name-v1 UTF-8 collision-key equality."
     }
   ],
   "contract_allowlist": {
@@ -464,25 +655,20 @@
     "validation_order": [
       "Resolve canonical_contract_sha256 in the server allowlist.",
       "Verify contract_version and sync_protocol_version match that entry.",
-      "Verify declared capabilities are a subset of the allowlisted capabilities for the client build.",
+      "Verify every declared capability exists and its since_protocol is not greater than sync_protocol_version.",
+      "Verify all capabilities required by the selected protocol are declared.",
       "Verify project_sync_mode and minimum_write_protocol permit the requested intent.",
-      "Validate entity revisions and server invariants.",
+      "Validate batch metadata, operation intent, revisions, storage names, and invariants.",
       "Apply or reject the complete atomic boundary."
     ],
     "unknown_digest_behavior": "reject_with_CONTRACT_NOT_ALLOWED",
     "digest_mismatch_behavior": "reject_with_CONTRACT_DIGEST_MISMATCH",
     "client_declarations_are_authoritative": false
   },
-  "legacy_content_editing_in_id_based": {
-    "allowed": true,
-    "minimum_protocol_version": 1,
-    "conditions": [
-      "The document_id already exists and is live.",
-      "The relative path and parent folder assignment are unchanged.",
-      "The request does not create, rename, move, restore, delete, or reorder any entity.",
-      "Normal revision, operation_id, content hash, authorization, and edit lease checks pass."
-    ],
-    "legacy_structure_writes_allowed": false,
-    "rejection_code": "PROTOCOL_TOO_OLD"
+  "evidence_policy": {
+    "public_source": "Reproducible Git commits and repository files may support implementation claims.",
+    "preserved_local_database": "A preserved database is separate evidence and MUST include an accessible artifact identifier and digest before another platform claims to have verified it.",
+    "operational_database": "Repository migrations MUST NOT be described as deployed state unless the operational migration ledger was inspected read-only.",
+    "unknown_evidence": "Unavailable operational or preserved evidence MUST be reported as not verified."
   }
 }

@@ -1,8 +1,8 @@
 {
   "$schema": "../transition-vector.schema.json",
   "vector_id": "TV-010",
-  "title": "Legacy structural write rejected after ID-based promotion",
-  "contract_version": "0.1.0-draft.1",
+  "title": "Legacy writes rejected after manual ID-based promotion",
+  "contract_version": "0.1.0",
   "minimum_protocol_version": 1,
   "tags": [
     "id-based",
@@ -50,10 +50,11 @@
       "queue": [
         {
           "operation_id": "20000000-0000-4000-8000-000000000071",
-          "batch_id": "10000000-0000-4000-8000-000000000071",
+          "provenance_kind": "LEGACY_EPOCH_0",
           "entity_id": "30000000-0000-4000-8000-000000000101",
           "intent_kind": "rename",
           "base_revision": 7,
+          "payload_sha256": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
           "state": "pending",
           "attempt_count": 0
         }
@@ -80,12 +81,14 @@
       "actor": "windows-v1",
       "kind": "commit_batch",
       "input": {
+        "operation_id": "20000000-0000-4000-8000-000000000072",
+        "provenance_kind": "LEGACY_EPOCH_0",
         "content_only": true,
         "document_id": "40000000-0000-4000-8000-000000000101",
         "relative_path_unchanged": true,
         "parent_unchanged": true
       },
-      "expected_outcome": "content-only edit remains eligible for normal revision and lease validation"
+      "expected_outcome": "server rejects the content write with PROTOCOL_TOO_OLD because enforcement began before ID_BASED"
     }
   ],
   "fault_injections": [],
@@ -94,7 +97,7 @@
     "migration_epoch": 4,
     "entity_assertions": [
       "folder name remains 정식 폴더 at revision 7",
-      "content-only document edit may advance independently when normal checks pass"
+      "document content and revision remain unchanged"
     ],
     "tree_order_assertions": [
       "ID-based tree references remain unchanged"
@@ -105,8 +108,8 @@
     {
       "client_id": "windows-v1",
       "assertions": [
-        "the structural intent is visibly blocked with an update-required reason",
-        "the rejected name is not projected into local authoritative state"
+        "both intents are visibly blocked with an update-required reason",
+        "no rejected legacy value is projected into authoritative state"
       ]
     }
   ],
@@ -117,8 +120,17 @@
       "attempt_count": 1,
       "error_code": "PROTOCOL_TOO_OLD",
       "assertions": [
-        "the operation is not automatically downgraded or rewritten",
+        "the structural operation is not rewritten or assigned a fabricated batch",
         "server state is unchanged"
+      ]
+    },
+    {
+      "operation_id": "20000000-0000-4000-8000-000000000072",
+      "state": "blocked",
+      "attempt_count": 1,
+      "error_code": "PROTOCOL_TOO_OLD",
+      "assertions": [
+        "post-enforcement content cannot use LEGACY_EPOCH_0 provenance"
       ]
     }
   ],
@@ -132,8 +144,8 @@
       "assert": "the project does not downgrade to LEGACY"
     },
     {
-      "id": "TV-010-INV-01",
-      "assert": "legacy content-only editing is distinct from a structural write"
+      "id": "INV-009",
+      "assert": "no post-enforcement write is accepted without a released contract batch"
     }
   ]
 }

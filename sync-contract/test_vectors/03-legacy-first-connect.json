@@ -2,7 +2,7 @@
   "$schema": "../transition-vector.schema.json",
   "vector_id": "TV-003",
   "title": "Legacy client first connection",
-  "contract_version": "0.1.0-draft.1",
+  "contract_version": "0.1.0",
   "minimum_protocol_version": 1,
   "tags": [
     "bootstrap",
@@ -54,6 +54,9 @@
       "actor": "windows-v1",
       "kind": "connect_legacy_client",
       "input": {
+        "operation_id": "20000000-0000-4000-8000-000000000004",
+        "provenance_kind": "LEGACY_EPOCH_0",
+        "payload_sha256": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
         "tree_order": {
           "root": [
             "빈 폴더"

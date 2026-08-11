@@ -1,0 +1,155 @@
+{
+  "$schema": "../transition-vector.schema.json",
+  "vector_id": "TV-012",
+  "title": "Atomic structure failure rolls back every ordered intent",
+  "contract_version": "0.1.0",
+  "minimum_protocol_version": 3,
+  "tags": [
+    "atomic-structure",
+    "rollback",
+    "wire-contract"
+  ],
+  "initial_server_state": {
+    "project_id": "00000000-0000-4000-8000-000000000012",
+    "project_sync_mode": "ID_BASED",
+    "migration_epoch": 2,
+    "entities": [
+      {
+        "entity_id": "30000000-0000-4000-8000-000000000121",
+        "entity_kind": "folder",
+        "revision": 1,
+        "is_deleted": false,
+        "name": "Before"
+      },
+      {
+        "entity_id": "50000000-0000-4000-8000-000000000121",
+        "entity_kind": "tree_order",
+        "revision": 2,
+        "is_deleted": false
+      }
+    ],
+    "tree_order": {
+      "root": [
+        "30000000-0000-4000-8000-000000000121"
+      ]
+    }
+  },
+  "initial_client_states": [
+    {
+      "client_id": "windows-v3",
+      "platform": "windows",
+      "protocol_version": 3,
+      "capabilities": [
+        "folders_authoritative",
+        "tree_order_ids",
+        "tombstones",
+        "immutable_batch_contract_metadata",
+        "operation_attempt_history",
+        "operation_state_events",
+        "storage_name_v1"
+      ],
+      "local_entities": [],
+      "queue": [
+        {
+          "operation_id": "20000000-0000-4000-8000-000000000091",
+          "batch_id": "10000000-0000-4000-8000-000000000091",
+          "provenance_kind": "CONTRACT_BATCH",
+          "entity_id": "30000000-0000-4000-8000-000000000121",
+          "intent_kind": "rename",
+          "base_revision": 1,
+          "payload_sha256": "3333333333333333333333333333333333333333333333333333333333333333",
+          "state": "pending",
+          "attempt_count": 0
+        },
+        {
+          "operation_id": "20000000-0000-4000-8000-000000000092",
+          "batch_id": "10000000-0000-4000-8000-000000000091",
+          "provenance_kind": "CONTRACT_BATCH",
+          "entity_id": "50000000-0000-4000-8000-000000000121",
+          "intent_kind": "reorder",
+          "base_revision": 1,
+          "payload_sha256": "4444444444444444444444444444444444444444444444444444444444444444",
+          "state": "pending",
+          "attempt_count": 0
+        }
+      ]
+    }
+  ],
+  "ordered_actions": [
+    {
+      "action_id": "A01",
+      "actor": "windows-v3",
+      "kind": "atomic_structure_commit",
+      "input": {
+        "batch_id": "10000000-0000-4000-8000-000000000091",
+        "ordered_operation_ids": [
+          "20000000-0000-4000-8000-000000000091",
+          "20000000-0000-4000-8000-000000000092"
+        ]
+      },
+      "expected_outcome": "sequence 2 returns REVISION_CONFLICT and sequence 1 is rolled back"
+    }
+  ],
+  "fault_injections": [
+    {
+      "after_action_id": "A01",
+      "type": "inject_revision_conflict",
+      "parameters": {
+        "operation_id": "20000000-0000-4000-8000-000000000092",
+        "current_revision": 2
+      }
+    }
+  ],
+  "expected_server_state": {
+    "project_sync_mode": "ID_BASED",
+    "migration_epoch": 2,
+    "entity_assertions": [
+      "folder remains Before at revision 1",
+      "tree_order remains revision 2",
+      "no operation result is recorded as committed"
+    ],
+    "tree_order_assertions": [
+      "the original root order remains visible"
+    ],
+    "error_code": "REVISION_CONFLICT"
+  },
+  "expected_client_states": [
+    {
+      "client_id": "windows-v3",
+      "assertions": [
+        "the complete batch is reported rejected",
+        "no partial success is projected"
+      ]
+    }
+  ],
+  "expected_queue_states": [
+    {
+      "operation_id": "20000000-0000-4000-8000-000000000091",
+      "state": "blocked",
+      "attempt_count": 1,
+      "error_code": "REVISION_CONFLICT",
+      "assertions": [
+        "the first intent was validated but not committed"
+      ]
+    },
+    {
+      "operation_id": "20000000-0000-4000-8000-000000000092",
+      "state": "conflict",
+      "attempt_count": 1,
+      "error_code": "REVISION_CONFLICT",
+      "assertions": [
+        "the failing intent identifies the batch rejection cause"
+      ]
+    }
+  ],
+  "invariants": [
+    {
+      "id": "INV-008",
+      "assert": "the atomic request has no partially visible success"
+    },
+    {
+      "id": "INV-011",
+      "assert": "both queue projections are derived from the rejected batch event sequence"
+    }
+  ]
+}

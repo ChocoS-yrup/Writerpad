@@ -1,0 +1,189 @@
+{
+  "contract_version": "0.1.0",
+  "wire_schema": "../atomic-structure-commit.schema.json",
+  "cases": [
+    {
+      "case_id": "ASC-001",
+      "title": "Complete ordered structure batch commits",
+      "request": {
+        "kind": "atomic_structure_commit_request",
+        "project_id": "00000000-0000-4000-8000-000000000201",
+        "project_sync_mode": "ID_BASED",
+        "migration_epoch": 1,
+        "batch": {
+          "batch_id": "10000000-0000-4000-8000-000000000201",
+          "writer_device_id": "60000000-0000-4000-8000-000000000201",
+          "client_build_id": "conformance-0.1.0",
+          "sync_protocol_version": 3,
+          "contract_version": "0.1.0",
+          "canonical_contract_sha256": "fae86b4e6385ee37fbeb99f9256194ec319b64bfda92974ce90a3eb70d2e7a46",
+          "client_capabilities": [
+            "folders_authoritative",
+            "tree_order_ids",
+            "tombstones",
+            "immutable_batch_contract_metadata",
+            "operation_attempt_history",
+            "operation_state_events",
+            "storage_name_v1"
+          ],
+          "batch_payload_sha256": "0fd7de3e5329659757e0a391f3cfed43faac11a750ad13698301bfda7499e62c"
+        },
+        "ordered_intents": [
+          {
+            "sequence": 1,
+            "operation_id": "20000000-0000-4000-8000-000000000201",
+            "batch_id": "10000000-0000-4000-8000-000000000201",
+            "entity_kind": "folder",
+            "entity_id": "30000000-0000-4000-8000-000000000201",
+            "intent_kind": "rename",
+            "base_revision": 1,
+            "payload_sha256": "3782e48c5bf35825af922f03357cb9357ee7d9a08df7175dec392a09cb912dc3",
+            "payload": {
+              "name": "Renamed"
+            }
+          },
+          {
+            "sequence": 2,
+            "operation_id": "20000000-0000-4000-8000-000000000202",
+            "batch_id": "10000000-0000-4000-8000-000000000201",
+            "entity_kind": "tree_order",
+            "entity_id": "50000000-0000-4000-8000-000000000201",
+            "intent_kind": "reorder",
+            "base_revision": 1,
+            "payload_sha256": "abf3340eb74959cea7c406ffadfc9ecd6a4747cf1715718bf78a1e9fd4695fa7",
+            "payload": {
+              "children": [
+                "30000000-0000-4000-8000-000000000201"
+              ]
+            }
+          }
+        ]
+      },
+      "response": {
+        "kind": "atomic_structure_commit_success",
+        "batch_id": "10000000-0000-4000-8000-000000000201",
+        "batch_payload_sha256": "0fd7de3e5329659757e0a391f3cfed43faac11a750ad13698301bfda7499e62c",
+        "status": "committed",
+        "applied": true,
+        "results": [
+          {
+            "sequence": 1,
+            "operation_id": "20000000-0000-4000-8000-000000000201",
+            "entity_id": "30000000-0000-4000-8000-000000000201",
+            "result_revision": 2
+          },
+          {
+            "sequence": 2,
+            "operation_id": "20000000-0000-4000-8000-000000000202",
+            "entity_id": "50000000-0000-4000-8000-000000000201",
+            "result_revision": 2
+          }
+        ]
+      },
+      "expected_semantics": "committed"
+    },
+    {
+      "case_id": "ASC-002",
+      "title": "Identical batch replay returns the complete original result",
+      "replay_of": "ASC-001",
+      "response": {
+        "kind": "atomic_structure_commit_success",
+        "batch_id": "10000000-0000-4000-8000-000000000201",
+        "batch_payload_sha256": "0fd7de3e5329659757e0a391f3cfed43faac11a750ad13698301bfda7499e62c",
+        "status": "replayed",
+        "applied": true,
+        "results": [
+          {
+            "sequence": 1,
+            "operation_id": "20000000-0000-4000-8000-000000000201",
+            "entity_id": "30000000-0000-4000-8000-000000000201",
+            "result_revision": 2
+          },
+          {
+            "sequence": 2,
+            "operation_id": "20000000-0000-4000-8000-000000000202",
+            "entity_id": "50000000-0000-4000-8000-000000000201",
+            "result_revision": 2
+          }
+        ]
+      },
+      "expected_semantics": "replayed"
+    },
+    {
+      "case_id": "ASC-003",
+      "title": "Second intent failure rolls back the complete batch",
+      "request_from": "ASC-001",
+      "response": {
+        "kind": "atomic_structure_commit_failure",
+        "batch_id": "10000000-0000-4000-8000-000000000201",
+        "batch_payload_sha256": "0fd7de3e5329659757e0a391f3cfed43faac11a750ad13698301bfda7499e62c",
+        "status": "rejected",
+        "applied": false,
+        "error": {
+          "code": "REVISION_CONFLICT",
+          "message": "tree_order revision changed",
+          "failed_sequence": 2
+        },
+        "results": []
+      },
+      "expected_semantics": "rollback_all"
+    },
+    {
+      "case_id": "ASC-004",
+      "title": "Same batch ID with a different payload is rejected",
+      "request": {
+        "kind": "atomic_structure_commit_request",
+        "project_id": "00000000-0000-4000-8000-000000000201",
+        "project_sync_mode": "ID_BASED",
+        "migration_epoch": 1,
+        "batch": {
+          "batch_id": "10000000-0000-4000-8000-000000000201",
+          "writer_device_id": "60000000-0000-4000-8000-000000000201",
+          "client_build_id": "conformance-0.1.0",
+          "sync_protocol_version": 3,
+          "contract_version": "0.1.0",
+          "canonical_contract_sha256": "fae86b4e6385ee37fbeb99f9256194ec319b64bfda92974ce90a3eb70d2e7a46",
+          "client_capabilities": [
+            "folders_authoritative",
+            "tree_order_ids",
+            "tombstones",
+            "immutable_batch_contract_metadata",
+            "operation_attempt_history",
+            "operation_state_events",
+            "storage_name_v1"
+          ],
+          "batch_payload_sha256": "9f29a4a93b6362d7fea10351f78717d3a9b98614837b3359ea89e2fbbd3351aa"
+        },
+        "ordered_intents": [
+          {
+            "sequence": 1,
+            "operation_id": "20000000-0000-4000-8000-000000000201",
+            "batch_id": "10000000-0000-4000-8000-000000000201",
+            "entity_kind": "folder",
+            "entity_id": "30000000-0000-4000-8000-000000000201",
+            "intent_kind": "rename",
+            "base_revision": 1,
+            "payload_sha256": "238c19be39dccc9be74d0122a5f3c6530d08bc814cdc991b8fcd9dd30bf68fa3",
+            "payload": {
+              "name": "Different"
+            }
+          }
+        ]
+      },
+      "response": {
+        "kind": "atomic_structure_commit_failure",
+        "batch_id": "10000000-0000-4000-8000-000000000201",
+        "batch_payload_sha256": "9f29a4a93b6362d7fea10351f78717d3a9b98614837b3359ea89e2fbbd3351aa",
+        "status": "rejected",
+        "applied": false,
+        "error": {
+          "code": "BATCH_ID_REUSED",
+          "message": "batch_id already belongs to a different payload",
+          "failed_sequence": null
+        },
+        "results": []
+      },
+      "expected_semantics": "batch_id_reused"
+    }
+  ]
+}

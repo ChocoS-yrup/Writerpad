@@ -1,6 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "urn:writerpad:sync-contract:snapshot-schema:0.1.0-draft.1",
+  "$id": "urn:writerpad:sync-contract:snapshot-schema:0.1.0",
   "title": "WriterPad Sync Server Snapshot",
   "type": "object",
   "additionalProperties": false,
@@ -17,7 +17,7 @@
   ],
   "properties": {
     "snapshot_version": {
-      "const": "0.1.0-draft.1"
+      "const": "0.1.0"
     },
     "captured_at": {
       "$ref": "#/$defs/timestamp"
