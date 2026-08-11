@@ -6,8 +6,8 @@
 - 소스 구현: 완료
 - 로컬 정적 검증: 통과
 - 임시 PostgreSQL 16 migration/RPC conformance: 통과
-- Stage 7 판정: `READY_FOR_STAGING_PREFLIGHT`
-- staging 쓰기: 수행하지 않음
+- Stage 7 판정: `BLOCKED_STAGING_BASELINE_MISSING`
+- staging 쓰기: foundation 적용 시도 실패 후 transaction rollback 확인
 - 운영 쓰기: 수행하지 않음
 - client 앱 변경: 없음
 - PR: https://github.com/ChocoS-yrup/Writerpad/pull/4
@@ -82,16 +82,18 @@ PostgreSQL job은 reference v2 migration 다음에 두 Stage 7 migration을 적�
 atomic commit/rollback/replay, cancellation, 수동 migration, intentional empty
 document commit과 document replay를 실제 SQL로 검증했다.
 
-## staging 승인 게이트
+## staging 적용 결과
 
-현재 환경에는 확인된 staging project ID, endpoint 및 DB 자격 증명이 없다. 따라서
-아래 항목은 `UNVERIFIED`이며 staging 쓰기를 승인받기 전까지 실행하지 않는다.
+2026-08-11에 `WriterPad Staging` (`mhpnszcorfzrvhyondxr`)을 읽기 전용으로
+확인한 결과 PostgreSQL `17.6`의 빈 프로젝트였으며 migration ledger와 v2 baseline
+table이 없었다. 승인된 foundation migration을 checksum 확인 후 그대로 실행했지만
+명시적인 guard가 `STAGE7_BASELINE_MISSING`을 반환했다. outer transaction 전체가
+rollback되었고 RPC migration은 실행하지 않았다.
 
-1. `supabase/preflight/stage7_readonly.sql`로 migration ledger와 catalog snapshot 확인
-2. 정확한 staging project ID/endpoint 및 실행할 두 migration을 사용자에게 제시
-3. staging 쓰기 승인 후에만 migration 적용 및 재실행 검증
-4. 배포 RPC catalog, document/structure 왕복, restart replay 확인
-5. rollback/복구 절차와 test project ID 보존
+비밀값을 제거한 상세 증거는
+`Docs/stage-7-staging-migration-attempt-2026-08-11.md`에 기록했다. authoritative v2
+baseline migration set과 별도 staging 적용 승인이 확보되기 전에는 Stage 7 migration을
+재시도하지 않는다.
 
 ## rollback 및 복구
 
@@ -110,16 +112,16 @@ server_merge_candidate_commit: 5b218026d6b786dada2053e0a04761597d9083f8
 migration_ids:
   - 20260811010000
   - 20260811020000
-staging_project_id: UNVERIFIED
-staging_endpoint: UNVERIFIED
-migration_ledger_verified: false
+staging_project_id: mhpnszcorfzrvhyondxr
+staging_endpoint: https://mhpnszcorfzrvhyondxr.supabase.co
+migration_ledger_verified: true_absent
 protocol_3_document_rpc: implemented_and_ci_passed
 atomic_structure_rpc: implemented_and_ci_passed
-test_results: local_static_and_postgresql_16_ci_passed
-rollback_status: transaction_rollback_passed_operational_restore_unverified
+test_results: local_static_and_postgresql_16_ci_passed_staging_17_6_blocked_on_missing_v2_baseline
+rollback_status: failed_foundation_transaction_fully_rolled_back
 production_changes: none
 unverified_items:
-  - staging migration ledger and catalog
+  - authoritative v2 baseline migration set for blank staging
   - actual deployed RPC catalog
   - staging document/structure round trip
   - staging restart replay
