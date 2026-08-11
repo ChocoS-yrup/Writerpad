@@ -2,108 +2,128 @@
 
 ## 상태
 
-- 구현 범위: Server/Supabase only
-- 구현 상태: structure/server 기반 구현과 CI는 통과했으나 protocol 3 문서 commit wire의 계약 공백으로 시작 게이트 차단
-- Stage 7 판정: `BLOCKED_CONTRACT_AMENDMENT_REQUIRED`
-- 운영 쓰기: 수행하지 않음
+- 범위: Server/Supabase only
+- 소스 구현: 완료
+- 로컬 정적 검증: 통과
+- 임시 PostgreSQL 16 migration/RPC conformance: 통과
+- Stage 7 판정: `READY_FOR_STAGING_PREFLIGHT`
 - staging 쓰기: 수행하지 않음
+- 운영 쓰기: 수행하지 않음
 - client 앱 변경: 없음
-- 구현 브랜치: `codex/stage-7-server-contract-implementation`
-- 구현 커밋: `1fbc31bee3e36d46e86e8723936b5c2c7b71081f`
-- 검증된 server build SHA: `3111faa589a302404aa57ae88b9eee347a961dc8`
+- PR: https://github.com/ChocoS-yrup/Writerpad/pull/4
+- server implementation commit: `5b218026d6b786dada2053e0a04761597d9083f8`
 
-## Protocol 3 문서 commit 계약 게이트
-
-Released contract `0.1.0`은 `document` entity와 protocol 3 batch provenance를
-정의하지만 문서 본문 commit의 규범적 request/response schema, RPC 경계,
-본문 payload, replay 응답 및 오류 shape를 정의하지 않는다.
-
-- 규범 wire schema는 `atomic-structure-commit.schema.json`뿐이며 structure batch 전용이다.
-- `protocol.json`의 `atomic_structure_commit`도 structure write에만 적용된다.
-- `Docs/SyncV2Contract.md`의 `commit_document(...)`는 기존 protocol 2/legacy 구현 문서이며 released contract package의 규범 wire가 아니다.
-- 따라서 `commit_document_contract` 같은 새 RPC를 Stage 7에서 임의로 설계하면 platform별 구현이 서로 다른 wire를 선택할 수 있고 canonical digest가 해당 동작을 보호하지 못한다.
-
-지시에 따라 protocol 3 문서 RPC를 추가하거나 staging migration을 적용하지 않았다.
-계약 개정 요구사항과 재개 조건은
-`Docs/stage-6-document-commit-contract-amendment-required.md`에 기록했다.
-
-## 계약 pin
+## 최종 계약 pin
 
 ```yaml
 repository: https://github.com/ChocoS-yrup/Writerpad
-contract_version: 0.1.0
-contract_git_commit: 45d18cff62cc48e29d0e6efcfc634fec96150198
-contract_content_commit: 7f05f32dd385ce0e1922b88d688742fca2a503fa
-canonical_contract_bytes: 19473
-canonical_contract_sha256: fae86b4e6385ee37fbeb99f9256194ec319b64bfda92974ce90a3eb70d2e7a46
+contract_pr: https://github.com/ChocoS-yrup/Writerpad/pull/5
+contract_version: 0.2.0
+contract_git_commit: fcd99b7098b9a04bd93c585d89b16588aa482530
+contract_content_commit: 7bcb5d25c5376b02469666df7318b90b456ffee6
+canonical_contract_bytes: 23256
+canonical_contract_sha256: 416c1b99edb9bda694731dee4b25688d9d82d1f32610aa23ddfda571ec3c7670
 ```
 
-## 적용 대상 migration
+PR #5에서 protocol 3 문서 본문 commit wire가 확정된 뒤 PR #4에 main merge
+commit `e712cb0`으로 반영했다.
 
-1. `20260811010000_sync_contract_0_1_0_foundation.sql`
-2. `20260811020000_sync_contract_0_1_0_rpcs.sql`
-
-첫 migration은 contract allowlist, LEGACY/epoch 0 provenance, Unicode 15 storage-name 정규화 자료와 함수, immutable operation/batch/event 저장소, RLS 및 읽기 권한을 추가한다. allowlist row는 기본적으로 `enabled = false`라서 migration 적용만으로 enforcement가 켜지거나 기존 project가 승격되지 않는다.
-
-두 번째 migration은 protocol/capability 검증, atomic ordered structure batch, idempotent replay, cancellation, 수동 project migration RPC와 document write enforcement boundary를 추가한다.
-
-## 검증 결과
-
-- Python: `3.12.13`
-- contract schema: 6 passed
-- transition vectors: 12 passed
-- storage-name vectors: 15 passed
-- atomic wire cases: 4 passed
-- canonical bytes/digest: pin과 일치
-- Stage 7 정적 검사: 2 migrations passed
-- PostgreSQL parser 검사: 두 migration 모두 parse 성공
-- whitespace 검사: passed
-- secret scan: 발견 없음
-- PostgreSQL 16 통합 검증: passed ([Actions run 31453547913](https://github.com/ChocoS-yrup/Writerpad/actions/runs/31453547913))
-
-CI는 reference v2 migration을 적용한 임시 PostgreSQL 16에서 Stage 7 migration과 SQL conformance test를 실행한다. 운영 또는 staging 데이터베이스를 사용하지 않는다.
-
-## 읽기 전용 운영/staging 확인 절차
-
-`supabase/preflight/stage7_readonly.sql`을 대상 DB에서 읽기 전용으로 실행해 다음 증거를 보존해야 한다.
-
-- Supabase migration ledger
-- PostgreSQL version과 catalog snapshot
-- reference v2 및 Stage 7 object/RPC 존재 여부
-- 기존 project의 legacy 분포
-- provenance 불일치와 migration ID 충돌
-
-현재 환경에는 staging endpoint, project ID, DB 자격 증명이 없어서 이 확인은 수행하지 않았다.
-
-## Stage 8에 전달할 값
+## migration
 
 ```yaml
-staging_project_id: UNVERIFIED
-staging_endpoint: UNVERIFIED
 migration_ids:
   - 20260811010000
   - 20260811020000
-server_build_sha: 3111faa589a302404aa57ae88b9eee347a961dc8
-contract_version: 0.1.0
-canonical_contract_sha256: fae86b4e6385ee37fbeb99f9256194ec319b64bfda92974ce90a3eb70d2e7a46
+migration_files:
+  - supabase/migrations/20260811010000_sync_contract_0_1_0_foundation.sql
+  - supabase/migrations/20260811020000_sync_contract_0_1_0_rpcs.sql
 ```
 
-Stage 8은 먼저 문서 commit 계약 개정과 Stage 7 재검증/병합을 기다려야 한다.
-현재 값은 구현 참고값일 뿐 다음 단계의 최종 pin으로 사용할 수 없다.
+두 ID와 파일명은 Stage 7 최초 draft에서 할당되었으며 staging 또는 운영에 적용된
+적이 없다. 계약 개정 후 같은 미적용 migration ID의 내용을 최종 계약 0.2.0 pin으로
+갱신했다. staging preflight에서 ledger 충돌이 발견되면 적용하지 않고 새 corrective
+migration ID를 발급해야 한다.
 
-## 미적용 운영 작업
+첫 migration은 allowlist(`enabled=false`), 정직한 `LEGACY/epoch 0` 경계,
+Unicode 15 storage-name-v1, immutable batch/operation, append-only attempt/event,
+document `structure_revision`, RLS와 project 격리를 추가한다.
 
-1. staging에서 preflight를 읽기 전용으로 실행하고 ledger/catalog snapshot을 보존한다.
-2. 두 migration을 순서대로 staging에 적용한다.
-3. staging conformance, replay, rollback, concurrency, cancellation, mixed-client 검증을 수행한다.
-4. 검증 결과를 근거로 contract allowlist 활성화 여부를 별도 승인한다.
-5. project별 수동 승격 전 `validate_project_sync_migration` 결과를 보존한다.
-6. 운영 적용은 별도 승인과 maintenance/복구 계획이 있을 때만 수행한다.
+두 번째 migration은 다음을 구현한다.
 
-## 복구 원칙
+- contract 0.2.0 digest/build/protocol/capability enforcement
+- `atomic_structure_commit(jsonb)`와 전체 transaction rollback
+- document rename/move의 `structure_revision` 장벽
+- 규범 wire 그대로의 `document_commit(jsonb)`
+- intentional empty body와 exact UTF-8 byte count/SHA-256 검증
+- create/update/delete/restore와 delete/restore snapshot 보존
+- batch/operation idempotency와 response-loss/server-restart replay
+- append-only cancellation 및 수동 project migration RPC
+- legacy document RPC에 대한 enforcement boundary
 
-- 적용 도중 실패하면 transaction 전체 실패를 확인하고 ledger에 성공 migration으로 기록되지 않았는지 확인한다.
-- 데이터가 생성되기 전에는 staging을 snapshot으로 복원하거나 새 staging DB에서 재검증한다.
-- operation/event/batch 데이터가 생성된 후에는 append-only 기록을 삭제하거나 덮어쓰지 않는다. 새 corrective migration으로 복구한다.
-- allowlist를 활성화했을 경우 우선 `enabled = false`로 되돌려 신규 protocol 3 요청을 차단하고, project mode를 자동 변경하지 않은 상태에서 원인을 조사한다.
-- 기존 project는 명시적 완료 절차 없이는 계속 `LEGACY/epoch 0`으로 취급한다.
+## 검증 결과
+
+```yaml
+python: 3.12.13
+unicode: 15.0.0
+contract_schemas: 7 passed
+transition_vectors: 12 passed
+storage_name_vectors: 15 passed
+atomic_wire_cases: 4 passed
+document_wire_cases: 7 passed
+stage7_static_checks: passed
+postgresql_version: 16
+postgresql_migration_parse_apply: passed
+postgresql_rpc_conformance: passed
+github_actions_server_run: https://github.com/ChocoS-yrup/Writerpad/actions/runs/31459172995
+github_actions_contract_run: https://github.com/ChocoS-yrup/Writerpad/actions/runs/31459172997
+```
+
+PostgreSQL job은 reference v2 migration 다음에 두 Stage 7 migration을 적용하고
+atomic commit/rollback/replay, cancellation, 수동 migration, intentional empty
+document commit과 document replay를 실제 SQL로 검증했다.
+
+## staging 승인 게이트
+
+현재 환경에는 확인된 staging project ID, endpoint 및 DB 자격 증명이 없다. 따라서
+아래 항목은 `UNVERIFIED`이며 staging 쓰기를 승인받기 전까지 실행하지 않는다.
+
+1. `supabase/preflight/stage7_readonly.sql`로 migration ledger와 catalog snapshot 확인
+2. 정확한 staging project ID/endpoint 및 실행할 두 migration을 사용자에게 제시
+3. staging 쓰기 승인 후에만 migration 적용 및 재실행 검증
+4. 배포 RPC catalog, document/structure 왕복, restart replay 확인
+5. rollback/복구 절차와 test project ID 보존
+
+## rollback 및 복구
+
+- CI transaction 실패 시 migration 전체 rollback은 검증했다.
+- staging snapshot 복원 및 Supabase 운영 복구는 대상이 없어 아직 검증하지 않았다.
+- allowlist 활성화 뒤 문제가 생기면 먼저 `enabled=false`로 신규 요청을 차단한다.
+- append-only 자료는 삭제·덮어쓰지 않고 corrective migration/event로 복구한다.
+- project mode는 자동으로 변경하거나 되돌리지 않는다.
+
+## Stage 7 handoff
+
+```yaml
+contract_version: 0.2.0
+canonical_contract_sha256: 416c1b99edb9bda694731dee4b25688d9d82d1f32610aa23ddfda571ec3c7670
+server_merge_candidate_commit: 5b218026d6b786dada2053e0a04761597d9083f8
+migration_ids:
+  - 20260811010000
+  - 20260811020000
+staging_project_id: UNVERIFIED
+staging_endpoint: UNVERIFIED
+migration_ledger_verified: false
+protocol_3_document_rpc: implemented_and_ci_passed
+atomic_structure_rpc: implemented_and_ci_passed
+test_results: local_static_and_postgresql_16_ci_passed
+rollback_status: transaction_rollback_passed_operational_restore_unverified
+production_changes: none
+unverified_items:
+  - staging migration ledger and catalog
+  - actual deployed RPC catalog
+  - staging document/structure round trip
+  - staging restart replay
+  - staging snapshot restore procedure
+```
+
+Stage 8은 Stage 7 PR 병합 commit과 staging 검증 결과가 확정되기 전에는 시작하지 않는다.

@@ -1,4 +1,8 @@
-# Stage 6 document-commit contract amendment required
+# Stage 6 document-commit contract amendment — resolved
+
+> Resolved by sync-contract 0.2.0 in PR #5, merged as
+> `fcd99b7098b9a04bd93c585d89b16588aa482530`. This file is retained as the
+> historical reason Stage 7 initially stopped rather than inventing an RPC.
 
 ## 판정
 
