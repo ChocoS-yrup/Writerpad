@@ -2,7 +2,7 @@
   "$schema": "../transition-vector.schema.json",
   "vector_id": "TV-001",
   "title": "ID-based empty folder creation",
-  "contract_version": "0.1.0-draft.1",
+  "contract_version": "0.1.0",
   "minimum_protocol_version": 3,
   "tags": [
     "empty-folder",
@@ -27,7 +27,10 @@
         "folders_authoritative",
         "tree_order_ids",
         "tombstones",
-        "immutable_batch_contract_metadata"
+        "immutable_batch_contract_metadata",
+        "operation_attempt_history",
+        "operation_state_events",
+        "storage_name_v1"
       ],
       "local_entities": [],
       "queue": []

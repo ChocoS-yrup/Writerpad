@@ -251,3 +251,31 @@ ID_BASED의 legacy content-only 예외를 적용하려면 server-side mode gate�
 - 보존 DB 복사본은 immutable read-only mode로 schema만 읽었다.
 - 동기화 작업을 실행하거나 재시도하지 않았다.
 - 서버 데이터와 보존 incident를 변경하지 않았다.
+
+## 6단계 최종화 후속 기록
+
+이 문서의 원 검토는 `0.1.0-draft.1`과 PR #2의 정확한 head에 대한 역사적
+기록으로 유지한다. 이후 계약 `0.1.0`은 C-01부터 C-06까지 다음과 같이
+규범적으로 해소했다.
+
+- rebase는 원 intent를 변경하지 않고 새 operation/batch와
+  `supersedes_operation_id`를 만든다.
+- protocol 1/2는 batch가 없는 정직한 `LEGACY_EPOCH_0`, protocol 3은 완전한
+  `CONTRACT_BATCH`로 구분한다.
+- cancellation과 supersession은 append-only state event로 기록하고 projection을
+  event sequence에서 재생성한다.
+- protocol 3 구조 write는 `atomic-structure-commit.schema.json`의 단일 request
+  boundary에서만 성공 또는 전체 rollback한다.
+- sibling name 충돌은 Unicode 15.0.0 `storage-name-v1`의 정확한 UTF-8 key로
+  판정한다.
+- 기존 project는 `LEGACY/epoch 0`으로 유지하며 알 수 없는 과거 metadata를
+  만들지 않는다. 수동 MIGRATING 전환 시점부터 protocol 3을 강제한다.
+
+원 검토의 preserved Windows SQLite 경로와 SHA-256은 공개 source commit과 별도
+근거다. 해당 artifact에 접근하지 못한 플랫폼은 DB 전용 schema 주장을 검증한
+것으로 표현하면 안 된다. 마찬가지로 repository Supabase migration은 운영
+migration ledger의 배포 상태를 증명하지 않는다.
+
+`sync-contract/scripts/verify_contract.py`는 최종화 이후 schema 모양뿐 아니라
+capability `since_protocol`, operation 생성 경로, 상태 도출, batch provenance,
+immutable rebase, storage-name 결과와 atomic replay/rollback을 교차 검증한다.

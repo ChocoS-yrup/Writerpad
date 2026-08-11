@@ -1,6 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "urn:writerpad:sync-contract:incident-schema:0.1.0-draft.1",
+  "$id": "urn:writerpad:sync-contract:incident-schema:0.1.0",
   "title": "WriterPad Sync Incident Evidence",
   "type": "object",
   "additionalProperties": false,
@@ -22,7 +22,7 @@
   ],
   "properties": {
     "incident_schema_version": {
-      "const": "0.1.0-draft.1"
+      "const": "0.1.0"
     },
     "incident_id": {
       "$ref": "#/$defs/uuid"

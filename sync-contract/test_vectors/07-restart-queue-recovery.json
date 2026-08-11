@@ -2,7 +2,7 @@
   "$schema": "../transition-vector.schema.json",
   "vector_id": "TV-007",
   "title": "Client termination and durable queue recovery",
-  "contract_version": "0.1.0-draft.1",
+  "contract_version": "0.1.0",
   "minimum_protocol_version": 3,
   "tags": [
     "durability",
@@ -38,16 +38,20 @@
         "tree_order_ids",
         "tombstones",
         "immutable_batch_contract_metadata",
-        "operation_attempt_history"
+        "operation_attempt_history",
+        "operation_state_events",
+        "storage_name_v1"
       ],
       "local_entities": [],
       "queue": [
         {
           "operation_id": "20000000-0000-4000-8000-000000000041",
           "batch_id": "10000000-0000-4000-8000-000000000041",
+          "provenance_kind": "CONTRACT_BATCH",
           "entity_id": "30000000-0000-4000-8000-000000000007",
           "intent_kind": "rename",
           "base_revision": 1,
+          "payload_sha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
           "state": "pending",
           "attempt_count": 0
         }

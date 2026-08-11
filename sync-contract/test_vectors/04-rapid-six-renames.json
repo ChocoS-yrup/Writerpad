@@ -2,7 +2,7 @@
   "$schema": "../transition-vector.schema.json",
   "vector_id": "TV-004",
   "title": "Six rapid structural renames",
-  "contract_version": "0.1.0-draft.1",
+  "contract_version": "0.1.0",
   "minimum_protocol_version": 3,
   "tags": [
     "fifo",
@@ -78,7 +78,9 @@
         "tree_order_ids",
         "tombstones",
         "immutable_batch_contract_metadata",
-        "operation_attempt_history"
+        "operation_attempt_history",
+        "operation_state_events",
+        "storage_name_v1"
       ],
       "local_entities": [],
       "queue": []
@@ -90,6 +92,8 @@
       "actor": "ipad-v3",
       "kind": "rename_folder",
       "input": {
+        "operation_id": "20000000-0000-4000-8000-000000000011",
+        "batch_id": "10000000-0000-4000-8000-000000000011",
         "entity_id": "30000000-0000-4000-8000-000000000011",
         "name": "R1"
       },
@@ -100,6 +104,8 @@
       "actor": "ipad-v3",
       "kind": "rename_folder",
       "input": {
+        "operation_id": "20000000-0000-4000-8000-000000000012",
+        "batch_id": "10000000-0000-4000-8000-000000000011",
         "entity_id": "30000000-0000-4000-8000-000000000012",
         "name": "R2"
       },
@@ -110,6 +116,8 @@
       "actor": "ipad-v3",
       "kind": "rename_folder",
       "input": {
+        "operation_id": "20000000-0000-4000-8000-000000000013",
+        "batch_id": "10000000-0000-4000-8000-000000000011",
         "entity_id": "30000000-0000-4000-8000-000000000013",
         "name": "R3"
       },
@@ -120,6 +128,8 @@
       "actor": "ipad-v3",
       "kind": "rename_folder",
       "input": {
+        "operation_id": "20000000-0000-4000-8000-000000000014",
+        "batch_id": "10000000-0000-4000-8000-000000000011",
         "entity_id": "30000000-0000-4000-8000-000000000014",
         "name": "R4"
       },
@@ -130,6 +140,8 @@
       "actor": "ipad-v3",
       "kind": "rename_folder",
       "input": {
+        "operation_id": "20000000-0000-4000-8000-000000000015",
+        "batch_id": "10000000-0000-4000-8000-000000000011",
         "entity_id": "30000000-0000-4000-8000-000000000015",
         "name": "R5"
       },
@@ -140,6 +152,8 @@
       "actor": "ipad-v3",
       "kind": "rename_document",
       "input": {
+        "operation_id": "20000000-0000-4000-8000-000000000016",
+        "batch_id": "10000000-0000-4000-8000-000000000011",
         "entity_id": "30000000-0000-4000-8000-000000000016",
         "name": "R6.txt"
       },
@@ -150,6 +164,8 @@
       "actor": "ipad-v3",
       "kind": "commit_batch",
       "input": {
+        "operation_id": "20000000-0000-4000-8000-000000000017",
+        "batch_id": "10000000-0000-4000-8000-000000000011",
         "tree_checkpoint": "final-only"
       },
       "expected_outcome": "all six entity revisions commit before the final tree checkpoint"

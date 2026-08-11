@@ -2,7 +2,7 @@
   "$schema": "../transition-vector.schema.json",
   "vector_id": "TV-008",
   "title": "Concurrent rename and delete conflict",
-  "contract_version": "0.1.0-draft.1",
+  "contract_version": "0.1.0",
   "minimum_protocol_version": 3,
   "tags": [
     "conflict",
@@ -37,7 +37,10 @@
         "folders_authoritative",
         "tree_order_ids",
         "tombstones",
-        "immutable_batch_contract_metadata"
+        "immutable_batch_contract_metadata",
+        "operation_attempt_history",
+        "operation_state_events",
+        "storage_name_v1"
       ],
       "local_entities": [],
       "queue": []
@@ -50,7 +53,10 @@
         "folders_authoritative",
         "tree_order_ids",
         "tombstones",
-        "immutable_batch_contract_metadata"
+        "immutable_batch_contract_metadata",
+        "operation_attempt_history",
+        "operation_state_events",
+        "storage_name_v1"
       ],
       "local_entities": [],
       "queue": []
@@ -63,6 +69,7 @@
       "kind": "delete_folder",
       "input": {
         "operation_id": "20000000-0000-4000-8000-000000000051",
+        "batch_id": "10000000-0000-4000-8000-000000000051",
         "entity_id": "30000000-0000-4000-8000-000000000008",
         "base_revision": 4
       },
@@ -74,6 +81,7 @@
       "kind": "rename_folder",
       "input": {
         "operation_id": "20000000-0000-4000-8000-000000000052",
+        "batch_id": "10000000-0000-4000-8000-000000000052",
         "entity_id": "30000000-0000-4000-8000-000000000008",
         "base_revision": 4,
         "name": "새 이름"
