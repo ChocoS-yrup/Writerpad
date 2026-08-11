@@ -65,6 +65,8 @@ jobs:
           psql -v ON_ERROR_STOP=1 -f supabase/migrations/20260811000000_operational_v2_schema_baseline_snapshot.sql
           actual_catalog="$(psql -Atq -v ON_ERROR_STOP=1 -f supabase/tests/operational_v2_catalog_manifest.sql)"
           expected_catalog="on|6c71ff36a90993dc327557b4a1a64c0dfb27b347134ed89e7f126dae76c6ff9a|49540"
+          echo "actual_catalog=$actual_catalog"
+          echo "expected_catalog=$expected_catalog"
           test "$actual_catalog" = "$expected_catalog"
       - name: Verify snapshot guard and failed-apply rollback
         shell: bash
@@ -75,6 +77,7 @@ jobs:
           fi
           grep -q "BASELINE_SNAPSHOT_REQUIRES_EMPTY_APP_SCHEMA" /tmp/snapshot-rerun.log
           actual_catalog="$(psql -Atq -v ON_ERROR_STOP=1 -f supabase/tests/operational_v2_catalog_manifest.sql)"
+          echo "catalog_after_guard=$actual_catalog"
           test "$actual_catalog" = "on|6c71ff36a90993dc327557b4a1a64c0dfb27b347134ed89e7f126dae76c6ff9a|49540"
 
           createdb writerpad_snapshot_failure
