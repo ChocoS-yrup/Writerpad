@@ -402,7 +402,6 @@ as $$
 declare
   v_user_id uuid := auth.uid();
   v_now timestamptz := pg_catalog.transaction_timestamp();
-
   v_ttl integer;
   v_project_id uuid;
   v_lease public.edit_leases%rowtype;
@@ -583,7 +582,6 @@ begin
      or p_content is null
      or not private.is_valid_relative_path(p_relative_path)
      or pg_catalog.octet_length(p_content) > 10485760 then
-
     raise exception using errcode = 'P0001', message = 'INVALID_ARGUMENT';
   end if;
   if not private.has_project_role(p_project_id, v_user_id, 'editor') then
@@ -764,7 +762,6 @@ $$;
 
 revoke all on function public.acquire_edit_lease(uuid, uuid, integer) from public, anon;
 revoke all on function public.ensure_project(uuid, text) from public, anon;
-
 revoke all on function public.renew_edit_lease(uuid, uuid, uuid, integer) from public, anon;
 revoke all on function public.release_edit_lease(uuid, uuid, uuid) from public, anon;
 revoke all on function public.get_edit_lease(uuid, uuid) from public, anon;
