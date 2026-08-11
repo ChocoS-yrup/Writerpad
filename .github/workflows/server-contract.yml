@@ -1,0 +1,71 @@
+name: Validate Server Sync Contract
+
+on:
+  pull_request:
+    paths:
+      - "sync-contract/**"
+      - "supabase/**"
+      - ".github/workflows/server-contract.yml"
+  push:
+    branches:
+      - main
+    paths:
+      - "sync-contract/**"
+      - "supabase/**"
+      - ".github/workflows/server-contract.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  postgres-contract:
+    name: PostgreSQL migration and RPC conformance
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: writerpad_stage7
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d writerpad_stage7"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+    env:
+      PGHOST: localhost
+      PGPORT: 5432
+      PGDATABASE: writerpad_stage7
+      PGUSER: postgres
+      PGPASSWORD: postgres
+    steps:
+      - name: Check out exact source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Set up Python 3.12
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12.13"
+          cache: pip
+          cache-dependency-path: sync-contract/requirements-validation.txt
+      - name: Install pinned contract verifier
+        run: python -m pip install -r sync-contract/requirements-validation.txt
+      - name: Verify released contract and Stage 7 pins
+        run: |
+          python sync-contract/scripts/verify_contract.py
+          python supabase/tests/verify_stage7_server.py
+      - name: Apply baseline and Stage 7 migrations
+        shell: bash
+        run: |
+          psql -v ON_ERROR_STOP=1 -f supabase/tests/bootstrap_postgres.sql
+          psql -v ON_ERROR_STOP=1 -f "참조파일/20260714000000_supabase_v2_protocol.sql"
+          psql -v ON_ERROR_STOP=1 -f "참조파일/20260714010000_windows_v2_client_support.sql"
+          psql -v ON_ERROR_STOP=1 -f "참조파일/20260729000000_repair_owner_project_membership.sql"
+          psql -v ON_ERROR_STOP=1 -f supabase/migrations/20260811010000_sync_contract_0_1_0_foundation.sql
+          psql -v ON_ERROR_STOP=1 -f supabase/migrations/20260811020000_sync_contract_0_1_0_rpcs.sql
+      - name: Run atomic, replay, cancellation, and migration checks
+        run: psql -v ON_ERROR_STOP=1 -f supabase/tests/stage7_server_contract.sql
