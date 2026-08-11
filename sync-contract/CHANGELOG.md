@@ -4,6 +4,24 @@ All notable changes to the WriterPad shared sync contract package are recorded
 here. This file describes contract artifacts only; it is not an application or
 server release log.
 
+## 0.2.0 - 2026-08-11
+
+### Released
+
+- Added the normative protocol-3 `document_commit` request, success, and
+  failure wire for document create, body update, delete, and restore.
+- Added `document_commit_v1` client/server capability requirements.
+- Defined intentional empty content, exact UTF-8 byte count and SHA-256,
+  structure revision barriers, immutable idempotency, response-loss/server-
+  restart replay, and fail-closed partial-response behavior.
+- Added seven document conformance cases and cross-file semantic verification.
+
+### Release identity
+
+- RFC 8785 canonical protocol bytes: `23256`.
+- Canonical SHA-256:
+  `416c1b99edb9bda694731dee4b25688d9d82d1f32610aa23ddfda571ec3c7670`.
+
 ## 0.1.0 - 2026-08-11
 
 ### Released

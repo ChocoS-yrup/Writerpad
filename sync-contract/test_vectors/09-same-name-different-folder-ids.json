@@ -2,7 +2,7 @@
   "$schema": "../transition-vector.schema.json",
   "vector_id": "TV-009",
   "title": "Same folder name with different identities",
-  "contract_version": "0.1.0",
+  "contract_version": "0.2.0",
   "minimum_protocol_version": 3,
   "tags": [
     "folder-id",
@@ -48,7 +48,8 @@
         "immutable_batch_contract_metadata",
         "operation_attempt_history",
         "operation_state_events",
-        "storage_name_v1"
+        "storage_name_v1",
+        "document_commit_v1"
       ],
       "local_entities": [],
       "queue": []
