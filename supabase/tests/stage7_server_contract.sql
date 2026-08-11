@@ -25,7 +25,7 @@ insert into public.project_members(project_id, user_id, role) values
 update private.sync_contract_allowlist
 set enabled = true
 where canonical_contract_sha256 =
-  'fae86b4e6385ee37fbeb99f9256194ec319b64bfda92974ce90a3eb70d2e7a46';
+  '416c1b99edb9bda694731dee4b25688d9d82d1f32610aa23ddfda571ec3c7670';
 
 insert into public.project_sync_settings (
   project_id, project_sync_mode, migration_epoch,
@@ -33,7 +33,7 @@ insert into public.project_sync_settings (
 ) values (
   '00000000-0000-4000-8000-000000000201', 'ID_BASED', 1,
   pg_catalog.transaction_timestamp(),
-  'fae86b4e6385ee37fbeb99f9256194ec319b64bfda92974ce90a3eb70d2e7a46'
+  '416c1b99edb9bda694731dee4b25688d9d82d1f32610aa23ddfda571ec3c7670'
 );
 
 insert into public.folders (
@@ -75,10 +75,10 @@ select 'ASC-001', public.atomic_structure_commit($request$
   "batch": {
     "batch_id": "10000000-0000-4000-8000-000000000201",
     "writer_device_id": "60000000-0000-4000-8000-000000000201",
-    "client_build_id": "conformance-0.1.0",
+    "client_build_id": "conformance-0.2.0",
     "sync_protocol_version": 3,
-    "contract_version": "0.1.0",
-    "canonical_contract_sha256": "fae86b4e6385ee37fbeb99f9256194ec319b64bfda92974ce90a3eb70d2e7a46",
+    "contract_version": "0.2.0",
+    "canonical_contract_sha256": "416c1b99edb9bda694731dee4b25688d9d82d1f32610aa23ddfda571ec3c7670",
     "client_capabilities": [
       "folders_authoritative",
       "tree_order_ids",
@@ -86,7 +86,8 @@ select 'ASC-001', public.atomic_structure_commit($request$
       "immutable_batch_contract_metadata",
       "operation_attempt_history",
       "operation_state_events",
-      "storage_name_v1"
+      "storage_name_v1",
+      "document_commit_v1"
     ],
     "batch_payload_sha256": "0fd7de3e5329659757e0a391f3cfed43faac11a750ad13698301bfda7499e62c"
   },
@@ -145,11 +146,11 @@ select 'ASC-002', public.atomic_structure_commit($request$
   "batch":{
     "batch_id":"10000000-0000-4000-8000-000000000201",
     "writer_device_id":"60000000-0000-4000-8000-000000000201",
-    "client_build_id":"conformance-0.1.0",
+    "client_build_id":"conformance-0.2.0",
     "sync_protocol_version":3,
-    "contract_version":"0.1.0",
-    "canonical_contract_sha256":"fae86b4e6385ee37fbeb99f9256194ec319b64bfda92974ce90a3eb70d2e7a46",
-    "client_capabilities":["folders_authoritative","tree_order_ids","tombstones","immutable_batch_contract_metadata","operation_attempt_history","operation_state_events","storage_name_v1"],
+    "contract_version":"0.2.0",
+    "canonical_contract_sha256":"416c1b99edb9bda694731dee4b25688d9d82d1f32610aa23ddfda571ec3c7670",
+    "client_capabilities":["folders_authoritative","tree_order_ids","tombstones","immutable_batch_contract_metadata","operation_attempt_history","operation_state_events","storage_name_v1","document_commit_v1"],
     "batch_payload_sha256":"0fd7de3e5329659757e0a391f3cfed43faac11a750ad13698301bfda7499e62c"
   },
   "ordered_intents":[
@@ -189,9 +190,9 @@ select 'ASC-004', public.atomic_structure_commit(
         "writer_device_id":"60000000-0000-4000-8000-000000000201",
         "client_build_id":"changed-build",
         "sync_protocol_version":3,
-        "contract_version":"0.1.0",
-        "canonical_contract_sha256":"fae86b4e6385ee37fbeb99f9256194ec319b64bfda92974ce90a3eb70d2e7a46",
-        "client_capabilities":["folders_authoritative","tree_order_ids","tombstones","immutable_batch_contract_metadata","operation_attempt_history","operation_state_events","storage_name_v1"],
+        "contract_version":"0.2.0",
+        "canonical_contract_sha256":"416c1b99edb9bda694731dee4b25688d9d82d1f32610aa23ddfda571ec3c7670",
+        "client_capabilities":["folders_authoritative","tree_order_ids","tombstones","immutable_batch_contract_metadata","operation_attempt_history","operation_state_events","storage_name_v1","document_commit_v1"],
         "batch_payload_sha256":"9f29a4a93b6362d7fea10351f78717d3a9b98614837b3359ea89e2fbbd3351aa"
       },
       "ordered_intents":[
@@ -215,6 +216,98 @@ begin
 end;
 $assert_reuse$;
 
+-- Protocol 3 document wire: an intentional empty body is a real atomic write,
+-- and an identical transport retry replays the same committed result.
+insert into stage7_results(case_id, response)
+values (
+  'DC-001',
+  public.document_commit($request$
+  {
+    "kind":"document_commit_request",
+    "project_id":"00000000-0000-4000-8000-000000000201",
+    "project_sync_mode":"ID_BASED",
+    "migration_epoch":1,
+    "batch":{
+      "batch_id":"10000000-0000-4000-8000-000000000301",
+      "writer_device_id":"60000000-0000-4000-8000-000000000301",
+      "client_build_id":"conformance-0.2.0",
+      "sync_protocol_version":3,
+      "contract_version":"0.2.0",
+      "canonical_contract_sha256":"416c1b99edb9bda694731dee4b25688d9d82d1f32610aa23ddfda571ec3c7670",
+      "client_capabilities":["folders_authoritative","tree_order_ids","tombstones","immutable_batch_contract_metadata","operation_attempt_history","operation_state_events","storage_name_v1","document_commit_v1"],
+      "batch_payload_sha256":"e2571bcb8611ea13c058753470871eb61fb6117d8dd8adbd36688eac0cd5d34d"
+    },
+    "ordered_intents":[{
+      "sequence":1,
+      "operation_id":"20000000-0000-4000-8000-000000000301",
+      "batch_id":"10000000-0000-4000-8000-000000000301",
+      "entity_kind":"document",
+      "document_id":"30000000-0000-4000-8000-000000000301",
+      "intent_kind":"create",
+      "base_revision":0,
+      "payload_sha256":"4d5cb940c384f2c3cec1acba872a149bc294e7383f37e6a5f805b575b29fca0e",
+      "payload":{
+        "parent_folder_id":null,
+        "name":"Empty.md",
+        "content":"",
+        "content_sha256":"e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "content_byte_count":0,
+        "is_deleted":false,
+        "structure_revision":1
+      }
+    }]
+  }
+  $request$::jsonb)
+);
+insert into stage7_results(case_id, response)
+select 'DC-002', public.document_commit($request$
+  {
+    "kind":"document_commit_request",
+    "project_id":"00000000-0000-4000-8000-000000000201",
+    "project_sync_mode":"ID_BASED",
+    "migration_epoch":1,
+    "batch":{
+      "batch_id":"10000000-0000-4000-8000-000000000301",
+      "writer_device_id":"60000000-0000-4000-8000-000000000301",
+      "client_build_id":"conformance-0.2.0",
+      "sync_protocol_version":3,
+      "contract_version":"0.2.0",
+      "canonical_contract_sha256":"416c1b99edb9bda694731dee4b25688d9d82d1f32610aa23ddfda571ec3c7670",
+      "client_capabilities":["folders_authoritative","tree_order_ids","tombstones","immutable_batch_contract_metadata","operation_attempt_history","operation_state_events","storage_name_v1","document_commit_v1"],
+      "batch_payload_sha256":"e2571bcb8611ea13c058753470871eb61fb6117d8dd8adbd36688eac0cd5d34d"
+    },
+    "ordered_intents":[{
+      "sequence":1,
+      "operation_id":"20000000-0000-4000-8000-000000000301",
+      "batch_id":"10000000-0000-4000-8000-000000000301",
+      "entity_kind":"document",
+      "document_id":"30000000-0000-4000-8000-000000000301",
+      "intent_kind":"create",
+      "base_revision":0,
+      "payload_sha256":"4d5cb940c384f2c3cec1acba872a149bc294e7383f37e6a5f805b575b29fca0e",
+      "payload":{"parent_folder_id":null,"name":"Empty.md","content":"","content_sha256":"e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855","content_byte_count":0,"is_deleted":false,"structure_revision":1}
+    }]
+  }
+  $request$::jsonb);
+
+do $assert_document_wire$
+declare v_create jsonb; v_replay jsonb; v_content text;
+begin
+  select response into v_create from stage7_results where case_id = 'DC-001';
+  select response into v_replay from stage7_results where case_id = 'DC-002';
+  select content into v_content from public.documents
+  where document_id = '30000000-0000-4000-8000-000000000301';
+  if v_create->>'kind' <> 'document_commit_success'
+     or v_create->>'status' <> 'committed'
+     or v_replay->>'status' <> 'replayed'
+     or v_content <> ''
+     or v_create->'results'->0->>'content_sha256' <>
+       'e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855' then
+    raise exception 'document wire failed: create %, replay %', v_create, v_replay;
+  end if;
+end;
+$assert_document_wire$;
+
 -- Cancellation is append-only and deterministic.
 insert into public.sync_batches (
   batch_id, project_id, writer_user_id, writer_device_id, client_build_id,
@@ -225,9 +318,9 @@ insert into public.sync_batches (
   '10000000-0000-4000-8000-000000000211',
   '00000000-0000-4000-8000-000000000201',
   '90000000-0000-4000-8000-000000000001',
-  '60000000-0000-4000-8000-000000000201', 'test', 3, '0.1.0',
-  'fae86b4e6385ee37fbeb99f9256194ec319b64bfda92974ce90a3eb70d2e7a46',
-  array['folders_authoritative','tree_order_ids','tombstones','immutable_batch_contract_metadata','operation_attempt_history','operation_state_events','storage_name_v1'],
+  '60000000-0000-4000-8000-000000000201', 'test', 3, '0.2.0',
+  '416c1b99edb9bda694731dee4b25688d9d82d1f32610aa23ddfda571ec3c7670',
+  array['folders_authoritative','tree_order_ids','tombstones','immutable_batch_contract_metadata','operation_attempt_history','operation_state_events','storage_name_v1','document_commit_v1'],
   repeat('a', 64), 'ID_BASED', 1, repeat('b', 64)
 );
 insert into public.sync_operations (
@@ -296,7 +389,7 @@ $assert_legacy_default$;
 select public.begin_project_sync_migration(
   '00000000-0000-4000-8000-000000000301',
   '60000000-0000-4000-8000-000000000301',
-  'fae86b4e6385ee37fbeb99f9256194ec319b64bfda92974ce90a3eb70d2e7a46'
+  '416c1b99edb9bda694731dee4b25688d9d82d1f32610aa23ddfda571ec3c7670'
 );
 select public.complete_project_sync_migration(
   '00000000-0000-4000-8000-000000000301',

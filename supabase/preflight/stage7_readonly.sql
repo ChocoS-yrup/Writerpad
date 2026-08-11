@@ -46,7 +46,7 @@ from pg_catalog.pg_proc p
 join pg_catalog.pg_namespace n on n.oid = p.pronamespace
 where n.nspname in ('public', 'private')
   and p.proname in (
-    'ensure_project', 'commit_document', 'commit_document_contract',
+    'ensure_project', 'commit_document', 'document_commit',
     'commit_folder', 'atomic_structure_commit',
     'cancel_sync_operation', 'begin_project_sync_migration',
     'validate_project_sync_migration', 'complete_project_sync_migration',

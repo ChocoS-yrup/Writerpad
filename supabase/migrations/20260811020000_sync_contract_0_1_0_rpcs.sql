@@ -1,9 +1,9 @@
 begin;
 
--- WriterPad sync-contract 0.1.0 server RPCs.
--- contract_git_commit: 45d18cff62cc48e29d0e6efcfc634fec96150198
--- contract_content_commit: 7f05f32dd385ce0e1922b88d688742fca2a503fa
--- canonical bytes/SHA-256: 19473 / fae86b4e6385ee37fbeb99f9256194ec319b64bfda92974ce90a3eb70d2e7a46
+-- WriterPad sync-contract 0.2.0 server RPCs.
+-- contract_git_commit: fcd99b7098b9a04bd93c585d89b16588aa482530
+-- contract_content_commit: 7bcb5d25c5376b02469666df7318b90b456ffee6
+-- canonical bytes/SHA-256: 23256 / 416c1b99edb9bda694731dee4b25688d9d82d1f32610aa23ddfda571ec3c7670
 
 create or replace function private.rfc8785_canonical_json(p_value jsonb)
 returns text
@@ -102,6 +102,33 @@ as $$
   );
 $$;
 
+create or replace function private.document_failure(
+  p_batch_id uuid,
+  p_batch_payload_sha256 text,
+  p_code text,
+  p_message text,
+  p_failed_sequence integer default null
+)
+returns jsonb
+language sql
+immutable
+set search_path = ''
+as $$
+  select pg_catalog.jsonb_build_object(
+    'kind', 'document_commit_failure',
+    'batch_id', p_batch_id,
+    'batch_payload_sha256', p_batch_payload_sha256,
+    'status', 'rejected',
+    'applied', false,
+    'error', pg_catalog.jsonb_build_object(
+      'code', p_code,
+      'message', p_message,
+      'failed_sequence', p_failed_sequence
+    ),
+    'results', '[]'::jsonb
+  );
+$$;
+
 create or replace function private.storage_name_v1_result(p_name text)
 returns jsonb
 language plpgsql
@@ -120,6 +147,51 @@ begin
 exception
   when sqlstate 'P0001' then
     return pg_catalog.jsonb_build_object('valid', false, 'error_code', sqlerrm);
+end;
+$$;
+
+create or replace function private.document_relative_path(
+  p_project_id uuid,
+  p_parent_folder_id uuid,
+  p_name text
+)
+returns text
+language plpgsql
+stable
+set search_path = ''
+as $$
+declare
+  v_parent_id uuid := p_parent_folder_id;
+  v_folder public.folders%rowtype;
+  v_parts text[] := array[p_name]::text[];
+  v_seen uuid[] := '{}'::uuid[];
+  v_depth integer := 0;
+  v_path text;
+begin
+  perform private.storage_name_v1(p_name);
+  while v_parent_id is not null loop
+    v_depth := v_depth + 1;
+    if v_depth > 1024 then
+      raise exception using errcode = 'P0001', message = 'PARENT_CYCLE';
+    end if;
+    select * into v_folder
+    from public.folders
+    where folder_id = v_parent_id and project_id = p_project_id;
+    if not found or v_folder.is_deleted then
+      raise exception using errcode = 'P0001', message = 'FOLDER_NOT_FOUND';
+    end if;
+    if v_folder.folder_id = any(v_seen) then
+      raise exception using errcode = 'P0001', message = 'PARENT_CYCLE';
+    end if;
+    v_seen := pg_catalog.array_append(v_seen, v_folder.folder_id);
+    v_parts := pg_catalog.array_prepend(v_folder.name, v_parts);
+    v_parent_id := v_folder.parent_folder_id;
+  end loop;
+  v_path := pg_catalog.array_to_string(v_parts, '/');
+  if not private.is_valid_relative_path(v_path) then
+    raise exception using errcode = 'P0001', message = 'INVALID_ARGUMENT';
+  end if;
+  return v_path;
 end;
 $$;
 
@@ -252,7 +324,7 @@ declare
   v_required text[] := array[
     'folders_authoritative', 'tree_order_ids', 'tombstones',
     'immutable_batch_contract_metadata', 'operation_attempt_history',
-    'operation_state_events', 'storage_name_v1'
+    'operation_state_events', 'storage_name_v1', 'document_commit_v1'
   ]::text[];
   v_intent jsonb;
   v_sequence integer := 0;
@@ -289,11 +361,11 @@ begin
     raise exception using errcode = 'P0001', message = 'STALE_MIGRATION_EPOCH';
   end if;
 
-  if p_batch->>'contract_version' <> '0.1.0' then
+  if p_batch->>'contract_version' <> '0.2.0' then
     raise exception using errcode = 'P0001', message = 'CONTRACT_DIGEST_MISMATCH';
   end if;
   if p_batch->>'canonical_contract_sha256' <>
-     'fae86b4e6385ee37fbeb99f9256194ec319b64bfda92974ce90a3eb70d2e7a46' then
+     '416c1b99edb9bda694731dee4b25688d9d82d1f32610aa23ddfda571ec3c7670' then
     if exists (
       select 1 from private.sync_contract_allowlist
       where contract_version = p_batch->>'contract_version'
@@ -343,7 +415,7 @@ begin
   if v_actual_mode in ('MIGRATING', 'ID_BASED') then
     if v_settings.contract_enforcement_started_at is null
        or v_settings.active_contract_sha256 <>
-         'fae86b4e6385ee37fbeb99f9256194ec319b64bfda92974ce90a3eb70d2e7a46' then
+         '416c1b99edb9bda694731dee4b25688d9d82d1f32610aa23ddfda571ec3c7670' then
       raise exception using errcode = 'P0001', message = 'CONTRACT_NOT_ALLOWED';
     end if;
   end if;
@@ -582,6 +654,79 @@ begin
       );
     end if;
     return v_revision;
+  end if;
+
+  if v_entity_kind = 'document' then
+    if v_intent_kind not in ('rename', 'move') then
+      raise exception using errcode = 'P0001', message = 'INVALID_ARGUMENT';
+    end if;
+    declare
+      v_document public.documents%rowtype;
+      v_document_name text;
+      v_document_parent uuid;
+      v_document_storage_key bytea;
+      v_document_structure_revision bigint;
+      v_document_path text;
+    begin
+      select * into v_document
+      from public.documents
+      where document_id = v_entity_id
+      for update;
+      if not found or v_document.project_id <> p_project_id or v_document.is_deleted then
+        raise exception using errcode = 'P0001', message = 'DOCUMENT_NOT_FOUND';
+      end if;
+      if v_document.name is null or v_document.structure_revision is null then
+        raise exception using errcode = 'P0001', message = 'INVARIANT_VIOLATION';
+      end if;
+      if v_document.structure_revision <> v_base_revision then
+        raise exception using errcode = 'P0001', message = 'STRUCTURE_REVISION_CONFLICT';
+      end if;
+      v_document_name := v_document.name;
+      v_document_parent := v_document.parent_folder_id;
+      if v_intent_kind = 'rename' then
+        if not (v_payload ? 'name') then
+          raise exception using errcode = 'P0001', message = 'INVALID_ARGUMENT';
+        end if;
+        v_document_name := v_payload->>'name';
+      else
+        if not (v_payload ? 'parent_folder_id') then
+          raise exception using errcode = 'P0001', message = 'INVALID_ARGUMENT';
+        end if;
+        v_document_parent := case when v_payload->'parent_folder_id' = 'null'::jsonb
+          then null else (v_payload->>'parent_folder_id')::uuid end;
+      end if;
+      v_document_storage_key := private.storage_name_v1(v_document_name);
+      v_document_path := private.document_relative_path(
+        p_project_id, v_document_parent, v_document_name
+      );
+      if exists (
+        select 1 from public.folders sibling
+        where sibling.project_id = p_project_id
+          and sibling.parent_folder_id is not distinct from v_document_parent
+          and not sibling.is_deleted
+          and sibling.storage_name_key = v_document_storage_key
+      ) or exists (
+        select 1 from public.documents sibling
+        where sibling.project_id = p_project_id
+          and sibling.parent_folder_id is not distinct from v_document_parent
+          and sibling.document_id <> v_entity_id
+          and not sibling.is_deleted
+          and sibling.storage_name_key = v_document_storage_key
+      ) then
+        raise exception using errcode = 'P0001', message = 'PATH_CONFLICT';
+      end if;
+      v_document_structure_revision := v_document.structure_revision + 1;
+      update public.documents
+      set name = v_document_name,
+          parent_folder_id = v_document_parent,
+          storage_name_key = v_document_storage_key,
+          relative_path = v_document_path,
+          structure_revision = v_document_structure_revision,
+          updated_by = p_user_id,
+          updated_at = pg_catalog.transaction_timestamp()
+      where document_id = v_entity_id;
+      return v_document_structure_revision;
+    end;
   end if;
 
   if v_entity_kind = 'tree_order' then
@@ -919,6 +1064,391 @@ begin
 end;
 $$;
 
+create or replace function public.document_commit(p_request jsonb)
+returns jsonb
+language plpgsql
+security definer
+set search_path = ''
+as $$
+declare
+  v_user_id uuid := auth.uid();
+  v_project_id uuid;
+  v_mode text;
+  v_epoch integer;
+  v_batch jsonb;
+  v_intents jsonb;
+  v_intent jsonb;
+  v_payload jsonb;
+  v_batch_id uuid;
+  v_operation_id uuid;
+  v_document_id uuid;
+  v_device_id uuid;
+  v_base_revision bigint;
+  v_intent_kind text;
+  v_payload_sha text;
+  v_request_sha text;
+  v_content text;
+  v_content_sha text;
+  v_content_bytes integer;
+  v_name text;
+  v_parent_id uuid;
+  v_structure_revision bigint;
+  v_storage_key bytea;
+  v_relative_path text;
+  v_is_deleted boolean;
+  v_now timestamptz := pg_catalog.transaction_timestamp();
+  v_started_at timestamptz := pg_catalog.clock_timestamp();
+  v_document public.documents%rowtype;
+  v_version public.document_versions%rowtype;
+  v_existing_batch public.sync_batches%rowtype;
+  v_existing_result public.sync_batch_results%rowtype;
+  v_result_revision bigint;
+  v_response jsonb;
+  v_error_code text;
+begin
+  if v_user_id is null then
+    raise exception using errcode = 'P0001', message = 'AUTH_REQUIRED';
+  end if;
+  if pg_catalog.jsonb_typeof(p_request) <> 'object'
+     or p_request->>'kind' <> 'document_commit_request'
+     or exists (
+       select 1 from pg_catalog.jsonb_object_keys(p_request) key
+       where key not in (
+         'kind', 'project_id', 'project_sync_mode', 'migration_epoch',
+         'batch', 'ordered_intents'
+       )
+     ) then
+    raise exception using errcode = 'P0001', message = 'INVALID_ARGUMENT';
+  end if;
+
+  begin
+    v_project_id := (p_request->>'project_id')::uuid;
+    v_mode := p_request->>'project_sync_mode';
+    v_epoch := (p_request->>'migration_epoch')::integer;
+    v_batch := p_request->'batch';
+    v_intents := p_request->'ordered_intents';
+    if pg_catalog.jsonb_typeof(v_intents) <> 'array'
+       or pg_catalog.jsonb_array_length(v_intents) <> 1 then
+      raise exception using errcode = 'P0001', message = 'INVALID_ARGUMENT';
+    end if;
+    v_intent := v_intents->0;
+    v_payload := v_intent->'payload';
+    v_batch_id := (v_batch->>'batch_id')::uuid;
+    v_operation_id := (v_intent->>'operation_id')::uuid;
+    v_document_id := (v_intent->>'document_id')::uuid;
+    v_device_id := (v_batch->>'writer_device_id')::uuid;
+    v_base_revision := (v_intent->>'base_revision')::bigint;
+    v_intent_kind := v_intent->>'intent_kind';
+    v_payload_sha := v_batch->>'batch_payload_sha256';
+    v_request_sha := private.jsonb_rfc8785_sha256(p_request);
+    v_content := v_payload->>'content';
+    v_content_sha := v_payload->>'content_sha256';
+    v_content_bytes := (v_payload->>'content_byte_count')::integer;
+    v_name := v_payload->>'name';
+    v_parent_id := case when v_payload->'parent_folder_id' = 'null'::jsonb
+      then null else (v_payload->>'parent_folder_id')::uuid end;
+    v_structure_revision := (v_payload->>'structure_revision')::bigint;
+    v_is_deleted := (v_payload->>'is_deleted')::boolean;
+  exception when others then
+    raise exception using errcode = 'P0001', message = 'INVALID_ARGUMENT';
+  end;
+
+  perform pg_catalog.pg_advisory_xact_lock(
+    pg_catalog.hashtextextended('project:' || v_project_id::text, 0)
+  );
+  perform pg_catalog.pg_advisory_xact_lock(
+    pg_catalog.hashtextextended('document:' || v_document_id::text, 0)
+  );
+  if not private.has_project_role(v_project_id, v_user_id, 'editor') then
+    raise exception using errcode = 'P0001', message = 'FORBIDDEN';
+  end if;
+
+  select * into v_existing_batch
+  from public.sync_batches
+  where batch_id = v_batch_id;
+  if found then
+    if v_existing_batch.project_id <> v_project_id
+       or v_existing_batch.writer_user_id <> v_user_id
+       or v_existing_batch.writer_device_id <> v_device_id
+       or v_existing_batch.client_build_id <> v_batch->>'client_build_id'
+       or v_existing_batch.sync_protocol_version <> (v_batch->>'sync_protocol_version')::integer
+       or v_existing_batch.contract_version <> v_batch->>'contract_version'
+       or v_existing_batch.canonical_contract_sha256 <> v_batch->>'canonical_contract_sha256'
+       or v_existing_batch.batch_payload_sha256 <> v_payload_sha
+       or v_existing_batch.project_sync_mode <> v_mode
+       or v_existing_batch.migration_epoch <> v_epoch
+       or v_existing_batch.request_sha256 <> v_request_sha then
+      return private.document_failure(
+        v_batch_id, v_payload_sha, 'BATCH_ID_REUSED',
+        'batch_id already belongs to a different payload', null
+      );
+    end if;
+    select * into strict v_existing_result
+    from public.sync_batch_results
+    where batch_id = v_batch_id;
+    if v_existing_result.applied then
+      return pg_catalog.jsonb_set(
+        v_existing_result.response, '{status}', '"replayed"'::jsonb, false
+      );
+    end if;
+    return v_existing_result.response;
+  end if;
+
+  begin
+    perform private.validate_contract_request(
+      v_user_id, v_project_id, v_mode, v_epoch, v_batch, v_intents
+    );
+    if v_intent->>'entity_kind' <> 'document'
+       or (v_intent->>'sequence')::integer <> 1
+       or (v_intent->>'batch_id')::uuid <> v_batch_id
+       or v_intent_kind not in ('create', 'update', 'delete', 'restore')
+       or pg_catalog.jsonb_typeof(v_payload) <> 'object'
+       or pg_catalog.char_length(v_name) < 1
+       or pg_catalog.char_length(v_name) > 255
+       or v_structure_revision < 1
+       or v_content_bytes < 0
+       or v_content_bytes > 10485760 then
+      raise exception using errcode = 'P0001', message = 'INVALID_ARGUMENT';
+    end if;
+    if v_intent->>'payload_sha256' <> private.jsonb_rfc8785_sha256(v_payload) then
+      raise exception using errcode = 'P0001', message = 'CONTRACT_DIGEST_MISMATCH';
+    end if;
+    if pg_catalog.octet_length(v_content) <> v_content_bytes then
+      raise exception using errcode = 'P0001', message = 'CONTENT_SIZE_MISMATCH';
+    end if;
+    if private.content_sha256(v_content) <> v_content_sha then
+      raise exception using errcode = 'P0001', message = 'CONTENT_DIGEST_MISMATCH';
+    end if;
+    if (v_intent_kind = 'create' and (v_base_revision <> 0 or v_is_deleted))
+       or (v_intent_kind <> 'create' and v_base_revision < 1)
+       or (v_intent_kind = 'update' and v_is_deleted)
+       or (v_intent_kind = 'delete' and not v_is_deleted)
+       or (v_intent_kind = 'restore' and v_is_deleted) then
+      raise exception using errcode = 'P0001', message = 'INVALID_ARGUMENT';
+    end if;
+    v_storage_key := private.storage_name_v1(v_name);
+    v_relative_path := private.document_relative_path(
+      v_project_id, v_parent_id, v_name
+    );
+  exception when sqlstate 'P0001' then
+    return private.document_failure(v_batch_id, v_payload_sha, sqlerrm, sqlerrm, 1);
+  end;
+
+  if exists (
+    select 1 from public.sync_operations where operation_id = v_operation_id
+  ) then
+    return private.document_failure(
+      v_batch_id, v_payload_sha, 'OPERATION_ID_REUSED',
+      'operation_id already belongs to an immutable intent', null
+    );
+  end if;
+
+  insert into public.sync_batches (
+    batch_id, project_id, writer_user_id, writer_device_id, client_build_id,
+    sync_protocol_version, contract_version, canonical_contract_sha256,
+    client_capabilities, batch_payload_sha256, project_sync_mode,
+    migration_epoch, request_sha256
+  ) values (
+    v_batch_id, v_project_id, v_user_id, v_device_id,
+    v_batch->>'client_build_id', (v_batch->>'sync_protocol_version')::integer,
+    v_batch->>'contract_version', v_batch->>'canonical_contract_sha256',
+    array(select value from pg_catalog.jsonb_array_elements_text(v_batch->'client_capabilities') order by value),
+    v_payload_sha, v_mode, v_epoch, v_request_sha
+  );
+  insert into public.sync_operations (
+    operation_id, project_id, provenance_kind, batch_id, sequence,
+    entity_kind, entity_id, intent_kind, base_revision, payload_sha256,
+    payload, supersedes_operation_id, created_by
+  ) values (
+    v_operation_id, v_project_id, 'CONTRACT_BATCH', v_batch_id, 1,
+    'document', v_document_id, v_intent_kind, v_base_revision,
+    v_intent->>'payload_sha256', v_payload,
+    case when v_intent ? 'supersedes_operation_id'
+      then (v_intent->>'supersedes_operation_id')::uuid else null end,
+    v_user_id
+  );
+  perform private.append_operation_event(
+    v_operation_id, pg_catalog.gen_random_uuid(), 'enqueued'
+  );
+  perform private.append_operation_event(
+    v_operation_id, pg_catalog.gen_random_uuid(), 'dispatch_started'
+  );
+  if v_intent ? 'supersedes_operation_id' then
+    perform private.append_operation_event(
+      (v_intent->>'supersedes_operation_id')::uuid,
+      pg_catalog.gen_random_uuid(), 'superseded', null, v_operation_id,
+      pg_catalog.jsonb_build_object('successor_operation_id', v_operation_id)
+    );
+  end if;
+
+  begin
+    select * into v_document
+    from public.documents
+    where document_id = v_document_id
+    for update;
+
+    if v_intent_kind = 'create' then
+      if found then
+        raise exception using errcode = 'P0001', message = 'DOCUMENT_ALREADY_EXISTS';
+      end if;
+      if exists (
+        select 1 from public.folders sibling
+        where sibling.project_id = v_project_id
+          and sibling.parent_folder_id is not distinct from v_parent_id
+          and not sibling.is_deleted
+          and sibling.storage_name_key = v_storage_key
+      ) or exists (
+        select 1 from public.documents sibling
+        where sibling.project_id = v_project_id
+          and sibling.parent_folder_id is not distinct from v_parent_id
+          and not sibling.is_deleted
+          and sibling.storage_name_key = v_storage_key
+      ) then
+        raise exception using errcode = 'P0001', message = 'PATH_CONFLICT';
+      end if;
+      v_result_revision := 1;
+      insert into public.documents (
+        document_id, project_id, relative_path, content, revision,
+        current_version_id, is_deleted, deleted_at, created_by, updated_by,
+        created_at, updated_at, parent_folder_id, storage_name_key, name,
+        structure_revision
+      ) values (
+        v_document_id, v_project_id, v_relative_path, v_content, 1,
+        null, false, null, v_user_id, v_user_id, v_now, v_now,
+        v_parent_id, v_storage_key, v_name, 1
+      );
+    else
+      if not found or v_document.project_id <> v_project_id then
+        raise exception using errcode = 'P0001', message = 'DOCUMENT_NOT_FOUND';
+      end if;
+      if v_document.revision <> v_base_revision then
+        raise exception using errcode = 'P0001', message = 'REVISION_CONFLICT';
+      end if;
+      if v_document.name is distinct from v_name
+         or v_document.parent_folder_id is distinct from v_parent_id
+         or v_document.structure_revision is distinct from v_structure_revision then
+        raise exception using errcode = 'P0001', message = 'STRUCTURE_REVISION_CONFLICT';
+      end if;
+      if v_intent_kind = 'update' and v_document.is_deleted then
+        raise exception using errcode = 'P0001', message = 'DOCUMENT_NOT_FOUND';
+      end if;
+      if v_intent_kind = 'delete' then
+        if v_document.is_deleted then
+          raise exception using errcode = 'P0001', message = 'DOCUMENT_NOT_FOUND';
+        end if;
+        if exists (
+          select 1 from public.tree_orders tree
+          where tree.project_id = v_project_id
+            and v_document_id = any(tree.children)
+        ) then
+          raise exception using errcode = 'P0001', message = 'INVARIANT_VIOLATION';
+        end if;
+      end if;
+      if v_intent_kind = 'restore' and not v_document.is_deleted then
+        raise exception using errcode = 'P0001', message = 'DOCUMENT_ALREADY_EXISTS';
+      end if;
+      if v_intent_kind in ('delete', 'restore')
+         and (v_document.content <> v_content
+           or private.content_sha256(v_document.content) <> v_content_sha) then
+        raise exception using errcode = 'P0001', message = 'CONTENT_DIGEST_MISMATCH';
+      end if;
+      v_result_revision := v_document.revision + 1;
+    end if;
+
+    insert into public.document_versions (
+      document_id, project_id, revision, base_revision, operation_id, device_id,
+      operation_kind, relative_path, content, content_hash, is_deleted,
+      created_by, created_at
+    ) values (
+      v_document_id, v_project_id, v_result_revision, v_base_revision,
+      v_operation_id, v_device_id, v_intent_kind, v_relative_path, v_content,
+      v_content_sha, v_is_deleted, v_user_id, v_now
+    ) returning * into v_version;
+
+    update public.documents
+    set content = v_content,
+        revision = v_result_revision,
+        current_version_id = v_version.version_id,
+        is_deleted = v_is_deleted,
+        deleted_at = case when v_is_deleted then v_now else null end,
+        updated_by = v_user_id,
+        updated_at = v_now
+    where document_id = v_document_id;
+    if v_is_deleted then
+      delete from public.edit_leases where document_id = v_document_id;
+    end if;
+  exception when sqlstate 'P0001' then
+    v_error_code := sqlerrm;
+  end;
+
+  if v_error_code is not null then
+    v_response := private.document_failure(
+      v_batch_id, v_payload_sha, v_error_code, v_error_code, 1
+    );
+    perform private.append_operation_event(
+      v_operation_id, pg_catalog.gen_random_uuid(),
+      case when v_error_code in ('REVISION_CONFLICT', 'STRUCTURE_REVISION_CONFLICT')
+        then 'conflict_detected' else 'blocked' end,
+      v_error_code, null, pg_catalog.jsonb_build_object('failed_sequence', 1)
+    );
+    insert into public.sync_operation_attempts (
+      attempt_id, operation_id, attempt_number, started_at, finished_at,
+      rpc_name, outcome, request_sha256, response_sha256, error_code, error_detail
+    ) values (
+      pg_catalog.gen_random_uuid(), v_operation_id, 1, v_started_at,
+      pg_catalog.clock_timestamp(), 'document_commit',
+      case when v_error_code in ('REVISION_CONFLICT', 'STRUCTURE_REVISION_CONFLICT')
+        then 'conflict' else 'blocked' end,
+      v_request_sha, private.jsonb_rfc8785_sha256(v_response), v_error_code,
+      pg_catalog.jsonb_build_object('failed_sequence', 1)
+    );
+    insert into public.sync_batch_results (
+      batch_id, response, response_sha256, applied
+    ) values (
+      v_batch_id, v_response, private.jsonb_rfc8785_sha256(v_response), false
+    );
+    return v_response;
+  end if;
+
+  v_response := pg_catalog.jsonb_build_object(
+    'kind', 'document_commit_success',
+    'batch_id', v_batch_id,
+    'batch_payload_sha256', v_payload_sha,
+    'status', 'committed',
+    'applied', true,
+    'results', pg_catalog.jsonb_build_array(pg_catalog.jsonb_build_object(
+      'sequence', 1,
+      'operation_id', v_operation_id,
+      'document_id', v_document_id,
+      'result_revision', v_result_revision,
+      'structure_revision', v_structure_revision,
+      'parent_folder_id', v_parent_id,
+      'name', v_name,
+      'content_sha256', v_content_sha,
+      'content_byte_count', v_content_bytes,
+      'is_deleted', v_is_deleted
+    ))
+  );
+  perform private.append_operation_event(
+    v_operation_id, pg_catalog.gen_random_uuid(), 'committed'
+  );
+  insert into public.sync_operation_attempts (
+    attempt_id, operation_id, attempt_number, started_at, finished_at,
+    rpc_name, outcome, request_sha256, response_sha256, result_revision
+  ) values (
+    pg_catalog.gen_random_uuid(), v_operation_id, 1, v_started_at,
+    pg_catalog.clock_timestamp(), 'document_commit', 'committed',
+    v_request_sha, private.jsonb_rfc8785_sha256(v_response), v_result_revision
+  );
+  insert into public.sync_batch_results (
+    batch_id, response, response_sha256, applied
+  ) values (
+    v_batch_id, v_response, private.jsonb_rfc8785_sha256(v_response), true
+  );
+  return v_response;
+end;
+$$;
+
 create or replace function public.cancel_sync_operation(
   p_operation_id uuid,
   p_cancel_event_id uuid
@@ -1086,7 +1616,7 @@ begin
     raise exception using errcode = 'P0001', message = 'INVALID_ARGUMENT';
   end if;
   if p_target_contract_sha256 <>
-     'fae86b4e6385ee37fbeb99f9256194ec319b64bfda92974ce90a3eb70d2e7a46'
+     '416c1b99edb9bda694731dee4b25688d9d82d1f32610aa23ddfda571ec3c7670'
      or not exists (
        select 1 from private.sync_contract_allowlist
        where canonical_contract_sha256 = p_target_contract_sha256
@@ -1265,7 +1795,7 @@ begin
       and operation.provenance_kind = 'CONTRACT_BATCH'
       and batch.sync_protocol_version = 3
       and batch.canonical_contract_sha256 =
-        'fae86b4e6385ee37fbeb99f9256194ec319b64bfda92974ce90a3eb70d2e7a46'
+        '416c1b99edb9bda694731dee4b25688d9d82d1f32610aa23ddfda571ec3c7670'
   ) then
     raise exception using errcode = 'P0001', message = 'PROTOCOL_TOO_OLD';
   end if;
@@ -1281,26 +1811,32 @@ for each row execute function private.enforce_document_write_boundary();
 revoke all on function private.rfc8785_canonical_json(jsonb) from public, anon, authenticated;
 revoke all on function private.jsonb_rfc8785_sha256(jsonb) from public, anon, authenticated;
 revoke all on function private.atomic_failure(uuid, text, text, text, integer) from public, anon, authenticated;
+revoke all on function private.document_failure(uuid, text, text, text, integer) from public, anon, authenticated;
 revoke all on function private.storage_name_v1_result(text) from public, anon, authenticated;
+revoke all on function private.document_relative_path(uuid, uuid, text) from public, anon, authenticated;
 revoke all on function private.append_operation_event(uuid, uuid, text, text, uuid, jsonb) from public, anon, authenticated;
 revoke all on function private.validate_contract_request(uuid, uuid, text, integer, jsonb, jsonb) from public, anon, authenticated;
 revoke all on function private.apply_structure_intent(uuid, uuid, jsonb) from public, anon, authenticated;
 revoke all on function private.enforce_document_write_boundary() from public, anon, authenticated;
 
 revoke all on function public.atomic_structure_commit(jsonb) from public, anon;
+revoke all on function public.document_commit(jsonb) from public, anon;
 revoke all on function public.cancel_sync_operation(uuid, uuid) from public, anon;
 revoke all on function public.validate_project_sync_migration(uuid) from public, anon;
 revoke all on function public.begin_project_sync_migration(uuid, uuid, text) from public, anon;
 revoke all on function public.complete_project_sync_migration(uuid, uuid, integer) from public, anon;
 
 grant execute on function public.atomic_structure_commit(jsonb) to authenticated;
+grant execute on function public.document_commit(jsonb) to authenticated;
 grant execute on function public.cancel_sync_operation(uuid, uuid) to authenticated;
 grant execute on function public.validate_project_sync_migration(uuid) to authenticated;
 grant execute on function public.begin_project_sync_migration(uuid, uuid, text) to authenticated;
 grant execute on function public.complete_project_sync_migration(uuid, uuid, integer) to authenticated;
 
 comment on function public.atomic_structure_commit(jsonb) is
-  'Contract 0.1.0 ordered structure batch: validates all intents and commits all or rolls back all.';
+  'Contract 0.2.0 ordered structure batch: validates all intents and commits all or rolls back all.';
+comment on function public.document_commit(jsonb) is
+  'Contract 0.2.0 single-document create/update/delete/restore boundary with deterministic replay.';
 comment on function public.cancel_sync_operation(uuid, uuid) is
   'Appends the deterministic cancel_requested event without mutating operation intent.';
 comment on function public.begin_project_sync_migration(uuid, uuid, text) is

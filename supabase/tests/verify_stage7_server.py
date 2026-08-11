@@ -13,11 +13,11 @@ ROOT = pathlib.Path(__file__).resolve().parents[2]
 CONTRACT_DIR = ROOT / "sync-contract"
 MIGRATIONS = ROOT / "supabase" / "migrations"
 
-VERSION = "0.1.0"
-CONTRACT_GIT_COMMIT = "45d18cff62cc48e29d0e6efcfc634fec96150198"
-CONTRACT_CONTENT_COMMIT = "7f05f32dd385ce0e1922b88d688742fca2a503fa"
-DIGEST = "fae86b4e6385ee37fbeb99f9256194ec319b64bfda92974ce90a3eb70d2e7a46"
-CANONICAL_BYTES = 19473
+VERSION = "0.2.0"
+CONTRACT_GIT_COMMIT = "fcd99b7098b9a04bd93c585d89b16588aa482530"
+CONTRACT_CONTENT_COMMIT = "7bcb5d25c5376b02469666df7318b90b456ffee6"
+DIGEST = "416c1b99edb9bda694731dee4b25688d9d82d1f32610aa23ddfda571ec3c7670"
+CANONICAL_BYTES = 23256
 
 
 def require(condition: bool, message: str) -> None:
@@ -61,6 +61,7 @@ def main() -> None:
         "sync_batch_results",
         "tree_orders",
         "atomic_structure_commit",
+        "document_commit",
         "cancel_sync_operation",
         "begin_project_sync_migration",
         "validate_project_sync_migration",
@@ -83,6 +84,9 @@ def main() -> None:
         "OPERATION_TERMINAL",
         "STORAGE_NAME_INVALID",
         "STORAGE_NAME_RESERVED",
+        "CONTENT_DIGEST_MISMATCH",
+        "CONTENT_SIZE_MISMATCH",
+        "STRUCTURE_REVISION_CONFLICT",
         "MIGRATION_LOCKED",
         "STALE_MIGRATION_EPOCH",
     )
@@ -99,6 +103,10 @@ def main() -> None:
             "append-only ledgers need mutation triggers")
     require("supersedes_operation_id" in sql,
             "immutable rebase relationship is missing")
+    require("create or replace function public.document_commit(p_request jsonb)" in sql,
+            "normative protocol 3 document_commit RPC is missing")
+    require("structure_revision" in sql and "document_relative_path" in sql,
+            "document structure barrier implementation is missing")
     require("pg_catalog.normalize(" not in sql,
             "NORMALIZE special syntax must not be schema-qualified")
     require(sql.count("normalize(v_assigned_buffer, NFKC)") == 2,

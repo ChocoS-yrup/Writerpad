@@ -1,11 +1,11 @@
 begin;
 
 -- WriterPad sync-contract release pin. These values move together.
--- contract_version:        0.1.0
--- contract_git_commit:     45d18cff62cc48e29d0e6efcfc634fec96150198
--- contract_content_commit: 7f05f32dd385ce0e1922b88d688742fca2a503fa
--- canonical bytes:         19473
--- canonical SHA-256:       fae86b4e6385ee37fbeb99f9256194ec319b64bfda92974ce90a3eb70d2e7a46
+-- contract_version:        0.2.0
+-- contract_git_commit:     fcd99b7098b9a04bd93c585d89b16588aa482530
+-- contract_content_commit: 7bcb5d25c5376b02469666df7318b90b456ffee6
+-- canonical bytes:         23256
+-- canonical SHA-256:       416c1b99edb9bda694731dee4b25688d9d82d1f32610aa23ddfda571ec3c7670
 
 create schema if not exists extensions;
 create extension if not exists pgcrypto with schema extensions;
@@ -66,11 +66,11 @@ insert into private.sync_contract_allowlist (
   valid_from,
   enabled
 ) values (
-  'fae86b4e6385ee37fbeb99f9256194ec319b64bfda92974ce90a3eb70d2e7a46',
-  '0.1.0',
-  '45d18cff62cc48e29d0e6efcfc634fec96150198',
-  '7f05f32dd385ce0e1922b88d688742fca2a503fa',
-  19473,
+  '416c1b99edb9bda694731dee4b25688d9d82d1f32610aa23ddfda571ec3c7670',
+  '0.2.0',
+  'fcd99b7098b9a04bd93c585d89b16588aa482530',
+  '7bcb5d25c5376b02469666df7318b90b456ffee6',
+  23256,
   array[3]::integer[],
   array[
     'folders_authoritative',
@@ -79,7 +79,8 @@ insert into private.sync_contract_allowlist (
     'immutable_batch_contract_metadata',
     'operation_attempt_history',
     'operation_state_events',
-    'storage_name_v1'
+    'storage_name_v1',
+    'document_commit_v1'
   ]::text[],
   array[
     'atomic_structure_commit',
@@ -88,7 +89,8 @@ insert into private.sync_contract_allowlist (
     'folder_tombstones',
     'id_tree_validation',
     'legacy_epoch_zero_adapter',
-    'storage_name_v1'
+    'storage_name_v1',
+    'document_commit_v1'
   ]::text[],
   '{}'::jsonb,
   pg_catalog.transaction_timestamp(),
@@ -103,12 +105,12 @@ begin
   select * into strict v_entry
   from private.sync_contract_allowlist
   where canonical_contract_sha256 =
-    'fae86b4e6385ee37fbeb99f9256194ec319b64bfda92974ce90a3eb70d2e7a46';
+    '416c1b99edb9bda694731dee4b25688d9d82d1f32610aa23ddfda571ec3c7670';
 
-  if v_entry.contract_version <> '0.1.0'
-     or v_entry.contract_git_commit <> '45d18cff62cc48e29d0e6efcfc634fec96150198'
-     or v_entry.contract_content_commit <> '7f05f32dd385ce0e1922b88d688742fca2a503fa'
-     or v_entry.canonical_contract_bytes <> 19473
+  if v_entry.contract_version <> '0.2.0'
+     or v_entry.contract_git_commit <> 'fcd99b7098b9a04bd93c585d89b16588aa482530'
+     or v_entry.contract_content_commit <> '7bcb5d25c5376b02469666df7318b90b456ffee6'
+     or v_entry.canonical_contract_bytes <> 23256
      or v_entry.allowed_protocol_versions <> array[3]::integer[] then
     raise exception using errcode = 'P0001', message = 'CONTRACT_DIGEST_MISMATCH';
   end if;
@@ -2624,7 +2626,15 @@ drop index if exists public.folders_live_child_name_uidx;
 
 alter table public.documents
   add column if not exists parent_folder_id uuid,
-  add column if not exists storage_name_key bytea;
+  add column if not exists storage_name_key bytea,
+  add column if not exists name text,
+  add column if not exists structure_revision bigint;
+
+alter table public.documents
+  drop constraint if exists documents_contract_structure_revision_ck;
+alter table public.documents
+  add constraint documents_contract_structure_revision_ck
+  check (structure_revision is null or structure_revision >= 1) not valid;
 
 do $document_parent_fk$
 begin
@@ -2957,11 +2967,11 @@ revoke all on function private.storage_name_v1(text) from public, anon, authenti
 revoke all on function private.storage_name_v1_text(text) from public, anon, authenticated;
 
 comment on table private.sync_contract_allowlist is
-  'Server authority for released sync contracts. 0.1.0 is installed disabled and requires a separate rollout decision.';
+  'Server authority for released sync contracts. 0.2.0 is installed disabled and requires a separate rollout decision.';
 comment on table public.project_sync_settings is
   'Rows are created only by explicit migration. Row absence means honest LEGACY epoch 0.';
 comment on table public.sync_batches is
-  'Immutable CONTRACT_BATCH metadata pinned to WriterPad sync-contract 0.1.0.';
+  'Immutable CONTRACT_BATCH metadata pinned to WriterPad sync-contract 0.2.0.';
 comment on table public.sync_operations is
   'Immutable operation intents. Rebase creates a new row linked by supersedes_operation_id.';
 comment on table public.sync_operation_attempts is
