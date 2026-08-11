@@ -24,7 +24,7 @@ jobs:
     runs-on: ubuntu-latest
     services:
       postgres:
-        image: postgres:16
+        image: postgres:17.6
         env:
           POSTGRES_PASSWORD: postgres
           POSTGRES_DB: writerpad_stage7
@@ -58,13 +58,36 @@ jobs:
         run: |
           python sync-contract/scripts/verify_contract.py
           python supabase/tests/verify_stage7_server.py
-      - name: Apply baseline and Stage 7 migrations
+      - name: Apply operational v2 snapshot to a blank PostgreSQL 17.6 database
         shell: bash
         run: |
           psql -v ON_ERROR_STOP=1 -f supabase/tests/bootstrap_postgres.sql
-          psql -v ON_ERROR_STOP=1 -f "참조파일/20260714000000_supabase_v2_protocol.sql"
-          psql -v ON_ERROR_STOP=1 -f "참조파일/20260714010000_windows_v2_client_support.sql"
-          psql -v ON_ERROR_STOP=1 -f "참조파일/20260729000000_repair_owner_project_membership.sql"
+          psql -v ON_ERROR_STOP=1 -f supabase/migrations/20260811000000_operational_v2_schema_baseline_snapshot.sql
+          actual_catalog="$(psql -Atq -v ON_ERROR_STOP=1 -f supabase/tests/operational_v2_catalog_manifest.sql)"
+          expected_catalog="on|6c71ff36a90993dc327557b4a1a64c0dfb27b347134ed89e7f126dae76c6ff9a|49540"
+          test "$actual_catalog" = "$expected_catalog"
+      - name: Verify snapshot guard and failed-apply rollback
+        shell: bash
+        run: |
+          if psql -v ON_ERROR_STOP=1 -f supabase/migrations/20260811000000_operational_v2_schema_baseline_snapshot.sql > /tmp/snapshot-rerun.log 2>&1; then
+            echo "snapshot unexpectedly re-applied over an existing app schema"
+            exit 1
+          fi
+          grep -q "BASELINE_SNAPSHOT_REQUIRES_EMPTY_APP_SCHEMA" /tmp/snapshot-rerun.log
+          actual_catalog="$(psql -Atq -v ON_ERROR_STOP=1 -f supabase/tests/operational_v2_catalog_manifest.sql)"
+          test "$actual_catalog" = "on|6c71ff36a90993dc327557b4a1a64c0dfb27b347134ed89e7f126dae76c6ff9a|49540"
+
+          createdb writerpad_snapshot_failure
+          if PGDATABASE=writerpad_snapshot_failure psql -v ON_ERROR_STOP=1 -f supabase/migrations/20260811000000_operational_v2_schema_baseline_snapshot.sql > /tmp/snapshot-failure.log 2>&1; then
+            echo "snapshot unexpectedly succeeded without Supabase auth prerequisites"
+            exit 1
+          fi
+          test "$(PGDATABASE=writerpad_snapshot_failure psql -Atq -c "select to_regclass('public.projects') is null and to_regnamespace('private') is null")" = "t"
+      - name: Apply and safely re-run Stage 7 migrations
+        shell: bash
+        run: |
+          psql -v ON_ERROR_STOP=1 -f supabase/migrations/20260811010000_sync_contract_0_1_0_foundation.sql
+          psql -v ON_ERROR_STOP=1 -f supabase/migrations/20260811020000_sync_contract_0_1_0_rpcs.sql
           psql -v ON_ERROR_STOP=1 -f supabase/migrations/20260811010000_sync_contract_0_1_0_foundation.sql
           psql -v ON_ERROR_STOP=1 -f supabase/migrations/20260811020000_sync_contract_0_1_0_rpcs.sql
       - name: Run atomic, replay, cancellation, and migration checks

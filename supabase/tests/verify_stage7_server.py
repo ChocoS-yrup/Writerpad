@@ -18,6 +18,10 @@ CONTRACT_GIT_COMMIT = "fcd99b7098b9a04bd93c585d89b16588aa482530"
 CONTRACT_CONTENT_COMMIT = "7bcb5d25c5376b02469666df7318b90b456ffee6"
 DIGEST = "416c1b99edb9bda694731dee4b25688d9d82d1f32610aa23ddfda571ec3c7670"
 CANONICAL_BYTES = 23256
+BASELINE_NAME = "20260811000000_operational_v2_schema_baseline_snapshot.sql"
+SOURCE_CATALOG_DIGEST = (
+    "6c71ff36a90993dc327557b4a1a64c0dfb27b347134ed89e7f126dae76c6ff9a"
+)
 
 
 def require(condition: bool, message: str) -> None:
@@ -38,8 +42,58 @@ def main() -> None:
     require(lock["canonical_contract_sha256"] == DIGEST, "contract digest pin mismatch")
 
     sql_paths = sorted(MIGRATIONS.glob("*.sql"))
-    require(len(sql_paths) >= 2, "Stage 7 foundation and RPC migrations are required")
+    require(
+        [path.name for path in sql_paths]
+        == [
+            BASELINE_NAME,
+            "20260811010000_sync_contract_0_1_0_foundation.sql",
+            "20260811020000_sync_contract_0_1_0_rpcs.sql",
+        ],
+        "the blank-environment chain must be snapshot, foundation, then RPC",
+    )
     sql = "\n".join(path.read_text(encoding="utf-8") for path in sql_paths)
+    baseline = (MIGRATIONS / BASELINE_NAME).read_text(encoding="utf-8")
+
+    for marker in (
+        "purpose: bootstrap blank staging/new environment",
+        "historical_migration_replay: false",
+        "production_execution: forbidden",
+        "production_reconciliation_required: true",
+        "source_catalog_project: redacted",
+        f"source_catalog_snapshot_sha256: {SOURCE_CATALOG_DIGEST}",
+        "BASELINE_SNAPSHOT_REQUIRES_EMPTY_APP_SCHEMA",
+    ):
+        require(marker in baseline, f"baseline snapshot safety marker missing: {marker}")
+
+    for forbidden in (
+        "isotfvmlklrxspusjpcn",
+        "supabase.co",
+        "service_role_key",
+        "postgresql://",
+    ):
+        require(forbidden not in baseline.lower(), f"baseline leaks forbidden value: {forbidden}")
+
+    for required_baseline_object in (
+        "public.projects",
+        "public.project_members",
+        "public.documents",
+        "public.document_versions",
+        "public.edit_leases",
+        "public.folders",
+        "public.folder_versions",
+        "private.project_purge_tombstones",
+        "private.has_project_role",
+        "p.trashed_at is null",
+        "public.commit_folder",
+        "public.trash_project",
+        "public.restore_project",
+        "public.purge_project",
+        "supabase_realtime",
+    ):
+        require(
+            required_baseline_object in baseline,
+            f"operational snapshot object missing: {required_baseline_object}",
+        )
 
     for value in (
         VERSION,
@@ -114,8 +168,11 @@ def main() -> None:
 
     generator = ROOT / "supabase" / "scripts" / "generate_casefold_sql.py"
     generator_sha = hashlib.sha256(generator.read_bytes()).hexdigest()
+    baseline_sha = hashlib.sha256((MIGRATIONS / BASELINE_NAME).read_bytes()).hexdigest()
     print(f"Stage 7 static checks passed ({len(sql_paths)} migrations)")
     print(f"contract: {VERSION} {DIGEST}")
+    print(f"operational catalog: {SOURCE_CATALOG_DIGEST}")
+    print(f"baseline snapshot sha256: {baseline_sha}")
     print(f"casefold generator sha256: {generator_sha}")
 
 
