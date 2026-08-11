@@ -6,7 +6,7 @@
 - 소스 구현: 완료
 - 로컬 정적 검증: 통과
 - 임시 PostgreSQL 16 migration/RPC conformance: 통과
-- Stage 7 판정: `BLOCKED_STAGING_BASELINE_MISSING`
+- Stage 7 판정: `BLOCKED_PARTIAL_OR_LATER_OPERATIONAL_SCHEMA`
 - staging 쓰기: foundation 적용 시도 실패 후 transaction rollback 확인
 - 운영 쓰기: 수행하지 않음
 - client 앱 변경: 없음
@@ -95,6 +95,20 @@ rollback되었고 RPC migration은 실행하지 않았다.
 baseline migration set과 별도 staging 적용 승인이 확보되기 전에는 Stage 7 migration을
 재시도하지 않는다.
 
+## 기존 프로젝트 baseline provenance
+
+별도 승인된 읽기 전용 조사에서 `ChocoS-yrup's Web`
+(`isotfvmlklrxspusjpcn`)을 `READ ONLY` transaction과 `ROLLBACK`으로 확인했다.
+baseline core는 대부분 일치하고 최종 `ensure_project`도 repair 파일과 정확히
+일치하지만 세 baseline ID는 ledger에 없다. 대신 folder policy 관련 후속 ledger
+세 건과 folder/project-trash 확장 schema가 존재한다. 최종 판정은
+`PARTIAL_OR_LATER_SCHEMA`다.
+
+상세 metadata-only 증거와 function body digest 비교는
+`Docs/stage-7-baseline-provenance-review.md`에 기록했다. 누락된 folder 및
+project-trash migration provenance를 복원하기 전에는 reference SQL을 정식
+migration으로 승격하거나 staging에 적용하지 않는다.
+
 ## rollback 및 복구
 
 - CI transaction 실패 시 migration 전체 rollback은 검증했다.
@@ -115,14 +129,17 @@ migration_ids:
 staging_project_id: mhpnszcorfzrvhyondxr
 staging_endpoint: https://mhpnszcorfzrvhyondxr.supabase.co
 migration_ledger_verified: true_absent
+operational_provenance_project_id: isotfvmlklrxspusjpcn
+operational_provenance_transaction_read_only: on
+operational_provenance_classification: PARTIAL_OR_LATER_SCHEMA
 protocol_3_document_rpc: implemented_and_ci_passed
 atomic_structure_rpc: implemented_and_ci_passed
 test_results: local_static_and_postgresql_16_ci_passed_staging_17_6_blocked_on_missing_v2_baseline
 rollback_status: failed_foundation_transaction_fully_rolled_back
 production_changes: none
 unverified_items:
-  - authoritative v2 baseline migration set for blank staging
-  - actual deployed RPC catalog
+  - missing folder and project-trash migration provenance
+  - complete authoritative blank-database migration chain
   - staging document/structure round trip
   - staging restart replay
   - staging snapshot restore procedure
