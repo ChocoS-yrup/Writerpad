@@ -157,16 +157,20 @@ Only counts were read:
 
 ## CI fixture status
 
-The files are active CI inputs. `.github/workflows/server-contract.yml` runs:
+At the time of the reference-file review, the three files were CI fixtures and
+were not authoritative migrations. After the `PARTIAL_OR_LATER_SCHEMA`
+classification, PR #4 stopped applying them in the server workflow.
+
+The current `.github/workflows/server-contract.yml` runs:
 
 1. `supabase/tests/bootstrap_postgres.sql`;
-2. the three reviewed reference SQL files in version order;
+2. `20260811000000_operational_v2_schema_baseline_snapshot.sql`;
 3. the two Stage 7 migrations.
 
 The bootstrap creates test-only `anon`/`authenticated` roles, `auth.users` and
-`auth.uid()`. This proves a fresh PostgreSQL 16 test database can establish the
-expected v2 shape before Stage 7. It does not validate a Supabase migration
-ledger, production data compatibility, production drift, or PostgreSQL 17.6.
+`auth.uid()`. PostgreSQL 17.6 CI now checks the blank-environment chain against
+the read-only operational catalog manifest. It does not validate a Supabase
+migration ledger or authorize staging/production deployment.
 
 ## Object manifest
 
@@ -278,18 +282,18 @@ of a missing owner membership before updating the project.
 
 Changing this order is not supported.
 
-## Blank database and rerun safety
+## Reference-file blank database and rerun assessment
 
-- Vanilla blank PostgreSQL: not directly applicable because Supabase auth
-  roles/schema/function are prerequisites. CI supplies a test bootstrap.
-- Blank Supabase project: structurally plausible, but not executed because
-  staging baseline application was not approved. PostgreSQL 17.6 remains
-  unverified for these three files.
-- First file raw rerun: not idempotent. It uses unguarded `create table`,
-  `create index`, and `create policy`. A rerun fails when objects already
-  exist. Its outer transaction makes that failure atomic.
-- Second and third file rerun: idempotent once prerequisites exist because
+- The three reference files were not tested on staging and were not promoted.
+- Their first file is not raw-rerun idempotent because it uses unguarded
+  `create table`, `create index`, and `create policy`; its outer transaction
+  makes an object-exists failure atomic.
+- Their second and third files are rerunnable once prerequisites exist because
   they use `create or replace function` plus repeatable revoke/grant.
+- This historical assessment is superseded for blank-environment bootstrap by
+  the squashed snapshot validation recorded below. PostgreSQL 17.6 CI passed
+  the snapshot guard, failed-apply rollback, Stage 7 rerun, and exact catalog
+  digest checks.
 
 The files contain no migration-ledger writes. Running them as raw SQL cannot by
 itself establish an authoritative `supabase_migrations.schema_migrations`
@@ -318,31 +322,60 @@ required.
 - both cases require read-only operational ledger and catalog comparison before
   choosing copy-as-is, ledger reconciliation, or new corrective migration IDs.
 
-## Conditional promotion design — not yet approved or implemented
+## Source-only squashed snapshot resolution
 
-If operational evidence later proves an exact match and confirms the three IDs
-are the correct authoritative history, the proposed changed paths are:
+The three reference files were not promoted. Instead PR #4 now contains:
 
-- add `supabase/migrations/20260714000000_supabase_v2_protocol.sql`
-- add `supabase/migrations/20260714010000_windows_v2_client_support.sql`
-- add `supabase/migrations/20260729000000_repair_owner_project_membership.sql`
-- update `.github/workflows/server-contract.yml` to consume the formal paths
-- add a checksum/object-manifest verifier under `supabase/tests/`
-- update the Stage 7 handoff with the operational ledger/catalog evidence
+```text
+supabase/migrations/
+  20260811000000_operational_v2_schema_baseline_snapshot.sql
+  20260811010000_sync_contract_0_1_0_foundation.sql
+  20260811020000_sync_contract_0_1_0_rpcs.sql
+```
 
-A byte-for-byte copy would retain the three reviewed SHA-256 values. No such
-copy was made because authoritative operational provenance is not established.
+The first file is explicitly a current-schema snapshot for a blank
+staging/new environment, not a historical migration replay. Its SHA-256 is
+`323c6e092cd9afabb438eaf233b7e63abd0195d5e1a91a5f5fe3fe5940699198`.
+It contains an empty-app-schema guard and states that production execution is
+forbidden and production ledger reconciliation requires separate approval.
+
+The snapshot includes the complete core/folder/trash catalog found by the
+read-only review, including the later `has_project_role` trash guard. It
+contains no application rows, content/path values, auth metadata, secret,
+sequence value, endpoint or source project identifier.
+
+A deterministic metadata manifest covers relation/column/constraint/index,
+RLS/policy, function signature and normalized body/definition digest, semantic
+table/function privileges, Realtime membership, comments, triggers and
+sequences. All arrays use explicit `COLLATE "C"`, so the operational ICU
+locale and CI locale produce the same canonical order.
+
+```yaml
+source_catalog_manifest_bytes: 49540
+source_catalog_manifest_sha256: 6c71ff36a90993dc327557b4a1a64c0dfb27b347134ed89e7f126dae76c6ff9a
+postgresql_17_6_blank_snapshot_catalog_sha256: 6c71ff36a90993dc327557b4a1a64c0dfb27b347134ed89e7f126dae76c6ff9a
+github_actions_run: https://github.com/ChocoS-yrup/Writerpad/actions/runs/31465930836
+```
+
+PostgreSQL 17.6 CI proved blank snapshot apply, exact catalog match, fail-closed
+rerun on an existing app schema, full rollback when Supabase auth prerequisites
+are absent, Stage 7 foundation/RPC apply, both Stage 7 migrations' safe rerun,
+and the atomic/replay/cancellation/migration SQL conformance suite.
+
+The original `PARTIAL_OR_LATER_SCHEMA` classification remains the honest
+historical-provenance decision. The snapshot resolves blank-environment
+reproducibility without inventing that missing history.
 
 ## Required next gate
 
-Do not promote or apply the three reference files yet. Reconstruct the missing
-folder and project-trash migration provenance from repository history and the
-metadata-only catalog snapshot. The result must define a complete ordered
-blank-database chain without replacing the later operational
-`has_project_role` or losing folder/project-trash behavior.
+Obtain separate approval to apply exactly the three-file chain, in order, to
+the already preflighted blank WriterPad Staging project. Reconfirm every
+checksum immediately before applying. Stop on the first failure and preserve
+ledger/schema state.
 
-After that chain has independent PostgreSQL 17.6 apply and replay checks, show
-the proposed formal `supabase/migrations` paths and checksums and obtain a new
-staging-only approval. Do not replay the historical baseline SQL against this
-operational project and do not reconcile its ledger without a separate plan
-and approval.
+After apply, verify the staging ledger and RPC catalog plus real
+`document_commit`, `atomic_structure_commit`, replay, rollback,
+cancellation and restart/response-loss behavior. Do not execute the snapshot
+against the existing operational project. Production ledger reconciliation,
+allowlist activation, project promotion, PR #4 merge and production rollout
+remain separately gated.
