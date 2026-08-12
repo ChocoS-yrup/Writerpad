@@ -5384,23 +5384,18 @@ final class SyncV2StoreTests: XCTestCase {
     /// 여기 나온 것이 곧 옮겨야 할 목록이다. 하나씩 사건을 남기도록 고칠
     /// 때마다 이 목록에서 지운다. 다 지워지면 읽는 쪽을 옮겨도 화면의 숫자가
     /// 달라지지 않는다.
-    ///
-    /// - Note: 지금은 전부 어긋난다. 아직 아무 경로도 옮기지 않았기 때문이다.
-    ///   이 시험은 "옮겼는데 눈치채지 못하는 일"을 막으려고 둔다.
     func testWritePathsThatDoNotYetRecordEvents() async throws {
-        // 대기 → 발송 중
+        // 아직 안 옮겼다. 대기 → 발송 중.
         let claimOnly = try await divergenceAfterTransition { _, _ in }
         XCTAssertEqual(claimOnly.map(\.storedStatus), [.inflight])
         XCTAssertEqual(claimOnly.map(\.derivedStatus), [.pending])
 
-        // 발송 중 → 완료
+        // 옮겼다. 발송이 끝나는 네 갈래는 모두 한 함수를 지난다.
         let completed = try await divergenceAfterTransition { store, operation in
             try await store.complete(operation, result: self.commitResult(for: operation))
         }
-        XCTAssertEqual(completed.map(\.storedStatus), [.completed])
-        XCTAssertEqual(completed.map(\.derivedStatus), [.pending])
+        XCTAssertEqual(completed, [])
 
-        // 발송 중 → 다시 시도 대기
         let retryWait = try await divergenceAfterTransition { store, operation in
             try await store.deferRetry(
                 operation,
@@ -5409,10 +5404,8 @@ final class SyncV2StoreTests: XCTestCase {
                 nextAttemptAt: Date(timeIntervalSince1970: 200)
             )
         }
-        XCTAssertEqual(retryWait.map(\.storedStatus), [.retryWait])
-        XCTAssertEqual(retryWait.map(\.derivedStatus), [.pending])
+        XCTAssertEqual(retryWait, [])
 
-        // 발송 중 → 충돌
         let conflict = try await divergenceAfterTransition { store, operation in
             try await store.markConflict(
                 operation,
@@ -5420,10 +5413,8 @@ final class SyncV2StoreTests: XCTestCase {
                 detail: nil
             )
         }
-        XCTAssertEqual(conflict.map(\.storedStatus), [.conflict])
-        XCTAssertEqual(conflict.map(\.derivedStatus), [.pending])
+        XCTAssertEqual(conflict, [])
 
-        // 발송 중 → 막힘
         let blocked = try await divergenceAfterTransition { store, operation in
             try await store.markBlocked(
                 operation,
@@ -5431,17 +5422,20 @@ final class SyncV2StoreTests: XCTestCase {
                 detail: nil
             )
         }
-        XCTAssertEqual(blocked.map(\.storedStatus), [.blocked])
-        XCTAssertEqual(blocked.map(\.derivedStatus), [.pending])
+        XCTAssertEqual(blocked, [])
 
         // 대기 → 발송 중 → 다시 시도 대기 → 대기.
         //
-        // 이 눈의 사각지대다. 세 번 상태를 바꾸고도 처음 자리로 돌아오면
-        // 칸과 계산이 같아져 어긋남으로 보이지 않는다. 사건은 하나도 남지
-        // 않았는데 아무 일도 없었던 것처럼 보인다.
+        // 양쪽 다 안 옮겼을 때는 이 왕복이 이 눈의 사각지대였다. 세 번 상태를
+        // 바꾸고도 처음 자리로 돌아오면 칸과 계산이 우연히 같아져 아무 일도
+        // 없었던 것처럼 보였다.
         //
-        // 그래서 어긋남이 없다는 것만으로 "다 옮겼다"고 말할 수 없다. 옮길
-        // 목록은 코드에서 직접 세어야 한다.
+        // 앞쪽 절반을 옮기고 나니 뒤쪽이 드러났다. `deferRetry`는 사건을 남기고
+        // `makeRetryWaitOperationsReady`는 남기지 않아, 이제는 어긋남으로 보인다.
+        //
+        // 그래도 어긋남이 없다는 것만으로 "다 옮겼다"고 말할 수는 없다. 아직
+        // 아무것도 안 옮긴 짝끼리는 여전히 서로를 가린다. 옮길 목록은 코드에서
+        // 직접 세어야 한다.
         let roundTrip = try await divergenceAfterTransition { store, operation in
             try await store.deferRetry(
                 operation,
@@ -5451,11 +5445,115 @@ final class SyncV2StoreTests: XCTestCase {
             )
             try await store.makeRetryWaitOperationsReady(localProjectID: nil)
         }
+        XCTAssertEqual(roundTrip.map(\.storedStatus), [.pending])
         XCTAssertEqual(
-            roundTrip,
-            [],
-            "제자리로 돌아온 변화는 이 눈으로 볼 수 없다"
+            roundTrip.map(\.derivedStatus),
+            [.retryWait],
+            "makeRetryWaitOperationsReady가 아직 사건을 남기지 않는다"
         )
+    }
+
+    /// 발송이 끝날 때 남는 사건이 실제로 무엇인지 본다. 어긋나지 않는 것만으로는
+    /// 옳은 기록이 남았는지 알 수 없다.
+    func testDispatchOutcomeRecordsMatchingEvent() async throws {
+        let cases: [(String, (SyncV2Store, SyncV2DispatchOperation) async throws -> Void, SyncV2OperationEventType, String?)] = [
+            ("완료", { store, operation in
+                try await store.complete(operation, result: self.commitResult(for: operation))
+            }, .committed, nil),
+            ("다시 시도", { store, operation in
+                try await store.deferRetry(
+                    operation,
+                    errorCode: "NETWORK_UNAVAILABLE",
+                    detail: nil,
+                    nextAttemptAt: Date(timeIntervalSince1970: 200)
+                )
+            }, .retryScheduled, "NETWORK_UNAVAILABLE"),
+            ("충돌", { store, operation in
+                try await store.markConflict(
+                    operation,
+                    errorCode: "REVISION_CONFLICT",
+                    detail: nil
+                )
+            }, .conflictDetected, "REVISION_CONFLICT"),
+            ("막힘", { store, operation in
+                try await store.markBlocked(
+                    operation,
+                    errorCode: "AUTH_REQUIRED",
+                    detail: nil
+                )
+            }, .blocked, "AUTH_REQUIRED"),
+        ]
+
+        for (label, transition, expectedType, expectedError) in cases {
+            let url = try databaseURL()
+            let context = QueueAPIContext()
+            let operationID = UUID()
+            let store = try await connectedStore(at: url, context: context)
+            _ = try await store.enqueue(
+                context.batch(
+                    mutations: [context.documentMutation(operationID: operationID)]
+                )
+            )
+            try await store.backfillOperationEvents()
+            let claimed = try await store.claimReadyOperations(
+                limit: 1,
+                now: Date(timeIntervalSince1970: 100)
+            )
+            try await transition(store, try XCTUnwrap(claimed.first))
+            let events = try await store.operationEvents(operationID: operationID)
+            await store.close()
+
+            XCTAssertEqual(events.last?.type, expectedType, label)
+            XCTAssertEqual(events.last?.errorCode, expectedError, label)
+            // 앞선 실패를 성공이 지우지 않는다. 기록은 덧붙이기만 한다.
+            XCTAssertEqual(events.first?.type, .enqueued, label)
+            XCTAssertEqual(events.map(\.sequence), Array(1...events.count), label)
+        }
+    }
+
+    /// 같은 작업을 다시 보내 받은 멱등 응답은 처음 올린 것과 다른 일이다.
+    /// 둘 다 완료로 수렴하지만 기록에는 구분해 남는다.
+    func testReplayedCommitRecordsReplayedEvent() async throws {
+        let url = try databaseURL()
+        let context = QueueAPIContext()
+        let operationID = UUID()
+        let store = try await connectedStore(at: url, context: context)
+        _ = try await store.enqueue(
+            context.batch(
+                mutations: [context.documentMutation(operationID: operationID)]
+            )
+        )
+        try await store.backfillOperationEvents()
+        let claimed = try await store.claimReadyOperations(
+            limit: 1,
+            now: Date(timeIntervalSince1970: 100)
+        )
+        let operation = try XCTUnwrap(claimed.first)
+        var result = commitResult(for: operation)
+        result = SyncV2CommitDocumentResult(
+            status: .replayed,
+            documentID: result.documentID,
+            versionID: result.versionID,
+            operationID: result.operationID,
+            operationKind: result.operationKind,
+            serverRevision: result.serverRevision,
+            relativePath: result.relativePath,
+            isDeleted: result.isDeleted,
+            contentHash: result.contentHash,
+            committedAt: result.committedAt
+        )
+
+        try await store.complete(operation, result: result)
+        let events = try await store.operationEvents(operationID: operationID)
+        let divergences = try await store.operationStateDivergences()
+        await store.close()
+
+        XCTAssertEqual(events.last?.type, .replayed)
+        XCTAssertEqual(
+            try SyncV2OperationStateDerivation.state(from: events),
+            .completed
+        )
+        XCTAssertEqual(divergences, [])
     }
 
     /// 폴더 줄도 문서 줄과 같은 문제를 안고 있다.
@@ -5481,11 +5579,12 @@ final class SyncV2StoreTests: XCTestCase {
         )
         let folder = try XCTUnwrap(claimed.first)
         try await store.complete(folder, result: folderCommitResult(for: folder))
+        let events = try await store.operationEvents(operationID: folderOperationID)
         let divergences = try await store.operationStateDivergences()
         await store.close()
 
-        XCTAssertEqual(divergences.map(\.storedStatus), [.completed])
-        XCTAssertEqual(divergences.map(\.derivedStatus), [.pending])
+        XCTAssertEqual(divergences, [])
+        XCTAssertEqual(events.last?.type, .committed)
     }
 
     /// 사건 표는 존재하지 않는 작업을 가리킬 수 없다.

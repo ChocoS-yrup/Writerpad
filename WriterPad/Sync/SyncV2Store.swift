@@ -2819,7 +2819,10 @@ actor SyncV2Store:
                     errorCode: nil,
                     detail: nil,
                     nextAttemptAt: nil,
-                    timestamp: timestamp
+                    timestamp: timestamp,
+                    // 같은 작업을 다시 보내 받은 멱등 응답이면 그대로 적는다.
+                    // 처음 올린 것과 다시 확인한 것은 다른 일이다.
+                    eventType: result.status == .replayed ? .replayed : .committed
                 )
                 try withStatement(
                     """
@@ -2934,7 +2937,8 @@ actor SyncV2Store:
                 errorCode: nil,
                 detail: nil,
                 nextAttemptAt: nil,
-                timestamp: timestamp
+                timestamp: timestamp,
+                eventType: result.status == .replayed ? .replayed : .committed
             )
             try withStatement(
                 """
@@ -5101,7 +5105,8 @@ actor SyncV2Store:
         errorCode: String?,
         detail: String?,
         nextAttemptAt: Date?,
-        timestamp: String
+        timestamp: String,
+        eventType: SyncV2OperationEventType? = nil
     ) throws {
         try transitionInflightOperation(
             operationID: operation.operationID,
@@ -5110,12 +5115,16 @@ actor SyncV2Store:
             errorCode: errorCode,
             detail: detail,
             nextAttemptAt: nextAttemptAt,
-            timestamp: timestamp
+            timestamp: timestamp,
+            eventType: eventType
         )
     }
 
     /// 문서와 폴더가 같은 표를 쓰므로 상태 전이도 같다. 시도 횟수를 조건에 넣어
     /// 이미 다른 흐름이 건드린 줄은 바꾸지 않는다.
+    ///
+    /// status 칸을 바꾸는 것과 사건을 남기는 것이 한 거래 안에서 함께 일어난다.
+    /// 둘 중 하나만 남으면 그때부터 기록과 칸이 갈라진다.
     private func transitionInflightOperation(
         operationID: UUID,
         attempts: Int,
@@ -5123,8 +5132,15 @@ actor SyncV2Store:
         errorCode: String?,
         detail: String?,
         nextAttemptAt: Date?,
-        timestamp: String
+        timestamp: String,
+        eventType: SyncV2OperationEventType? = nil
     ) throws {
+        // 칸을 바꾸기 전에 지난 일을 채워 둔다. 바꾼 뒤에 채우면 바뀐 상태를
+        // 지난 일로 잘못 적는다.
+        try ensureOperationEventHistory(
+            operationID: operationID.uuidString.lowercased(),
+            timestamp: timestamp
+        )
         try withStatement(
             """
             UPDATE sync_operations
@@ -5154,6 +5170,12 @@ actor SyncV2Store:
                 throw SyncV2DispatchStoreError.operationStateChanged
             }
         }
+        try appendOperationEvent(
+            operationID: operationID.uuidString.lowercased(),
+            type: eventType ?? Self.eventType(reaching: status),
+            errorCode: errorCode,
+            timestamp: timestamp
+        )
     }
 
     private func refreshBatchState(
@@ -6793,23 +6815,121 @@ actor SyncV2Store:
             guard let state = SyncV2OperationStatus(rawValue: status) else {
                 throw SyncV2StoreError.invalidStoredData
             }
-            let types = Self.seedEventTypes(for: state)
-            for (index, type) in types.enumerated() {
-                // 마지막 사건만 오류를 안고 간다. 그 앞의 사건들은 이 작업이
-                // 어떤 길을 지나왔는지 표시할 뿐 오류를 낸 적이 없다.
-                let isLast = index == types.count - 1
-                try insertOperationEvent(
-                    eventID: Self.legacyEventID(
-                        operationID: operationID,
-                        eventType: type
-                    ),
-                    operationID: operationID,
-                    sequence: index + 1,
-                    type: type,
-                    recordedAt: recordedAt,
-                    errorCode: isLast ? errorCode : nil
-                )
+            try seedOperationEvents(
+                operationID: operationID,
+                state: state,
+                errorCode: errorCode,
+                recordedAt: recordedAt,
+                skipIfPresent: false
+            )
+        }
+    }
+
+    /// 그 상태에 이르게 하는 사건이다.
+    ///
+    /// `completed`는 `committed`와 `replayed` 둘 다에서 나온다. 둘을 가릴 수
+    /// 있는 자리에서는 부르는 쪽이 직접 알려 준다. 여기서는 흔한 쪽을 고른다.
+    static func eventType(
+        reaching status: SyncV2OperationStatus
+    ) -> SyncV2OperationEventType {
+        switch status {
+        case .pending: return .enqueued
+        case .inflight: return .dispatchStarted
+        case .retryWait: return .retryScheduled
+        case .blocked: return .blocked
+        case .conflict: return .conflictDetected
+        case .completed: return .committed
+        case .cancelled: return .cancelRequested
+        }
+    }
+
+    /// 사건 기록이 아직 없는 작업에 지금 상태를 되만들어 넣는다.
+    ///
+    /// 쓰기 경로를 하나씩 옮기는 동안에는, 아직 안 옮긴 경로가 만든 작업이
+    /// 기록 없이 들어와 있을 수 있다. 그 위에 곧바로 사건을 얹으면 시작도
+    /// 없이 끝만 있는 기록이 된다. 그래서 얹기 전에 지난 일을 채운다.
+    ///
+    /// 쓰기 경로를 다 옮기고 나면 이 되만들기는 아무 일도 하지 않는다.
+    private func ensureOperationEventHistory(
+        operationID: String,
+        timestamp: String
+    ) throws {
+        let status = try withStatement(
+            """
+            SELECT status FROM sync_operations WHERE operation_id = ?;
+            """
+        ) { statement -> String? in
+            try bind(operationID, at: 1, to: statement)
+            guard sqlite3_step(statement) == SQLITE_ROW,
+                  let value = sqlite3_column_text(statement, 0)
+            else {
+                return nil
             }
+            return String(cString: value)
+        }
+        guard let status, let state = SyncV2OperationStatus(rawValue: status) else {
+            return
+        }
+        try seedOperationEvents(
+            operationID: operationID,
+            state: state,
+            errorCode: nil,
+            recordedAt: timestamp,
+            skipIfPresent: true
+        )
+    }
+
+    /// 사건을 하나 덧붙인다.
+    ///
+    /// 이미 끝난 작업에는 붙이지 않는다. 붙이면 끝난 작업이 되살아나 다시
+    /// 발송된다. 계약이 `OPERATION_TERMINAL`로 막으라고 한 자리다.
+    private func appendOperationEvent(
+        operationID: String,
+        type: SyncV2OperationEventType,
+        errorCode: String?,
+        timestamp: String,
+        relatedOperationID: String? = nil
+    ) throws {
+        let events = try operationEvents(operationID: operationID)
+        try SyncV2OperationStateDerivation.requireAppendable(to: events)
+        try insertOperationEvent(
+            eventID: UUID().uuidString.lowercased(),
+            operationID: operationID,
+            sequence: events.count + 1,
+            type: type,
+            recordedAt: timestamp,
+            errorCode: errorCode,
+            relatedOperationID: relatedOperationID
+        )
+    }
+
+    /// 한 작업의 지난 일을 되만들어 넣는다.
+    private func seedOperationEvents(
+        operationID: String,
+        state: SyncV2OperationStatus,
+        errorCode: String?,
+        recordedAt: String,
+        skipIfPresent: Bool
+    ) throws {
+        if skipIfPresent,
+           try !operationEvents(operationID: operationID).isEmpty {
+            return
+        }
+        let types = Self.seedEventTypes(for: state)
+        for (index, type) in types.enumerated() {
+            // 마지막 사건만 오류를 안고 간다. 그 앞의 사건들은 이 작업이 어떤
+            // 길을 지나왔는지 표시할 뿐 오류를 낸 적이 없다.
+            try insertOperationEvent(
+                eventID: Self.legacyEventID(
+                    operationID: operationID,
+                    eventType: type
+                ),
+                operationID: operationID,
+                sequence: index + 1,
+                type: type,
+                recordedAt: recordedAt,
+                errorCode: index == types.count - 1 ? errorCode : nil
+            )
         }
     }
 
