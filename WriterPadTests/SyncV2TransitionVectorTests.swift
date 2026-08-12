@@ -218,36 +218,10 @@ final class SyncV2TransitionVectorTests: XCTestCase {
 
         let queue = SyncV2StoreVectorQueue(
             store: store,
-            operationIDs: mapping
-        ) { store, operationID in
-            // 벡터의 commit_batch는 "집어들어 보내고 끝낸다"는 뜻이다.
-            let claimed = try await store.claimReadyOperations(
-                limit: 10,
-                now: Date(timeIntervalSince1970: 100)
-            )
-            guard let operation = claimed.first(where: {
-                $0.operationID == operationID
-            }) else {
-                throw SyncV2ContractError("INVALID_ARGUMENT", "집어들지 못했다")
-            }
-            try await store.complete(
-                operation,
-                result: SyncV2CommitDocumentResult(
-                    status: .committed,
-                    documentID: operation.documentID,
-                    versionID: UUID(),
-                    operationID: operation.operationID,
-                    operationKind: operation.baseRevision == 0 ? .create : .update,
-                    serverRevision: operation.baseRevision + 1,
-                    relativePath: operation.relativePath,
-                    isDeleted: operation.isDeleted,
-                    contentHash: SHA256ContentHasher()
-                        .sha256(for: Data(operation.content.utf8))
-                        .rawValue,
-                    committedAt: Date(timeIntervalSince1970: 1_800_000_000)
-                )
-            )
-        }
+            url: url,
+            operationIDs: mapping,
+            dispatch: Self.storeDispatch
+        )
 
         let runner = SyncV2VectorRunner(vector: vector, queue: queue)
         try await runner.run()
@@ -256,8 +230,8 @@ final class SyncV2TransitionVectorTests: XCTestCase {
         let firstEvents = try await queue.events(
             of: UUID(uuidString: "20000000-0000-4000-8000-000000000081")!
         )
-        let divergences = try await store.operationStateDivergences()
-        await store.close()
+        let divergences = try await queue.currentStore.operationStateDivergences()
+        await queue.close()
 
         XCTAssertEqual(
             mismatches,
@@ -270,6 +244,162 @@ final class SyncV2TransitionVectorTests: XCTestCase {
             1
         )
         XCTAssertEqual(divergences, [], "기록과 칸이 끝까지 붙어 있어야 한다")
+    }
+
+    // MARK: - TV-007 재시작 복구
+
+    /// 보내는 도중 앱이 꺼졌다가 다시 열렸을 때, 같은 작업이 신원을 지킨 채
+    /// 다시 발송되는지 본다.
+    ///
+    /// 끊긴 시도도 실제로 있었던 일이므로 시도 횟수에서 빼지 않는다. 벡터가
+    /// 기대하는 최종 시도 횟수가 2인 이유다.
+    func testVector07AgainstProductionStore() async throws {
+        let vector = try SyncV2TransitionVector.load("07-restart-queue-recovery")
+        let (queue, mapping) = try await makeStoreQueue(for: vector, name: "TV007")
+        let vectorOperationID = try XCTUnwrap(mapping.keys.first)
+
+        let runner = SyncV2VectorRunner(vector: vector, queue: queue)
+        try await runner.run()
+        let mismatches = await runner.mechanicalMismatches()
+        let events = try await queue.events(of: vectorOperationID)
+        let divergences = try await queue.currentStore.operationStateDivergences()
+        await queue.close()
+
+        XCTAssertEqual(
+            mismatches,
+            [],
+            "저장소가 벡터와 어긋났다:\n" + mismatches.joined(separator: "\n")
+        )
+        // 집어들었다가 꺼졌고, 다시 열며 대기로 돌아왔고, 다시 보내 끝났다.
+        XCTAssertEqual(
+            events.map(\.type),
+            [.enqueued, .dispatchStarted, .enqueued, .dispatchStarted, .committed]
+        )
+        XCTAssertEqual(divergences, [])
+    }
+
+    /// 재시작해도 작업의 신원은 그대로여야 한다. 새 신원을 만들면 서버가 같은
+    /// 편집을 두 번 받는다.
+    func testVector07PreservesOperationIdentityAcrossRestart() async throws {
+        let vector = try SyncV2TransitionVector.load("07-restart-queue-recovery")
+        let (queue, mapping) = try await makeStoreQueue(for: vector, name: "TV007-identity")
+        let vectorOperationID = try XCTUnwrap(mapping.keys.first)
+        let realOperationID = try XCTUnwrap(mapping[vectorOperationID])
+
+        let runner = SyncV2VectorRunner(vector: vector, queue: queue)
+        try await runner.run()
+        let store = queue.currentStore
+        let status = try await store.operationStatus(operationID: realOperationID)
+        let attempts = try await store.operationAttempts(operationID: realOperationID)
+        await queue.close()
+
+        XCTAssertEqual(status, "completed")
+        XCTAssertEqual(attempts, 2, "끊긴 시도도 있었던 일이다")
+    }
+
+    // MARK: - 저장소 고정물
+
+    /// 벡터의 대기열을 저장소의 정식 경로로 만들고 어댑터를 돌려준다.
+    private func makeStoreQueue(
+        for vector: SyncV2TransitionVector,
+        name: String
+    ) async throws -> (SyncV2StoreVectorQueue, [UUID: UUID]) {
+        let client = try SyncV2VectorRunner.primaryClient(of: vector)
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("WriterPad-\(name)-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(
+            at: directory,
+            withIntermediateDirectories: true
+        )
+        addTeardownBlock { try? FileManager.default.removeItem(at: directory) }
+        let url = directory.appendingPathComponent("sync-v2.sqlite3")
+
+        guard case let .available(store) = await SyncV2Store.open(at: url) else {
+            throw SyncV2ContractError("INVALID_ARGUMENT", "저장소를 열지 못했다")
+        }
+        let localProjectID = ProjectID(rawValue: UUID())
+        let deviceID = UUID()
+        try await store.save(
+            .connected(
+                localProjectID: localProjectID,
+                serverProjectID: UUID(),
+                kind: .newServerProject,
+                projectName: name,
+                ownerSubject: UUID()
+            )
+        )
+
+        var mapping: [UUID: UUID] = [:]
+        for (index, item) in client.queue.enumerated() {
+            let realOperationID = UUID()
+            mapping[item.operationID] = realOperationID
+            _ = try await store.enqueue(
+                SyncV2EnqueueBatch(
+                    batchID: UUID(),
+                    localProjectID: localProjectID,
+                    localTransactionID: UUID(),
+                    kind: .documentSave,
+                    mutations: [
+                        .document(
+                            SyncV2DocumentMutation(
+                                operationID: realOperationID,
+                                documentID: item.entityID,
+                                deviceID: deviceID,
+                                localSaveGeneration: 1,
+                                kind: .documentCommit,
+                                localPath: "/fixture/원고/\(index).txt",
+                                relativePath: "원고/\(index).txt",
+                                content: "본문 \(index)",
+                                isDeleted: false
+                            )
+                        )
+                    ]
+                )
+            )
+        }
+        let queue = SyncV2StoreVectorQueue(
+            store: store,
+            url: url,
+            operationIDs: mapping,
+            dispatch: Self.storeDispatch
+        )
+        return (queue, mapping)
+    }
+
+    /// 저장소로 발송을 흉내 낸다.
+    ///
+    /// `complete`가 거짓이면 집어들기만 하고 끝내지 않는다. 보내는 도중에
+    /// 앱이 꺼진 상태를 만들 때 쓴다.
+    private static func storeDispatch(
+        _ store: SyncV2Store,
+        _ operationID: UUID,
+        _ complete: Bool
+    ) async throws {
+        let claimed = try await store.claimReadyOperations(
+            limit: 10,
+            now: Date(timeIntervalSince1970: 100)
+        )
+        guard let operation = claimed.first(where: { $0.operationID == operationID }) else {
+            throw SyncV2ContractError("INVALID_ARGUMENT", "집어들지 못했다")
+        }
+        guard complete else { return }
+        try await store.complete(
+            operation,
+            result: SyncV2CommitDocumentResult(
+                status: .committed,
+                documentID: operation.documentID,
+                versionID: UUID(),
+                operationID: operation.operationID,
+                operationKind: operation.baseRevision == 0 ? .create : .update,
+                serverRevision: operation.baseRevision + 1,
+                relativePath: operation.relativePath,
+                isDeleted: operation.isDeleted,
+                contentHash: SHA256ContentHasher()
+                    .sha256(for: Data(operation.content.utf8))
+                    .rawValue,
+                committedAt: Date(timeIntervalSince1970: 1_800_000_000)
+            )
+        )
     }
 
     // MARK: - 하네스가 실제로 무언가를 잡는가
@@ -305,6 +435,17 @@ final class SyncV2TransitionVectorTests: XCTestCase {
         func commitBatch(operationID: UUID) async throws {
             attempts[operationID] = (attempts[operationID] ?? 0) + 1
             // 상태 칸을 갱신하지 않는다. 완료됐는데 pending으로 남는다.
+        }
+
+        func beginDispatch(operationID: UUID) async throws {
+            attempts[operationID] = (attempts[operationID] ?? 0) + 1
+        }
+
+        // 껐다 켜도 아무것도 되살리지 않는다. 보내던 작업이 그대로 멈춰 있는다.
+        func restart() async throws {}
+
+        func retry(operationID: UUID) async throws {
+            try await commitBatch(operationID: operationID)
         }
 
         func state(of operationID: UUID) async throws -> SyncV2OperationStatus {

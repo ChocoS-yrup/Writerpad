@@ -10,6 +10,14 @@ import XCTest
 protocol SyncV2VectorQueue: AnyObject {
     func cancelOperation(operationID: UUID, cancelEventID: UUID) async throws -> SyncV2CancelOutcome
     func commitBatch(operationID: UUID) async throws
+    /// 집어들어 발송을 시작하기만 한다. 끝내지 않는다.
+    ///
+    /// 벡터가 "보내는 도중 앱이 꺼졌다"를 만들 때 쓴다.
+    func beginDispatch(operationID: UUID) async throws
+    /// 앱을 껐다 켠다.
+    func restart() async throws
+    /// 같은 작업을 다시 보낸다. 새 신원을 만들지 않는다.
+    func retry(operationID: UUID) async throws
     func state(of operationID: UUID) async throws -> SyncV2OperationStatus
     func attemptCount(of operationID: UUID) async throws -> Int
     func events(of operationID: UUID) async throws -> [SyncV2OperationEvent]
@@ -122,12 +130,33 @@ final class SyncV2ReferenceQueue: SyncV2VectorQueue {
 
     /// 배치를 보내 커밋한다. 한 번의 시도로 친다.
     func commitBatch(operationID: UUID) async throws {
-        try append(.dispatchStarted, to: operationID)
-        attempts[operationID] = (attempts[operationID] ?? 0) + 1
+        try await beginDispatch(operationID: operationID)
         try append(.committed, to: operationID)
         if let entityID = entityOfOperation[operationID] {
             entityRevisions[entityID] = (baseRevisions[operationID] ?? 0) + 1
         }
+    }
+
+    func beginDispatch(operationID: UUID) async throws {
+        try append(.dispatchStarted, to: operationID)
+        attempts[operationID] = (attempts[operationID] ?? 0) + 1
+    }
+
+    /// 껐다 켠다. 보내는 도중이던 작업을 다시 대기로 돌린다.
+    ///
+    /// 계속 보내는 중이라고 믿으면 아무도 다시 손대지 않아 영영 대기에 남는다.
+    /// 시도 횟수는 줄이지 않는다. 끊긴 시도도 실제로 있었던 일이다.
+    func restart() async throws {
+        for operationID in eventsByOperation.keys {
+            let state = try await state(of: operationID)
+            guard state == .inflight else { continue }
+            try append(.enqueued, to: operationID)
+        }
+    }
+
+    /// 같은 작업을 다시 보낸다. 신원은 그대로다.
+    func retry(operationID: UUID) async throws {
+        try await commitBatch(operationID: operationID)
     }
 }
 
@@ -142,18 +171,23 @@ final class SyncV2ReferenceQueue: SyncV2VectorQueue {
 /// 벡터의 대기열은 표에 직접 밀어 넣지 않고 저장소의 정식 경로로 만들어야,
 /// 시험이 저장소가 하는 일을 실제로 확인한다.
 final class SyncV2StoreVectorQueue: SyncV2VectorQueue {
-    private let store: SyncV2Store
+    private let url: URL
     private let operationIDs: [UUID: UUID]
-    private let commit: (SyncV2Store, UUID) async throws -> Void
+    private let dispatch: (SyncV2Store, UUID, Bool) async throws -> Void
+    private var store: SyncV2Store
 
+    /// - Parameter dispatch: 저장소·작업·끝까지 갈지 여부를 받아 발송을 흉내
+    ///   낸다. 끝까지 가지 않으면 보내는 도중인 채로 남는다.
     init(
         store: SyncV2Store,
+        url: URL,
         operationIDs: [UUID: UUID],
-        commit: @escaping (SyncV2Store, UUID) async throws -> Void
+        dispatch: @escaping (SyncV2Store, UUID, Bool) async throws -> Void
     ) {
         self.store = store
+        self.url = url
         self.operationIDs = operationIDs
-        self.commit = commit
+        self.dispatch = dispatch
     }
 
     private func resolved(_ vectorOperationID: UUID) throws -> UUID {
@@ -180,7 +214,27 @@ final class SyncV2StoreVectorQueue: SyncV2VectorQueue {
     }
 
     func commitBatch(operationID: UUID) async throws {
-        try await commit(store, try resolved(operationID))
+        try await dispatch(store, try resolved(operationID), true)
+    }
+
+    func beginDispatch(operationID: UUID) async throws {
+        try await dispatch(store, try resolved(operationID), false)
+    }
+
+    /// 진짜로 닫았다가 다시 연다. 저장소가 열면서 하는 복구를 그대로 태운다.
+    ///
+    /// 상태만 손으로 되돌리면 저장소가 실제로 하는 일을 건너뛰게 되어, 시험이
+    /// 저장소가 아니라 시험 자신을 확인하게 된다.
+    func restart() async throws {
+        await store.close()
+        guard case let .available(reopened) = await SyncV2Store.open(at: url) else {
+            throw SyncV2ContractError("INVALID_ARGUMENT", "저장소를 다시 열지 못했다")
+        }
+        store = reopened
+    }
+
+    func retry(operationID: UUID) async throws {
+        try await commitBatch(operationID: operationID)
     }
 
     func state(of operationID: UUID) async throws -> SyncV2OperationStatus {
@@ -204,6 +258,14 @@ final class SyncV2StoreVectorQueue: SyncV2VectorQueue {
             operationID: try resolved(operationID)
         )
     }
+
+    /// 시험이 끝난 뒤 정리한다.
+    func close() async {
+        await store.close()
+    }
+
+    /// 지금 열려 있는 저장소다. 시험이 어긋남을 직접 확인할 때 쓴다.
+    var currentStore: SyncV2Store { store }
 }
 
 // MARK: - 실행기
@@ -285,6 +347,13 @@ final class SyncV2VectorRunner {
         proseAssertions.append(contentsOf: vector.invariants.map { "\($0.id) \($0.assert)" })
     }
 
+    /// 이 동작 뒤에 클라이언트가 강제로 꺼지는가.
+    private func terminatesAfter(_ action: SyncV2TransitionVector.Action) -> Bool {
+        vector.faultInjections.contains {
+            $0.afterActionID == action.actionID && $0.type == "terminate_client"
+        }
+    }
+
     private func perform(_ action: SyncV2TransitionVector.Action) async throws {
         switch action.kind {
         case .cancelOperation:
@@ -302,7 +371,22 @@ final class SyncV2VectorRunner {
             guard let operationID = action.input["operation_id"]?.uuidValue else {
                 throw SyncV2ContractError("INVALID_ARGUMENT", "\(action.actionID): 커밋 입력이 모자라다")
             }
-            try await queue.commitBatch(operationID: operationID)
+            // 이 동작 뒤에 강제 종료가 예정돼 있으면 끝까지 가지 않는다.
+            // 보내는 도중에 꺼진 상태를 만들어야 하기 때문이다.
+            if terminatesAfter(action) {
+                try await queue.beginDispatch(operationID: operationID)
+            } else {
+                try await queue.commitBatch(operationID: operationID)
+            }
+
+        case .restartClient:
+            try await queue.restart()
+
+        case .retryOperation:
+            guard let operationID = action.input["operation_id"]?.uuidValue else {
+                throw SyncV2ContractError("INVALID_ARGUMENT", "\(action.actionID): 재시도 입력이 모자라다")
+            }
+            try await queue.retry(operationID: operationID)
 
         default:
             throw UnsupportedAction(actionID: action.actionID, kind: action.kind)
