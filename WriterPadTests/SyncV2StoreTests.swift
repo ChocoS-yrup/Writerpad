@@ -5650,6 +5650,109 @@ final class SyncV2StoreTests: XCTestCase {
         XCTAssertEqual(divergences, [])
     }
 
+    /// 여러 경로를 섞어 태워도 기록과 칸이 끝까지 붙어 있어야 한다.
+    ///
+    /// 지금까지는 경로를 하나씩 따로 태웠다. 실제로는 섞여서 온다.
+    func testMixedLifecycleKeepsEventsAndColumnTogether() async throws {
+        let url = try databaseURL()
+        let context = QueueAPIContext()
+        let documentID = UUID()
+        let operationID = UUID()
+
+        let store = try await connectedStore(at: url, context: context)
+        _ = try await store.enqueue(
+            context.batch(
+                mutations: [
+                    context.documentMutation(
+                        operationID: operationID,
+                        documentID: documentID
+                    )
+                ]
+            )
+        )
+
+        // 세 번 실패하고 네 번째에 성공한다.
+        for round in 0..<3 {
+            let claimed = try await store.claimReadyOperations(
+                limit: 1,
+                now: Date(timeIntervalSince1970: TimeInterval(100 + round * 10))
+            )
+            try await store.deferRetry(
+                try XCTUnwrap(claimed.first),
+                errorCode: "NETWORK_UNAVAILABLE",
+                detail: nil,
+                nextAttemptAt: Date(timeIntervalSince1970: TimeInterval(105 + round * 10))
+            )
+            let midway = try await store.operationStateDivergences()
+            XCTAssertEqual(midway, [], "\(round + 1)번째 실패 뒤")
+            try await store.makeRetryWaitOperationsReady(localProjectID: nil)
+        }
+        let finalClaim = try await store.claimReadyOperations(
+            limit: 1,
+            now: Date(timeIntervalSince1970: 200)
+        )
+        let operation = try XCTUnwrap(finalClaim.first)
+        try await store.complete(operation, result: commitResult(for: operation))
+
+        let events = try await store.operationEvents(operationID: operationID)
+        let divergences = try await store.operationStateDivergences()
+        await store.close()
+
+        XCTAssertEqual(divergences, [], "섞어 태워도 끝까지 붙어 있어야 한다")
+        XCTAssertEqual(
+            try SyncV2OperationStateDerivation.state(from: events),
+            .completed
+        )
+        XCTAssertEqual(events.map(\.sequence), Array(1...events.count))
+
+        // 실패한 자취가 성공 뒤에도 남아 있어야 한다.
+        XCTAssertEqual(
+            events.filter { $0.errorCode == "NETWORK_UNAVAILABLE" }.count,
+            3
+        )
+        XCTAssertEqual(events.last?.type, .committed)
+    }
+
+    /// 다시 시도를 되풀이하면 기록이 얼마나 길어지는지 재 둔다.
+    ///
+    /// 되돌아올 때마다 사건이 둘씩 붙는다. 오래 쓴 장부가 감당 못 할 만큼
+    /// 불어나는지 알아 두어야 한다.
+    func testEventHistoryGrowthPerRetryCycle() async throws {
+        let url = try databaseURL()
+        let context = QueueAPIContext()
+        let operationID = UUID()
+        let cycles = 20
+
+        let store = try await connectedStore(at: url, context: context)
+        _ = try await store.enqueue(
+            context.batch(
+                mutations: [context.documentMutation(operationID: operationID)]
+            )
+        )
+        for round in 0..<cycles {
+            let claimed = try await store.claimReadyOperations(
+                limit: 1,
+                now: Date(timeIntervalSince1970: TimeInterval(100 + round))
+            )
+            try await store.deferRetry(
+                try XCTUnwrap(claimed.first),
+                errorCode: "NETWORK_UNAVAILABLE",
+                detail: nil,
+                nextAttemptAt: Date(timeIntervalSince1970: TimeInterval(101 + round))
+            )
+            try await store.makeRetryWaitOperationsReady(localProjectID: nil)
+        }
+        let events = try await store.operationEvents(operationID: operationID)
+        await store.close()
+
+        // 대기 1 + 주기마다 (발송 시작, 다시 시도, 대기) 3개.
+        XCTAssertEqual(events.count, 1 + cycles * 3)
+        XCTAssertEqual(
+            try SyncV2OperationStateDerivation.state(from: events),
+            .pending
+        )
+    }
+
     /// 장부 한 줄이 어긋났다고 저장소가 통째로 안 열리면 안 된다. 사용자는
     /// 그 순간 동기화를 전부 잃는다. 어긋난 줄은 그냥 두고 눈에 띄게만 한다.
     func testDivergentOperationDoesNotBlockStoreOpen() async throws {

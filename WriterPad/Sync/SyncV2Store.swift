@@ -2030,7 +2030,22 @@ actor SyncV2Store:
         try scalarInt("SELECT COUNT(*) FROM sync_operations;")
     }
 
+    /// 작업의 지금 상태다.
+    ///
+    /// 저장된 칸이 아니라 사건 기록에서 계산한다. 칸은 계산 결과를 그대로
+    /// 비추어 두는 자리일 뿐이고, 둘이 갈라지면 사건 쪽이 옳다. 기록이 아직
+    /// 없는 작업만 칸을 그대로 읽는다.
     func operationStatus(
+        operationID: UUID
+    ) throws -> String? {
+        let events = try operationEvents(operationID: operationID)
+        if let derived = try? SyncV2OperationStateDerivation.state(from: events) {
+            return derived.rawValue
+        }
+        return try storedOperationStatus(operationID: operationID)
+    }
+
+    private func storedOperationStatus(
         operationID: UUID
     ) throws -> String? {
         try withStatement(
@@ -7363,6 +7378,99 @@ actor SyncV2Store:
                 )
             }
             return events
+        }
+    }
+
+    /// 작업을 취소한다.
+    ///
+    /// 계약이 정한 세 가지를 지킨다. 같은 사건 식별자로 다시 오면 기록을
+    /// 늘리지 않고 이미 취소됐다고 답한다. 이미 취소된 작업에 다시 요청해도
+    /// 오류가 아니다. 그러나 이미 끝난 작업은 `OPERATION_TERMINAL`로 거절한다.
+    /// 완료된 작업을 취소로 덮으면 서버에 이미 올라간 글이 안 올라간 것처럼
+    /// 보인다.
+    @discardableResult
+    func cancelOperation(
+        operationID: UUID,
+        cancelEventID: UUID
+    ) throws -> SyncV2OperationCancelOutcome {
+        let operationKey = operationID.uuidString.lowercased()
+        let eventKey = cancelEventID.uuidString.lowercased()
+        return try transaction {
+            guard try storedOperationStatus(operationID: operationID) != nil else {
+                throw SyncV2ContractError("INVALID_ARGUMENT", "모르는 작업이다")
+            }
+            if let owner = try operationEventOwner(eventID: eventKey) {
+                guard owner.operationID == operationKey,
+                      owner.type == .cancelRequested
+                else {
+                    throw SyncV2ContractError("EVENT_ID_REUSED")
+                }
+                return .alreadyCancelled(eventID: cancelEventID)
+            }
+
+            let timestamp = Self.timestamp()
+            try ensureOperationEventHistory(
+                operationID: operationKey,
+                timestamp: timestamp
+            )
+            let current = try SyncV2OperationStateDerivation.state(
+                from: try operationEvents(operationID: operationKey)
+            )
+            if current == .completed {
+                throw SyncV2ContractError.operationTerminal
+            }
+            if current == .cancelled {
+                return .alreadyCancelled(eventID: nil)
+            }
+
+            try withStatement(
+                """
+                UPDATE sync_operations
+                SET status = 'cancelled',
+                    next_attempt_at = NULL,
+                    updated_at = ?
+                WHERE operation_id = ?;
+                """
+            ) { statement in
+                try bind(timestamp, at: 1, to: statement)
+                try bind(operationKey, at: 2, to: statement)
+                try stepDone(statement)
+            }
+            try insertOperationEvent(
+                eventID: eventKey,
+                operationID: operationKey,
+                sequence: try operationEvents(operationID: operationKey).count + 1,
+                type: .cancelRequested,
+                recordedAt: timestamp,
+                errorCode: nil
+            )
+            return .cancelled(eventID: cancelEventID)
+        }
+    }
+
+    /// 사건 식별자가 어느 작업의 무슨 사건이었는지 찾는다.
+    private func operationEventOwner(
+        eventID: String
+    ) throws -> (operationID: String, type: SyncV2OperationEventType)? {
+        try withStatement(
+            """
+            SELECT operation_id, event_type
+            FROM sync_operation_events
+            WHERE event_id = ?
+            LIMIT 1;
+            """
+        ) { statement in
+            try bind(eventID, at: 1, to: statement)
+            guard sqlite3_step(statement) == SQLITE_ROW,
+                  let operationID = sqlite3_column_text(statement, 0),
+                  let rawType = sqlite3_column_text(statement, 1),
+                  let type = SyncV2OperationEventType(
+                      rawValue: String(cString: rawType)
+                  )
+            else {
+                return nil
+            }
+            return (String(cString: operationID), type)
         }
     }
 

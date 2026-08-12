@@ -4,20 +4,15 @@ import XCTest
 
 /// 상태 전이 벡터를 실제로 돌리는 하네스다.
 ///
-/// 벡터가 두드리는 대상은 `SyncV2VectorQueue`다. 지금은 계약 모듈 위에 얹은
-/// 참조 구현(`SyncV2ReferenceQueue`)이 붙어 있고, `SyncV2Store`가 사건 파생
-/// 상태로 바뀌면 같은 프로토콜을 채워 **같은 벡터를 그대로 받는다.** 그때
-/// 벡터를 다시 쓰지 않아도 되도록 경계를 지금 그어 둔다.
-///
-/// - Important: 지금 이 하네스가 검증하는 것은 참조 구현이지 운영 저장소가
-///   아니다. 이 단계의 값어치는 (1) 하네스가 실제로 무언가를 잡는지 확인하고
-///   (2) 취소·멱등·종료 상태의 의미를 못 박아 두는 데 있다.
+/// 벡터가 두드리는 대상은 `SyncV2VectorQueue`다. 계약 모듈 위에 얹은 참조
+/// 구현과, 실제로 사용자 글을 나르는 `SyncV2Store` 둘 다 이 프로토콜을 채운다.
+/// **같은 벡터를 둘에 그대로 먹여** 답이 같은지 본다.
 protocol SyncV2VectorQueue: AnyObject {
-    func cancelOperation(operationID: UUID, cancelEventID: UUID) throws -> SyncV2CancelOutcome
-    func commitBatch(operationID: UUID) throws
-    func state(of operationID: UUID) throws -> SyncV2OperationStatus
-    func attemptCount(of operationID: UUID) -> Int
-    func events(of operationID: UUID) -> [SyncV2OperationEvent]
+    func cancelOperation(operationID: UUID, cancelEventID: UUID) async throws -> SyncV2CancelOutcome
+    func commitBatch(operationID: UUID) async throws
+    func state(of operationID: UUID) async throws -> SyncV2OperationStatus
+    func attemptCount(of operationID: UUID) async throws -> Int
+    func events(of operationID: UUID) async throws -> [SyncV2OperationEvent]
 }
 
 /// 취소 요청의 결과다. 이미 취소된 작업에 다시 요청해도 오류가 아니다.
@@ -55,45 +50,28 @@ final class SyncV2ReferenceQueue: SyncV2VectorQueue {
         }
     }
 
-    /// 벡터가 깔아 둔 상태를 사건 기록으로 되돌린다.
-    ///
-    /// Windows도 낡은 대기열을 계약으로 이관할 때 같은 표를 쓴다. 특히
-    /// `inflight`는 그대로 두지 않고 `retry_wait`로 내려앉힌다. 발송 도중
-    /// 꺼진 작업을 계속 발송 중이라고 믿으면 영원히 아무도 손대지 않는다.
+    /// 벡터가 깔아 둔 상태를 사건 기록으로 되돌린다. 저장소의 되만들기 표와
+    /// 같은 규칙을 쓴다.
     private static func seedEvents(for state: SyncV2OperationStatus) -> [SyncV2OperationEvent] {
-        var types: [SyncV2OperationEventType] = [.enqueued]
-        switch state {
-        case .pending:
-            break
-        case .inflight, .retryWait:
-            types += [.dispatchStarted, .retryScheduled]
-        case .blocked:
-            types += [.blocked]
-        case .conflict:
-            types += [.conflictDetected]
-        case .completed:
-            types += [.committed]
-        case .cancelled:
-            types += [.cancelRequested]
-        }
-        return types.enumerated().map { index, type in
+        SyncV2Store.seedEventTypes(for: state).enumerated().map { index, type in
             SyncV2OperationEvent(sequence: index + 1, type: type)
         }
     }
 
-    func events(of operationID: UUID) -> [SyncV2OperationEvent] {
+    func events(of operationID: UUID) async throws -> [SyncV2OperationEvent] {
         eventsByOperation[operationID] ?? []
     }
 
-    func state(of operationID: UUID) throws -> SyncV2OperationStatus {
-        try SyncV2OperationStateDerivation.state(from: events(of: operationID))
+    func state(of operationID: UUID) async throws -> SyncV2OperationStatus {
+        try SyncV2OperationStateDerivation.state(
+            from: eventsByOperation[operationID] ?? []
+        )
     }
 
-    func attemptCount(of operationID: UUID) -> Int {
+    func attemptCount(of operationID: UUID) async throws -> Int {
         attempts[operationID] ?? 0
     }
 
-    /// 사건을 하나 덧붙인다. 끝난 작업에는 붙지 않는다.
     private func append(
         _ type: SyncV2OperationEventType,
         to operationID: UUID,
@@ -118,7 +96,10 @@ final class SyncV2ReferenceQueue: SyncV2VectorQueue {
     /// 같은 사건 식별자로 다시 오면 사건을 늘리지 않고 이미 취소됐다고
     /// 답한다. 완료된 작업은 `OPERATION_TERMINAL`로 거절한다. 이미 취소된
     /// 작업은 오류가 아니다.
-    func cancelOperation(operationID: UUID, cancelEventID: UUID) throws -> SyncV2CancelOutcome {
+    func cancelOperation(
+        operationID: UUID,
+        cancelEventID: UUID
+    ) async throws -> SyncV2CancelOutcome {
         guard eventsByOperation[operationID] != nil else {
             throw SyncV2ContractError("INVALID_ARGUMENT", "모르는 작업이다")
         }
@@ -128,7 +109,7 @@ final class SyncV2ReferenceQueue: SyncV2VectorQueue {
             }
             return .alreadyCancelled(eventID: cancelEventID)
         }
-        let current = try state(of: operationID)
+        let current = try await state(of: operationID)
         if current == .completed {
             throw SyncV2ContractError.operationTerminal
         }
@@ -140,13 +121,88 @@ final class SyncV2ReferenceQueue: SyncV2VectorQueue {
     }
 
     /// 배치를 보내 커밋한다. 한 번의 시도로 친다.
-    func commitBatch(operationID: UUID) throws {
+    func commitBatch(operationID: UUID) async throws {
         try append(.dispatchStarted, to: operationID)
-        attempts[operationID] = attemptCount(of: operationID) + 1
+        attempts[operationID] = (attempts[operationID] ?? 0) + 1
         try append(.committed, to: operationID)
         if let entityID = entityOfOperation[operationID] {
             entityRevisions[entityID] = (baseRevisions[operationID] ?? 0) + 1
         }
+    }
+}
+
+// MARK: - 운영 저장소 어댑터
+
+/// 벡터를 운영 저장소로 돌린다.
+///
+/// 참조 구현은 계약을 옳게 옮겼는지 확인해 주지만, 실제로 사용자 글을 나르는
+/// 것은 `SyncV2Store`다. 같은 벡터를 저장소에도 그대로 먹여 봐야 한다.
+///
+/// 벡터가 부르는 작업 식별자와 저장소가 실제로 만든 것을 잇는 표를 받는다.
+/// 벡터의 대기열은 표에 직접 밀어 넣지 않고 저장소의 정식 경로로 만들어야,
+/// 시험이 저장소가 하는 일을 실제로 확인한다.
+final class SyncV2StoreVectorQueue: SyncV2VectorQueue {
+    private let store: SyncV2Store
+    private let operationIDs: [UUID: UUID]
+    private let commit: (SyncV2Store, UUID) async throws -> Void
+
+    init(
+        store: SyncV2Store,
+        operationIDs: [UUID: UUID],
+        commit: @escaping (SyncV2Store, UUID) async throws -> Void
+    ) {
+        self.store = store
+        self.operationIDs = operationIDs
+        self.commit = commit
+    }
+
+    private func resolved(_ vectorOperationID: UUID) throws -> UUID {
+        guard let real = operationIDs[vectorOperationID] else {
+            throw SyncV2ContractError("INVALID_ARGUMENT", "벡터 작업을 잇지 못했다")
+        }
+        return real
+    }
+
+    func cancelOperation(
+        operationID: UUID,
+        cancelEventID: UUID
+    ) async throws -> SyncV2CancelOutcome {
+        let outcome = try await store.cancelOperation(
+            operationID: try resolved(operationID),
+            cancelEventID: cancelEventID
+        )
+        switch outcome {
+        case let .cancelled(eventID):
+            return .cancelled(eventID: eventID)
+        case let .alreadyCancelled(eventID):
+            return .alreadyCancelled(eventID: eventID)
+        }
+    }
+
+    func commitBatch(operationID: UUID) async throws {
+        try await commit(store, try resolved(operationID))
+    }
+
+    func state(of operationID: UUID) async throws -> SyncV2OperationStatus {
+        let raw = try await store.operationStatus(
+            operationID: try resolved(operationID)
+        )
+        guard let raw, let state = SyncV2OperationStatus(rawValue: raw) else {
+            throw SyncV2ContractError("INVALID_ARGUMENT", "상태를 읽지 못했다")
+        }
+        return state
+    }
+
+    func attemptCount(of operationID: UUID) async throws -> Int {
+        try await store.operationAttempts(
+            operationID: try resolved(operationID)
+        ) ?? 0
+    }
+
+    func events(of operationID: UUID) async throws -> [SyncV2OperationEvent] {
+        try await store.operationEvents(
+            operationID: try resolved(operationID)
+        )
     }
 }
 
@@ -175,11 +231,7 @@ final class SyncV2VectorRunner {
 
     /// 참조 구현으로 벡터를 돌릴 준비를 한다.
     static func withReferenceQueue(_ vector: SyncV2TransitionVector) throws -> SyncV2VectorRunner {
-        guard let client = vector.initialClientStates.first(where: { $0.platform == "ipad" })
-            ?? vector.initialClientStates.first
-        else {
-            throw SyncV2ContractError("INVALID_ARGUMENT", "벡터에 클라이언트가 없다")
-        }
+        let client = try primaryClient(of: vector)
         return SyncV2VectorRunner(
             vector: vector,
             queue: SyncV2ReferenceQueue(
@@ -187,6 +239,18 @@ final class SyncV2VectorRunner {
                 serverState: vector.initialServerState
             )
         )
+    }
+
+    /// 벡터가 겨냥하는 클라이언트다. 아이패드가 있으면 아이패드를 본다.
+    static func primaryClient(
+        of vector: SyncV2TransitionVector
+    ) throws -> SyncV2TransitionVector.ClientState {
+        guard let client = vector.initialClientStates.first(where: { $0.platform == "ipad" })
+            ?? vector.initialClientStates.first
+        else {
+            throw SyncV2ContractError("INVALID_ARGUMENT", "벡터에 클라이언트가 없다")
+        }
+        return client
     }
 
     /// 아직 다루지 못하는 동작이다. 조용히 넘기지 않고 이름을 들고 올라간다.
@@ -199,11 +263,11 @@ final class SyncV2VectorRunner {
     }
 
     /// 동작을 차례대로 돌린다.
-    func run() throws {
+    func run() async throws {
         for action in vector.orderedActions {
             proseAssertions.append("\(action.actionID) \(action.expectedOutcome)")
             do {
-                try perform(action)
+                try await perform(action)
             } catch let error as SyncV2ContractError {
                 // 계약 오류는 벡터가 기대하는 결과일 수 있다. 어느 작업에서
                 // 났는지 기록해 두고 계속 간다.
@@ -221,7 +285,7 @@ final class SyncV2VectorRunner {
         proseAssertions.append(contentsOf: vector.invariants.map { "\($0.id) \($0.assert)" })
     }
 
-    private func perform(_ action: SyncV2TransitionVector.Action) throws {
+    private func perform(_ action: SyncV2TransitionVector.Action) async throws {
         switch action.kind {
         case .cancelOperation:
             guard let operationID = action.input["operation_id"]?.uuidValue,
@@ -229,13 +293,16 @@ final class SyncV2VectorRunner {
             else {
                 throw SyncV2ContractError("INVALID_ARGUMENT", "\(action.actionID): 취소 입력이 모자라다")
             }
-            _ = try queue.cancelOperation(operationID: operationID, cancelEventID: eventID)
+            _ = try await queue.cancelOperation(
+                operationID: operationID,
+                cancelEventID: eventID
+            )
 
         case .commitBatch:
             guard let operationID = action.input["operation_id"]?.uuidValue else {
                 throw SyncV2ContractError("INVALID_ARGUMENT", "\(action.actionID): 커밋 입력이 모자라다")
             }
-            try queue.commitBatch(operationID: operationID)
+            try await queue.commitBatch(operationID: operationID)
 
         default:
             throw UnsupportedAction(actionID: action.actionID, kind: action.kind)
@@ -248,21 +315,25 @@ final class SyncV2VectorRunner {
     /// 판정을 `XCTAssert`로 바로 하지 않고 목록으로 내는 이유는, 하네스가
     /// 실제로 무언가를 잡는지 확인하는 시험에서 "틀린 구현을 넣으면 어긋남이
     /// 나온다"를 그대로 확인할 수 있어야 하기 때문이다.
-    func mechanicalMismatches() -> [String] {
+    func mechanicalMismatches() async -> [String] {
         var mismatches: [String] = []
         for expectation in vector.expectedQueueStates {
             let label = "\(vector.vectorID) \(expectation.operationID)"
             do {
-                let actual = try queue.state(of: expectation.operationID)
+                let actual = try await queue.state(of: expectation.operationID)
                 if actual != expectation.state {
                     mismatches.append("\(label): 상태 \(actual) ≠ 기대 \(expectation.state)")
                 }
             } catch {
                 mismatches.append("\(label): 상태를 계산하지 못했다 — \(error)")
             }
-            let attempts = queue.attemptCount(of: expectation.operationID)
-            if attempts != expectation.attemptCount {
-                mismatches.append("\(label): 시도 \(attempts) ≠ 기대 \(expectation.attemptCount)")
+            do {
+                let attempts = try await queue.attemptCount(of: expectation.operationID)
+                if attempts != expectation.attemptCount {
+                    mismatches.append("\(label): 시도 \(attempts) ≠ 기대 \(expectation.attemptCount)")
+                }
+            } catch {
+                mismatches.append("\(label): 시도 횟수를 읽지 못했다 — \(error)")
             }
             if let expectedCode = expectation.errorCode {
                 let actual = lastActionErrorCode[expectation.operationID]
@@ -280,8 +351,8 @@ final class SyncV2VectorRunner {
     func assertMechanicalExpectations(
         file: StaticString = #filePath,
         line: UInt = #line
-    ) {
-        let mismatches = mechanicalMismatches()
+    ) async {
+        let mismatches = await mechanicalMismatches()
         XCTAssertEqual(
             mismatches,
             [],

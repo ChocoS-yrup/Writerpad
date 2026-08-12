@@ -869,6 +869,14 @@ enum SyncV2OperationEventType: String, Equatable, Sendable {
     }
 }
 
+/// 취소 요청의 결과다. 이미 취소된 작업에 다시 요청해도 오류가 아니다.
+enum SyncV2OperationCancelOutcome: Equatable, Sendable {
+    case cancelled(eventID: UUID)
+    /// 같은 요청이 다시 왔다. 사건 식별자가 같으면 그 값을, 이미 다른 요청으로
+    /// 취소돼 있었으면 nil을 준다.
+    case alreadyCancelled(eventID: UUID?)
+}
+
 /// 사건에서 계산한 상태와 저장된 status 칸이 어긋난 작업이다.
 ///
 /// 읽는 쪽을 사건 계산으로 옮기기 전에 이 목록이 비어 있어야 한다.
