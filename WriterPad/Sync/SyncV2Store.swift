@@ -2375,6 +2375,10 @@ actor SyncV2Store:
                 // 상태 정리가 모두 끝난 뒤에 사건 기록을 채운다. 앞의 정리들이
                 // status를 바꾸므로, 먼저 채우면 기록과 칸이 어긋난 채로 남는다.
                 try backfillOperationEvents()
+                // 앞이 끊겨 발송 대상에서 빠진 작업을 지금 리비전 위로
+                // 되세운다. 이것이 없으면 사용자가 쓴 글이 대기 중이라는
+                // 표시만 단 채 영영 올라가지 않는다.
+                try adoptOrphanedOperationsLocked()
             }
         } catch {
             throw SyncV2StoreError.unavailable(
@@ -7381,7 +7385,93 @@ actor SyncV2Store:
         }
     }
 
-    /// 작업을 취소한다.
+    /// 앞이 끊겨 영영 발송되지 않는 작업이다.
+    ///
+    /// 연쇄 편집의 뒤쪽은 기준 리비전 없이 큐에 들어가고, 앞선 작업이 완료될
+    /// 때 그 값을 받는다. 앞선 작업이 완료 아닌 길로 끝나면 — 취소되거나
+    /// 밀려나거나 — 뒤쪽은 값이 빈 채로 남는다. 발송 조건이 그 값을 요구하므로
+    /// 영영 대상에서 빠지는데, 상태는 대기 중이라 화면에는 아무 문제 없어
+    /// 보인다. 큐가 통째로 멈춘다.
+    ///
+    /// 앞에 살아 있는 작업이 없는데도 기준 리비전이 비어 있으면 그것이다.
+    func orphanedOperationIDs() throws -> [String] {
+        try operationIDs(
+            where: """
+            o.document_id IS NOT NULL
+              AND o.base_revision IS NULL
+              AND o.status IN ('pending', 'retry_wait', 'blocked')
+              AND NOT EXISTS (
+                  SELECT 1 FROM sync_operations earlier
+                  WHERE earlier.document_id = o.document_id
+                    AND earlier.document_sequence < o.document_sequence
+                    AND earlier.status NOT IN ('completed', 'cancelled')
+              )
+            """,
+            alias: "o"
+        ) { _ in }
+    }
+
+    /// 앞이 끊긴 작업을 문서의 지금 리비전으로 다시 세운다.
+    ///
+    /// 앞선 작업이 사라졌으니 그것이 만들려던 상태는 오지 않는다. 남은 것은
+    /// 서버에 지금 있는 것 위에 이 편집을 얹는 길뿐이다. 기준을 지금 리비전으로
+    /// 바꿔 발송 대상에 되돌린다.
+    ///
+    /// 사용자가 쓴 글은 건드리지 않는다. 무엇을 보낼지는 그대로 두고 어디에
+    /// 얹을지만 고친다.
+    @discardableResult
+    func adoptOrphanedOperations() throws -> [String] {
+        try transaction {
+            try adoptOrphanedOperationsLocked()
+        }
+    }
+
+    /// 이미 거래 안에 있을 때 쓴다. 거래를 또 열면 안 된다.
+    @discardableResult
+    private func adoptOrphanedOperationsLocked() throws -> [String] {
+        let orphans = try orphanedOperationIDs()
+        guard !orphans.isEmpty else { return [] }
+        let timestamp = Self.timestamp()
+        for operationID in orphans {
+            try withStatement(
+                """
+                UPDATE sync_operations
+                SET base_revision = (
+                        SELECT d.server_revision FROM sync_documents d
+                        WHERE d.document_id = sync_operations.document_id
+                    ),
+                    base_content = (
+                        SELECT d.base_content FROM sync_documents d
+                        WHERE d.document_id = sync_operations.document_id
+                    ),
+                    next_attempt_at = NULL,
+                    updated_at = ?
+                WHERE operation_id = ?
+                  AND base_revision IS NULL;
+                """
+            ) { statement in
+                try bind(timestamp, at: 1, to: statement)
+                try bind(operationID, at: 2, to: statement)
+                try stepDone(statement)
+            }
+        }
+        // 다시 대기열에 올랐다는 것을 남긴다. 왜 되살아났는지 기록에 없으면
+        // 나중에 되짚을 수 없다.
+        let appendable = try orphans.filter { operationID in
+            let events = try operationEvents(operationID: operationID)
+            return (try? SyncV2OperationStateDerivation
+                .requireAppendable(to: events)) != nil
+        }
+        try recordOperationEvents(
+            appendable,
+            type: .enqueued,
+            errorCode: "ADOPTED_AFTER_ORPHANED_CHAIN",
+            timestamp: timestamp
+        )
+        return orphans
+    }
+
+    /// 작업을 취소한다. 안쪽에서 되세우기까지 함께 한다.
     ///
     /// 계약이 정한 세 가지를 지킨다. 같은 사건 식별자로 다시 오면 기록을
     /// 늘리지 않고 이미 취소됐다고 답한다. 이미 취소된 작업에 다시 요청해도
@@ -7444,6 +7534,9 @@ actor SyncV2Store:
                 recordedAt: timestamp,
                 errorCode: nil
             )
+            // 취소한 작업을 기다리던 뒤쪽 편집이 있으면 여기서 끊긴다. 다음에
+            // 열 때까지 두지 않고 그 자리에서 되세운다.
+            try adoptOrphanedOperationsLocked()
             return .cancelled(eventID: cancelEventID)
         }
     }

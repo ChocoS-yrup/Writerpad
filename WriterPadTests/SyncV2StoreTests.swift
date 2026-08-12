@@ -5753,6 +5753,221 @@ final class SyncV2StoreTests: XCTestCase {
         )
     }
 
+    /// 연쇄 편집의 뒤쪽이 영영 발송되지 않는 자리를 막는다.
+    ///
+    /// 앞선 저장이 아직 안 끝났는데 또 저장하면, 뒤쪽 작업은 기준 리비전 없이
+    /// 큐에 들어간다. 그 값은 앞선 작업이 **완료될 때** 채워진다. 앞선 작업이
+    /// 완료 아닌 길로 끝나면 뒤쪽은 값이 빈 채로 남아 발송 대상에서 영영
+    /// 빠진다. 큐가 통째로 멈추는데 화면에는 대기 중으로만 보인다.
+    ///
+    /// 취소하는 그 자리에서 되세워 그런 일이 생기지 않게 한다.
+    func testCancelledLeaderDoesNotOrphanFollowingEdit() async throws {
+        let url = try databaseURL()
+        let context = QueueAPIContext()
+        let leaderID = UUID()
+        let followerID = UUID()
+        let followerContent = "첫 문장 그리고 둘째 문장"
+
+        let store = try await connectedStore(at: url, context: context)
+        _ = try await store.enqueue(
+            context.batch(
+                mutations: [
+                    context.documentMutation(
+                        operationID: leaderID,
+                        content: "첫 문장",
+                        generation: 1
+                    )
+                ]
+            )
+        )
+        // 앞선 저장이 아직 안 끝났는데 또 저장한다.
+        _ = try await store.enqueue(
+            context.batch(
+                mutations: [
+                    context.documentMutation(
+                        operationID: followerID,
+                        content: followerContent,
+                        generation: 2
+                    )
+                ]
+            )
+        )
+
+        try await store.cancelOperation(
+            operationID: leaderID,
+            cancelEventID: UUID()
+        )
+
+        let claimed = try await store.claimReadyOperations(
+            limit: 10,
+            now: Date(timeIntervalSince1970: 100)
+        )
+        let orphans = try await store.orphanedOperationIDs()
+        let events = try await store.operationEvents(operationID: followerID)
+        let divergences = try await store.operationStateDivergences()
+        await store.close()
+
+        XCTAssertEqual(
+            claimed.map(\.operationID),
+            [followerID],
+            "앞이 취소돼도 뒤쪽은 발송된다"
+        )
+        XCTAssertEqual(
+            claimed.first?.content,
+            followerContent,
+            "사용자가 쓴 글은 그대로다"
+        )
+        XCTAssertEqual(orphans, [])
+        XCTAssertTrue(
+            events.contains { $0.errorCode == "ADOPTED_AFTER_ORPHANED_CHAIN" },
+            "왜 되세워졌는지 기록에 남아야 한다"
+        )
+        XCTAssertEqual(divergences, [])
+    }
+
+    /// 이미 끊긴 채로 남아 있던 장부는 다음에 열 때 되세워야 한다.
+    ///
+    /// 지금 빌드는 취소하는 자리에서 바로 되세우지만, 예전 빌드가 남긴 장부에는
+    /// 이미 끊긴 작업이 들어 있을 수 있다.
+    func testLaunchRecoveryAdoptsOrphanLeftByOlderBuild() async throws {
+        let url = try databaseURL()
+        let context = QueueAPIContext()
+        let operationID = UUID()
+
+        let store = try await connectedStore(at: url, context: context)
+        _ = try await store.enqueue(
+            context.batch(
+                mutations: [
+                    context.documentMutation(operationID: operationID, content: "본문")
+                ]
+            )
+        )
+        await store.close()
+
+        // 예전 빌드가 남긴 모양을 흉내 낸다. 기준 리비전이 비어 있어 발송
+        // 대상에서 빠져 있다.
+        let raw = try RawSQLite(url: url)
+        try raw.execute(
+            """
+            UPDATE sync_operations SET base_revision = NULL
+            WHERE operation_id = '\(operationID.uuidString.lowercased())';
+            """
+        )
+        raw.close()
+
+        let reopened = try await openStore(at: url)
+        let orphans = try await reopened.orphanedOperationIDs()
+        let claimed = try await reopened.claimReadyOperations(
+            limit: 10,
+            now: Date(timeIntervalSince1970: 100)
+        )
+        await reopened.close()
+
+        XCTAssertEqual(orphans, [], "열면서 되세워야 한다")
+        XCTAssertEqual(claimed.map(\.operationID), [operationID])
+    }
+
+    /// 앞이 끊긴 작업을 지금 리비전 위로 되세우면 다시 발송된다.
+    ///
+    /// 사용자가 쓴 글은 건드리지 않는다. 무엇을 보낼지는 그대로 두고 어디에
+    /// 얹을지만 고친다.
+    func testAdoptingOrphanedOperationMakesItDispatchableAgain() async throws {
+        let url = try databaseURL()
+        let context = QueueAPIContext()
+        let leaderID = UUID()
+        let followerID = UUID()
+        let followerContent = "첫 문장 그리고 둘째 문장"
+
+        let store = try await connectedStore(at: url, context: context)
+        _ = try await store.enqueue(
+            context.batch(
+                mutations: [
+                    context.documentMutation(operationID: leaderID, content: "첫 문장", generation: 1)
+                ]
+            )
+        )
+        _ = try await store.enqueue(
+            context.batch(
+                mutations: [
+                    context.documentMutation(
+                        operationID: followerID,
+                        content: followerContent,
+                        generation: 2
+                    )
+                ]
+            )
+        )
+        try await store.cancelOperation(
+            operationID: leaderID,
+            cancelEventID: UUID()
+        )
+
+        // 취소가 이미 되세웠으므로 여기서 더 되세울 것은 없다.
+        let adopted = try await store.adoptOrphanedOperations()
+        let claimed = try await store.claimReadyOperations(
+            limit: 10,
+            now: Date(timeIntervalSince1970: 100)
+        )
+        let remaining = try await store.orphanedOperationIDs()
+        let events = try await store.operationEvents(operationID: followerID)
+        let divergences = try await store.operationStateDivergences()
+        await store.close()
+
+        XCTAssertEqual(adopted, [], "취소하는 자리에서 이미 되세웠다")
+        XCTAssertEqual(claimed.map(\.operationID), [followerID], "다시 발송된다")
+        XCTAssertEqual(
+            claimed.first?.content,
+            followerContent,
+            "사용자가 쓴 글은 그대로다"
+        )
+        XCTAssertEqual(remaining, [], "더 남은 고아가 없다")
+        XCTAssertTrue(
+            events.contains { $0.errorCode == "ADOPTED_AFTER_ORPHANED_CHAIN" },
+            "왜 되살아났는지 기록에 남아야 한다"
+        )
+        XCTAssertEqual(divergences, [])
+    }
+
+    /// 앞선 작업이 정상으로 끝났으면 고아가 아니다. 되세울 것도 없다.
+    func testCompletedLeaderDoesNotLeaveOrphan() async throws {
+        let url = try databaseURL()
+        let context = QueueAPIContext()
+        let leaderID = UUID()
+        let followerID = UUID()
+
+        let store = try await connectedStore(at: url, context: context)
+        _ = try await store.enqueue(
+            context.batch(
+                mutations: [
+                    context.documentMutation(operationID: leaderID, content: "첫 문장", generation: 1)
+                ]
+            )
+        )
+        _ = try await store.enqueue(
+            context.batch(
+                mutations: [
+                    context.documentMutation(operationID: followerID, content: "둘째 문장", generation: 2)
+                ]
+            )
+        )
+        let claimed = try await store.claimReadyOperations(
+            limit: 1,
+            now: Date(timeIntervalSince1970: 100)
+        )
+        let leader = try XCTUnwrap(claimed.first)
+        try await store.complete(leader, result: commitResult(for: leader))
+
+        let orphans = try await store.orphanedOperationIDs()
+        let next = try await store.claimReadyOperations(
+            limit: 1,
+            now: Date(timeIntervalSince1970: 110)
+        )
+        await store.close()
+
+        XCTAssertEqual(orphans, [], "정상으로 끝났으면 고아가 없다")
+        XCTAssertEqual(next.map(\.operationID), [followerID])
+    }
+
     /// 장부 한 줄이 어긋났다고 저장소가 통째로 안 열리면 안 된다. 사용자는
     /// 그 순간 동기화를 전부 잃는다. 어긋난 줄은 그냥 두고 눈에 띄게만 한다.
     func testDivergentOperationDoesNotBlockStoreOpen() async throws {
