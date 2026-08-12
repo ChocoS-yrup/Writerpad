@@ -710,8 +710,8 @@ actor SyncV2Store:
     SyncV2DocumentRevisionProviding,
     SyncV2FolderMigrationMarking,
     SyncV2SnapshotStateStoring {
-    static let currentSchemaVersion = 4
-    static let migrationName = "SyncV2StoreSchemaV4"
+    static let currentSchemaVersion = 5
+    static let migrationName = "SyncV2StoreSchemaV5"
     static let maximumContentByteCount = 10 * 1_024 * 1_024
     static let contentTooLargeErrorCode = "CONTENT_TOO_LARGE"
 
@@ -2290,6 +2290,9 @@ actor SyncV2Store:
                     updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
                     """
                 )
+                // 상태 정리가 모두 끝난 뒤에 사건 기록을 채운다. 앞의 정리들이
+                // status를 바꾸므로, 먼저 채우면 기록과 칸이 어긋난 채로 남는다.
+                try backfillOperationEvents()
             }
         } catch {
             throw SyncV2StoreError.unavailable(
@@ -6736,6 +6739,218 @@ actor SyncV2Store:
         } catch {
             throw ProjectBindingStoreError.invalidBinding
         }
+    }
+
+    // MARK: - 사건 기록
+
+    /// 사건 기록이 없는 작업에 지금 상태를 되만들어 넣는다.
+    ///
+    /// 이미 대기열에 쌓여 있던 작업들은 사건 기록 없이 status 칸만 들고 있다.
+    /// 읽는 쪽을 사건 계산으로 옮기려면 그 전에 기록이 있어야 한다.
+    ///
+    /// 되만든 기록은 **다시 계산했을 때 지금 status와 같은 값이 나오도록** 만든다.
+    /// 그래야 읽는 쪽을 옮기는 순간 아무것도 달라지지 않고, 그 뒤에 생기는
+    /// 어긋남은 전부 진짜 신호가 된다.
+    ///
+    /// 발송 도중 꺼진 작업을 어떻게 되살릴지는 여기서 정하지 않는다. 그것은
+    /// 복구의 문제이고, 이 함수는 지금 있는 것을 옮겨 적기만 한다.
+    ///
+    /// 같은 작업에 여러 번 돌아도 결과가 같다. 사건 식별자를 작업 식별자와
+    /// 사건 종류에서 계산하고, 이미 기록이 있는 작업은 건너뛴다.
+    func backfillOperationEvents() throws {
+        let pending = try withStatement(
+            """
+            SELECT operation_id, status, last_error_code
+            FROM sync_operations
+            WHERE NOT EXISTS (
+                SELECT 1 FROM sync_operation_events e
+                WHERE e.operation_id = sync_operations.operation_id
+            )
+            ORDER BY queue_id;
+            """
+        ) { statement -> [(String, String, String?)] in
+            var rows: [(String, String, String?)] = []
+            while sqlite3_step(statement) == SQLITE_ROW {
+                guard let operationID = sqlite3_column_text(statement, 0),
+                      let status = sqlite3_column_text(statement, 1)
+                else {
+                    throw SyncV2StoreError.invalidStoredData
+                }
+                let errorCode = sqlite3_column_text(statement, 2)
+                    .map { String(cString: $0) }
+                rows.append((
+                    String(cString: operationID),
+                    String(cString: status),
+                    errorCode
+                ))
+            }
+            return rows
+        }
+        guard !pending.isEmpty else { return }
+
+        let recordedAt = Self.timestamp()
+        for (operationID, status, errorCode) in pending {
+            guard let state = SyncV2OperationStatus(rawValue: status) else {
+                throw SyncV2StoreError.invalidStoredData
+            }
+            let types = Self.seedEventTypes(for: state)
+            for (index, type) in types.enumerated() {
+                // 마지막 사건만 오류를 안고 간다. 그 앞의 사건들은 이 작업이
+                // 어떤 길을 지나왔는지 표시할 뿐 오류를 낸 적이 없다.
+                let isLast = index == types.count - 1
+                try insertOperationEvent(
+                    eventID: Self.legacyEventID(
+                        operationID: operationID,
+                        eventType: type
+                    ),
+                    operationID: operationID,
+                    sequence: index + 1,
+                    type: type,
+                    recordedAt: recordedAt,
+                    errorCode: isLast ? errorCode : nil
+                )
+            }
+        }
+    }
+
+    /// 지금 상태를 그대로 되돌려 주는 최소한의 사건 줄기다.
+    ///
+    /// 각 줄기의 마지막 사건이 그 상태로 이어져야 한다. 그렇지 않으면 되만든
+    /// 순간부터 기록과 칸이 어긋난다.
+    static func seedEventTypes(
+        for state: SyncV2OperationStatus
+    ) -> [SyncV2OperationEventType] {
+        switch state {
+        case .pending: return [.enqueued]
+        case .inflight: return [.enqueued, .dispatchStarted]
+        case .retryWait: return [.enqueued, .dispatchStarted, .retryScheduled]
+        case .blocked: return [.enqueued, .blocked]
+        case .conflict: return [.enqueued, .dispatchStarted, .conflictDetected]
+        case .completed: return [.enqueued, .dispatchStarted, .committed]
+        case .cancelled: return [.enqueued, .cancelRequested]
+        }
+    }
+
+    /// 되만든 사건의 식별자다. 무작위로 만들면 다시 돌릴 때마다 달라져
+    /// 같은 사건이 여러 벌 쌓인다. Windows도 같은 이름으로 계산한다.
+    static func legacyEventID(operationID: String, eventType: SyncV2OperationEventType) -> String {
+        let namespaceURL = UUID(uuidString: "6ba7b811-9dad-11d1-80b4-00c04fd430c8")!
+        return syncV2UUIDv5(
+            namespace: namespaceURL,
+            name: "writerpad:stage8:legacy:\(operationID):\(eventType.rawValue)"
+        ).uuidString.lowercased()
+    }
+
+    private func insertOperationEvent(
+        eventID: String,
+        operationID: String,
+        sequence: Int,
+        type: SyncV2OperationEventType,
+        recordedAt: String,
+        errorCode: String?,
+        relatedOperationID: String? = nil
+    ) throws {
+        try withStatement(
+            """
+            INSERT OR IGNORE INTO sync_operation_events (
+                event_id, operation_id, event_sequence, event_type,
+                recorded_at, error_code, related_operation_id, detail_json
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, '{}');
+            """
+        ) { statement in
+            try bind(eventID, at: 1, to: statement)
+            try bind(operationID, at: 2, to: statement)
+            try bind(sequence, at: 3, to: statement)
+            try bind(type.rawValue, at: 4, to: statement)
+            try bind(recordedAt, at: 5, to: statement)
+            try bind(errorCode, at: 6, to: statement)
+            try bind(relatedOperationID, at: 7, to: statement)
+            guard sqlite3_step(statement) == SQLITE_DONE else {
+                throw sqliteError()
+            }
+        }
+    }
+
+    /// 한 작업의 사건 기록을 차례대로 읽는다.
+    ///
+    /// 저장소는 식별자를 소문자로 적는다. 문자열을 그대로 받으면 대소문자가
+    /// 어긋난 조회가 조용히 빈 결과를 내므로 UUID로 받아 안에서 맞춘다.
+    func operationEvents(operationID: UUID) throws -> [SyncV2OperationEvent] {
+        try operationEvents(operationID: operationID.uuidString.lowercased())
+    }
+
+    private func operationEvents(operationID: String) throws -> [SyncV2OperationEvent] {
+        try withStatement(
+            """
+            SELECT event_sequence, event_type, error_code
+            FROM sync_operation_events
+            WHERE operation_id = ?
+            ORDER BY event_sequence;
+            """
+        ) { statement in
+            try bind(operationID, at: 1, to: statement)
+            var events: [SyncV2OperationEvent] = []
+            while sqlite3_step(statement) == SQLITE_ROW {
+                guard let rawType = sqlite3_column_text(statement, 1),
+                      let type = SyncV2OperationEventType(
+                          rawValue: String(cString: rawType)
+                      )
+                else {
+                    throw SyncV2StoreError.invalidStoredData
+                }
+                let errorCode = sqlite3_column_text(statement, 2)
+                    .map { String(cString: $0) }
+                events.append(
+                    SyncV2OperationEvent(
+                        sequence: Int(sqlite3_column_int64(statement, 0)),
+                        type: type,
+                        errorCode: errorCode
+                    )
+                )
+            }
+            return events
+        }
+    }
+
+    /// 사건에서 계산한 상태와 status 칸이 어긋난 작업이다.
+    ///
+    /// 읽는 쪽을 옮기기 전에 이것이 비어 있어야 한다. 비어 있지 않다면 어느
+    /// 쓰기 경로가 칸만 고치고 사건을 남기지 않았다는 뜻이고, 그 경로를 찾기
+    /// 전에는 옮기면 안 된다.
+    func operationStateDivergences() throws -> [SyncV2OperationStateDivergence] {
+        let rows = try withStatement(
+            """
+            SELECT operation_id, status FROM sync_operations ORDER BY queue_id;
+            """
+        ) { statement -> [(String, String)] in
+            var rows: [(String, String)] = []
+            while sqlite3_step(statement) == SQLITE_ROW {
+                guard let operationID = sqlite3_column_text(statement, 0),
+                      let status = sqlite3_column_text(statement, 1)
+                else {
+                    throw SyncV2StoreError.invalidStoredData
+                }
+                rows.append((String(cString: operationID), String(cString: status)))
+            }
+            return rows
+        }
+
+        var divergences: [SyncV2OperationStateDivergence] = []
+        for (operationID, status) in rows {
+            let stored = SyncV2OperationStatus(rawValue: status)
+            let events = try operationEvents(operationID: operationID)
+            let derived = try? SyncV2OperationStateDerivation.state(from: events)
+            if derived != stored {
+                divergences.append(
+                    SyncV2OperationStateDivergence(
+                        operationID: operationID,
+                        storedStatus: stored,
+                        derivedStatus: derived
+                    )
+                )
+            }
+        }
+        return divergences
     }
 
     private func transaction<T>(_ body: () throws -> T) throws -> T {

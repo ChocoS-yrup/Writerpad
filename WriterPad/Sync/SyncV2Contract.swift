@@ -869,6 +869,17 @@ enum SyncV2OperationEventType: String, Equatable, Sendable {
     }
 }
 
+/// 사건에서 계산한 상태와 저장된 status 칸이 어긋난 작업이다.
+///
+/// 읽는 쪽을 사건 계산으로 옮기기 전에 이 목록이 비어 있어야 한다.
+struct SyncV2OperationStateDivergence: Equatable, Sendable {
+    let operationID: String
+    /// status 칸에 적힌 값이다. 알 수 없는 문자열이면 nil이다.
+    let storedStatus: SyncV2OperationStatus?
+    /// 사건 기록에서 계산한 값이다. 기록이 없거나 중간이 비면 nil이다.
+    let derivedStatus: SyncV2OperationStatus?
+}
+
 /// 기록된 사건 하나다.
 struct SyncV2OperationEvent: Equatable, Sendable {
     let sequence: Int

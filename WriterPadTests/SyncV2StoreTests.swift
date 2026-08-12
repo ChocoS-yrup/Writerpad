@@ -4569,6 +4569,7 @@ final class SyncV2StoreTests: XCTestCase {
         try downgrade.execute(
             """
             DROP TABLE sync_folders;
+            DROP TABLE sync_operation_events;
             ALTER TABLE sync_projects
                 DROP COLUMN folder_migration_completed_at;
             DELETE FROM schema_migrations WHERE version >= 3;
@@ -5115,6 +5116,256 @@ final class SyncV2StoreTests: XCTestCase {
             isDeleted: operation.isDeleted,
             committedAt: Date(timeIntervalSince1970: 1_800_000_001)
         )
+    }
+
+    // MARK: - 사건 기록 (스키마 V5)
+
+    /// 새 저장소에 사건 표가 생겨야 한다.
+    func testSchemaV5CreatesOperationEventTable() async throws {
+        let url = try databaseURL()
+
+        let store = try await openStore(at: url)
+        let version = try await store.schemaVersion()
+        await store.close()
+
+        XCTAssertEqual(version, 5)
+        let raw = try RawSQLite(url: url)
+        XCTAssertEqual(
+            try raw.scalarInt(
+                """
+                SELECT COUNT(*) FROM sqlite_master
+                WHERE type = 'table' AND name = 'sync_operation_events';
+                """
+            ),
+            1
+        )
+        let checksum = try raw.scalarText(
+            "SELECT checksum FROM schema_migrations WHERE version = 5;"
+        )
+        XCTAssertEqual(checksum.count, 64)
+        XCTAssertNotEqual(checksum, "design-fixture-v5")
+        raw.close()
+    }
+
+    /// 이미 쌓여 있던 작업에 사건 기록이 채워져야 한다. 그리고 그 기록에서
+    /// 다시 계산한 상태가 지금 status와 같아야 한다. 이것이 어긋나면 읽는
+    /// 쪽을 옮기는 순간 화면의 숫자가 달라진다.
+    func testBackfillSeedsEventsThatDeriveToStoredStatus() async throws {
+        let url = try databaseURL()
+        let context = QueueAPIContext()
+        let completedID = UUID()
+        let conflictID = UUID()
+        let pendingID = UUID()
+
+        let store = try await connectedStore(at: url, context: context)
+        for (operationID, documentID) in [
+            (completedID, UUID()), (conflictID, UUID()), (pendingID, UUID()),
+        ] {
+            _ = try await store.enqueue(
+                context.batch(
+                    mutations: [
+                        context.documentMutation(
+                            operationID: operationID,
+                            documentID: documentID,
+                            relativePath: "원고/\(operationID.uuidString).txt"
+                        )
+                    ]
+                )
+            )
+        }
+        await store.close()
+
+        // 사건을 지우고 status만 바꿔 둔다. 되만들기 표가 실제로 도는지
+        // 확인하려면 pending 말고 다른 상태가 있어야 한다.
+        let raw = try RawSQLite(url: url)
+        try raw.execute("DELETE FROM sync_operation_events;")
+        try raw.execute(
+            """
+            UPDATE sync_operations SET status = 'completed'
+            WHERE operation_id = '\(completedID.uuidString.lowercased())';
+            """
+        )
+        try raw.execute(
+            """
+            UPDATE sync_operations
+            SET status = 'conflict', last_error_code = 'PATH_CONFLICT'
+            WHERE operation_id = '\(conflictID.uuidString.lowercased())';
+            """
+        )
+        raw.close()
+
+        let reopened = try await openStore(at: url)
+        let completedEvents = try await reopened.operationEvents(
+            operationID: completedID
+        )
+        let conflictEvents = try await reopened.operationEvents(
+            operationID: conflictID
+        )
+        let pendingEvents = try await reopened.operationEvents(
+            operationID: pendingID
+        )
+        let divergences = try await reopened.operationStateDivergences()
+        await reopened.close()
+
+        XCTAssertEqual(
+            completedEvents.map(\.type),
+            [.enqueued, .dispatchStarted, .committed]
+        )
+        XCTAssertEqual(
+            conflictEvents.map(\.type),
+            [.enqueued, .dispatchStarted, .conflictDetected]
+        )
+        XCTAssertEqual(pendingEvents.map(\.type), [.enqueued])
+
+        // 사건 번호는 1부터 빈틈없이 이어져야 계산을 믿을 수 있다.
+        XCTAssertEqual(completedEvents.map(\.sequence), [1, 2, 3])
+
+        // 오류는 마지막 사건만 안고 간다. 앞의 사건들은 오류를 낸 적이 없다.
+        XCTAssertEqual(conflictEvents.map(\.errorCode), [nil, nil, "PATH_CONFLICT"])
+
+        XCTAssertEqual(
+            try SyncV2OperationStateDerivation.state(from: completedEvents),
+            .completed
+        )
+        XCTAssertEqual(
+            try SyncV2OperationStateDerivation.state(from: conflictEvents),
+            .conflict
+        )
+        XCTAssertEqual(divergences, [], "되만든 직후에는 어긋난 작업이 없어야 한다")
+    }
+
+    /// 되만들기는 몇 번을 돌려도 결과가 같아야 한다. 열 때마다 같은 사건이
+    /// 한 벌씩 더 쌓이면 기록을 믿을 수 없게 된다.
+    func testBackfillIsIdempotentAcrossReopens() async throws {
+        let url = try databaseURL()
+        let context = QueueAPIContext()
+        let operationID = UUID()
+
+        let store = try await connectedStore(at: url, context: context)
+        _ = try await store.enqueue(
+            context.batch(
+                mutations: [context.documentMutation(operationID: operationID)]
+            )
+        )
+        await store.close()
+
+        for _ in 0..<3 {
+            let reopened = try await openStore(at: url)
+            try await reopened.backfillOperationEvents()
+            await reopened.close()
+        }
+
+        let raw = try RawSQLite(url: url)
+        let total = try raw.scalarInt(
+            """
+            SELECT COUNT(*) FROM sync_operation_events
+            WHERE operation_id = '\(operationID.uuidString.lowercased())';
+            """
+        )
+        let storedEventID = try raw.scalarText(
+            """
+            SELECT event_id FROM sync_operation_events
+            WHERE operation_id = '\(operationID.uuidString.lowercased())'
+              AND event_sequence = 1;
+            """
+        )
+        raw.close()
+
+        XCTAssertEqual(total, 1)
+        XCTAssertEqual(
+            storedEventID,
+            SyncV2Store.legacyEventID(
+                operationID: operationID.uuidString.lowercased(),
+                eventType: .enqueued
+            ),
+            "사건 식별자는 작업과 종류에서 계산해야 다시 돌려도 같다"
+        )
+    }
+
+    /// 되만들기 표의 모든 상태가 자기 자신으로 되돌아와야 한다. 하나라도
+    /// 어긋나면 그 상태의 작업들이 옮기는 순간 다른 값이 된다.
+    func testSeedEventTypesRoundTripEveryStatus() throws {
+        for state in [
+            SyncV2OperationStatus.pending, .inflight, .retryWait,
+            .blocked, .conflict, .completed, .cancelled,
+        ] {
+            let events = SyncV2Store.seedEventTypes(for: state)
+                .enumerated()
+                .map { SyncV2OperationEvent(sequence: $0.offset + 1, type: $0.element) }
+            XCTAssertEqual(
+                try SyncV2OperationStateDerivation.state(from: events),
+                state,
+                "\(state)"
+            )
+        }
+    }
+
+    /// status 칸만 고치고 사건을 남기지 않으면 어긋남으로 잡혀야 한다.
+    /// 읽는 쪽을 옮기기 전에 이걸로 남은 쓰기 경로를 찾는다.
+    func testDivergenceReporterCatchesColumnOnlyChange() async throws {
+        let url = try databaseURL()
+        let context = QueueAPIContext()
+        let operationID = UUID()
+
+        let store = try await connectedStore(at: url, context: context)
+        _ = try await store.enqueue(
+            context.batch(
+                mutations: [context.documentMutation(operationID: operationID)]
+            )
+        )
+        // 되만들기는 저장소를 열 때 돈다. 방금 넣은 작업에는 아직 기록이 없다.
+        let beforeBackfill = try await store.operationStateDivergences()
+        try await store.backfillOperationEvents()
+        let afterBackfill = try await store.operationStateDivergences()
+        await store.close()
+
+        // 사건은 그대로 두고 칸만 바꾼다. 지금 남아 있는 쓰기 경로들이 하는 짓이다.
+        let raw = try RawSQLite(url: url)
+        try raw.execute(
+            """
+            UPDATE sync_operations SET status = 'completed'
+            WHERE operation_id = '\(operationID.uuidString.lowercased())';
+            """
+        )
+        raw.close()
+
+        let reopened = try await openStore(at: url)
+        let after = try await reopened.operationStateDivergences()
+        await reopened.close()
+
+        XCTAssertEqual(
+            beforeBackfill.map(\.derivedStatus),
+            [nil],
+            "기록이 없으면 계산할 수 없다는 것도 어긋남이다"
+        )
+        XCTAssertEqual(afterBackfill, [], "되만든 뒤에는 어긋남이 없어야 한다")
+        XCTAssertEqual(after.count, 1)
+        XCTAssertEqual(after.first?.operationID, operationID.uuidString.lowercased())
+        XCTAssertEqual(after.first?.storedStatus, .completed)
+        XCTAssertEqual(after.first?.derivedStatus, .pending)
+    }
+
+    /// 사건 표는 존재하지 않는 작업을 가리킬 수 없다.
+    func testOperationEventRequiresExistingOperation() async throws {
+        let url = try databaseURL()
+        let store = try await openStore(at: url)
+        await store.close()
+
+        let raw = try RawSQLite(url: url)
+        XCTAssertThrowsError(
+            try raw.execute(
+                """
+                INSERT INTO sync_operation_events (
+                    event_id, operation_id, event_sequence, event_type, recorded_at
+                ) VALUES (
+                    '\(UUID().uuidString.lowercased())',
+                    '\(UUID().uuidString.lowercased())',
+                    1, 'enqueued', '2026-08-12T00:00:00.000Z'
+                );
+                """
+            )
+        )
+        raw.close()
     }
 
     private func databaseURL() throws -> URL {
