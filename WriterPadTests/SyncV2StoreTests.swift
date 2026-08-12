@@ -6242,6 +6242,94 @@ final class SyncV2StoreTests: XCTestCase {
         )
     }
 
+    // MARK: - revision 충돌 되감기 (계약 대조)
+
+    /// 되감기가 원본 작업을 그 자리에서 고쳐 쓰는지 본다.
+    ///
+    /// 계약은 의도를 불변으로 다룬다. 되감을 때 원본은 그대로 두고 새 작업을
+    /// 만들어 원본을 밀어내라고 한다(벡터 05). 원본의 payload가 같은
+    /// operation_id 아래에서 바뀌면, 서버가 그 식별자로 기억해 둔 멱등 응답이
+    /// 어느 payload의 것인지 알 수 없게 된다. 다시 보냈을 때 서버는 "이미
+    /// 처리했다"고 답하는데 그 내용이 지금 보내려던 것과 다를 수 있다.
+    ///
+    /// 지금 저장소가 실제로 무엇을 하는지 못 박아 둔다.
+    func testRebaseMutatesOriginalIntentInPlace() async throws {
+        let url = try databaseURL()
+        let context = QueueAPIContext()
+        let store = try await connectedStore(at: url, context: context)
+        let operationID = UUID()
+        let originalContent = "내가 쓴 것\n"
+
+        _ = try await store.enqueue(
+            context.batch(
+                mutations: [
+                    context.documentMutation(
+                        operationID: operationID,
+                        content: originalContent,
+                        generation: 1
+                    )
+                ]
+            )
+        )
+        let claimed = try await store.claimReadyOperations(
+            limit: 1,
+            now: Date(timeIntervalSince1970: 100)
+        )
+        let operation = try XCTUnwrap(claimed.first)
+        let before = try await store.queuedOperations(documentID: context.documentID)
+        let beforeHash = try XCTUnwrap(
+            before.first { $0.operationID == operationID }?.contentHash
+        )
+
+        let remote = SyncV2RemoteDocumentSnapshot(
+            documentID: context.documentID,
+            relativePath: operation.relativePath,
+            content: "서버가 가진 것\n",
+            revision: operation.baseRevision + 2,
+            isDeleted: false,
+            deletedAt: nil,
+            updatedAt: Date(timeIntervalSince1970: 50)
+        )
+        let local = try await store.latestLocalSnapshot(for: operation)
+        let result = try await store.rebaseAfterRevisionConflict(
+            operation,
+            remote: remote,
+            local: local,
+            mergedContent: "내가 쓴 것\n서버가 가진 것\n",
+            mergedPath: remote.relativePath
+        )
+
+        let after = try await store.queuedOperations(documentID: context.documentID)
+        let events = try await store.operationEvents(operationID: operationID)
+        await store.close()
+
+        XCTAssertEqual(result, .rebased)
+
+        // 지금 동작: 새 작업을 만들지 않고 원본 하나를 고쳐 쓴다.
+        XCTAssertEqual(after.count, 1, "새 작업이 생기지 않는다")
+        let rebased = try XCTUnwrap(after.first)
+        XCTAssertEqual(
+            rebased.operationID,
+            operationID,
+            "같은 신원이 그대로 남는다"
+        )
+        XCTAssertNotEqual(
+            rebased.contentHash,
+            beforeHash,
+            "그런데 같은 신원 아래에서 보낼 내용이 바뀌었다"
+        )
+        XCTAssertEqual(
+            rebased.baseRevision.map(Int64.init),
+            remote.revision,
+            "기준도 서버 것으로 바뀌었다"
+        )
+        // 계약이라면 원본에 superseded가 남고 새 작업이 생겨야 한다.
+        XCTAssertFalse(
+            events.contains { $0.type == .superseded },
+            "원본이 밀려났다는 기록도 남지 않는다"
+        )
+    }
+
     /// 장부 한 줄이 어긋났다고 저장소가 통째로 안 열리면 안 된다. 사용자는
     /// 그 순간 동기화를 전부 잃는다. 어긋난 줄은 그냥 두고 눈에 띄게만 한다.
     func testDivergentOperationDoesNotBlockStoreOpen() async throws {
