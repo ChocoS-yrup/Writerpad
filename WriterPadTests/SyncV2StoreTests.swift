@@ -5968,6 +5968,282 @@ final class SyncV2StoreTests: XCTestCase {
         XCTAssertEqual(next.map(\.operationID), [followerID])
     }
 
+    // MARK: - 빠른 연속 이름 변경 (진단)
+
+    /// 여섯 개를 한 배치로 잇달아 바꿀 때 저장소가 무엇을 하는지 읽는다.
+    ///
+    /// 미해결 사건과 같은 모양이다. 고치지 않는다. 지금 무슨 일이 일어나는지
+    /// 기록으로 남겨, 나중에 보존된 사건에서 원인을 판정할 때 쓸 재료를 만든다.
+    ///
+    /// - Note: 벡터 04는 `ID_BASED/1`이고 사용자 작품은 `LEGACY/0`이다. 여기서
+    ///   무엇이 나오든 그 사건이 재현됐다는 뜻은 아니다.
+    func testRapidSixRenamesInOneBatchDiagnostic() async throws {
+        let url = try databaseURL()
+        let context = QueueAPIContext()
+        let store = try await connectedStore(at: url, context: context)
+
+        let folderIDs = (0..<5).map { _ in UUID() }
+        let operationIDs = (0..<5).map { _ in UUID() }
+        let documentOperationID = UUID()
+        let documentID = UUID()
+
+        // 여섯 변경이 하나의 배치를 함께 쓴다. 벡터가 그렇게 규정한다.
+        var mutations: [SyncV2Mutation] = folderIDs.enumerated().map { index, folderID in
+            context.folderMutation(
+                operationID: operationIDs[index],
+                folderID: folderID,
+                name: "R\(index + 1)"
+            )
+        }
+        mutations.append(
+            context.documentMutation(
+                operationID: documentOperationID,
+                documentID: documentID,
+                relativePath: "R6.txt",
+                content: "여섯째"
+            )
+        )
+        _ = try await store.enqueue(
+            context.batch(kind: .structureChange, mutations: mutations)
+        )
+
+        // 폴더 줄과 문서 줄을 번갈아 끝까지 흘린다.
+        var dispatchedFolders: [UUID] = []
+        for round in 0..<10 {
+            let folders = try await store.claimReadyFolderOperations(
+                limit: 10,
+                now: Date(timeIntervalSince1970: TimeInterval(100 + round))
+            )
+            if folders.isEmpty { break }
+            for folder in folders {
+                dispatchedFolders.append(folder.operationID)
+                try await store.complete(folder, result: folderCommitResult(for: folder))
+            }
+        }
+        var dispatchedDocuments: [UUID] = []
+        for round in 0..<10 {
+            let documents = try await store.claimReadyOperations(
+                limit: 10,
+                now: Date(timeIntervalSince1970: TimeInterval(200 + round))
+            )
+            if documents.isEmpty { break }
+            for document in documents {
+                dispatchedDocuments.append(document.operationID)
+                try await store.complete(document, result: commitResult(for: document))
+            }
+        }
+
+        var states: [String] = []
+        for operationID in operationIDs + [documentOperationID] {
+            let status = try await store.operationStatus(operationID: operationID) ?? "없음"
+            let attempts = try await store.operationAttempts(operationID: operationID) ?? -1
+            states.append("\(status)/\(attempts)")
+        }
+        let orphans = try await store.orphanedOperationIDs()
+        let divergences = try await store.operationStateDivergences()
+        await store.close()
+
+        // 지금 저장소가 실제로 하는 일을 못 박아 둔다. 이 값이 달라지면
+        // 무엇인가 바뀐 것이고, 그때 다시 봐야 한다.
+        XCTAssertEqual(
+            states,
+            Array(repeating: "completed/1", count: 6),
+            "여섯 변경의 최종 상태와 시도 횟수"
+        )
+        XCTAssertEqual(
+            dispatchedFolders.count,
+            5,
+            "폴더 다섯이 모두 발송됐다"
+        )
+        XCTAssertEqual(
+            dispatchedDocuments.count,
+            1,
+            "문서 하나가 발송됐다. 폴더 줄이 막혀도 문서 줄이 굶지 않는다"
+        )
+        XCTAssertEqual(orphans, [], "앞이 끊겨 남은 것이 없다")
+        XCTAssertEqual(divergences, [], "기록과 칸이 붙어 있다")
+    }
+
+    /// 같은 폴더를 잇달아 여섯 번 바꾸면 무엇이 일어나는지 읽는다.
+    ///
+    /// 서로 다른 폴더 여섯은 독립된 여섯 줄이라 서로를 막지 않는다. 같은
+    /// 폴더를 여섯 번 바꾸면 한 줄에 여섯이 늘어서고, 뒤쪽은 앞이 끝나야
+    /// 기준을 받는다. 사건의 모양에 더 가깝다.
+    ///
+    /// 고치지 않는다. 지금 무슨 일이 일어나는지 기록으로 남긴다.
+    func testSameFolderRenamedSixTimesDiagnostic() async throws {
+        let url = try databaseURL()
+        let context = QueueAPIContext()
+        let store = try await connectedStore(at: url, context: context)
+        let folderID = UUID()
+        let operationIDs = (0..<6).map { _ in UUID() }
+
+        for (index, operationID) in operationIDs.enumerated() {
+            _ = try await store.enqueue(
+                context.batch(
+                    kind: .structureChange,
+                    mutations: [
+                        context.folderMutation(
+                            operationID: operationID,
+                            folderID: folderID,
+                            name: "R\(index + 1)"
+                        )
+                    ]
+                )
+            )
+        }
+
+        // 앞의 셋만 정상으로 흘리고, 넷째에서 앞선 작업이 완료 아닌 길로
+        // 끝나게 한다. 사건에서 마지막 셋이 남았다고 했다.
+        var completed: [UUID] = []
+        for round in 0..<3 {
+            let folders = try await store.claimReadyFolderOperations(
+                limit: 10,
+                now: Date(timeIntervalSince1970: TimeInterval(100 + round))
+            )
+            guard let folder = folders.first else { break }
+            completed.append(folder.operationID)
+            try await store.complete(folder, result: folderCommitResult(for: folder))
+        }
+        let fourth = try await store.claimReadyFolderOperations(
+            limit: 1,
+            now: Date(timeIntervalSince1970: 200)
+        )
+        if let stalled = fourth.first {
+            try await store.markConflict(
+                stalled,
+                errorCode: "PATH_CONFLICT",
+                detail: nil
+            )
+        }
+
+        // 그 뒤로 더 흘려 본다.
+        var laterRounds = 0
+        for round in 0..<5 {
+            let folders = try await store.claimReadyFolderOperations(
+                limit: 10,
+                now: Date(timeIntervalSince1970: TimeInterval(300 + round))
+            )
+            if folders.isEmpty { break }
+            laterRounds += 1
+            for folder in folders {
+                completed.append(folder.operationID)
+                try await store.complete(folder, result: folderCommitResult(for: folder))
+            }
+        }
+
+        var states: [String] = []
+        for operationID in operationIDs {
+            states.append(
+                try await store.operationStatus(operationID: operationID) ?? "없음"
+            )
+        }
+        let orphans = try await store.orphanedOperationIDs()
+        let stuck = try await store.operationsMissingBaseRevision()
+        await store.close()
+
+        // 지금 저장소가 실제로 하는 일을 못 박아 둔다.
+        XCTAssertEqual(states.prefix(3).map { $0 }, Array(repeating: "completed", count: 3))
+        XCTAssertEqual(states[3], "conflict", "넷째가 막혔다")
+        XCTAssertEqual(
+            Array(states.suffix(2)),
+            ["pending", "pending"],
+            "마지막 둘은 대기 중으로 남는다"
+        )
+        XCTAssertEqual(
+            laterRounds,
+            0,
+            "넷째가 막힌 뒤로는 아무것도 발송되지 않는다"
+        )
+        // 여기가 핵심이다. 기준이 비어 발송 대상에서 빠진 것을 지금 눈이
+        // 잡아내는지 본다.
+        XCTAssertEqual(orphans, [], "문서만 보는 눈에는 폴더 줄이 안 보인다")
+        XCTAssertEqual(
+            stuck.count,
+            2,
+            "기준을 못 받은 폴더 작업이 둘 남았다: \(stuck)"
+        )
+    }
+
+    /// 막힌 폴더 작업을 취소하면 뒤쪽이 어떻게 되는지 읽는다.
+    ///
+    /// 문서 줄에서는 앞을 취소하면 뒤쪽을 지금 리비전 위로 되세운다. 폴더
+    /// 줄에도 같은 일이 일어나는지 확인한다. 고치지 않는다.
+    func testCancellingBlockedFolderLeaderDiagnostic() async throws {
+        let url = try databaseURL()
+        let context = QueueAPIContext()
+        let store = try await connectedStore(at: url, context: context)
+        let folderID = UUID()
+        let operationIDs = (0..<3).map { _ in UUID() }
+
+        for (index, operationID) in operationIDs.enumerated() {
+            _ = try await store.enqueue(
+                context.batch(
+                    kind: .structureChange,
+                    mutations: [
+                        context.folderMutation(
+                            operationID: operationID,
+                            folderID: folderID,
+                            name: "R\(index + 1)"
+                        )
+                    ]
+                )
+            )
+        }
+        // 첫째를 집어들어 막는다.
+        let claimed = try await store.claimReadyFolderOperations(
+            limit: 1,
+            now: Date(timeIntervalSince1970: 100)
+        )
+        try await store.markConflict(
+            try XCTUnwrap(claimed.first),
+            errorCode: "PATH_CONFLICT",
+            detail: nil
+        )
+        // 그 첫째를 취소한다. 뒤쪽 둘은 기준을 못 받은 채로 남아 있다.
+        try await store.cancelOperation(
+            operationID: operationIDs[0],
+            cancelEventID: UUID()
+        )
+
+        let orphans = try await store.orphanedOperationIDs()
+        let stuck = try await store.operationsMissingBaseRevision()
+        let ready = try await store.claimReadyFolderOperations(
+            limit: 10,
+            now: Date(timeIntervalSince1970: 300)
+        )
+        var states: [String] = []
+        for operationID in operationIDs {
+            states.append(
+                try await store.operationStatus(operationID: operationID) ?? "없음"
+            )
+        }
+        await store.close()
+
+        XCTAssertEqual(states[0], "cancelled")
+        // 지금 저장소가 실제로 하는 일이다.
+        XCTAssertEqual(
+            orphans,
+            [],
+            "고아 탐지기가 폴더 줄을 보지 못한다"
+        )
+        XCTAssertEqual(
+            stuck.count,
+            2,
+            "기준을 못 받은 폴더 작업이 둘 남아 있다"
+        )
+        XCTAssertEqual(
+            ready.map(\.operationID),
+            [],
+            "앞을 취소했는데도 뒤쪽이 발송되지 않는다"
+        )
+        XCTAssertEqual(
+            Array(states.suffix(2)),
+            ["pending", "pending"],
+            "화면에는 대기 중으로만 보인다"
+        )
+    }
+
     /// 장부 한 줄이 어긋났다고 저장소가 통째로 안 열리면 안 된다. 사용자는
     /// 그 순간 동기화를 전부 잃는다. 어긋난 줄은 그냥 두고 눈에 띄게만 한다.
     func testDivergentOperationDoesNotBlockStoreOpen() async throws {

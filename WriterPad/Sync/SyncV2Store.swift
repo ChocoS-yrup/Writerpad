@@ -7411,6 +7411,20 @@ actor SyncV2Store:
         ) { _ in }
     }
 
+    /// 기준 리비전을 못 받아 발송 대상에서 빠져 있는 작업 전부다.
+    ///
+    /// `orphanedOperationIDs()`는 앞이 이미 끊긴 것만 고른다. 이것은 앞이
+    /// 아직 살아 있는 것까지 포함한다. 진단용이다. 앞이 살아 있으면 정상이지만,
+    /// 그 앞이 영영 끝나지 않으면 여기 있는 것들이 함께 멈춘다.
+    func operationsMissingBaseRevision() throws -> [String] {
+        try operationIDs(
+            where: """
+            base_revision IS NULL
+              AND status IN ('pending', 'retry_wait', 'blocked')
+            """
+        ) { _ in }
+    }
+
     /// 앞이 끊긴 작업을 문서의 지금 리비전으로 다시 세운다.
     ///
     /// 앞선 작업이 사라졌으니 그것이 만들려던 상태는 오지 않는다. 남은 것은
