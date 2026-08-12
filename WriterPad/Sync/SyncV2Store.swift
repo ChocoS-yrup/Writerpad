@@ -7394,17 +7394,27 @@ actor SyncV2Store:
     /// 보인다. 큐가 통째로 멈춘다.
     ///
     /// 앞에 살아 있는 작업이 없는데도 기준 리비전이 비어 있으면 그것이다.
+    ///
+    /// 문서 줄과 폴더 줄을 모두 본다. 둘은 각자의 줄에 늘어서므로 앞선 작업을
+    /// 찾는 조건도 각자의 식별자로 본다. 문서만 보면 같은 폴더를 잇달아 바꾼
+    /// 뒤쪽이 멈춰 있어도 눈에 띄지 않는다.
     func orphanedOperationIDs() throws -> [String] {
         try operationIDs(
             where: """
-            o.document_id IS NOT NULL
-              AND o.base_revision IS NULL
+            o.base_revision IS NULL
               AND o.status IN ('pending', 'retry_wait', 'blocked')
+              AND (o.document_id IS NOT NULL OR o.folder_id IS NOT NULL)
               AND NOT EXISTS (
                   SELECT 1 FROM sync_operations earlier
-                  WHERE earlier.document_id = o.document_id
-                    AND earlier.document_sequence < o.document_sequence
+                  WHERE earlier.document_sequence < o.document_sequence
                     AND earlier.status NOT IN ('completed', 'cancelled')
+                    AND (
+                        (o.document_id IS NOT NULL
+                         AND earlier.document_id = o.document_id)
+                        OR
+                        (o.folder_id IS NOT NULL
+                         AND earlier.folder_id = o.folder_id)
+                    )
               )
             """,
             alias: "o"
@@ -7447,17 +7457,28 @@ actor SyncV2Store:
         guard !orphans.isEmpty else { return [] }
         let timestamp = Self.timestamp()
         for operationID in orphans {
+            // 문서는 문서의 지금 리비전을, 폴더는 폴더의 지금 리비전을 받는다.
+            // 본문은 문서에만 있다. 폴더는 이름과 부모만 나르므로 그대로 둔다.
             try withStatement(
                 """
                 UPDATE sync_operations
-                SET base_revision = (
-                        SELECT d.server_revision FROM sync_documents d
-                        WHERE d.document_id = sync_operations.document_id
-                    ),
-                    base_content = (
-                        SELECT d.base_content FROM sync_documents d
-                        WHERE d.document_id = sync_operations.document_id
-                    ),
+                SET base_revision = CASE
+                        WHEN document_id IS NOT NULL THEN (
+                            SELECT d.server_revision FROM sync_documents d
+                            WHERE d.document_id = sync_operations.document_id
+                        )
+                        ELSE (
+                            SELECT f.server_revision FROM sync_folders f
+                            WHERE f.folder_id = sync_operations.folder_id
+                        )
+                    END,
+                    base_content = CASE
+                        WHEN document_id IS NOT NULL THEN (
+                            SELECT d.base_content FROM sync_documents d
+                            WHERE d.document_id = sync_operations.document_id
+                        )
+                        ELSE base_content
+                    END,
                     next_attempt_at = NULL,
                     updated_at = ?
                 WHERE operation_id = ?

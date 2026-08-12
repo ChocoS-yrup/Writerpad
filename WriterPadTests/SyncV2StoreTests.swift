@@ -6155,21 +6155,21 @@ final class SyncV2StoreTests: XCTestCase {
             0,
             "넷째가 막힌 뒤로는 아무것도 발송되지 않는다"
         )
-        // 여기가 핵심이다. 기준이 비어 발송 대상에서 빠진 것을 지금 눈이
-        // 잡아내는지 본다.
-        XCTAssertEqual(orphans, [], "문서만 보는 눈에는 폴더 줄이 안 보인다")
+        // 넷째가 충돌로 막혀 있을 뿐 아직 살아 있다. 뒤쪽이 기다리는 것은
+        // 줄을 지키는 옳은 동작이지 끊긴 것이 아니다.
+        XCTAssertEqual(orphans, [], "앞이 살아 있으면 끊긴 것이 아니다")
         XCTAssertEqual(
             stuck.count,
             2,
-            "기준을 못 받은 폴더 작업이 둘 남았다: \(stuck)"
+            "다만 둘이 기준을 못 받은 채 멈춰 있다: \(stuck)"
         )
     }
 
-    /// 막힌 폴더 작업을 취소하면 뒤쪽이 어떻게 되는지 읽는다.
+    /// 막힌 폴더 작업을 취소하면 뒤쪽도 되세워져야 한다.
     ///
-    /// 문서 줄에서는 앞을 취소하면 뒤쪽을 지금 리비전 위로 되세운다. 폴더
-    /// 줄에도 같은 일이 일어나는지 확인한다. 고치지 않는다.
-    func testCancellingBlockedFolderLeaderDiagnostic() async throws {
+    /// 문서 줄과 폴더 줄이 같아야 한다. 한쪽만 되세우면 폴더를 잇달아 바꾼
+    /// 사용자만 큐가 멈춘 채로 남는다.
+    func testCancellingBlockedFolderLeaderAdoptsFollowers() async throws {
         let url = try databaseURL()
         let context = QueueAPIContext()
         let store = try await connectedStore(at: url, context: context)
@@ -6221,26 +6221,24 @@ final class SyncV2StoreTests: XCTestCase {
         await store.close()
 
         XCTAssertEqual(states[0], "cancelled")
-        // 지금 저장소가 실제로 하는 일이다.
-        XCTAssertEqual(
-            orphans,
-            [],
-            "고아 탐지기가 폴더 줄을 보지 못한다"
-        )
+        XCTAssertEqual(orphans, [], "되세운 뒤에는 남은 고아가 없다")
+        // 줄의 맨 앞만 되세운다. 셋째는 둘째가 살아 있으니 그 뒤에서 기다리는
+        // 것이 옳다. 둘째가 끝나면 그때 기준을 받는다.
         XCTAssertEqual(
             stuck.count,
-            2,
-            "기준을 못 받은 폴더 작업이 둘 남아 있다"
+            1,
+            "맨 앞만 풀리고 그다음은 줄을 지킨다: \(stuck)"
         )
         XCTAssertEqual(
             ready.map(\.operationID),
-            [],
-            "앞을 취소했는데도 뒤쪽이 발송되지 않는다"
+            [operationIDs[1]],
+            "앞을 취소하면 뒤쪽이 다시 발송된다"
         )
+        // 둘째는 방금 집어들었으니 발송 중이고, 셋째는 그 뒤에서 기다린다.
         XCTAssertEqual(
             Array(states.suffix(2)),
-            ["pending", "pending"],
-            "화면에는 대기 중으로만 보인다"
+            ["inflight", "pending"],
+            "줄을 지켜 하나씩 나간다"
         )
     }
 
