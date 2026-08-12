@@ -128,6 +128,44 @@ final class SyncSettingsModel: ObservableObject {
         await reloadProjects()
     }
 
+    func observeAuthenticationChanges() async {
+        let updates = await authenticationService.stateUpdates()
+        for await updatedState in updates {
+            guard !Task.isCancelled else { return }
+            authenticationState = updatedState
+        }
+    }
+
+    func signUp(email: String, password: String) async {
+        guard !isWorking else { return }
+        isWorking = true
+        errorMessage = nil
+        informationMessage = nil
+
+        let result = await authenticationService.signUp(
+            email: email,
+            password: password
+        )
+        authenticationState = await authenticationService.currentState()
+        switch result {
+        case .authenticated:
+            if isSyncAllEnabled {
+                await syncDispatcher?.start()
+                await backgroundSyncCoordinator?.start()
+            }
+            await syncDispatcher?.loginSucceeded()
+            informationMessage = "계정을 만들고 로그인했습니다."
+        case let .confirmationRequired(maskedEmail):
+            let recipient = maskedEmail.map { " (\($0))" } ?? ""
+            informationMessage = "확인 이메일을 보냈습니다\(recipient). 이메일을 확인한 뒤 로그인하세요."
+        case let .failed(failure):
+            errorMessage = Self.authenticationMessage(
+                .unavailable(failure)
+            )
+        }
+        isWorking = false
+    }
+
     func signIn(email: String, password: String) async {
         guard !isWorking else { return }
         isWorking = true
@@ -355,6 +393,14 @@ final class SyncSettingsModel: ObservableObject {
                 return "서버 주소와 공개 키가 이 빌드에 설정되지 않았습니다."
             case .invalidCredentials:
                 return "아이디 또는 비밀번호가 올바르지 않습니다."
+            case .weakPassword:
+                return "더 안전한 비밀번호를 사용하세요."
+            case .accountAlreadyExists:
+                return "이미 등록된 이메일입니다. 로그인해 주세요."
+            case .signUpDisabled:
+                return "현재 새 계정을 만들 수 없습니다."
+            case .emailNotConfirmed:
+                return "이메일 확인을 완료한 뒤 로그인하세요."
             case .networkUnavailable:
                 return "서버에 연결할 수 없습니다. 네트워크를 확인하세요."
             case .keychainAccess:
@@ -405,6 +451,20 @@ final class SyncSettingsModel: ObservableObject {
     }
 }
 
+private enum AuthenticationFormMode: String, CaseIterable, Identifiable {
+    case signIn
+    case signUp
+
+    var id: String { rawValue }
+
+    var title: String {
+        switch self {
+        case .signIn: "로그인"
+        case .signUp: "회원 가입"
+        }
+    }
+}
+
 private enum ExistingConnectionKind: String, Identifiable {
     case existing
     case windows
@@ -432,8 +492,10 @@ private struct ExistingConnectionRequest: Identifiable {
 
 struct SyncSettingsView: View {
     @StateObject private var model: SyncSettingsModel
+    @State private var authenticationMode: AuthenticationFormMode = .signIn
     @State private var email = ""
     @State private var password = ""
+    @State private var passwordConfirmation = ""
     @State private var isConfirmingEnableAll = false
     @State private var connectionRequest: ExistingConnectionRequest?
     @State private var disconnectTarget: SyncProjectRow?
@@ -462,8 +524,12 @@ struct SyncSettingsView: View {
     var body: some View {
         Form {
             accountSection
-            globalSyncSection
-            projectConnectionsSection
+            if model.isAuthenticated {
+                globalSyncSection
+                projectConnectionsSection
+            } else {
+                protectedCloudSection
+            }
         }
         .navigationTitle("서버 동기화")
         .navigationBarTitleDisplayMode(.inline)
@@ -475,7 +541,10 @@ struct SyncSettingsView: View {
                     .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 14))
             }
         }
-        .task { await model.load() }
+        .task {
+            await model.load()
+            await model.observeAuthenticationChanges()
+        }
         .confirmationDialog(
             "연결되지 않은 작품 \(model.unconnectedProjectCount)개를 새 서버 작품으로 연결할까요?",
             isPresented: $isConfirmingEnableAll,
@@ -565,6 +634,13 @@ struct SyncSettingsView: View {
                     Text("저장된 로그인을 확인하는 중…")
                 }
             case .localOnly, .signedOut, .unavailable:
+                Picker("인증 방식", selection: $authenticationMode) {
+                    ForEach(AuthenticationFormMode.allCases) { mode in
+                        Text(mode.title).tag(mode)
+                    }
+                }
+                .pickerStyle(.segmented)
+                .accessibilityIdentifier("writerpad.auth-mode")
                 TextField("이메일", text: $email)
                     .textInputAutocapitalization(.never)
                     .keyboardType(.emailAddress)
@@ -572,24 +648,47 @@ struct SyncSettingsView: View {
                     .autocorrectionDisabled()
                     .accessibilityIdentifier("writerpad.sync-email")
                 SecureField("비밀번호", text: $password)
-                    .textContentType(.password)
+                    .textContentType(
+                        authenticationMode == .signUp
+                            ? .newPassword
+                            : .password
+                    )
                     .accessibilityIdentifier("writerpad.sync-password")
-                Button("로그인") {
+                if authenticationMode == .signUp {
+                    SecureField("비밀번호 확인", text: $passwordConfirmation)
+                        .textContentType(.newPassword)
+                        .accessibilityIdentifier(
+                            "writerpad.sync-password-confirmation"
+                        )
+                    Text("비밀번호는 6자 이상이어야 합니다. 서버의 보안 정책에 따라 더 강한 비밀번호가 필요할 수 있습니다.")
+                        .font(.footnote)
+                        .foregroundStyle(.secondary)
+                }
+                Button(authenticationMode.title) {
                     let submittedEmail = email
                     let submittedPassword = password
                     password = ""
+                    passwordConfirmation = ""
                     Task {
-                        await model.signIn(
-                            email: submittedEmail,
-                            password: submittedPassword
-                        )
+                        if authenticationMode == .signUp {
+                            await model.signUp(
+                                email: submittedEmail,
+                                password: submittedPassword
+                            )
+                        } else {
+                            await model.signIn(
+                                email: submittedEmail,
+                                password: submittedPassword
+                            )
+                        }
                     }
                 }
-                .disabled(
-                    email.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-                        || password.isEmpty
+                .disabled(!canSubmitAuthentication)
+                .accessibilityIdentifier(
+                    authenticationMode == .signUp
+                        ? "writerpad.sync-sign-up"
+                        : "writerpad.sync-sign-in"
                 )
-                .accessibilityIdentifier("writerpad.sync-sign-in")
 
                 if case let .unavailable(failure) = model.authenticationState {
                     Text(unavailableHint(failure))
@@ -598,10 +697,32 @@ struct SyncSettingsView: View {
                 }
             }
 
-            Text("비밀번호는 로그인 요청에만 사용하며 앱 설정에 저장하지 않습니다. 로그인 토큰은 iPad 키체인에 저장합니다.")
+            Text("비밀번호는 로그인·회원 가입 요청에만 사용하며 앱 설정에 저장하지 않습니다. 로그인 토큰은 iPad 키체인에 저장합니다.")
                 .font(.footnote)
                 .foregroundStyle(.secondary)
         }
+    }
+
+    private var protectedCloudSection: some View {
+        Section("보호된 클라우드 기능") {
+            Label("로그인 필요", systemImage: "lock.fill")
+                .font(.headline)
+            Text("모든 작품 동기화와 작품별 서버 연결은 인증된 계정에서만 열립니다. 로컬 작품 작성과 저장은 계속 사용할 수 있습니다.")
+                .font(.footnote)
+                .foregroundStyle(.secondary)
+        }
+        .accessibilityIdentifier("writerpad.protected-cloud-route")
+    }
+
+    private var canSubmitAuthentication: Bool {
+        let hasEmail = !email.trimmingCharacters(
+            in: .whitespacesAndNewlines
+        ).isEmpty
+        guard hasEmail, !password.isEmpty else { return false }
+        if authenticationMode == .signUp {
+            return password.count >= 6 && password == passwordConfirmation
+        }
+        return true
     }
 
     private var globalSyncSection: some View {
@@ -733,6 +854,14 @@ struct SyncSettingsView: View {
             return "이 빌드에는 서버 주소와 공개 키가 설정되지 않았습니다."
         case .invalidCredentials:
             return "아이디 또는 비밀번호를 다시 확인하세요."
+        case .weakPassword:
+            return "더 안전한 비밀번호를 사용하세요."
+        case .accountAlreadyExists:
+            return "이미 등록된 이메일입니다. 로그인해 주세요."
+        case .signUpDisabled:
+            return "현재 새 계정을 만들 수 없습니다."
+        case .emailNotConfirmed:
+            return "이메일 확인을 완료한 뒤 로그인하세요."
         case .networkUnavailable:
             return "네트워크에 연결되면 다시 시도하세요."
         case .keychainAccess:
@@ -780,11 +909,13 @@ private struct ExistingProjectConnectionView: View {
             .toolbar {
                 ToolbarItem(placement: .cancellationAction) {
                     Button("취소", action: onCancel)
+                        .keyboardShortcut(.cancelAction)
                 }
                 ToolbarItem(placement: .confirmationAction) {
                     Button("연결") {
                         onConnect(serverID, confirmation)
                     }
+                    .keyboardShortcut(.defaultAction)
                     .disabled(serverID.isEmpty || confirmation.isEmpty)
                 }
             }
