@@ -3157,6 +3157,11 @@ final class SyncV2StoreTests: XCTestCase {
         )
 
         XCTAssertEqual(result, .rebased)
+        // 아래 세 줄은 되감기 결과를 firstID 아래에서 찾는다. 곧 계약 위반인
+        // 그 자리 고쳐 쓰기에 기대고 있다는 뜻이다(미해결 A, 벡터 05).
+        // A를 고치면 결과는 새 operation_id 아래에 오므로 이 세 줄이 깨진다.
+        // 그때 구현을 되돌리지 말고, 후속 작업을 찾도록 여기를 고쳐라.
+        // 이 시험의 본래 관심사인 세대 승격과 종속 취소는 그대로 남는다.
         XCTAssertEqual(rebased.status, .pending)
         XCTAssertEqual(rebased.baseRevision, 4)
         XCTAssertEqual(
@@ -6244,6 +6249,9 @@ final class SyncV2StoreTests: XCTestCase {
 
     // MARK: - revision 충돌 되감기 (계약 대조)
 
+    // 계약 벡터 05 위반. 현재 동작을 기록만 한다.
+    // A 수정 시 이 시험을 고치지 말고 삭제하라.
+    //
     /// 되감기가 원본 작업을 그 자리에서 고쳐 쓰는지 본다.
     ///
     /// 계약은 의도를 불변으로 다룬다. 되감을 때 원본은 그대로 두고 새 작업을
@@ -6252,8 +6260,11 @@ final class SyncV2StoreTests: XCTestCase {
     /// 어느 payload의 것인지 알 수 없게 된다. 다시 보냈을 때 서버는 "이미
     /// 처리했다"고 답하는데 그 내용이 지금 보내려던 것과 다를 수 있다.
     ///
-    /// 지금 저장소가 실제로 무엇을 하는지 못 박아 둔다.
-    func testRebaseMutatesOriginalIntentInPlace() async throws {
+    /// 지금 저장소가 실제로 무엇을 하는지 못 박아 둔다. 이 시험이 통과한다는
+    /// 것은 구현이 아직 계약을 어기고 있다는 뜻이다. 계약을 지키도록 고치면
+    /// 이 시험은 깨져야 옳다. 그때 기대값을 손보지 말고 통째로 지워라.
+    /// 계약을 지키는 쪽의 시험은 벡터 05 하네스가 맡는다.
+    func testRebaseMutatesOperationInPlace_CONTRACT_VIOLATION_PINNED() async throws {
         let url = try databaseURL()
         let context = QueueAPIContext()
         let store = try await connectedStore(at: url, context: context)
