@@ -353,7 +353,7 @@ enum SyncV2StorageName {
 
 /// 작품이 어느 규약으로 쓰이고 있는지다. 승격은 한 방향이고 클라이언트가
 /// 임의로 올리지 않는다.
-enum SyncV2ProjectSyncMode: String, Equatable, Sendable {
+enum SyncV2ProjectSyncMode: String, Codable, Equatable, Sendable {
     case legacy = "LEGACY"
     case migrating = "MIGRATING"
     case idBased = "ID_BASED"

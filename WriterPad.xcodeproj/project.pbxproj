@@ -115,6 +115,9 @@
 		A9000000000000000000000D /* SyncV2StoreTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = B90000000000000000000011 /* SyncV2StoreTests.swift */; };
 		A96000000000000000000001 /* SyncV2Contract.swift in Sources */ = {isa = PBXBuildFile; fileRef = B96000000000000000000001 /* SyncV2Contract.swift */; };
 		A96000000000000000000002 /* SyncV2ContractTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = B96000000000000000000002 /* SyncV2ContractTests.swift */; };
+		A96000000000000000000003 /* SyncV2TransitionVector.swift in Sources */ = {isa = PBXBuildFile; fileRef = B96000000000000000000003 /* SyncV2TransitionVector.swift */; };
+		A96000000000000000000004 /* SyncV2VectorHarness.swift in Sources */ = {isa = PBXBuildFile; fileRef = B96000000000000000000004 /* SyncV2VectorHarness.swift */; };
+		A96000000000000000000005 /* SyncV2TransitionVectorTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = B96000000000000000000005 /* SyncV2TransitionVectorTests.swift */; };
 		A90000000000000000000031 /* SyncV2FolderIdentityTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = B90000000000000000000031 /* SyncV2FolderIdentityTests.swift */; };
 		A90000000000000000000032 /* SyncV2FolderMigrationTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = B90000000000000000000032 /* SyncV2FolderMigrationTests.swift */; };
 		A90000000000000000000033 /* SyncV2RemoteFolderPlannerTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = B90000000000000000000033 /* SyncV2RemoteFolderPlannerTests.swift */; };
@@ -285,6 +288,9 @@
 		B90000000000000000000011 /* SyncV2StoreTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SyncV2StoreTests.swift; sourceTree = "<group>"; };
 		B96000000000000000000001 /* SyncV2Contract.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SyncV2Contract.swift; sourceTree = "<group>"; };
 		B96000000000000000000002 /* SyncV2ContractTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SyncV2ContractTests.swift; sourceTree = "<group>"; };
+		B96000000000000000000003 /* SyncV2TransitionVector.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SyncV2TransitionVector.swift; sourceTree = "<group>"; };
+		B96000000000000000000004 /* SyncV2VectorHarness.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SyncV2VectorHarness.swift; sourceTree = "<group>"; };
+		B96000000000000000000005 /* SyncV2TransitionVectorTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SyncV2TransitionVectorTests.swift; sourceTree = "<group>"; };
 		B90000000000000000000031 /* SyncV2FolderIdentityTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SyncV2FolderIdentityTests.swift; sourceTree = "<group>"; };
 		B90000000000000000000032 /* SyncV2FolderMigrationTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SyncV2FolderMigrationTests.swift; sourceTree = "<group>"; };
 		B90000000000000000000033 /* SyncV2RemoteFolderPlannerTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SyncV2RemoteFolderPlannerTests.swift; sourceTree = "<group>"; };
@@ -509,6 +515,9 @@
 				B9000000000000000000000D /* DeviceIdentityServiceTests.swift */,
 				B9000000000000000000000F /* SupabaseProjectBindingServiceTests.swift */,
 				B96000000000000000000002 /* SyncV2ContractTests.swift */,
+				B96000000000000000000003 /* SyncV2TransitionVector.swift */,
+				B96000000000000000000004 /* SyncV2VectorHarness.swift */,
+				B96000000000000000000005 /* SyncV2TransitionVectorTests.swift */,
 				B90000000000000000000011 /* SyncV2StoreTests.swift */,
 				B90000000000000000000031 /* SyncV2FolderIdentityTests.swift */,
 				B90000000000000000000032 /* SyncV2FolderMigrationTests.swift */,
@@ -984,6 +993,9 @@
 				A90000000000000000000009 /* DeviceIdentityServiceTests.swift in Sources */,
 				A9000000000000000000000B /* SupabaseProjectBindingServiceTests.swift in Sources */,
 				A96000000000000000000002 /* SyncV2ContractTests.swift in Sources */,
+				A96000000000000000000003 /* SyncV2TransitionVector.swift in Sources */,
+				A96000000000000000000004 /* SyncV2VectorHarness.swift in Sources */,
+				A96000000000000000000005 /* SyncV2TransitionVectorTests.swift in Sources */,
 				A9000000000000000000000D /* SyncV2StoreTests.swift in Sources */,
 				A90000000000000000000031 /* SyncV2FolderIdentityTests.swift in Sources */,
 				A90000000000000000000032 /* SyncV2FolderMigrationTests.swift in Sources */,
