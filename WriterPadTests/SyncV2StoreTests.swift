@@ -5345,6 +5345,149 @@ final class SyncV2StoreTests: XCTestCase {
         XCTAssertEqual(after.first?.derivedStatus, .pending)
     }
 
+    // MARK: - 아직 사건을 남기지 않는 쓰기 경로
+
+    /// 한 가지 상태 변화를 실제로 태우고, 사건 기록과 status 칸이 어긋나는지
+    /// 본다.
+    ///
+    /// 되만들기를 먼저 돌려 바탕을 깨끗하게 만든 뒤에 변화를 준다. 그래야
+    /// 나온 어긋남이 전부 그 변화 때문임이 분명해진다.
+    private func divergenceAfterTransition(
+        _ transition: (SyncV2Store, SyncV2DispatchOperation) async throws -> Void
+    ) async throws -> [SyncV2OperationStateDivergence] {
+        let url = try databaseURL()
+        let context = QueueAPIContext()
+        let store = try await connectedStore(at: url, context: context)
+        _ = try await store.enqueue(
+            context.batch(
+                mutations: [context.documentMutation(operationID: UUID())]
+            )
+        )
+        try await store.backfillOperationEvents()
+        let baseline = try await store.operationStateDivergences()
+        XCTAssertEqual(baseline, [], "바탕이 이미 어긋나 있으면 결과를 믿을 수 없다")
+
+        let claimed = try await store.claimReadyOperations(
+            limit: 1,
+            now: Date(timeIntervalSince1970: 100)
+        )
+        let operation = try XCTUnwrap(claimed.first)
+        try await transition(store, operation)
+
+        let divergences = try await store.operationStateDivergences()
+        await store.close()
+        return divergences
+    }
+
+    /// 지금 어느 쓰기 경로가 status 칸만 고치고 사건을 남기지 않는지 적어 둔다.
+    ///
+    /// 여기 나온 것이 곧 옮겨야 할 목록이다. 하나씩 사건을 남기도록 고칠
+    /// 때마다 이 목록에서 지운다. 다 지워지면 읽는 쪽을 옮겨도 화면의 숫자가
+    /// 달라지지 않는다.
+    ///
+    /// - Note: 지금은 전부 어긋난다. 아직 아무 경로도 옮기지 않았기 때문이다.
+    ///   이 시험은 "옮겼는데 눈치채지 못하는 일"을 막으려고 둔다.
+    func testWritePathsThatDoNotYetRecordEvents() async throws {
+        // 대기 → 발송 중
+        let claimOnly = try await divergenceAfterTransition { _, _ in }
+        XCTAssertEqual(claimOnly.map(\.storedStatus), [.inflight])
+        XCTAssertEqual(claimOnly.map(\.derivedStatus), [.pending])
+
+        // 발송 중 → 완료
+        let completed = try await divergenceAfterTransition { store, operation in
+            try await store.complete(operation, result: self.commitResult(for: operation))
+        }
+        XCTAssertEqual(completed.map(\.storedStatus), [.completed])
+        XCTAssertEqual(completed.map(\.derivedStatus), [.pending])
+
+        // 발송 중 → 다시 시도 대기
+        let retryWait = try await divergenceAfterTransition { store, operation in
+            try await store.deferRetry(
+                operation,
+                errorCode: "NETWORK_UNAVAILABLE",
+                detail: nil,
+                nextAttemptAt: Date(timeIntervalSince1970: 200)
+            )
+        }
+        XCTAssertEqual(retryWait.map(\.storedStatus), [.retryWait])
+        XCTAssertEqual(retryWait.map(\.derivedStatus), [.pending])
+
+        // 발송 중 → 충돌
+        let conflict = try await divergenceAfterTransition { store, operation in
+            try await store.markConflict(
+                operation,
+                errorCode: "REVISION_CONFLICT",
+                detail: nil
+            )
+        }
+        XCTAssertEqual(conflict.map(\.storedStatus), [.conflict])
+        XCTAssertEqual(conflict.map(\.derivedStatus), [.pending])
+
+        // 발송 중 → 막힘
+        let blocked = try await divergenceAfterTransition { store, operation in
+            try await store.markBlocked(
+                operation,
+                errorCode: "AUTH_REQUIRED",
+                detail: nil
+            )
+        }
+        XCTAssertEqual(blocked.map(\.storedStatus), [.blocked])
+        XCTAssertEqual(blocked.map(\.derivedStatus), [.pending])
+
+        // 대기 → 발송 중 → 다시 시도 대기 → 대기.
+        //
+        // 이 눈의 사각지대다. 세 번 상태를 바꾸고도 처음 자리로 돌아오면
+        // 칸과 계산이 같아져 어긋남으로 보이지 않는다. 사건은 하나도 남지
+        // 않았는데 아무 일도 없었던 것처럼 보인다.
+        //
+        // 그래서 어긋남이 없다는 것만으로 "다 옮겼다"고 말할 수 없다. 옮길
+        // 목록은 코드에서 직접 세어야 한다.
+        let roundTrip = try await divergenceAfterTransition { store, operation in
+            try await store.deferRetry(
+                operation,
+                errorCode: "NETWORK_UNAVAILABLE",
+                detail: nil,
+                nextAttemptAt: Date(timeIntervalSince1970: 200)
+            )
+            try await store.makeRetryWaitOperationsReady(localProjectID: nil)
+        }
+        XCTAssertEqual(
+            roundTrip,
+            [],
+            "제자리로 돌아온 변화는 이 눈으로 볼 수 없다"
+        )
+    }
+
+    /// 폴더 줄도 문서 줄과 같은 문제를 안고 있다.
+    func testFolderWritePathsThatDoNotYetRecordEvents() async throws {
+        let url = try databaseURL()
+        let context = QueueAPIContext()
+        let folderOperationID = UUID()
+
+        let store = try await connectedStore(at: url, context: context)
+        _ = try await store.enqueue(
+            context.batch(
+                kind: .structureChange,
+                mutations: [context.folderMutation(operationID: folderOperationID)]
+            )
+        )
+        try await store.backfillOperationEvents()
+        let baseline = try await store.operationStateDivergences()
+        XCTAssertEqual(baseline, [])
+
+        let claimed = try await store.claimReadyFolderOperations(
+            limit: 1,
+            now: Date(timeIntervalSince1970: 100)
+        )
+        let folder = try XCTUnwrap(claimed.first)
+        try await store.complete(folder, result: folderCommitResult(for: folder))
+        let divergences = try await store.operationStateDivergences()
+        await store.close()
+
+        XCTAssertEqual(divergences.map(\.storedStatus), [.completed])
+        XCTAssertEqual(divergences.map(\.derivedStatus), [.pending])
+    }
+
     /// 사건 표는 존재하지 않는 작업을 가리킬 수 없다.
     func testOperationEventRequiresExistingOperation() async throws {
         let url = try databaseURL()
