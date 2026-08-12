@@ -5313,10 +5313,9 @@ final class SyncV2StoreTests: XCTestCase {
                 mutations: [context.documentMutation(operationID: operationID)]
             )
         )
-        // 되만들기는 저장소를 열 때 돈다. 방금 넣은 작업에는 아직 기록이 없다.
-        let beforeBackfill = try await store.operationStateDivergences()
-        try await store.backfillOperationEvents()
-        let afterBackfill = try await store.operationStateDivergences()
+        // 이제는 대기열에 올리는 순간 첫 사건이 함께 남는다.
+        let afterEnqueue = try await store.operationStateDivergences()
+        let events = try await store.operationEvents(operationID: operationID)
         await store.close()
 
         // 사건은 그대로 두고 칸만 바꾼다. 지금 남아 있는 쓰기 경로들이 하는 짓이다.
@@ -5333,12 +5332,8 @@ final class SyncV2StoreTests: XCTestCase {
         let after = try await reopened.operationStateDivergences()
         await reopened.close()
 
-        XCTAssertEqual(
-            beforeBackfill.map(\.derivedStatus),
-            [nil],
-            "기록이 없으면 계산할 수 없다는 것도 어긋남이다"
-        )
-        XCTAssertEqual(afterBackfill, [], "되만든 뒤에는 어긋남이 없어야 한다")
+        XCTAssertEqual(events.map(\.type), [.enqueued])
+        XCTAssertEqual(afterEnqueue, [], "대기열에 올린 직후에는 어긋남이 없다")
         XCTAssertEqual(after.count, 1)
         XCTAssertEqual(after.first?.operationID, operationID.uuidString.lowercased())
         XCTAssertEqual(after.first?.storedStatus, .completed)
@@ -5651,6 +5646,101 @@ final class SyncV2StoreTests: XCTestCase {
             events.map(\.errorCode),
             [nil, nil, "FORBIDDEN", nil],
             "풀려났다고 무엇에 막혔었는지를 지우지 않는다"
+        )
+        XCTAssertEqual(divergences, [])
+    }
+
+    /// 장부 한 줄이 어긋났다고 저장소가 통째로 안 열리면 안 된다. 사용자는
+    /// 그 순간 동기화를 전부 잃는다. 어긋난 줄은 그냥 두고 눈에 띄게만 한다.
+    func testDivergentOperationDoesNotBlockStoreOpen() async throws {
+        let url = try databaseURL()
+        let context = QueueAPIContext()
+        let operationID = UUID()
+
+        let store = try await connectedStore(at: url, context: context)
+        _ = try await store.enqueue(
+            context.batch(
+                mutations: [context.documentMutation(operationID: operationID)]
+            )
+        )
+        let claimed = try await store.claimReadyOperations(
+            limit: 1,
+            now: Date(timeIntervalSince1970: 100)
+        )
+        try await store.complete(
+            try XCTUnwrap(claimed.first),
+            result: commitResult(for: try XCTUnwrap(claimed.first))
+        )
+        await store.close()
+
+        // 사건은 끝났다고 하는데 칸만 되돌려 놓는다. 정상 경로로는 나올 수 없는
+        // 모양이지만, 옛 빌드가 남긴 장부나 앞으로 생길 실수가 이럴 수 있다.
+        let raw = try RawSQLite(url: url)
+        try raw.execute(
+            """
+            UPDATE sync_operations SET status = 'pending'
+            WHERE operation_id = '\(operationID.uuidString.lowercased())';
+            """
+        )
+        raw.close()
+
+        let reopened = try await openStore(at: url)
+        let divergences = try await reopened.operationStateDivergences()
+        await reopened.close()
+
+        XCTAssertEqual(divergences.count, 1, "어긋난 것이 눈에 보여야 한다")
+        XCTAssertEqual(divergences.first?.derivedStatus, .completed)
+    }
+
+    /// 밀려난 작업은 취소된 것이 아니라 밀려난 것이다. 무엇에 밀렸는지까지
+    /// 기록에 남아야 나중에 왜 사라졌는지 되짚을 수 있다.
+    func testSupersededOperationRecordsSupersededEvent() async throws {
+        let url = try databaseURL()
+        let context = QueueAPIContext()
+        let firstID = UUID()
+        let secondID = UUID()
+
+        let treeDocumentID = UUID()
+        let store = try await connectedStore(at: url, context: context)
+
+        func enqueueTreeOrder(_ operationID: UUID, generation: Int, order: String) async throws {
+            _ = try await store.enqueue(
+                context.batch(
+                    kind: .structureChange,
+                    mutations: [
+                        context.documentMutation(
+                            operationID: operationID,
+                            documentID: treeDocumentID,
+                            relativePath: syncV2TreeOrderPath,
+                            content:
+                                "{\"tree_order\":{\"메인\":[\(order)]},\"version\":1}",
+                            generation: generation,
+                            kind: .treeOrder
+                        ),
+                    ]
+                )
+            )
+        }
+
+        try await enqueueTreeOrder(firstID, generation: 1, order: "\"가.txt\",\"나.txt\"")
+        // 뒤에 온 순서가 아직 못 보낸 앞의 순서를 밀어낸다.
+        try await enqueueTreeOrder(secondID, generation: 2, order: "\"나.txt\",\"가.txt\"")
+
+        let firstEvents = try await store.operationEvents(operationID: firstID)
+        let secondEvents = try await store.operationEvents(operationID: secondID)
+        let divergences = try await store.operationStateDivergences()
+        await store.close()
+
+        XCTAssertEqual(firstEvents.last?.type, .superseded)
+        XCTAssertEqual(firstEvents.last?.errorCode, "SUPERSEDED_BY_TREE_ORDER")
+        XCTAssertEqual(
+            try SyncV2OperationStateDerivation.state(from: firstEvents),
+            .cancelled
+        )
+        XCTAssertEqual(
+            try SyncV2OperationStateDerivation.state(from: secondEvents),
+            .pending,
+            "살아남은 순서는 그대로 대기한다"
         )
         XCTAssertEqual(divergences, [])
     }

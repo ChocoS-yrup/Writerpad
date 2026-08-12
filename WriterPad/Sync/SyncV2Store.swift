@@ -1392,6 +1392,18 @@ actor SyncV2Store:
             }
 
             let timestamp = Self.timestamp()
+            // 문서의 신원이 서버 것으로 넘어갔다. 옛 신원으로 보내려던 것들은
+            // 밀려난 것이지 취소된 것이 아니다. 이어받을 작업이 따로 없으므로
+            // 가리킬 상대는 없다.
+            let superseded = try prepareOperationEvents(
+                where: """
+                document_id = ?
+                  AND status NOT IN ('completed', 'cancelled')
+                """,
+                timestamp: timestamp
+            ) { statement in
+                try bind(localIdentifier, at: 1, to: statement)
+            }
             try withStatement(
                 """
                 UPDATE sync_operations
@@ -1408,6 +1420,12 @@ actor SyncV2Store:
                 try bind(localIdentifier, at: 2, to: statement)
                 try stepDone(statement)
             }
+            try recordOperationEvents(
+                superseded,
+                type: .superseded,
+                errorCode: "SUPERSEDED_BY_SERVER_IDENTITY",
+                timestamp: timestamp
+            )
             try withStatement(
                 """
                 UPDATE sync_documents
@@ -3324,6 +3342,11 @@ actor SyncV2Store:
                 let affectedBatchIDs = try activeBatchIDs(
                     documentID: operation.documentID
                 )
+                let superseded = try prepareSupersededSiblings(
+                    documentID: operation.documentID,
+                    survivingOperationID: operation.operationID,
+                    timestamp: timestamp
+                )
                 try withStatement(
                     """
                     UPDATE sync_operations
@@ -3349,6 +3372,16 @@ actor SyncV2Store:
                     )
                     try stepDone(statement)
                 }
+                // 밀려난 작업마다 누구에게 밀렸는지 함께 적는다. 나중에 왜
+                // 사라졌는지 되짚으려면 가리킬 상대가 있어야 한다.
+                try recordOperationEvents(
+                    superseded,
+                    type: .superseded,
+                    errorCode: "SUPERSEDED_BY_CONFLICT_SNAPSHOT",
+                    timestamp: timestamp,
+                    relatedOperationID:
+                        operation.operationID.uuidString.lowercased()
+                )
                 try transitionInflightOperation(
                     operation,
                     status: .conflict,
@@ -3519,6 +3552,11 @@ actor SyncV2Store:
                 let affectedBatchIDs = try activeBatchIDs(
                     documentID: request.documentID
                 )
+                let superseded = try prepareSupersededSiblings(
+                    documentID: request.documentID,
+                    survivingOperationID: request.resolutionOperationID,
+                    timestamp: timestamp
+                )
                 try withStatement(
                     """
                     UPDATE sync_operations
@@ -3551,6 +3589,14 @@ actor SyncV2Store:
                     )
                     try stepDone(statement)
                 }
+                try recordOperationEvents(
+                    superseded,
+                    type: .superseded,
+                    errorCode: "SUPERSEDED_BY_CONFLICT_RESOLUTION",
+                    timestamp: timestamp,
+                    relatedOperationID:
+                        request.resolutionOperationID.uuidString.lowercased()
+                )
                 try withStatement(
                     """
                     UPDATE sync_operations
@@ -4150,6 +4196,11 @@ actor SyncV2Store:
                 let affectedBatchIDs = try activeBatchIDs(
                     documentID: operation.documentID
                 )
+                let superseded = try prepareSupersededSiblings(
+                    documentID: operation.documentID,
+                    survivingOperationID: operation.operationID,
+                    timestamp: timestamp
+                )
                 try withStatement(
                     """
                     UPDATE sync_operations
@@ -4175,6 +4226,14 @@ actor SyncV2Store:
                     )
                     try stepDone(statement)
                 }
+                try recordOperationEvents(
+                    superseded,
+                    type: .superseded,
+                    errorCode: "SUPERSEDED_BY_AUTO_REBASE",
+                    timestamp: timestamp,
+                    relatedOperationID:
+                        operation.operationID.uuidString.lowercased()
+                )
 
                 let mergedData = Data(mergedContent.utf8)
                 let mergedHash = Self.sha256Hex(mergedData)
@@ -5727,6 +5786,12 @@ actor SyncV2Store:
             try bind(timestamp, at: 8, to: statement)
             try stepDone(statement)
         }
+        // 만들어지는 순간의 상태를 지난 일로 적어 둔다. 이것이 없으면 뒤에
+        // 붙는 사건이 시작 없이 끝만 있는 기록이 된다.
+        try ensureOperationEventHistory(
+            operationID: operation.operationID.uuidString.lowercased(),
+            timestamp: timestamp
+        )
         try withStatement(
             """
             UPDATE sync_projects
@@ -5925,6 +5990,11 @@ actor SyncV2Store:
             try bind(timestamp, at: 23, to: statement)
             try stepDone(statement)
         }
+        // 대기열에 올랐다는 것이 이 작업의 첫 사건이다.
+        try ensureOperationEventHistory(
+            operationID: operation.operationID.uuidString.lowercased(),
+            timestamp: timestamp
+        )
 
         try withStatement(
             """
@@ -5989,6 +6059,18 @@ actor SyncV2Store:
             }
         }
         guard !affectedBatchIDs.isEmpty else { return }
+        // 아직 못 보낸 옛 순서들은 새 순서에 밀려난다. 여섯 번 자리를 옮겨도
+        // 서버에 가는 것은 마지막 하나면 된다.
+        let superseded = try prepareOperationEvents(
+            where: """
+            document_id = ?
+              AND operation_kind = 'tree_order'
+              AND status IN ('pending', 'retry_wait', 'blocked')
+            """,
+            timestamp: timestamp
+        ) { statement in
+            try bind(documentID.uuidString.lowercased(), at: 1, to: statement)
+        }
         try withStatement(
             """
             UPDATE sync_operations
@@ -6010,6 +6092,12 @@ actor SyncV2Store:
             )
             try stepDone(statement)
         }
+        try recordOperationEvents(
+            superseded,
+            type: .superseded,
+            errorCode: "SUPERSEDED_BY_TREE_ORDER",
+            timestamp: timestamp
+        )
         for batchID in affectedBatchIDs {
             try refreshBatchState(batchID: batchID, timestamp: timestamp)
         }
@@ -6289,6 +6377,11 @@ actor SyncV2Store:
             try bind(timestamp, at: 14, to: statement)
             try stepDone(statement)
         }
+        // 폴더 작업도 대기열에 올랐다는 첫 사건을 남긴다.
+        try ensureOperationEventHistory(
+            operationID: operation.operationID.uuidString.lowercased(),
+            timestamp: timestamp
+        )
 
         try withStatement(
             """
@@ -7041,6 +7134,12 @@ actor SyncV2Store:
     /// 채워 둔 뒤 식별자를 돌려준다.
     ///
     /// 바꾼 다음에 `recordOperationEvents`로 사건을 남기면 된다.
+    ///
+    /// 이미 끝난 것으로 계산되는 작업은 목록에서 뺀다. 계약이 끝난 작업에는
+    /// 사건을 못 붙이게 하는데, 여기서 그걸 오류로 올리면 장부 한 줄이
+    /// 어긋났다는 이유로 저장소가 아예 열리지 않는다. 그러면 사용자는 동기화를
+    /// 통째로 잃는다. 대신 그냥 두고 `operationStateDivergences()`에 드러나게
+    /// 한다. 고칠 것이 있으면 그걸 보고 고치면 된다.
     private func prepareOperationEvents(
         where condition: String,
         alias: String? = nil,
@@ -7052,13 +7151,21 @@ actor SyncV2Store:
             alias: alias,
             bind: binder
         )
+        var appendable: [String] = []
         for operationID in targets {
             try ensureOperationEventHistory(
                 operationID: operationID,
                 timestamp: timestamp
             )
+            let events = try operationEvents(operationID: operationID)
+            guard (try? SyncV2OperationStateDerivation
+                .requireAppendable(to: events)) != nil
+            else {
+                continue
+            }
+            appendable.append(operationID)
         }
-        return targets
+        return appendable
     }
 
     /// 여러 작업에 같은 사건을 남긴다.
@@ -7066,14 +7173,42 @@ actor SyncV2Store:
         _ operationIDs: [String],
         type: SyncV2OperationEventType,
         errorCode: String?,
-        timestamp: String
+        timestamp: String,
+        relatedOperationID: String? = nil
     ) throws {
         for operationID in operationIDs {
             try appendOperationEvent(
                 operationID: operationID,
                 type: type,
                 errorCode: errorCode,
-                timestamp: timestamp
+                timestamp: timestamp,
+                relatedOperationID: relatedOperationID
+            )
+        }
+    }
+
+    /// 한 문서에 걸려 있던 다른 작업들을 밀어낼 준비를 한다.
+    ///
+    /// 살아남는 작업 하나만 남기고 나머지를 고른다. 밀어낸 뒤에는 조건에
+    /// 걸리지 않으므로 바꾸기 전에 불러야 한다.
+    private func prepareSupersededSiblings(
+        documentID: UUID,
+        survivingOperationID: UUID,
+        timestamp: String
+    ) throws -> [String] {
+        try prepareOperationEvents(
+            where: """
+            document_id = ?
+              AND operation_id <> ?
+              AND status NOT IN ('completed', 'cancelled')
+            """,
+            timestamp: timestamp
+        ) { statement in
+            try bind(documentID.uuidString.lowercased(), at: 1, to: statement)
+            try bind(
+                survivingOperationID.uuidString.lowercased(),
+                at: 2,
+                to: statement
             )
         }
     }
