@@ -2127,6 +2127,23 @@ actor SyncV2Store:
                 // 뒤에 남기는 durable 감사 기록이다. 별도 dispatcher lane이
                 // 없으므로 pending으로 두면 같은 초기 batch의 tree-order를
                 // 영구히 막는다. 예전 빌드가 남긴 행도 완료로 정리한다.
+                let settledEnsures = try prepareOperationEvents(
+                    where: """
+                    operation_kind = 'ensure_project'
+                      AND status NOT IN ('completed', 'cancelled')
+                      AND EXISTS (
+                          SELECT 1 FROM sync_projects p
+                          WHERE p.local_project_id =
+                                sync_operations.local_project_id
+                            AND p.server_project_id =
+                                sync_operations.project_id
+                            AND p.owner_subject =
+                                sync_operations.owner_subject
+                            AND p.binding_kind <> 'local_only'
+                      )
+                    """,
+                    timestamp: timestamp
+                )
                 try execute(
                     """
                     UPDATE sync_operations
@@ -2151,9 +2168,23 @@ actor SyncV2Store:
                       );
                     """
                 )
+                try recordOperationEvents(
+                    settledEnsures,
+                    type: .committed,
+                    errorCode: nil,
+                    timestamp: timestamp
+                )
                 // 폴더 revision 충돌은 최신 folders snapshot 위로 자동 rebase할
                 // 수 있다. 앱이 충돌을 기록한 직후 종료됐어도 다음 실행에서
                 // dispatcher가 다시 받아 영구 대기에 남지 않게 한다.
+                let rebasableFolders = try prepareOperationEvents(
+                    where: """
+                    folder_id IS NOT NULL
+                      AND status = 'conflict'
+                      AND last_error_code = 'REVISION_CONFLICT'
+                    """,
+                    timestamp: timestamp
+                )
                 try execute(
                     """
                     UPDATE sync_operations
@@ -2169,6 +2200,12 @@ actor SyncV2Store:
                       AND status = 'conflict'
                       AND last_error_code = 'REVISION_CONFLICT';
                     """
+                )
+                try recordOperationEvents(
+                    rebasableFolders,
+                    type: .enqueued,
+                    errorCode: nil,
+                    timestamp: timestamp
                 )
                 // 서버 프로젝트가 삭제 후 같은 UUID로 다시 만들어지는 등
                 // 로컬 revision 기준선만 남은 경우, 이전 실행에서
@@ -2262,6 +2299,12 @@ actor SyncV2Store:
                     localProjectID: nil,
                     timestamp: timestamp
                 )
+                // 발송 도중 앱이 꺼진 작업이다. 계속 발송 중이라고 믿으면
+                // 아무도 다시 손대지 않아 영영 대기에 남는다.
+                let interrupted = try prepareOperationEvents(
+                    where: "status = 'inflight'",
+                    timestamp: timestamp
+                )
                 try execute(
                     """
                     UPDATE sync_operations
@@ -2270,6 +2313,12 @@ actor SyncV2Store:
                         updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
                     WHERE status = 'inflight';
                     """
+                )
+                try recordOperationEvents(
+                    interrupted,
+                    type: .enqueued,
+                    errorCode: nil,
+                    timestamp: timestamp
                 )
                 try execute(
                     """
@@ -4592,6 +4641,19 @@ actor SyncV2Store:
             try bind(projectValue, at: 3, to: statement)
             try stepDone(statement)
         }
+        let unblocked = try prepareOperationEvents(
+            where: """
+            o.status = 'blocked'
+              AND o.last_error_code = 'FORBIDDEN'
+              AND (? IS NULL OR o.local_project_id = ?)
+              AND \(laneHeadPredicate)
+            """,
+            alias: "o",
+            timestamp: timestamp
+        ) { statement in
+            try bind(projectValue, at: 1, to: statement)
+            try bind(projectValue, at: 2, to: statement)
+        }
         try withStatement(
             """
             UPDATE sync_operations AS o
@@ -4612,6 +4674,12 @@ actor SyncV2Store:
             try bind(projectValue, at: 3, to: statement)
             try stepDone(statement)
         }
+        try recordOperationEvents(
+            unblocked,
+            type: .enqueued,
+            errorCode: nil,
+            timestamp: timestamp
+        )
         for batchID in affectedBatchIDs {
             try refreshBatchState(
                 batchID: batchID,
@@ -4724,6 +4792,23 @@ actor SyncV2Store:
             try bind(projectValue, at: 3, to: statement)
             try stepDone(statement)
         }
+        let requeued = try prepareOperationEvents(
+            where: """
+            status = 'conflict'
+              AND last_error_code IN (\(errorCodeList))
+              AND (? IS NULL OR local_project_id = ?)
+              AND NOT EXISTS (
+                  SELECT 1
+                  FROM sync_conflicts c
+                  WHERE c.document_id = sync_operations.document_id
+                    AND c.resolved_at IS NULL
+              )
+            """,
+            timestamp: timestamp
+        ) { statement in
+            try bind(projectValue, at: 1, to: statement)
+            try bind(projectValue, at: 2, to: statement)
+        }
         try withStatement(
             """
             UPDATE sync_operations
@@ -4749,6 +4834,12 @@ actor SyncV2Store:
             try bind(projectValue, at: 3, to: statement)
             try stepDone(statement)
         }
+        try recordOperationEvents(
+            requeued,
+            type: .enqueued,
+            errorCode: nil,
+            timestamp: timestamp
+        )
         for batchID in affectedBatchIDs {
             try refreshBatchState(
                 batchID: batchID,
@@ -6921,12 +7012,18 @@ actor SyncV2Store:
     /// 여러 줄을 한꺼번에 바꾸는 자리에서 쓴다. 바꾸기 **전에** 불러야 한다.
     /// 바꾼 뒤에는 조건에 더 이상 걸리지 않아 누구에게 사건을 남겨야 할지
     /// 알 수 없다.
+    ///
+    /// 조건이 별칭으로 자기 표를 가리키면 `alias`를 준다. 상관 부질의가
+    /// `sync_operations`라는 이름을 그대로 쓰는 조건에는 주지 않는다. 별칭을
+    /// 붙이면 그 이름으로는 더 이상 가리킬 수 없다.
     private func operationIDs(
         where condition: String,
+        alias: String? = nil,
         bind binder: (OpaquePointer) throws -> Void
     ) throws -> [String] {
-        try withStatement(
-            "SELECT operation_id FROM sync_operations WHERE \(condition);"
+        let target = alias.map { "sync_operations AS \($0)" } ?? "sync_operations"
+        return try withStatement(
+            "SELECT operation_id FROM \(target) WHERE \(condition);"
         ) { statement in
             try binder(statement)
             var ids: [String] = []
@@ -6938,6 +7035,30 @@ actor SyncV2Store:
             }
             return ids
         }
+    }
+
+    /// 여럿을 한꺼번에 바꾸기 직전에 부른다. 대상을 모으고, 각자의 지난 일을
+    /// 채워 둔 뒤 식별자를 돌려준다.
+    ///
+    /// 바꾼 다음에 `recordOperationEvents`로 사건을 남기면 된다.
+    private func prepareOperationEvents(
+        where condition: String,
+        alias: String? = nil,
+        timestamp: String,
+        bind binder: (OpaquePointer) throws -> Void = { _ in }
+    ) throws -> [String] {
+        let targets = try operationIDs(
+            where: condition,
+            alias: alias,
+            bind: binder
+        )
+        for operationID in targets {
+            try ensureOperationEventHistory(
+                operationID: operationID,
+                timestamp: timestamp
+            )
+        }
+        return targets
     }
 
     /// 여러 작업에 같은 사건을 남긴다.

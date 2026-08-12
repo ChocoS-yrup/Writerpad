@@ -5577,6 +5577,84 @@ final class SyncV2StoreTests: XCTestCase {
         XCTAssertEqual(divergences, [])
     }
 
+    /// 발송 도중 앱이 꺼진 뒤 다시 열면, 되살린 것도 기록에 남아야 한다.
+    ///
+    /// 계속 발송 중이라고 믿으면 아무도 다시 손대지 않아 영영 대기에 남는다.
+    /// 무엇이 되살아났는지 기록에 없으면 나중에 되짚을 수도 없다.
+    func testRestartRecoveryRecordsRequeueEvent() async throws {
+        let url = try databaseURL()
+        let context = QueueAPIContext()
+        let operationID = UUID()
+
+        let store = try await connectedStore(at: url, context: context)
+        _ = try await store.enqueue(
+            context.batch(
+                mutations: [context.documentMutation(operationID: operationID)]
+            )
+        )
+        _ = try await store.claimReadyOperations(
+            limit: 1,
+            now: Date(timeIntervalSince1970: 100)
+        )
+        // 여기서 앱이 꺼졌다. 작업은 발송 중인 채로 남는다.
+        await store.close()
+
+        let reopened = try await openStore(at: url)
+        let events = try await reopened.operationEvents(operationID: operationID)
+        let divergences = try await reopened.operationStateDivergences()
+        await reopened.close()
+
+        XCTAssertEqual(
+            events.map(\.type),
+            [.enqueued, .dispatchStarted, .enqueued],
+            "집어들었다가 되돌아온 자취가 남아야 한다"
+        )
+        XCTAssertEqual(
+            try SyncV2OperationStateDerivation.state(from: events),
+            .pending
+        )
+        XCTAssertEqual(divergences, [])
+    }
+
+    /// 막힌 작업을 다시 풀어 줄 때도 기록에 남는다.
+    func testForbiddenBlockRecoveryRecordsRequeueEvent() async throws {
+        let url = try databaseURL()
+        let context = QueueAPIContext()
+        let operationID = UUID()
+
+        let store = try await connectedStore(at: url, context: context)
+        _ = try await store.enqueue(
+            context.batch(
+                mutations: [context.documentMutation(operationID: operationID)]
+            )
+        )
+        let claimed = try await store.claimReadyOperations(
+            limit: 1,
+            now: Date(timeIntervalSince1970: 100)
+        )
+        try await store.markBlocked(
+            try XCTUnwrap(claimed.first),
+            errorCode: "FORBIDDEN",
+            detail: nil
+        )
+        try await store.makeRetryWaitOperationsReady(localProjectID: nil)
+
+        let events = try await store.operationEvents(operationID: operationID)
+        let divergences = try await store.operationStateDivergences()
+        await store.close()
+
+        XCTAssertEqual(
+            events.map(\.type),
+            [.enqueued, .dispatchStarted, .blocked, .enqueued]
+        )
+        XCTAssertEqual(
+            events.map(\.errorCode),
+            [nil, nil, "FORBIDDEN", nil],
+            "풀려났다고 무엇에 막혔었는지를 지우지 않는다"
+        )
+        XCTAssertEqual(divergences, [])
+    }
+
     /// 폴더 줄도 문서 줄과 같은 문제를 안고 있다.
     func testFolderWritePathsThatDoNotYetRecordEvents() async throws {
         let url = try databaseURL()
