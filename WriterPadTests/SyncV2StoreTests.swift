@@ -5385,10 +5385,9 @@ final class SyncV2StoreTests: XCTestCase {
     /// 때마다 이 목록에서 지운다. 다 지워지면 읽는 쪽을 옮겨도 화면의 숫자가
     /// 달라지지 않는다.
     func testWritePathsThatDoNotYetRecordEvents() async throws {
-        // 아직 안 옮겼다. 대기 → 발송 중.
+        // 옮겼다. 대기 → 발송 중.
         let claimOnly = try await divergenceAfterTransition { _, _ in }
-        XCTAssertEqual(claimOnly.map(\.storedStatus), [.inflight])
-        XCTAssertEqual(claimOnly.map(\.derivedStatus), [.pending])
+        XCTAssertEqual(claimOnly, [])
 
         // 옮겼다. 발송이 끝나는 네 갈래는 모두 한 함수를 지난다.
         let completed = try await divergenceAfterTransition { store, operation in
@@ -5424,32 +5423,50 @@ final class SyncV2StoreTests: XCTestCase {
         }
         XCTAssertEqual(blocked, [])
 
-        // 대기 → 발송 중 → 다시 시도 대기 → 대기.
+        // 대기 → 발송 중 → 다시 시도 대기 → 대기. 한 바퀴가 온전히 남는다.
         //
-        // 양쪽 다 안 옮겼을 때는 이 왕복이 이 눈의 사각지대였다. 세 번 상태를
-        // 바꾸고도 처음 자리로 돌아오면 칸과 계산이 우연히 같아져 아무 일도
-        // 없었던 것처럼 보였다.
-        //
-        // 앞쪽 절반을 옮기고 나니 뒤쪽이 드러났다. `deferRetry`는 사건을 남기고
-        // `makeRetryWaitOperationsReady`는 남기지 않아, 이제는 어긋남으로 보인다.
+        // 이 왕복은 한때 이 눈의 사각지대였다. 양쪽 다 안 옮겼을 때는 처음
+        // 자리로 돌아오면 칸과 계산이 우연히 같아져 아무 일도 없었던 것처럼
+        // 보였다. 이제는 지나온 자리가 전부 기록에 남는다.
         //
         // 그래도 어긋남이 없다는 것만으로 "다 옮겼다"고 말할 수는 없다. 아직
         // 아무것도 안 옮긴 짝끼리는 여전히 서로를 가린다. 옮길 목록은 코드에서
         // 직접 세어야 한다.
-        let roundTrip = try await divergenceAfterTransition { store, operation in
-            try await store.deferRetry(
-                operation,
-                errorCode: "NETWORK_UNAVAILABLE",
-                detail: nil,
-                nextAttemptAt: Date(timeIntervalSince1970: 200)
+        let url = try databaseURL()
+        let context = QueueAPIContext()
+        let operationID = UUID()
+        let store = try await connectedStore(at: url, context: context)
+        _ = try await store.enqueue(
+            context.batch(
+                mutations: [context.documentMutation(operationID: operationID)]
             )
-            try await store.makeRetryWaitOperationsReady(localProjectID: nil)
-        }
-        XCTAssertEqual(roundTrip.map(\.storedStatus), [.pending])
+        )
+        try await store.backfillOperationEvents()
+        let claimed = try await store.claimReadyOperations(
+            limit: 1,
+            now: Date(timeIntervalSince1970: 100)
+        )
+        try await store.deferRetry(
+            try XCTUnwrap(claimed.first),
+            errorCode: "NETWORK_UNAVAILABLE",
+            detail: nil,
+            nextAttemptAt: Date(timeIntervalSince1970: 200)
+        )
+        try await store.makeRetryWaitOperationsReady(localProjectID: nil)
+        let roundTrip = try await store.operationStateDivergences()
+        let events = try await store.operationEvents(operationID: operationID)
+        await store.close()
+
+        XCTAssertEqual(roundTrip, [])
         XCTAssertEqual(
-            roundTrip.map(\.derivedStatus),
-            [.retryWait],
-            "makeRetryWaitOperationsReady가 아직 사건을 남기지 않는다"
+            events.map(\.type),
+            [.enqueued, .dispatchStarted, .retryScheduled, .enqueued]
+        )
+        // 성공했다고 앞선 실패를 지우지 않는다. 무엇 때문에 다시 시도했는지가
+        // 기록에 남아 있어야 한다.
+        XCTAssertEqual(
+            events.map(\.errorCode),
+            [nil, nil, "NETWORK_UNAVAILABLE", nil]
         )
     }
 
@@ -5505,8 +5522,12 @@ final class SyncV2StoreTests: XCTestCase {
 
             XCTAssertEqual(events.last?.type, expectedType, label)
             XCTAssertEqual(events.last?.errorCode, expectedError, label)
-            // 앞선 실패를 성공이 지우지 않는다. 기록은 덧붙이기만 한다.
-            XCTAssertEqual(events.first?.type, .enqueued, label)
+            // 발송 한 바퀴가 온전히 남는다. 대기에서 시작해 발송을 거쳐 끝난다.
+            XCTAssertEqual(
+                events.map(\.type),
+                [.enqueued, .dispatchStarted, expectedType],
+                label
+            )
             XCTAssertEqual(events.map(\.sequence), Array(1...events.count), label)
         }
     }

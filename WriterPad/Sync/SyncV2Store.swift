@@ -2477,6 +2477,11 @@ actor SyncV2Store:
                     nowValue: nowValue
                 )
                 for operation in candidates {
+                    let operationKey = operation.operationID.uuidString.lowercased()
+                    try ensureOperationEventHistory(
+                        operationID: operationKey,
+                        timestamp: nowValue
+                    )
                     try withStatement(
                         """
                         UPDATE sync_operations
@@ -2489,17 +2494,19 @@ actor SyncV2Store:
                         """
                     ) { statement in
                         try bind(nowValue, at: 1, to: statement)
-                        try bind(
-                            operation.operationID.uuidString.lowercased(),
-                            at: 2,
-                            to: statement
-                        )
+                        try bind(operationKey, at: 2, to: statement)
                         try stepDone(statement)
                         guard sqlite3_changes(connection.handle) == 1 else {
                             throw SyncV2DispatchStoreError
                                 .operationStateChanged
                         }
                     }
+                    try appendOperationEvent(
+                        operationID: operationKey,
+                        type: .dispatchStarted,
+                        errorCode: nil,
+                        timestamp: nowValue
+                    )
                     try withStatement(
                         """
                         UPDATE sync_batches
@@ -2589,6 +2596,11 @@ actor SyncV2Store:
                 nowValue: nowValue
             )
             for operation in candidates {
+                let operationKey = operation.operationID.uuidString.lowercased()
+                try ensureOperationEventHistory(
+                    operationID: operationKey,
+                    timestamp: nowValue
+                )
                 try withStatement(
                     """
                     UPDATE sync_operations
@@ -2601,16 +2613,18 @@ actor SyncV2Store:
                     """
                 ) { statement in
                     try bind(nowValue, at: 1, to: statement)
-                    try bind(
-                        operation.operationID.uuidString.lowercased(),
-                        at: 2,
-                        to: statement
-                    )
+                    try bind(operationKey, at: 2, to: statement)
                     try stepDone(statement)
                     guard sqlite3_changes(connection.handle) == 1 else {
                         throw SyncV2DispatchStoreError.operationStateChanged
                     }
                 }
+                try appendOperationEvent(
+                    operationID: operationKey,
+                    type: .dispatchStarted,
+                    errorCode: nil,
+                    timestamp: nowValue
+                )
                 try withStatement(
                     """
                     UPDATE sync_batches
@@ -4217,6 +4231,11 @@ actor SyncV2Store:
         errorCode: String,
         timestamp: String
     ) throws {
+        let operationKey = operation.operationID.uuidString.lowercased()
+        try ensureOperationEventHistory(
+            operationID: operationKey,
+            timestamp: timestamp
+        )
         try withStatement(
             """
             UPDATE sync_operations
@@ -4231,17 +4250,19 @@ actor SyncV2Store:
         ) { statement in
             try bind(errorCode, at: 1, to: statement)
             try bind(timestamp, at: 2, to: statement)
-            try bind(
-                operation.operationID.uuidString.lowercased(),
-                at: 3,
-                to: statement
-            )
+            try bind(operationKey, at: 3, to: statement)
             try bind(operation.attempts, at: 4, to: statement)
             try stepDone(statement)
             guard sqlite3_changes(connection.handle) == 1 else {
                 throw SyncV2DispatchStoreError.operationStateChanged
             }
         }
+        try appendOperationEvent(
+            operationID: operationKey,
+            type: .enqueued,
+            errorCode: errorCode,
+            timestamp: timestamp
+        )
     }
 
     private func activeBatchIDs(documentID: UUID) throws -> [UUID] {
@@ -4463,6 +4484,16 @@ actor SyncV2Store:
                     localProjectID: localProjectID,
                     timestamp: timestamp
                 )
+                let projectValue =
+                    localProjectID?.rawValue.uuidString.lowercased()
+                // 바꾸기 전에 대상을 모은다. 바꾼 뒤에는 조건에 걸리지 않아
+                // 누구에게 사건을 남겨야 할지 알 수 없다.
+                let waiting = try operationIDs(
+                    where: "status = 'retry_wait' AND (? IS NULL OR local_project_id = ?)"
+                ) { statement in
+                    try bind(projectValue, at: 1, to: statement)
+                    try bind(projectValue, at: 2, to: statement)
+                }
                 try withStatement(
                     """
                     UPDATE sync_operations
@@ -4473,13 +4504,19 @@ actor SyncV2Store:
                       AND (? IS NULL OR local_project_id = ?);
                     """
                 ) { statement in
-                    let projectValue =
-                        localProjectID?.rawValue.uuidString.lowercased()
                     try bind(timestamp, at: 1, to: statement)
                     try bind(projectValue, at: 2, to: statement)
                     try bind(projectValue, at: 3, to: statement)
                     try stepDone(statement)
                 }
+                // 대기로 돌아왔다는 것을 적는다. 계약이 정한 사건 가운데
+                // 대기로 이어지는 것은 이것뿐이다.
+                try recordOperationEvents(
+                    waiting,
+                    type: .enqueued,
+                    errorCode: nil,
+                    timestamp: timestamp
+                )
             }
         } catch {
             throw SyncV2DispatchStoreError.unavailable
@@ -6877,6 +6914,47 @@ actor SyncV2Store:
             recordedAt: timestamp,
             skipIfPresent: true
         )
+    }
+
+    /// 조건에 걸리는 작업의 식별자를 모은다.
+    ///
+    /// 여러 줄을 한꺼번에 바꾸는 자리에서 쓴다. 바꾸기 **전에** 불러야 한다.
+    /// 바꾼 뒤에는 조건에 더 이상 걸리지 않아 누구에게 사건을 남겨야 할지
+    /// 알 수 없다.
+    private func operationIDs(
+        where condition: String,
+        bind binder: (OpaquePointer) throws -> Void
+    ) throws -> [String] {
+        try withStatement(
+            "SELECT operation_id FROM sync_operations WHERE \(condition);"
+        ) { statement in
+            try binder(statement)
+            var ids: [String] = []
+            while sqlite3_step(statement) == SQLITE_ROW {
+                guard let value = sqlite3_column_text(statement, 0) else {
+                    throw SyncV2StoreError.invalidStoredData
+                }
+                ids.append(String(cString: value))
+            }
+            return ids
+        }
+    }
+
+    /// 여러 작업에 같은 사건을 남긴다.
+    private func recordOperationEvents(
+        _ operationIDs: [String],
+        type: SyncV2OperationEventType,
+        errorCode: String?,
+        timestamp: String
+    ) throws {
+        for operationID in operationIDs {
+            try appendOperationEvent(
+                operationID: operationID,
+                type: type,
+                errorCode: errorCode,
+                timestamp: timestamp
+            )
+        }
     }
 
     /// 사건을 하나 덧붙인다.
