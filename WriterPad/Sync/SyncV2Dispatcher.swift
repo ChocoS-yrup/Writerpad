@@ -81,11 +81,28 @@ actor SyncV2AutomaticRebaser {
                 )
             }
             let local = try await store.latestLocalSnapshot(for: operation)
+            let mergedContent: String
+            if operation.baseRevision == 0 {
+                guard let merged = Self.mergeInitialTreeOrder(
+                    localContent: local.content,
+                    remoteContent: remote.content
+                ) else {
+                    return .conflict(
+                        code: "INVALID_TREE_ORDER",
+                        detail: "초기 tree-order와 서버 tree-order를 안전하게 병합할 수 없습니다."
+                    )
+                }
+                mergedContent = merged
+            } else {
+                // 이미 공유가 시작된 뒤의 순서 변경은 마지막 로컬 조작을
+                // 유지한다. 초기 연결 경쟁만 서버 항목과 합집합으로 병합한다.
+                mergedContent = local.content
+            }
             let result = try await store.rebaseAfterRevisionConflict(
                 operation,
                 remote: remote,
                 local: local,
-                mergedContent: local.content,
+                mergedContent: mergedContent,
                 mergedPath: syncV2TreeOrderPath
             )
             switch result {
@@ -326,6 +343,110 @@ actor SyncV2AutomaticRebaser {
                 detail: "자동 병합 목적 경로를 다른 UUID 문서가 사용 중입니다."
             )
         }
+    }
+
+    private static func mergeInitialTreeOrder(
+        localContent: String,
+        remoteContent: String
+    ) -> String? {
+        guard
+            let local = treeOrderPayload(localContent),
+            let remote = treeOrderPayload(remoteContent)
+        else { return nil }
+
+        var mergedOrder: [String: [String]] = [:]
+        for key in Set(remote.order.keys).union(local.order.keys).sorted() {
+            var names: [String] = []
+            for name in (remote.order[key] ?? []) + (local.order[key] ?? []) {
+                let canonical = name.precomposedStringWithCanonicalMapping
+                if !names.contains(canonical) {
+                    names.append(canonical)
+                }
+            }
+            mergedOrder[key.precomposedStringWithCanonicalMapping] = names
+        }
+
+        var folderPaths: [String] = []
+        let derivedPaths = mergedOrder.keys.filter { $0 != "<root>" }
+        for path in remote.folderPaths + local.folderPaths + derivedPaths {
+            let canonical = path.precomposedStringWithCanonicalMapping
+            if !folderPaths.contains(canonical) {
+                folderPaths.append(canonical)
+            }
+        }
+        let object: [String: Any] = [
+            "folder_paths": folderPaths,
+            "tree_order": mergedOrder,
+            "version": 1,
+        ]
+        guard JSONSerialization.isValidJSONObject(object),
+              let data = try? JSONSerialization.data(
+                  withJSONObject: object,
+                  options: [.sortedKeys]
+              )
+        else { return nil }
+        return String(data: data, encoding: .utf8)
+    }
+
+    private static func treeOrderPayload(
+        _ content: String
+    ) -> (order: [String: [String]], folderPaths: [String])? {
+        guard
+            let data = content.data(using: .utf8),
+            let object = try? JSONSerialization.jsonObject(with: data),
+            let dictionary = object as? [String: Any],
+            let version = dictionary["version"] as? NSNumber,
+            CFGetTypeID(version) != CFBooleanGetTypeID(),
+            version.intValue == 1,
+            let rawOrder = dictionary["tree_order"] as? [String: Any]
+        else { return nil }
+
+        var order: [String: [String]] = [:]
+        for (key, value) in rawOrder {
+            guard let names = value as? [String] else { return nil }
+            order[key.precomposedStringWithCanonicalMapping] = names.map {
+                $0.precomposedStringWithCanonicalMapping
+            }
+        }
+        let folderPaths: [String]
+        if let value = dictionary["folder_paths"] {
+            guard let paths = value as? [String] else { return nil }
+            folderPaths = paths.map {
+                $0.precomposedStringWithCanonicalMapping
+            }
+        } else {
+            folderPaths = []
+        }
+        return (order, folderPaths)
+    }
+
+    func rebase(
+        _ operation: SyncV2FolderDispatchOperation
+    ) async throws -> SyncV2AutomaticRebaseOutcome {
+        guard
+            let remote = try await snapshotClient.fetchFolders(
+                projectID: operation.projectID
+            ).first(where: { $0.folderID == operation.folderID })
+        else {
+            return .conflict(
+                code: "FOLDER_NOT_FOUND",
+                detail: "revision conflict 뒤 최신 서버 폴더를 찾지 못했습니다."
+            )
+        }
+        guard !remote.isDeleted || operation.isDeleted else {
+            return .conflict(
+                code: "REMOTE_DELETION",
+                detail: "서버에서 삭제된 폴더는 이름변경으로 자동 복원하지 않습니다."
+            )
+        }
+        guard remote.revision > operation.baseRevision else {
+            throw SyncV2ClientError.invalidResponse
+        }
+        try await store.rebaseFolderAfterRevisionConflict(
+            operation,
+            remote: remote
+        )
+        return .rebased
     }
 
     private static func newest(
@@ -788,6 +909,7 @@ actor SyncV2Dispatcher {
                             client: client,
                             retryPolicy: retryPolicy,
                             randomUnit: randomUnit,
+                            automaticRebaser: automaticRebaser,
                             now: now()
                         )
                     }
@@ -1009,6 +1131,7 @@ actor SyncV2Dispatcher {
         client: any SyncV2CommitClienting,
         retryPolicy: SyncV2RetryPolicy,
         randomUnit: @Sendable () -> Double,
+        automaticRebaser: SyncV2AutomaticRebaser?,
         now: Date
     ) async {
         do {
@@ -1028,6 +1151,36 @@ actor SyncV2Dispatcher {
             )
             try await store.complete(operation, result: result)
         } catch let error as SyncV2ClientError {
+            if isAutomaticRebaseCandidate(error), let automaticRebaser {
+                do {
+                    let outcome = try await automaticRebaser.rebase(operation)
+                    switch outcome {
+                    case .rebased, .generationAdvanced:
+                        return
+                    case .conflictPreserved:
+                        return
+                    case let .conflict(code, detail):
+                        try await store.markConflict(
+                            operation,
+                            errorCode: code,
+                            detail: detail
+                        )
+                        return
+                    }
+                } catch {
+                    let delay = retryPolicy.delay(
+                        attempt: operation.attempts,
+                        randomUnit: randomUnit()
+                    )
+                    try? await store.deferRetry(
+                        operation,
+                        errorCode: "AUTO_REBASE_FAILED",
+                        detail: error.localizedDescription,
+                        nextAttemptAt: now.addingTimeInterval(delay)
+                    )
+                    return
+                }
+            }
             do {
                 switch handling(for: error) {
                 case let .retry(code, detail):

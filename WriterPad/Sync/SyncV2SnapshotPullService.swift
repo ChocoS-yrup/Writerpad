@@ -21,6 +21,53 @@ protocol SyncV2SnapshotStateStoring: Sendable {
         snapshot: SyncV2RemoteDocumentSnapshot,
         expectedRevision: Int64?
     ) async throws -> Bool
+
+    /// 서버 폴더를 로컬 바인더에 적용한 것과 같은 pull 안에서 동기화 장부의
+    /// revision 기준선도 함께 전진시킨다. 이 기준선이 뒤처지면 다음 이름변경이
+    /// 이미 지난 revision으로 전송되어 REVISION_CONFLICT가 난다.
+    func applyFolderSnapshotBaselines(
+        localProjectID: ProjectID,
+        serverProjectID: UUID,
+        folders: [SyncV2RemoteFolder],
+        excluding blockedFolderIDs: Set<UUID>
+    ) async throws
+
+    /// 두 기기가 빈 서버 작품을 동시에 채울면 같은 초기 문서에
+    /// 서로 다른 UUID가 생길 수 있다. 로컬 대기열이 정말 revision 0의
+    /// 동일한 초기 snapshot인 경우에만 서버 UUID를 정식 기준으로
+    /// 채택한다.
+    func adoptEquivalentInitialDocument(
+        localProjectID: ProjectID,
+        serverProjectID: UUID,
+        localDocumentID: UUID,
+        snapshot: SyncV2RemoteDocumentSnapshot
+    ) async throws -> Bool
+}
+
+extension SyncV2SnapshotStateStoring {
+    func applyFolderSnapshotBaselines(
+        localProjectID: ProjectID,
+        serverProjectID: UUID,
+        folders: [SyncV2RemoteFolder],
+        excluding blockedFolderIDs: Set<UUID>
+    ) async throws {
+        _ = (
+            localProjectID,
+            serverProjectID,
+            folders,
+            blockedFolderIDs
+        )
+    }
+
+    func adoptEquivalentInitialDocument(
+        localProjectID: ProjectID,
+        serverProjectID: UUID,
+        localDocumentID: UUID,
+        snapshot: SyncV2RemoteDocumentSnapshot
+    ) async throws -> Bool {
+        _ = (localProjectID, serverProjectID, localDocumentID, snapshot)
+        return false
+    }
 }
 
 actor SyncV2SnapshotPullService: SyncV2SnapshotPulling {
@@ -78,14 +125,19 @@ actor SyncV2SnapshotPullService: SyncV2SnapshotPulling {
             $0.relativePath != syncV2TreeOrderPath
                 && $0.relativePath != syncV2TrashPurgePath
         }
-        await localApplier.preparePull(
-            localProjectID: localProjectID,
-            remoteLiveDocumentPaths: Set(
-                ordinarySnapshots
-                    .filter { !$0.isDeleted }
-                    .map(\.relativePath)
-            )
+        let remoteLiveDocumentPaths = Set(
+            ordinarySnapshots
+                .filter { !$0.isDeleted }
+                .map(\.relativePath)
         )
+        try await mutationGate.withCriticalSection(
+            documentID: syncV2ProjectStructureMutationID(localProjectID)
+        ) { [self] in
+            await localApplier.preparePull(
+                localProjectID: localProjectID,
+                remoteLiveDocumentPaths: remoteLiveDocumentPaths
+            )
+        }
         // 폴더를 문서보다 먼저 제자리에 놓는다. 이름이 바뀐 폴더에 문서가 먼저
         // 도착하면 옛 경로에 자리를 잡아, 뒤이은 폴더 이동이 목적지 충돌로
         // 막힌다.
@@ -94,37 +146,57 @@ actor SyncV2SnapshotPullService: SyncV2SnapshotPulling {
             let folders = try await client.fetchFolders(
                 projectID: serverProjectID
             )
-            // 이관을 먼저 돌린다. 기존 폴더에 공유 UUID가 붙어 있어야 서버가
-            // 보낸 폴더와 짝이 맞는다. 그러지 않으면 모든 원격 폴더가 "이 기기가
-            // 모르는 폴더"로 보여 옮기는 대신 새로 만들게 된다.
-            if let folderMigration {
-                let documents =
-                    (try? await folderDocuments?.documents(
+            // fetch는 Gate 밖에서 한다. 네트워크를 기다리는 동안
+            // 사용자의 폴더 작업을 막지 않고, 디스크·메타데이터를
+            // 실제로 읽고 바꾸는 구간만 직렬화한다.
+            folderRejections = try await mutationGate.withCriticalSection(
+                documentID: syncV2ProjectStructureMutationID(localProjectID)
+            ) { [self] in
+                let folderDocuments =
+                    (try? await self.folderDocuments?.documents(
                         in: localProjectID
                     )) ?? nil ?? []
-                _ = await folderMigration.migrateIfNeeded(
+                let serverFolderIDsByPath =
+                    SyncV2RemoteFolderPlanner.serverFolderIDsByPath(
+                        remote: folders,
+                        documents: folderDocuments
+                    )
+                await localApplier.prepareRemoteFolders(
+                    localProjectID: localProjectID,
+                    remoteLiveFolderPaths: Set(serverFolderIDsByPath.keys)
+                )
+                // 이관을 먼저 돌린다. 기존 폴더에 공유 UUID가 붙어 있어야
+                // 서버가 보낸 폴더와 짝이 맞는다.
+                if let folderMigration {
+                    _ = await folderMigration.migrateIfNeeded(
+                        localProjectID: localProjectID,
+                        serverProjectID: serverProjectID,
+                        serverFolderIDsByPath: serverFolderIDsByPath
+                    )
+                }
+                let blockedServerFolderIDs = Set(
+                    (try? await folderMarker?.foldersWithPendingOperations(
+                        localProjectID: localProjectID
+                    )) ?? []
+                )
+                let blockedFolderIDs = Set(
+                    blockedServerFolderIDs.map(DocumentID.init(rawValue:))
+                )
+                let report = await folderApplier.applyRemoteFolders(
+                    localProjectID: localProjectID,
+                    remote: folders,
+                    blockedFolderIDs: blockedFolderIDs
+                )
+                try await stateStore.applyFolderSnapshotBaselines(
                     localProjectID: localProjectID,
                     serverProjectID: serverProjectID,
-                    serverFolderIDsByPath:
-                        SyncV2RemoteFolderPlanner.serverFolderIDsByPath(
-                            remote: folders,
-                            documents: documents
-                        )
-                )
-            }
-            let blockedFolderIDs = Set(
-                ((
-                    try? await folderMarker?.foldersWithPendingOperations(
-                        localProjectID: localProjectID
+                    folders: folders,
+                    excluding: blockedServerFolderIDs.union(
+                        report.rejectedFolderIDs.map(\.rawValue)
                     )
-                ) ?? []).map(DocumentID.init(rawValue:))
-            )
-            let report = await folderApplier.applyRemoteFolders(
-                localProjectID: localProjectID,
-                remote: folders,
-                blockedFolderIDs: blockedFolderIDs
-            )
-            folderRejections = report.rejectedNames
+                )
+                return report.rejectedNames
+            }
         }
 
         let orderedSnapshots = snapshots.filter {
@@ -146,8 +218,28 @@ actor SyncV2SnapshotPullService: SyncV2SnapshotPulling {
         for snapshot in orderedSnapshots {
             try Task.checkCancellation()
             let editing = editingGuards[snapshot.documentID] ?? .closed
+            let equivalentLocalDocumentID =
+                await localApplier.equivalentLocalDocumentID(
+                    localProjectID: localProjectID,
+                    snapshot: snapshot
+                )
+            let equivalentLocalEditing = equivalentLocalDocumentID.map {
+                editingGuards[$0] ?? .closed
+            } ?? .closed
             var eligibleDocumentIDs: Set<UUID> = []
             var lockedDocumentIDs = [snapshot.documentID]
+            // 일반 TXT snapshot까지 작품 전체를 잠그면 처음 열 때
+            // 모든 문서를 받는 동안 바인더가 느린 로딩에 머문다.
+            // 폴더 전체를 바꾸는 숨은 구조 문서만 작품 키를 잠근다.
+            if snapshot.relativePath == syncV2TreeOrderPath
+                || snapshot.relativePath == syncV2TrashPurgePath {
+                lockedDocumentIDs.append(
+                    syncV2ProjectStructureMutationID(localProjectID)
+                )
+            }
+            if let equivalentLocalDocumentID {
+                lockedDocumentIDs.append(equivalentLocalDocumentID)
+            }
             if snapshot.relativePath == syncV2TrashPurgePath,
                let remotePurge = try? SyncV2TrashPurgePayload(
                    strictContent: snapshot.content
@@ -186,6 +278,9 @@ actor SyncV2SnapshotPullService: SyncV2SnapshotPulling {
                     localProjectID: localProjectID,
                     serverProjectID: serverProjectID,
                     editing: editing,
+                    equivalentLocalDocumentID:
+                        equivalentLocalDocumentID,
+                    equivalentLocalEditing: equivalentLocalEditing,
                     effectivePurgeState: purgeStateForSnapshot,
                     eligibleDocumentIDs: eligibleIDsForSnapshot
                 )
@@ -215,6 +310,8 @@ actor SyncV2SnapshotPullService: SyncV2SnapshotPulling {
         localProjectID: ProjectID,
         serverProjectID: UUID,
         editing: SyncV2EditingGuard,
+        equivalentLocalDocumentID: UUID?,
+        equivalentLocalEditing: SyncV2EditingGuard,
         effectivePurgeState: SyncV2TrashPurgePayload,
         eligibleDocumentIDs: Set<UUID>
     ) async throws -> ProcessedSnapshot {
@@ -266,6 +363,29 @@ actor SyncV2SnapshotPullService: SyncV2SnapshotPulling {
                 appliedSnapshot: nil
             )
         }
+        if let equivalentLocalDocumentID,
+           !editing.isOpen,
+           !editing.isDirty,
+           !editing.isComposing,
+           !equivalentLocalEditing.isOpen,
+           !equivalentLocalEditing.isDirty,
+           !equivalentLocalEditing.isComposing,
+           try await stateStore.adoptEquivalentInitialDocument(
+               localProjectID: localProjectID,
+               serverProjectID: serverProjectID,
+               localDocumentID: equivalentLocalDocumentID,
+               snapshot: snapshot
+           ),
+           await localApplier.replaceEquivalentLocalDocumentIdentity(
+               localProjectID: localProjectID,
+               localDocumentID: equivalentLocalDocumentID,
+               snapshot: snapshot
+           ) {
+            await mergeStore.resolve(
+                localProjectID: localProjectID,
+                documentID: snapshot.documentID
+            )
+        }
         let state = try await stateStore.snapshotState(
             localProjectID: localProjectID,
             serverProjectID: serverProjectID,
@@ -308,12 +428,21 @@ actor SyncV2SnapshotPullService: SyncV2SnapshotPulling {
                 var requiresRecovery = false
                 if snapshot.revision == state.serverRevision,
                    snapshot.relativePath == state.serverPath,
-                   !isPurgedTombstone,
-                   hiddenPath == nil {
-                    requiresRecovery = await localApplier.requiresCopyRecovery(
-                        localProjectID: localProjectID,
-                        snapshot: snapshot
-                    )
+                   !isPurgedTombstone {
+                    if snapshot.relativePath == syncV2TreeOrderPath {
+                        // Windows는 folders 행을 갱신하지 못하고 tree_order만
+                        // 바꾼다. pull 앞부분에서 아직 옛 이름인 folders 행을
+                        // 적용하면, 이미 받아 둔 같은 revision의 tree_order를
+                        // 다시 실행해 새 이름으로 복구하고 folder commit을
+                        // 올려야 한다. 숨은 문서라고 무조건 up-to-date로 넘기면
+                        // Windows에서 바꾼 빈 폴더 이름이 옛 이름으로 회귀한다.
+                        requiresRecovery = true
+                    } else if hiddenPath == nil {
+                        requiresRecovery = await localApplier.requiresCopyRecovery(
+                            localProjectID: localProjectID,
+                            snapshot: snapshot
+                        )
+                    }
                 }
                 if requiresRecovery {
                     if let reason = Self.mergeReason(
@@ -546,12 +675,12 @@ actor SyncV2SnapshotPullService: SyncV2SnapshotPulling {
             localProjectID: localProjectID,
             documentID: snapshot.documentID
         )
-        if snapshot.relativePath == syncV2TrashPurgePath {
-            await mergeStore.resolve(
-                localProjectID: localProjectID,
-                documentID: snapshot.documentID
-            )
-        }
+        // 이전 pull이 경로 충돌 marker를 남겼더라도 이번 snapshot을
+        // 실제 파일과 baseline에 모두 적용했으면 해결된 것이다.
+        await mergeStore.resolve(
+            localProjectID: localProjectID,
+            documentID: snapshot.documentID
+        )
         return ProcessedSnapshot(
             outcome: .applied(
                 documentID: snapshot.documentID,
@@ -604,4 +733,3 @@ actor SyncV2SnapshotPullService: SyncV2SnapshotPulling {
         )
     }
 }
-

@@ -301,7 +301,7 @@ final class SyncV2StoreTests: XCTestCase {
         await reopened.close()
     }
 
-    func testStartupReturnsInflightToPendingWithSameIDAndAttempts()
+    func testStartupCompletesLegacyInflightEnsureWithSameIDAndAttempts()
         async throws {
         let url = try databaseURL()
         let created = try await openStore(at: url)
@@ -334,7 +334,7 @@ final class SyncV2StoreTests: XCTestCase {
             operationID: fixture.operationID
         )
         let count = try await reopened.operationCount()
-        XCTAssertEqual(status, "pending")
+        XCTAssertEqual(status, "completed")
         XCTAssertEqual(attempts, 3)
         XCTAssertEqual(count, 1)
         await reopened.close()
@@ -861,6 +861,97 @@ final class SyncV2StoreTests: XCTestCase {
                 ).path
             )
         )
+    }
+
+    func testInitialSnapshotTreeOrderUsesNFCAndDeclaresEmptyFolder()
+        async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent(
+                "WriterPad-NFCTreeOrder-\(UUID().uuidString)",
+                isDirectory: true
+            )
+        try FileManager.default.createDirectory(
+            at: root,
+            withIntermediateDirectories: true
+        )
+        addTeardownBlock {
+            try? FileManager.default.removeItem(at: root)
+        }
+        let projectID = ProjectID(rawValue: UUID())
+        let rootID = DocumentID(rawValue: UUID())
+        let notesID = DocumentID(rawValue: UUID())
+        let emptyID = DocumentID(rawValue: UUID())
+        let date = Date(timeIntervalSince1970: 1)
+        func decomposed(_ path: String) -> RelativeDocumentPath {
+            RelativeDocumentPath(
+                rawValue: path.decomposedStringWithCanonicalMapping
+            )
+        }
+        let nodes = [
+            DocumentNode(
+                id: rootID,
+                projectID: projectID,
+                kind: .folder,
+                parentID: nil,
+                relativePath: decomposed("메인"),
+                userOrder: 0,
+                modifiedAt: date,
+                contentHash: nil
+            ),
+            DocumentNode(
+                id: notesID,
+                projectID: projectID,
+                kind: .folder,
+                parentID: rootID,
+                relativePath: decomposed("메인/메모장"),
+                userOrder: 0,
+                modifiedAt: date,
+                contentHash: nil
+            ),
+            DocumentNode(
+                id: emptyID,
+                projectID: projectID,
+                kind: .folder,
+                parentID: notesID,
+                relativePath: decomposed("메인/메모장/한글 빈폴더"),
+                userOrder: 0,
+                modifiedAt: date,
+                contentHash: nil
+            ),
+        ]
+        let durable = ScriptedDurableChangeRecorder(
+            results: [.queued(operationIDs: [UUID()])]
+        )
+        let recorder = ProjectInitialSyncRecorder(
+            documentRepository: InitialSnapshotDocumentRepository(nodes),
+            workspaceLocator: FixedWorkspaceLocator(root: root),
+            durableChangeRecorder: durable
+        )
+
+        guard case .queued = await recorder.recordInitialSnapshot(
+            projectID: projectID,
+            projectName: "NFC 작품",
+            batchKind: .projectBinding
+        ) else {
+            return XCTFail("초기 tree_order가 queue되어야 합니다.")
+        }
+        let batches = await durable.batches
+        let batch = try XCTUnwrap(batches.first)
+        guard case let .treeOrder(_, content, _) = batch.mutations.last
+        else {
+            return XCTFail("초기 tree_order snapshot이 없습니다.")
+        }
+        let object = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: Data(content.utf8))
+                as? [String: Any]
+        )
+        let treeOrder = try XCTUnwrap(
+            object["tree_order"] as? [String: [String]]
+        )
+
+        XCTAssertEqual(treeOrder["<root>"], ["메모장"])
+        XCTAssertEqual(treeOrder["메인/메모장"], ["한글 빈폴더"])
+        XCTAssertEqual(treeOrder["메인/메모장/한글 빈폴더"], [])
     }
 
     func testSQLiteBindingUniqueIndexRejectsSecondLocalProject()
@@ -1565,6 +1656,91 @@ final class SyncV2StoreTests: XCTestCase {
         await store.close()
     }
 
+    func testTreeOrderCheckpointSurvivesWhileItsFolderIsPending()
+        async throws {
+        let url = try databaseURL()
+        let context = QueueAPIContext()
+        let store = try await connectedStore(at: url, context: context)
+        let treeDocumentID = syncV2UUIDv5(
+            namespace: context.serverProjectID,
+            name: syncV2TreeOrderPath
+        )
+        let folderOperationID = UUID()
+        let firstTreeID = UUID()
+        let leaseSensitiveDocumentID = UUID()
+        let leaseSensitiveOperationID = UUID()
+        let secondTreeID = UUID()
+
+        _ = try await store.enqueue(
+            context.batch(
+                kind: .structureChange,
+                mutations: [
+                    context.folderMutation(
+                        operationID: folderOperationID,
+                        name: "팯-빈폴더-팯"
+                    ),
+                    context.documentMutation(
+                        operationID: firstTreeID,
+                        documentID: treeDocumentID,
+                        relativePath: syncV2TreeOrderPath,
+                        content:
+                            "{\"tree_order\":{\"메인\":[\"팯-빈폴더-팯\"]},\"version\":1}",
+                        generation: 1,
+                        kind: .treeOrder
+                    ),
+                ]
+            )
+        )
+        _ = try await store.enqueue(
+            context.batch(
+                kind: .structureChange,
+                mutations: [
+                    context.documentMutation(
+                        operationID: leaseSensitiveOperationID,
+                        documentID: leaseSensitiveDocumentID,
+                        relativePath: "메인/다른 폴더/임대 중 문서.txt",
+                        content: "경로 변경",
+                        generation: 1
+                    ),
+                    context.documentMutation(
+                        operationID: secondTreeID,
+                        documentID: treeDocumentID,
+                        relativePath: syncV2TreeOrderPath,
+                        content:
+                            "{\"tree_order\":{\"메인\":[\"팯-빈폴더-팯\",\"다음 항목\"]},\"version\":1}",
+                        generation: 2,
+                        kind: .treeOrder
+                    ),
+                ]
+            )
+        )
+
+        let firstTreeStatus = try await store.operationStatus(
+            operationID: firstTreeID
+        )
+        XCTAssertEqual(
+            firstTreeStatus,
+            SyncV2OperationStatus.pending.rawValue
+        )
+        let folders = try await store.claimReadyFolderOperations(
+            limit: 1,
+            now: Date(timeIntervalSince1970: 10)
+        )
+        let folder = try XCTUnwrap(folders.first)
+        XCTAssertEqual(folder.operationID, folderOperationID)
+        try await store.complete(
+            folder,
+            result: folderCommitResult(for: folder)
+        )
+
+        let documents = try await store.claimReadyOperations(
+            limit: 1,
+            now: Date(timeIntervalSince1970: 20)
+        )
+        XCTAssertEqual(documents.map(\.operationID), [firstTreeID])
+        await store.close()
+    }
+
     func testTrashPurgeWaitsForTombstoneAndMaterializesItsCommittedRevision()
         async throws {
         let url = try databaseURL()
@@ -1872,8 +2048,67 @@ final class SyncV2StoreTests: XCTestCase {
         XCTAssertNil(queued[0].documentID)
         XCTAssertNil(queued[0].documentSequence)
         XCTAssertEqual(queued[0].kind, .ensureProject)
+        XCTAssertEqual(queued[0].status, .completed)
         XCTAssertEqual(binding?.projectName, "변경된 작품 이름")
         await store.close()
+    }
+
+    func testLaunchRecoveryCompletesLegacyEnsureProjectAndReleasesTreeOrder()
+        async throws {
+        let url = try databaseURL()
+        let context = QueueAPIContext()
+        let store = try await connectedStore(at: url, context: context)
+        let ensureID = UUID()
+        let treeID = UUID()
+        let treeDocumentID = syncV2UUIDv5(
+            namespace: context.serverProjectID,
+            name: syncV2TreeOrderPath
+        )
+        _ = try await store.enqueue(
+            context.batch(
+                kind: .projectBinding,
+                mutations: [
+                    .ensureProject(
+                        SyncV2EnsureProjectMutation(
+                            operationID: ensureID,
+                            projectName: "언제까지"
+                        )
+                    ),
+                    context.documentMutation(
+                        operationID: treeID,
+                        documentID: treeDocumentID,
+                        relativePath: syncV2TreeOrderPath,
+                        content: "{\"tree_order\":{\"<root>\":[]},\"version\":1}",
+                        generation: 1,
+                        kind: .treeOrder
+                    ),
+                ]
+            )
+        )
+        await store.close()
+
+        // 예전 빌드가 남긴 실제 장부 모양을 재현한다.
+        let raw = try RawSQLite(url: url)
+        try raw.execute(
+            """
+            UPDATE sync_operations SET status = 'pending'
+            WHERE operation_id = '\(ensureID.uuidString.lowercased())';
+            """
+        )
+        raw.close()
+
+        let reopened = try await openStore(at: url)
+        let recoveredEnsureStatus = try await reopened.operationStatus(
+            operationID: ensureID
+        )
+        let ready = try await reopened.claimReadyOperations(
+            limit: 1,
+            now: Date(timeIntervalSince1970: 20)
+        )
+
+        XCTAssertEqual(recoveredEnsureStatus, "completed")
+        XCTAssertEqual(ready.map(\.operationID), [treeID])
+        await reopened.close()
     }
 
     func testDispatcherClaimPreservesDocumentFIFOAndPromotesNextRevision()
@@ -3676,6 +3911,166 @@ final class SyncV2StoreTests: XCTestCase {
         await store.close()
     }
 
+    func testEquivalentRevisionZeroInitialDocumentAdoptsServerIdentity()
+        async throws {
+        let url = try databaseURL()
+        let store = try await openStore(at: url)
+        let localProjectID = ProjectID(rawValue: UUID())
+        let serverProjectID = UUID()
+        let localDocumentID = UUID()
+        let remoteDocumentID = UUID()
+        let path = "메인/1권/001화.txt"
+        try await store.save(
+            .connected(
+                localProjectID: localProjectID,
+                serverProjectID: serverProjectID,
+                kind: .newServerProject,
+                projectName: "identity race",
+                ownerSubject: UUID()
+            )
+        )
+        _ = try await store.enqueue(
+            SyncV2EnqueueBatch(
+                batchID: UUID(),
+                localProjectID: localProjectID,
+                localTransactionID: nil,
+                kind: .projectBinding,
+                mutations: [
+                    .document(
+                        SyncV2DocumentMutation(
+                            operationID: UUID(),
+                            documentID: localDocumentID,
+                            deviceID: UUID(),
+                            localSaveGeneration: 0,
+                            kind: .documentCommit,
+                            localPath: path,
+                            relativePath: path,
+                            content: "",
+                            isDeleted: false
+                        )
+                    ),
+                ]
+            )
+        )
+        let snapshot = SyncV2RemoteDocumentSnapshot(
+            documentID: remoteDocumentID,
+            relativePath: path,
+            content: "",
+            revision: 1,
+            isDeleted: false,
+            deletedAt: nil,
+            updatedAt: Date(timeIntervalSince1970: 50)
+        )
+        let initialState = try await store.snapshotState(
+            localProjectID: localProjectID,
+            serverProjectID: serverProjectID,
+            documentID: localDocumentID
+        )
+        XCTAssertEqual(initialState?.serverRevision, 0)
+        XCTAssertEqual(initialState?.serverPath, path)
+        XCTAssertTrue(initialState?.hasActiveOperation == true)
+        let queuedBeforeClaim = try await store.queuedOperations(
+            documentID: localDocumentID
+        )
+        XCTAssertEqual(
+            queuedBeforeClaim.first?.contentHash,
+            SHA256ContentHasher().sha256(for: Data()).rawValue
+        )
+
+        let adopted = try await store.adoptEquivalentInitialDocument(
+            localProjectID: localProjectID,
+            serverProjectID: serverProjectID,
+            localDocumentID: localDocumentID,
+            snapshot: snapshot
+        )
+
+        XCTAssertTrue(adopted)
+        let remoteState = try await store.snapshotState(
+            localProjectID: localProjectID,
+            serverProjectID: serverProjectID,
+            documentID: remoteDocumentID
+        )
+        XCTAssertEqual(remoteState?.serverRevision, 1)
+        XCTAssertEqual(remoteState?.serverPath, path)
+        XCTAssertFalse(remoteState?.hasActiveOperation == true)
+        let localOperations = try await store.queuedOperations(
+            documentID: localDocumentID
+        )
+        XCTAssertEqual(localOperations.map(\.status), [.cancelled])
+
+        let idempotent = try await store.adoptEquivalentInitialDocument(
+            localProjectID: localProjectID,
+            serverProjectID: serverProjectID,
+            localDocumentID: localDocumentID,
+            snapshot: snapshot
+        )
+        XCTAssertTrue(idempotent)
+        await store.close()
+    }
+
+    func testIdentityAdoptionRejectsEditedInitialDocument() async throws {
+        let url = try databaseURL()
+        let store = try await openStore(at: url)
+        let localProjectID = ProjectID(rawValue: UUID())
+        let serverProjectID = UUID()
+        let localDocumentID = UUID()
+        let path = "메인/1권/001화.txt"
+        try await store.save(
+            .connected(
+                localProjectID: localProjectID,
+                serverProjectID: serverProjectID,
+                kind: .newServerProject,
+                projectName: "edited identity race",
+                ownerSubject: UUID()
+            )
+        )
+        _ = try await store.enqueue(
+            SyncV2EnqueueBatch(
+                batchID: UUID(),
+                localProjectID: localProjectID,
+                localTransactionID: nil,
+                kind: .documentSave,
+                mutations: [
+                    .document(
+                        SyncV2DocumentMutation(
+                            operationID: UUID(),
+                            documentID: localDocumentID,
+                            deviceID: UUID(),
+                            localSaveGeneration: 1,
+                            kind: .documentCommit,
+                            localPath: path,
+                            relativePath: path,
+                            content: "로컬 편집",
+                            isDeleted: false
+                        )
+                    ),
+                ]
+            )
+        )
+
+        let adopted = try await store.adoptEquivalentInitialDocument(
+            localProjectID: localProjectID,
+            serverProjectID: serverProjectID,
+            localDocumentID: localDocumentID,
+            snapshot: SyncV2RemoteDocumentSnapshot(
+                documentID: UUID(),
+                relativePath: path,
+                content: "",
+                revision: 1,
+                isDeleted: false,
+                deletedAt: nil,
+                updatedAt: Date(timeIntervalSince1970: 50)
+            )
+        )
+
+        XCTAssertFalse(adopted)
+        let operations = try await store.queuedOperations(
+            documentID: localDocumentID
+        )
+        XCTAssertEqual(operations.map(\.status), [.pending])
+        await store.close()
+    }
+
     func testSnapshotStateAndCASBlockPendingDocumentOperation()
         async throws {
         let url = try databaseURL()
@@ -3774,6 +4169,223 @@ final class SyncV2StoreTests: XCTestCase {
         XCTAssertFalse(claimed.isDeleted)
         XCTAssertEqual(claimed.attempts, 1)
         await store.close()
+    }
+
+    func testRemoteFolderPullAdvancesRenameBaseRevision() async throws {
+        let url = try databaseURL()
+        let context = QueueAPIContext()
+        let store = try await connectedStore(at: url, context: context)
+        let remote = SyncV2RemoteFolder(
+            folderID: context.folderID,
+            parentFolderID: nil,
+            name: "윈도우 이름",
+            revision: 2,
+            isDeleted: false,
+            updatedAt: Date(timeIntervalSince1970: 20)
+        )
+
+        try await store.applyFolderSnapshotBaselines(
+            localProjectID: context.localProjectID,
+            serverProjectID: context.serverProjectID,
+            folders: [remote],
+            excluding: []
+        )
+        let baselineDatabase = try RawSQLite(url: url)
+        XCTAssertEqual(
+            try baselineDatabase.scalarInt(
+                """
+                SELECT server_revision FROM sync_folders
+                WHERE folder_id =
+                    '\(context.folderID.uuidString.lowercased())';
+                """
+            ),
+            2
+        )
+        baselineDatabase.close()
+        let renameID = UUID()
+        _ = try await store.enqueue(
+            context.batch(
+                kind: .structureChange,
+                mutations: [
+                    context.folderMutation(
+                        operationID: renameID,
+                        name: "아이패드 이름"
+                    )
+                ]
+            )
+        )
+        let ready = try await store.claimReadyFolderOperations(
+            limit: 1,
+            now: Date(timeIntervalSince1970: 30)
+        )
+
+        let claimed = try XCTUnwrap(ready.first)
+        XCTAssertEqual(claimed.operationID, renameID)
+        XCTAssertEqual(claimed.name, "아이패드 이름")
+        XCTAssertEqual(claimed.baseRevision, 2)
+        await store.close()
+    }
+
+    func testRemoteFolderPullDoesNotOverwriteActiveLocalRename()
+        async throws {
+        let url = try databaseURL()
+        let context = QueueAPIContext()
+        let store = try await connectedStore(at: url, context: context)
+        let renameID = UUID()
+        _ = try await store.enqueue(
+            context.batch(
+                kind: .structureChange,
+                mutations: [
+                    context.folderMutation(
+                        operationID: renameID,
+                        name: "아이패드 이름"
+                    )
+                ]
+            )
+        )
+
+        try await store.applyFolderSnapshotBaselines(
+            localProjectID: context.localProjectID,
+            serverProjectID: context.serverProjectID,
+            folders: [
+                SyncV2RemoteFolder(
+                    folderID: context.folderID,
+                    parentFolderID: nil,
+                    name: "늦게 도착한 서버 이름",
+                    revision: 7,
+                    isDeleted: false,
+                    updatedAt: Date(timeIntervalSince1970: 20)
+                )
+            ],
+            excluding: []
+        )
+        let ready = try await store.claimReadyFolderOperations(
+            limit: 1,
+            now: Date(timeIntervalSince1970: 30)
+        )
+
+        let claimed = try XCTUnwrap(ready.first)
+        XCTAssertEqual(claimed.name, "아이패드 이름")
+        XCTAssertEqual(claimed.baseRevision, 0)
+        await store.close()
+    }
+
+    func testFolderRevisionConflictRebasesSameFIFOOperation()
+        async throws {
+        let url = try databaseURL()
+        let context = QueueAPIContext()
+        let store = try await connectedStore(at: url, context: context)
+        try await store.applyFolderSnapshotBaselines(
+            localProjectID: context.localProjectID,
+            serverProjectID: context.serverProjectID,
+            folders: [
+                SyncV2RemoteFolder(
+                    folderID: context.folderID,
+                    parentFolderID: nil,
+                    name: "서버 revision 2",
+                    revision: 2,
+                    isDeleted: false,
+                    updatedAt: Date(timeIntervalSince1970: 20)
+                )
+            ],
+            excluding: []
+        )
+        let renameID = UUID()
+        _ = try await store.enqueue(
+            context.batch(
+                kind: .structureChange,
+                mutations: [
+                    context.folderMutation(
+                        operationID: renameID,
+                        name: "최종 아이패드 이름"
+                    )
+                ]
+            )
+        )
+        let firstClaims = try await store.claimReadyFolderOperations(
+            limit: 1,
+            now: Date(timeIntervalSince1970: 30)
+        )
+        let first = try XCTUnwrap(firstClaims.first)
+        let remote = SyncV2RemoteFolder(
+            folderID: context.folderID,
+            parentFolderID: nil,
+            name: "서버 revision 3",
+            revision: 3,
+            isDeleted: false,
+            updatedAt: Date(timeIntervalSince1970: 40)
+        )
+
+        try await store.rebaseFolderAfterRevisionConflict(
+            first,
+            remote: remote
+        )
+        let retriedClaims = try await store.claimReadyFolderOperations(
+            limit: 1,
+            now: Date(timeIntervalSince1970: 50)
+        )
+        let retried = try XCTUnwrap(retriedClaims.first)
+
+        XCTAssertEqual(retried.operationID, renameID)
+        XCTAssertEqual(retried.name, "최종 아이패드 이름")
+        XCTAssertEqual(retried.baseRevision, 3)
+        XCTAssertEqual(retried.attempts, 1)
+        await store.close()
+    }
+
+    func testLaunchRecoveryRequeuesPersistedFolderRevisionConflict()
+        async throws {
+        let url = try databaseURL()
+        let context = QueueAPIContext()
+        let store = try await connectedStore(at: url, context: context)
+        try await store.applyFolderSnapshotBaselines(
+            localProjectID: context.localProjectID,
+            serverProjectID: context.serverProjectID,
+            folders: [
+                SyncV2RemoteFolder(
+                    folderID: context.folderID,
+                    parentFolderID: nil,
+                    name: "서버 이름",
+                    revision: 1,
+                    isDeleted: false,
+                    updatedAt: Date(timeIntervalSince1970: 10)
+                )
+            ],
+            excluding: []
+        )
+        let renameID = UUID()
+        _ = try await store.enqueue(
+            context.batch(
+                kind: .structureChange,
+                mutations: [
+                    context.folderMutation(
+                        operationID: renameID,
+                        name: "팯-빈폴더-팯"
+                    )
+                ]
+            )
+        )
+        let claims = try await store.claimReadyFolderOperations(
+            limit: 1,
+            now: Date(timeIntervalSince1970: 20)
+        )
+        let claimed = try XCTUnwrap(claims.first)
+        try await store.markConflict(
+            claimed,
+            errorCode: "REVISION_CONFLICT",
+            detail: nil
+        )
+        await store.close()
+
+        let reopened = try await openStore(at: url)
+        let recovered = try await reopened.claimReadyFolderOperations(
+            limit: 1,
+            now: Date(timeIntervalSince1970: 30)
+        )
+
+        XCTAssertEqual(recovered.map(\.operationID), [renameID])
+        XCTAssertEqual(recovered.first?.baseRevision, 1)
+        await reopened.close()
     }
 
     func testFolderRenameKeepsFolderIDAndWaitsForUnknownRevision()
@@ -4113,6 +4725,156 @@ final class SyncV2StoreTests: XCTestCase {
         await store.close()
     }
 
+    func testStructureBatchPublishesFolderThenDocumentsThenTreeOrder()
+        async throws {
+        let url = try databaseURL()
+        let context = QueueAPIContext()
+        let store = try await connectedStore(at: url, context: context)
+        let folderOperationID = UUID()
+        let documentOperationID = UUID()
+        let treeOrderOperationID = UUID()
+        let treeOrderDocumentID = UUID()
+
+        // 실제 폴더 이름 변경 batch와 같은 순서다. 하위 TXT snapshot이 먼저
+        // 만들어져도 전송은 폴더 행을 앞세워야 한다.
+        _ = try await store.enqueue(
+            context.batch(
+                kind: .structureChange,
+                mutations: [
+                    context.documentMutation(
+                        operationID: documentOperationID,
+                        relativePath: "메모장/새 이름/문서.txt"
+                    ),
+                    context.folderMutation(
+                        operationID: folderOperationID,
+                        name: "새 이름"
+                    ),
+                    context.documentMutation(
+                        operationID: treeOrderOperationID,
+                        documentID: treeOrderDocumentID,
+                        relativePath: syncV2TreeOrderPath,
+                        content: "{\"tree_order\":{},\"version\":1}",
+                        generation: 1,
+                        kind: .treeOrder
+                    ),
+                ]
+            )
+        )
+
+        let documentsBeforeFolder = try await store.claimReadyOperations(
+            limit: 10,
+            now: Date(timeIntervalSince1970: 10)
+        )
+        XCTAssertTrue(documentsBeforeFolder.isEmpty)
+
+        let folders = try await store.claimReadyFolderOperations(
+            limit: 10,
+            now: Date(timeIntervalSince1970: 10)
+        )
+        let folder = try XCTUnwrap(folders.first)
+        XCTAssertEqual(folders.map(\.operationID), [folderOperationID])
+        try await store.complete(
+            folder,
+            result: folderCommitResult(for: folder)
+        )
+
+        let documents = try await store.claimReadyOperations(
+            limit: 10,
+            now: Date(timeIntervalSince1970: 20)
+        )
+        let document = try XCTUnwrap(documents.first)
+        XCTAssertEqual(documents.map(\.operationID), [documentOperationID])
+        try await store.complete(
+            document,
+            result: commitResult(for: document)
+        )
+
+        let treeOrder = try await store.claimReadyOperations(
+            limit: 10,
+            now: Date(timeIntervalSince1970: 30)
+        )
+        XCTAssertEqual(treeOrder.map(\.operationID), [treeOrderOperationID])
+        await store.close()
+    }
+
+    func testSixRapidFolderRenamesWaitBeforePublishingFinalTreeOrder()
+        async throws {
+        let url = try databaseURL()
+        let context = QueueAPIContext()
+        let store = try await connectedStore(at: url, context: context)
+        let treeOrderDocumentID = UUID()
+        let folderIDs = (0..<6).map { _ in UUID() }
+        var folderOperationIDs: [UUID] = []
+        var finalTreeOrderOperationID = UUID()
+
+        for index in folderIDs.indices {
+            let folderOperationID = UUID()
+            let treeOrderOperationID = UUID()
+            folderOperationIDs.append(folderOperationID)
+            finalTreeOrderOperationID = treeOrderOperationID
+            _ = try await store.enqueue(
+                context.batch(
+                    kind: .structureChange,
+                    mutations: [
+                        context.folderMutation(
+                            operationID: folderOperationID,
+                            folderID: folderIDs[index],
+                            name: "빠른 이름 \(index + 1)_팯"
+                        ),
+                        context.documentMutation(
+                            operationID: treeOrderOperationID,
+                            documentID: treeOrderDocumentID,
+                            relativePath: syncV2TreeOrderPath,
+                            content: "{\"tree_order\":{\"<root>\":[\"\(index + 1)\"]},\"version\":1}",
+                            generation: index + 1,
+                            kind: .treeOrder
+                        ),
+                    ]
+                )
+            )
+        }
+
+        let folders = try await store.claimReadyFolderOperations(
+            limit: 10,
+            now: Date(timeIntervalSince1970: 10)
+        )
+        XCTAssertEqual(folders.map(\.operationID), folderOperationIDs)
+        XCTAssertEqual(Set(folders.map(\.folderID)), Set(folderIDs))
+        XCTAssertEqual(Set(folders.map(\.name)).count, 6)
+        let treeOrderBeforeFolders = try await store.claimReadyOperations(
+            limit: 10,
+            now: Date(timeIntervalSince1970: 10)
+        )
+        XCTAssertTrue(treeOrderBeforeFolders.isEmpty)
+
+        for folder in folders.dropLast() {
+            try await store.complete(
+                folder,
+                result: folderCommitResult(for: folder)
+            )
+        }
+        let treeOrderBeforeLastFolder = try await store.claimReadyOperations(
+            limit: 10,
+            now: Date(timeIntervalSince1970: 20)
+        )
+        XCTAssertTrue(treeOrderBeforeLastFolder.isEmpty)
+
+        let lastFolder = try XCTUnwrap(folders.last)
+        try await store.complete(
+            lastFolder,
+            result: folderCommitResult(for: lastFolder)
+        )
+        let finalTreeOrder = try await store.claimReadyOperations(
+            limit: 10,
+            now: Date(timeIntervalSince1970: 30)
+        )
+        XCTAssertEqual(
+            finalTreeOrder.map(\.operationID),
+            [finalTreeOrderOperationID]
+        )
+        await store.close()
+    }
+
     func testParentTombstoneWaitsForItsChildFolder() async throws {
         let url = try databaseURL()
         let context = QueueAPIContext()
@@ -4140,13 +4902,15 @@ final class SyncV2StoreTests: XCTestCase {
         )
         // 두 폴더의 생성을 끝내 무덤이 기준선을 갖게 한다. 그러지 않으면
         // 순번이 아니라 아직 비어 있는 base_revision이 무덤을 붙잡는다.
-        for created in try await store.claimReadyFolderOperations(
-            limit: 10,
-            now: Date(timeIntervalSince1970: 10)
-        ) {
+        for step in 0..<2 {
+            let created = try await store.claimReadyFolderOperations(
+                limit: 10,
+                now: Date(timeIntervalSince1970: 10 + TimeInterval(step))
+            )
+            let operation = try XCTUnwrap(created.first)
             try await store.complete(
-                created,
-                result: folderCommitResult(for: created)
+                operation,
+                result: folderCommitResult(for: operation)
             )
         }
         _ = try await store.enqueue(

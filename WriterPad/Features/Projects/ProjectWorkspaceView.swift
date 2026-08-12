@@ -220,7 +220,10 @@ struct ProjectWorkspaceView: View {
             )
         ) {
             TextField("새 이름", text: $renameText)
+                .submitLabel(.done)
+                .onSubmit(submitProjectRename)
             Button("취소", role: .cancel) { renameTarget = nil }
+                .keyboardShortcut(.cancelAction)
             Button("변경") {
                 submitProjectRename()
             }

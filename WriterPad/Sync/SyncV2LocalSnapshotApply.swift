@@ -22,6 +22,10 @@ protocol SyncV2LocalSnapshotApplying: Sendable {
         localProjectID: ProjectID,
         remoteLiveDocumentPaths: Set<String>
     ) async
+    func prepareRemoteFolders(
+        localProjectID: ProjectID,
+        remoteLiveFolderPaths: Set<String>
+    ) async
     func apply(
         localProjectID: ProjectID,
         snapshot: SyncV2RemoteDocumentSnapshot
@@ -49,12 +53,30 @@ protocol SyncV2LocalSnapshotApplying: Sendable {
         localProjectID: ProjectID,
         documentID: UUID
     ) async
+
+    /// 서버 snapshot과 경로·본문이 바이트 단위로 같고, 열린 편집기나
+    /// 백업이 없는 로컬 문서의 UUID를 반환한다.
+    func equivalentLocalDocumentID(
+        localProjectID: ProjectID,
+        snapshot: SyncV2RemoteDocumentSnapshot
+    ) async -> UUID?
+
+    func replaceEquivalentLocalDocumentIdentity(
+        localProjectID: ProjectID,
+        localDocumentID: UUID,
+        snapshot: SyncV2RemoteDocumentSnapshot
+    ) async -> Bool
 }
 
 extension SyncV2LocalSnapshotApplying {
     func preparePull(
         localProjectID: ProjectID,
         remoteLiveDocumentPaths: Set<String>
+    ) async {}
+
+    func prepareRemoteFolders(
+        localProjectID: ProjectID,
+        remoteLiveFolderPaths: Set<String>
     ) async {}
 
     func finish(
@@ -100,6 +122,23 @@ extension SyncV2LocalSnapshotApplying {
         localProjectID: ProjectID,
         documentID: UUID
     ) async {}
+
+    func equivalentLocalDocumentID(
+        localProjectID: ProjectID,
+        snapshot: SyncV2RemoteDocumentSnapshot
+    ) async -> UUID? {
+        _ = (localProjectID, snapshot)
+        return nil
+    }
+
+    func replaceEquivalentLocalDocumentIdentity(
+        localProjectID: ProjectID,
+        localDocumentID: UUID,
+        snapshot: SyncV2RemoteDocumentSnapshot
+    ) async -> Bool {
+        _ = (localProjectID, localDocumentID, snapshot)
+        return false
+    }
 }
 
 enum SyncV2LocalSnapshotApplyError: Error, Equatable, Sendable {
@@ -191,6 +230,10 @@ actor LocalSyncV2SnapshotApplier: SyncV2LocalSnapshotApplying {
         let trashPurgeAppliedState: Data?
         let isTombstoneRepair: Bool?
         let tombstoneRepairHadTrashRecord: Bool?
+        /// tree-order가 서버 TXT를 보기 전에 같은 경로를 빈 폴더로
+        /// 잘못 물질화한 경우의 원본이다. 서버 baseline 저장이 실패하면
+        /// 이 기록으로 빈 디렉터리와 메타데이터를 다시 만든다.
+        let replacedTreeOrderPlaceholderFolder: DocumentNode?
 
         init(
             localProjectID: ProjectID,
@@ -206,7 +249,8 @@ actor LocalSyncV2SnapshotApplier: SyncV2LocalSnapshotApplying {
             trashPurgePreviousState: Data? = nil,
             trashPurgeAppliedState: Data? = nil,
             isTombstoneRepair: Bool? = nil,
-            tombstoneRepairHadTrashRecord: Bool? = nil
+            tombstoneRepairHadTrashRecord: Bool? = nil,
+            replacedTreeOrderPlaceholderFolder: DocumentNode? = nil
         ) {
             self.localProjectID = localProjectID
             self.snapshot = snapshot
@@ -223,6 +267,8 @@ actor LocalSyncV2SnapshotApplier: SyncV2LocalSnapshotApplying {
             self.isTombstoneRepair = isTombstoneRepair
             self.tombstoneRepairHadTrashRecord =
                 tombstoneRepairHadTrashRecord
+            self.replacedTreeOrderPlaceholderFolder =
+                replacedTreeOrderPlaceholderFolder
         }
     }
 
@@ -256,22 +302,96 @@ actor LocalSyncV2SnapshotApplier: SyncV2LocalSnapshotApplying {
     private let writer = POSIXAtomicFileWriter()
     private let hasher: any ContentHashing
     private let pathPolicy = PathPolicy()
+    private let backupStore: (any BackupStoring)?
     /// tree_order로 받은 폴더 이름 변경을 폴더 기록에도 올린다.
     private let folderIdentityPublisher: (any SyncV2FolderIdentityPublishing)?
     private var remoteLiveDocumentPaths: [ProjectID: Set<String>] = [:]
+    private var remoteLiveFolderPaths: [ProjectID: Set<String>] = [:]
 
     init(
         documentRepository: any DocumentRepository,
         workspaceLocator: any ProjectWorkspaceLocating,
         fileManager: FileManager = .default,
         hasher: any ContentHashing = SHA256ContentHasher(),
+        backupStore: (any BackupStoring)? = nil,
         folderIdentityPublisher: (any SyncV2FolderIdentityPublishing)? = nil
     ) {
         self.documentRepository = documentRepository
         self.workspaceLocator = workspaceLocator
         self.fileManager = fileManager
         self.hasher = hasher
+        self.backupStore = backupStore
         self.folderIdentityPublisher = folderIdentityPublisher
+    }
+
+    func equivalentLocalDocumentID(
+        localProjectID: ProjectID,
+        snapshot: SyncV2RemoteDocumentSnapshot
+    ) async -> UUID? {
+        guard !snapshot.isDeleted,
+              snapshot.relativePath != syncV2TreeOrderPath,
+              snapshot.relativePath != syncV2TrashPurgePath,
+              let backupStore,
+              documentRepository is any DocumentIdentityReplacing
+        else { return nil }
+
+        guard let documents = try? await documentRepository.documents(
+            in: localProjectID
+        ) else { return nil }
+        let targetID = DocumentID(rawValue: snapshot.documentID)
+        guard !documents.contains(where: { $0.id == targetID }) else {
+            return nil
+        }
+        let candidates = documents.filter {
+            $0.id != targetID
+                && $0.kind == .text
+                && isActive($0)
+                && normalized($0.relativePath.rawValue)
+                    == normalized(snapshot.relativePath)
+        }
+        guard candidates.count == 1, let local = candidates.first else {
+            return nil
+        }
+        guard let backups = try? await backupStore.snapshots(
+            for: local.id,
+            projectID: localProjectID
+        ), backups.isEmpty else {
+            return nil
+        }
+        guard let root = try? await workspaceLocator.workspaceRoot(
+            for: localProjectID
+        ), let data = try? Data(
+            contentsOf: root.appendingPathComponent(
+                local.relativePath.rawValue
+            )
+        ), data == Data(snapshot.content.utf8) else {
+            return nil
+        }
+        return local.id.rawValue
+    }
+
+    func replaceEquivalentLocalDocumentIdentity(
+        localProjectID: ProjectID,
+        localDocumentID: UUID,
+        snapshot: SyncV2RemoteDocumentSnapshot
+    ) async -> Bool {
+        guard await equivalentLocalDocumentID(
+            localProjectID: localProjectID,
+            snapshot: snapshot
+        ) == localDocumentID,
+        let identityRepository =
+            documentRepository as? any DocumentIdentityReplacing
+        else { return false }
+        do {
+            try await identityRepository.replaceDocumentIdentity(
+                from: DocumentID(rawValue: localDocumentID),
+                to: DocumentID(rawValue: snapshot.documentID),
+                in: localProjectID
+            )
+            return true
+        } catch {
+            return false
+        }
     }
 
     func preparePull(
@@ -297,6 +417,18 @@ actor LocalSyncV2SnapshotApplier: SyncV2LocalSnapshotApplying {
         }
         self.remoteLiveDocumentPaths[localProjectID] = Set(
             remoteLiveDocumentPaths.map(normalized)
+        )
+        // 이번 pull의 폴더 목록은 아직 받지 않았다. 이전 pull 값을
+        // 재사용하면 이번에는 서버에 없는 폴더를 잘못 보호할 수 있다.
+        remoteLiveFolderPaths[localProjectID] = []
+    }
+
+    func prepareRemoteFolders(
+        localProjectID: ProjectID,
+        remoteLiveFolderPaths: Set<String>
+    ) async {
+        self.remoteLiveFolderPaths[localProjectID] = Set(
+            remoteLiveFolderPaths.map(normalized)
         )
     }
 
@@ -349,14 +481,11 @@ actor LocalSyncV2SnapshotApplier: SyncV2LocalSnapshotApplying {
             modifiedAt: snapshot.updatedAt
         )
         documents = hierarchy.documents
-        if documents.contains(where: {
+        let occupyingDocument = documents.first(where: {
             $0.id != documentID
                 && normalized($0.relativePath.rawValue)
                     == normalized(path.rawValue)
-        }) {
-            throw SyncV2LocalSnapshotApplyError
-                .pathOccupiedByDifferentDocument
-        }
+        })
 
         let parentPath = (path.rawValue as NSString)
             .deletingLastPathComponent
@@ -411,9 +540,31 @@ actor LocalSyncV2SnapshotApplier: SyncV2LocalSnapshotApplying {
             && normalized(
                 existingMarker?.snapshot.relativePath ?? ""
             ) == normalized(snapshot.relativePath)
+        let placeholderFolder: DocumentNode?
+        if recoveringSameSnapshot,
+           let recorded = existingMarker?
+               .replacedTreeOrderPlaceholderFolder {
+            placeholderFolder = recorded
+        } else if let occupyingDocument,
+                  isReplaceableTreeOrderPlaceholder(
+                      occupyingDocument,
+                      path: path,
+                      localProjectID: localProjectID,
+                      documents: documents,
+                      root: root
+                  ) {
+            placeholderFolder = occupyingDocument
+        } else {
+            placeholderFolder = nil
+        }
+        if occupyingDocument != nil, placeholderFolder == nil {
+            throw SyncV2LocalSnapshotApplyError
+                .pathOccupiedByDifferentDocument
+        }
         if current?.relativePath != path,
            fileManager.fileExists(atPath: destination.path),
-           !recoveringSameSnapshot {
+           !recoveringSameSnapshot,
+           placeholderFolder == nil {
             throw SyncV2LocalSnapshotApplyError
                 .pathOccupiedByDifferentDocument
         }
@@ -439,7 +590,8 @@ actor LocalSyncV2SnapshotApplier: SyncV2LocalSnapshotApplying {
                 tombstonePath: nil,
                 trashRecord: nil,
                 createdFolders: hierarchy.createdFolders,
-                treeOrderPreviousDocuments: nil
+                treeOrderPreviousDocuments: nil,
+                replacedTreeOrderPlaceholderFolder: placeholderFolder
             )
             let encoder = JSONEncoder()
             encoder.outputFormatting = [.sortedKeys]
@@ -447,6 +599,16 @@ actor LocalSyncV2SnapshotApplier: SyncV2LocalSnapshotApplying {
                 to: markerURL,
                 options: [.atomic]
             )
+        }
+        if let placeholderFolder {
+            try await removeTreeOrderPlaceholder(
+                placeholderFolder,
+                path: path,
+                documents: documents,
+                root: root,
+                recoveringSameSnapshot: recoveringSameSnapshot
+            )
+            documents.removeAll { $0.id == placeholderFolder.id }
         }
         let temporary = parentURL.appendingPathComponent(
             LocalDocumentStore.temporaryPrefix
@@ -483,6 +645,99 @@ actor LocalSyncV2SnapshotApplier: SyncV2LocalSnapshotApplying {
                fileManager.fileExists(atPath: oldURL.path) {
                 try fileManager.removeItem(at: oldURL)
             }
+        }
+    }
+
+    /// tree-order의 자식 이름은 종류 정보가 없다. 서버 문서 목록보다
+    /// tree-order가 먼저 도착하면 `001화.txt`도 폴더로 물질화될 수 있다.
+    /// 경로에서 파생한 UUID의 빈 로컬 폴더이고, 서버가 실제 폴더로
+    /// 알고 있지 않을 때만 서버 TXT에 자리를 내준다.
+    private func isReplaceableTreeOrderPlaceholder(
+        _ candidate: DocumentNode,
+        path: RelativeDocumentPath,
+        localProjectID: ProjectID,
+        documents: [DocumentNode],
+        root: URL
+    ) -> Bool {
+        guard candidate.kind == .folder,
+              isActive(candidate),
+              candidate.id == syncedFolderIdentifier(
+                  localProjectID: localProjectID,
+                  path: path.rawValue
+              ),
+              remoteLiveDocumentPaths[localProjectID]?.contains(
+                  normalized(path.rawValue)
+              ) == true,
+              remoteLiveFolderPaths[localProjectID]?.contains(
+                  normalized(path.rawValue)
+              ) != true,
+              !documents.contains(where: {
+                  $0.parentID == candidate.id || (
+                      $0.id != candidate.id
+                          && normalized($0.relativePath.rawValue).hasPrefix(
+                              normalized(path.rawValue) + "/"
+                          )
+                  )
+              })
+        else { return false }
+
+        let url = root.appendingPathComponent(path.rawValue)
+            .standardizedFileURL
+        var isDirectory: ObjCBool = false
+        guard fileManager.fileExists(
+            atPath: url.path,
+            isDirectory: &isDirectory
+        ), isDirectory.boolValue,
+        (try? url.resourceValues(
+            forKeys: [.isSymbolicLinkKey]
+        ).isSymbolicLink) != true,
+        (try? fileManager.contentsOfDirectory(atPath: url.path))?.isEmpty
+            == true
+        else { return false }
+        return true
+    }
+
+    private func removeTreeOrderPlaceholder(
+        _ placeholder: DocumentNode,
+        path: RelativeDocumentPath,
+        documents: [DocumentNode],
+        root: URL,
+        recoveringSameSnapshot: Bool
+    ) async throws {
+        let url = root.appendingPathComponent(path.rawValue)
+            .standardizedFileURL
+        var isDirectory: ObjCBool = false
+        if fileManager.fileExists(
+            atPath: url.path,
+            isDirectory: &isDirectory
+        ) {
+            guard isDirectory.boolValue,
+                  (try? url.resourceValues(
+                      forKeys: [.isSymbolicLinkKey]
+                  ).isSymbolicLink) != true,
+                  (try? fileManager.contentsOfDirectory(
+                      atPath: url.path
+                  ))?.isEmpty == true
+            else {
+                throw SyncV2LocalSnapshotApplyError
+                    .pathOccupiedByDifferentDocument
+            }
+            try fileManager.removeItem(at: url)
+        } else if !recoveringSameSnapshot {
+            throw SyncV2LocalSnapshotApplyError
+                .pathOccupiedByDifferentDocument
+        }
+
+        if let stored = try await documentRepository.document(
+            id: placeholder.id
+        ) {
+            guard stored == placeholder,
+                  !documents.contains(where: { $0.parentID == stored.id })
+            else {
+                throw SyncV2LocalSnapshotApplyError
+                    .pathOccupiedByDifferentDocument
+            }
+            try await documentRepository.removeMetadata(id: placeholder.id)
         }
     }
 
@@ -1235,6 +1490,51 @@ actor LocalSyncV2SnapshotApplier: SyncV2LocalSnapshotApplying {
                         normalized(parentValue + "/" + name)
                     )
             }
+
+            // 문서가 든 폴더를 Windows에서 이름 변경하면 문서 snapshot이 먼저
+            // 새 경로에 도착해, tree-order를 적용할 때는 새 이름의 폴더가 이미
+            // 만들어져 있다. 그 폴더가 이번 pull이 경로에서 만든 임시 식별자이고
+            // 서버 folders projection에는 아직 없는 경로임이 모두 확인될 때만
+            // 옛 폴더 식별자를 새 경로에 승계한다.
+            let remoteFolderPaths = remoteLiveFolderPaths[localProjectID] ?? []
+            let materializedDestinations = children.filter { child in
+                guard child.kind == .folder else { return false }
+                let path = normalized(child.relativePath.rawValue)
+                return remoteKeys.contains(
+                    pathPolicy.collisionKey(for: storedName(of: child))
+                )
+                    && !remoteFolderPaths.contains(path)
+                    && child.id == syncedFolderIdentifier(
+                        localProjectID: localProjectID,
+                        path: child.relativePath.rawValue
+                    )
+                    && remotePaths.contains(where: {
+                        $0.hasPrefix(path + "/")
+                    })
+            }
+            if vanished.count == 1,
+               materializedDestinations.count == 1,
+               let source = vanished.first,
+               let destination = materializedDestinations.first,
+               remoteFolderPaths.contains(
+                   normalized(source.relativePath.rawValue)
+               ),
+               let promoted = try await promoteMaterializedFolderRename(
+                   source: source,
+                   destination: destination,
+                   documents: documents,
+                   root: root
+               ) {
+                documents = promoted
+                await folderIdentityPublisher?.publishFolder(
+                    localProjectID: localProjectID,
+                    folderID: source.id,
+                    parentFolderID: source.parentID,
+                    name: storedName(of: destination)
+                )
+                continue
+            }
+
             guard vanished.count == 1, added.count == 1,
                   let source = vanished.first,
                   let newName = added.first
@@ -1297,6 +1597,111 @@ actor LocalSyncV2SnapshotApplier: SyncV2LocalSnapshotApplying {
             )
         }
         return documents
+    }
+
+    /// 문서 snapshot이 새 경로를 먼저 물질화한 경우의 폴더 ID 승계다.
+    ///
+    /// 디스크의 새 폴더와 그 안의 문서는 그대로 두고, 이번 pull이 만든 임시
+    /// 폴더 메타데이터만 원래 공유 folder_id로 바꾼다. 옛 디렉터리는 숨김
+    /// 파일까지 완전히 비었을 때만 제거한다. 어느 저장 단계든 실패하면 원래
+    /// 메타데이터와 빈 디렉터리를 복원하므로 원고 파일은 이동하거나 지우지 않는다.
+    private func promoteMaterializedFolderRename(
+        source: DocumentNode,
+        destination: DocumentNode,
+        documents: [DocumentNode],
+        root: URL
+    ) async throws -> [DocumentNode]? {
+        guard source.kind == .folder,
+              destination.kind == .folder,
+              source.parentID == destination.parentID,
+              source.id != destination.id
+        else { return nil }
+
+        let sourceURL = root.appendingPathComponent(
+            source.relativePath.rawValue
+        ).standardizedFileURL
+        let destinationURL = root.appendingPathComponent(
+            destination.relativePath.rawValue
+        ).standardizedFileURL
+        var sourceIsDirectory: ObjCBool = false
+        let sourceExists = fileManager.fileExists(
+            atPath: sourceURL.path,
+            isDirectory: &sourceIsDirectory
+        )
+        if sourceExists {
+            guard sourceIsDirectory.boolValue,
+                  (try? sourceURL.resourceValues(
+                      forKeys: [.isSymbolicLinkKey]
+                  ).isSymbolicLink) != true,
+                  (try? fileManager.contentsOfDirectory(
+                      atPath: sourceURL.path
+                  ))?.isEmpty == true
+            else { return nil }
+        }
+        var destinationIsDirectory: ObjCBool = false
+        guard fileManager.fileExists(
+            atPath: destinationURL.path,
+            isDirectory: &destinationIsDirectory
+        ), destinationIsDirectory.boolValue,
+        (try? destinationURL.resourceValues(
+            forKeys: [.isSymbolicLinkKey]
+        ).isSymbolicLink) != true
+        else { return nil }
+
+        let directChildren = documents.filter {
+            $0.parentID == destination.id && isActive($0)
+        }
+        let reparentedChildren = directChildren.map {
+            $0.relocated(
+                to: $0.relativePath,
+                parentID: source.id,
+                userOrder: $0.userOrder,
+                at: $0.modifiedAt
+            )
+        }
+        let movedSource = source.relocated(
+            to: destination.relativePath,
+            parentID: source.parentID,
+            userOrder: source.userOrder,
+            at: source.modifiedAt
+        )
+
+        do {
+            for child in reparentedChildren {
+                try await documentRepository.save(child)
+            }
+            try await documentRepository.removeMetadata(id: destination.id)
+            try await documentRepository.save(movedSource)
+            if sourceExists {
+                try fileManager.removeItem(at: sourceURL)
+            }
+        } catch {
+            // 파일 본문은 처음부터 새 디렉터리에 그대로 있다. 메타데이터만
+            // 원상 복구하고, 지운 옛 빈 디렉터리가 있다면 다시 만든다.
+            try? await documentRepository.save(source)
+            try? await documentRepository.save(destination)
+            for child in directChildren {
+                try? await documentRepository.save(child)
+            }
+            if sourceExists,
+               !fileManager.fileExists(atPath: sourceURL.path) {
+                try? fileManager.createDirectory(
+                    at: sourceURL,
+                    withIntermediateDirectories: false
+                )
+            }
+            throw error
+        }
+
+        let directChildIDs = Set(directChildren.map(\.id))
+        var updated = documents.filter {
+            $0.id != source.id
+                && $0.id != destination.id
+                && !directChildIDs.contains($0.id)
+        }
+        updated.append(movedSource)
+        updated.append(contentsOf: reparentedChildren)
+        return updated
     }
 
     /// 거부한 이름을 로그와 오류에 함께 싣는다. 로그는 개발자용이고, 오류에
@@ -1933,6 +2338,31 @@ actor LocalSyncV2SnapshotApplier: SyncV2LocalSnapshotApplying {
         }
 
         do {
+            if let placeholder = marker
+                .replacedTreeOrderPlaceholderFolder {
+                if let current = try await documentRepository.document(
+                    id: DocumentID(rawValue: documentID)
+                ), current.relativePath == appliedPath {
+                    try await documentRepository.removeMetadata(id: current.id)
+                }
+                try fileManager.removeItem(at: appliedURL)
+                try fileManager.createDirectory(
+                    at: appliedURL,
+                    withIntermediateDirectories: false
+                )
+                try await documentRepository.save(placeholder)
+                await rollbackCreatedFolders(
+                    marker.createdFolders ?? [],
+                    root: root
+                )
+                try? fileManager.removeItem(
+                    at: recoveryMarkerURL(
+                        documentID: documentID,
+                        root: root
+                    )
+                )
+                return
+            }
             if let previousDocument = marker.previousDocument,
                let previousContent = marker.previousContent {
                 let previousURL = root.appendingPathComponent(

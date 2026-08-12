@@ -94,6 +94,17 @@ private func withSyncV2GateHoldLimit<
 /// 교체하지 않도록 하는 실행 중 전용 경계다.
 /// 이 Gate 안의 operation이 반환하지 않으면 공유 인스턴스를 사용하는
 /// 프로세스 전역 동기화가 멈추므로 보유 시간 상한을 제거하면 안 된다.
+///
+/// 폴더는 빈 경우 잠글 문서 UUID가 하나도 없다. 그래서 작품별
+/// 구조 변경은 아래의 전용 키를 같이 잠그고, 문서 UUID와 충돌하지
+/// 않도록 작품 UUID에서 다른 namespace로 파생한다.
+func syncV2ProjectStructureMutationID(_ projectID: ProjectID) -> UUID {
+    syncV2UUIDv5(
+        namespace: projectID.rawValue,
+        name: "writerpad-project-structure-mutation"
+    )
+}
+
 actor SyncV2DocumentMutationGate {
     private var lockedDocumentIDs: Set<UUID> = []
     private var waiters: [
@@ -860,8 +871,8 @@ final class SyncV2WorkspaceSyncModel: ObservableObject {
     private let networkMonitor: SyncV2NetworkRecoveryMonitor
     private var editingGuards:
         (@MainActor @Sendable () -> [UUID: SyncV2EditingGuard])?
-    private var applyOpenSnapshot:
-        (@MainActor @Sendable (SyncV2RemoteDocumentSnapshot) -> Void)?
+    private var applyOpenSnapshots:
+        (@MainActor @Sendable ([SyncV2RemoteDocumentSnapshot]) -> Void)?
     private var debounceTask = SingleFlightTask()
     private var periodicTask = SingleFlightTask()
     private var pullTask = SingleFlightTask()
@@ -968,12 +979,12 @@ final class SyncV2WorkspaceSyncModel: ObservableObject {
         editingGuards:
             @escaping @MainActor @Sendable
             () -> [UUID: SyncV2EditingGuard],
-        applyOpenSnapshot:
+        applyOpenSnapshots:
             @escaping @MainActor @Sendable
-            (SyncV2RemoteDocumentSnapshot) -> Void
+            ([SyncV2RemoteDocumentSnapshot]) -> Void
     ) async {
         self.editingGuards = editingGuards
-        self.applyOpenSnapshot = applyOpenSnapshot
+        self.applyOpenSnapshots = applyOpenSnapshots
         await updateSceneActivity(sceneIsActive)
     }
 
@@ -2020,8 +2031,8 @@ final class SyncV2WorkspaceSyncModel: ObservableObject {
     }
 
     private func complete(_ report: SyncV2SnapshotPullReport) {
-        report.appliedSnapshots.forEach {
-            applyOpenSnapshot?($0)
+        if !report.appliedSnapshots.isEmpty {
+            applyOpenSnapshots?(report.appliedSnapshots)
         }
         let mergeOutcomes = report.outcomes.compactMap {
             if case let .mergeRequired(_, _, reason) = $0 {

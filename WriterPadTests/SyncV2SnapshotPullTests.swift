@@ -204,6 +204,27 @@ final class SyncV2SnapshotPullTests: XCTestCase {
         XCTAssertEqual(fetched, target)
     }
 
+    func testClientUsesTheTransportFolderImplementation() async throws {
+        let folder = SyncV2RemoteFolder(
+            folderID: UUID(),
+            parentFolderID: nil,
+            name: "메인",
+            revision: 1,
+            isDeleted: false,
+            updatedAt: Date(timeIntervalSince1970: 10)
+        )
+        let client = SyncV2SnapshotClient(
+            transport: SnapshotTransportStub(
+                snapshots: [],
+                folders: [folder]
+            )
+        )
+
+        let fetched = try await client.fetchFolders(projectID: UUID())
+
+        XCTAssertEqual(fetched, [folder])
+    }
+
     func testPullAppliesOnlyHigherCleanDocumentAndPreservesEveryBlocker()
         async throws {
         let clean = UUID()
@@ -334,6 +355,104 @@ final class SyncV2SnapshotPullTests: XCTestCase {
                 ),
             ],
             "진행 중으로 묻히면 무한 동기화 대기로 되돌아간다."
+        )
+    }
+
+    /// 빈 서버 작품을 두 기기가 동시에 채우면 같은 초기 TXT가
+    /// 다른 UUID로 두 번 등록될 수 있다. 경로·본문이 같고 편집·백업이
+    /// 없는 초기 snapshot만 서버 UUID를 채택해 구조 추돌을 풀어야 한다.
+    func testEquivalentInitialDocumentAdoptsServerIdentityWithoutRewritingTXT()
+        async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("WriterPad-Identity-Adoption-\(UUID())")
+        defer { try? FileManager.default.removeItem(at: root) }
+        try FileManager.default.createDirectory(
+            at: root.appendingPathComponent("메인/1권"),
+            withIntermediateDirectories: true
+        )
+        let relativePath = "메인/1권/001화.txt"
+        let fileURL = root.appendingPathComponent(relativePath)
+        let originalData = Data()
+        try originalData.write(to: fileURL)
+
+        let projectID = ProjectID(rawValue: UUID())
+        let main = DocumentNode(
+            id: DocumentID(rawValue: UUID()),
+            projectID: projectID,
+            kind: .folder,
+            parentID: nil,
+            relativePath: RelativeDocumentPath(rawValue: "메인"),
+            userOrder: -1,
+            modifiedAt: .distantPast,
+            contentHash: nil
+        )
+        let volume = DocumentNode(
+            id: DocumentID(rawValue: UUID()),
+            projectID: projectID,
+            kind: .folder,
+            parentID: main.id,
+            relativePath: RelativeDocumentPath(rawValue: "메인/1권"),
+            userOrder: 0,
+            modifiedAt: .distantPast,
+            contentHash: nil
+        )
+        let localID = DocumentID(rawValue: UUID())
+        let local = DocumentNode(
+            id: localID,
+            projectID: projectID,
+            kind: .text,
+            parentID: volume.id,
+            relativePath: RelativeDocumentPath(rawValue: relativePath),
+            userOrder: 0,
+            modifiedAt: .distantPast,
+            contentHash: SHA256ContentHasher().sha256(for: originalData)
+        )
+        let repository = SnapshotDocumentRepository(
+            documents: [main, volume, local]
+        )
+        let locator = SnapshotWorkspaceLocator(root: root)
+        let applier = LocalSyncV2SnapshotApplier(
+            documentRepository: repository,
+            workspaceLocator: locator,
+            backupStore: LocalBackupStore(workspaceLocator: locator)
+        )
+        let remoteID = UUID()
+        let snapshot = makeSnapshot(
+            id: remoteID,
+            path: relativePath,
+            content: "",
+            revision: 1
+        )
+        let stateStore = EquivalentIdentityStateStoreStub(
+            remoteDocumentID: remoteID,
+            path: relativePath
+        )
+        let mergeStore = SnapshotMergeStoreSpy()
+        let service = SyncV2SnapshotPullService(
+            client: SnapshotClientStub(snapshots: [snapshot]),
+            stateStore: stateStore,
+            localApplier: applier,
+            mergeStore: mergeStore
+        )
+
+        let report = try await service.pull(
+            localProjectID: projectID,
+            serverProjectID: UUID(),
+            editingGuards: [:]
+        )
+
+        let documents = try await repository.documents(in: projectID)
+        XCTAssertFalse(documents.contains { $0.id == localID })
+        XCTAssertTrue(documents.contains {
+            $0.id.rawValue == remoteID
+                && $0.relativePath.rawValue == relativePath
+        })
+        XCTAssertEqual(try Data(contentsOf: fileURL), originalData)
+        let mergeReasons = await mergeStore.reasons()
+        XCTAssertEqual(mergeReasons, [])
+        XCTAssertEqual(
+            report.outcomes,
+            [.upToDate(documentID: remoteID, revision: 1)]
         )
     }
 
@@ -513,6 +632,59 @@ final class SyncV2SnapshotPullTests: XCTestCase {
                     reason: .blockedOperation
                 )
             )
+        )
+    }
+
+    /// Windows는 빈 폴더 이름을 tree_order에만 쓴다. 서버 folders 행이 아직 옛
+    /// 이름인 동안 pull 앞부분에서 로컬 이름을 되돌릴 수 있으므로, 이미 적용한
+    /// revision이어도 tree_order를 다시 실행해 새 이름과 folder commit을 복구한다.
+    func testSameRevisionTreeOrderIsReappliedAfterStaleFolderProjection()
+        async throws {
+        let serverProjectID = UUID()
+        let treeOrderID = syncV2UUIDv5(
+            namespace: serverProjectID,
+            name: syncV2TreeOrderPath
+        )
+        let snapshot = makeSnapshot(
+            id: treeOrderID,
+            path: syncV2TreeOrderPath,
+            content:
+                "{\"tree_order\":{\"메인/메모장\":[\"새폴더D\"]},\"version\":1}",
+            revision: 7
+        )
+        let state = SyncV2SnapshotLocalState(
+            serverRevision: 7,
+            serverPath: syncV2TreeOrderPath,
+            hasActiveOperation: false,
+            hasUnresolvedConflict: false,
+            blockingErrorCode: nil
+        )
+        let applier = SnapshotApplierSpy()
+        let service = SyncV2SnapshotPullService(
+            client: SnapshotClientStub(snapshots: [snapshot]),
+            stateStore: SnapshotStateStoreStub(
+                states: [treeOrderID: state]
+            ),
+            localApplier: applier,
+            mergeStore: SnapshotMergeStoreSpy()
+        )
+
+        let report = try await service.pull(
+            localProjectID: ProjectID(rawValue: UUID()),
+            serverProjectID: serverProjectID
+        )
+
+        let appliedIDs = await applier.appliedIDs()
+        XCTAssertEqual(appliedIDs, [treeOrderID])
+        XCTAssertEqual(
+            report.outcomes,
+            [
+                .applied(
+                    documentID: treeOrderID,
+                    revision: 7,
+                    wasOpen: false
+                ),
+            ]
         )
     }
 
@@ -1771,6 +1943,229 @@ final class SyncV2SnapshotPullTests: XCTestCase {
                 atPath: root.appendingPathComponent("__antigravity__").path
             )
         )
+    }
+
+    func testRemoteDocumentReplacesEmptyTreeOrderTXTPlaceholderFolder()
+        async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("WriterPad-TreeOrder-\(UUID())")
+        defer { try? FileManager.default.removeItem(at: root) }
+        try FileManager.default.createDirectory(
+            at: root.appendingPathComponent("메인"),
+            withIntermediateDirectories: true
+        )
+        let projectID = ProjectID(rawValue: UUID())
+        let main = DocumentNode(
+            id: DocumentID(rawValue: UUID()),
+            projectID: projectID,
+            kind: .folder,
+            parentID: nil,
+            relativePath: RelativeDocumentPath(rawValue: "메인"),
+            userOrder: -1,
+            modifiedAt: .distantPast,
+            contentHash: nil
+        )
+        let repository = SnapshotDocumentRepository(documents: [main])
+        let applier = LocalSyncV2SnapshotApplier(
+            documentRepository: repository,
+            workspaceLocator: SnapshotWorkspaceLocator(root: root)
+        )
+        let path = "메인/001화.txt"
+        try await applier.apply(
+            localProjectID: projectID,
+            snapshot: makeSnapshot(
+                path: syncV2TreeOrderPath,
+                content:
+                    "{\"tree_order\":{\"<root>\":[\"001화.txt\"]},\"version\":1}",
+                revision: 1
+            )
+        )
+        let initialDocuments = try await repository.documents(in: projectID)
+        let placeholder = try XCTUnwrap(initialDocuments.first {
+            $0.relativePath.rawValue == path
+        })
+        XCTAssertEqual(placeholder.kind, .folder)
+
+        let remoteID = UUID()
+        await applier.preparePull(
+            localProjectID: projectID,
+            remoteLiveDocumentPaths: [path]
+        )
+        try await applier.apply(
+            localProjectID: projectID,
+            snapshot: makeSnapshot(
+                id: remoteID,
+                path: path,
+                content: "",
+                revision: 1
+            )
+        )
+        await applier.finish(
+            localProjectID: projectID,
+            documentID: remoteID
+        )
+
+        let removedPlaceholder = try await repository.document(
+            id: placeholder.id
+        )
+        XCTAssertNil(removedPlaceholder)
+        let storedRemote = try await repository.document(
+            id: DocumentID(rawValue: remoteID)
+        )
+        let document = try XCTUnwrap(storedRemote)
+        XCTAssertEqual(document.kind, .text)
+        XCTAssertEqual(document.relativePath.rawValue, path)
+        var isDirectory: ObjCBool = true
+        XCTAssertTrue(
+            FileManager.default.fileExists(
+                atPath: root.appendingPathComponent(path).path,
+                isDirectory: &isDirectory
+            )
+        )
+        XCTAssertFalse(isDirectory.boolValue)
+        XCTAssertEqual(
+            try Data(contentsOf: root.appendingPathComponent(path)),
+            Data()
+        )
+    }
+
+    func testRemoteDocumentNeverReplacesNonemptyTreeOrderPlaceholderFolder()
+        async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("WriterPad-TreeOrder-\(UUID())")
+        defer { try? FileManager.default.removeItem(at: root) }
+        try FileManager.default.createDirectory(
+            at: root.appendingPathComponent("메인"),
+            withIntermediateDirectories: true
+        )
+        let projectID = ProjectID(rawValue: UUID())
+        let main = DocumentNode(
+            id: DocumentID(rawValue: UUID()),
+            projectID: projectID,
+            kind: .folder,
+            parentID: nil,
+            relativePath: RelativeDocumentPath(rawValue: "메인"),
+            userOrder: -1,
+            modifiedAt: .distantPast,
+            contentHash: nil
+        )
+        let repository = SnapshotDocumentRepository(documents: [main])
+        let applier = LocalSyncV2SnapshotApplier(
+            documentRepository: repository,
+            workspaceLocator: SnapshotWorkspaceLocator(root: root)
+        )
+        let path = "메인/001화.txt"
+        try await applier.apply(
+            localProjectID: projectID,
+            snapshot: makeSnapshot(
+                path: syncV2TreeOrderPath,
+                content:
+                    "{\"tree_order\":{\"<root>\":[\"001화.txt\"]},\"version\":1}",
+                revision: 1
+            )
+        )
+        let sentinel = root.appendingPathComponent(path)
+            .appendingPathComponent("do-not-delete")
+        try Data("preserve".utf8).write(to: sentinel)
+        await applier.preparePull(
+            localProjectID: projectID,
+            remoteLiveDocumentPaths: [path]
+        )
+
+        do {
+            try await applier.apply(
+                localProjectID: projectID,
+                snapshot: makeSnapshot(
+                    path: path,
+                    content: "",
+                    revision: 1
+                )
+            )
+            XCTFail("내용이 있는 폴더는 TXT로 바꾸면 안 됩니다.")
+        } catch let error as SyncV2LocalSnapshotApplyError {
+            XCTAssertEqual(error, .pathOccupiedByDifferentDocument)
+        }
+        XCTAssertEqual(
+            try String(contentsOf: sentinel, encoding: .utf8),
+            "preserve"
+        )
+    }
+
+    func testTreeOrderPlaceholderPromotionRollbackRestoresEmptyFolder()
+        async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("WriterPad-TreeOrder-\(UUID())")
+        defer { try? FileManager.default.removeItem(at: root) }
+        try FileManager.default.createDirectory(
+            at: root.appendingPathComponent("메인"),
+            withIntermediateDirectories: true
+        )
+        let projectID = ProjectID(rawValue: UUID())
+        let main = DocumentNode(
+            id: DocumentID(rawValue: UUID()),
+            projectID: projectID,
+            kind: .folder,
+            parentID: nil,
+            relativePath: RelativeDocumentPath(rawValue: "메인"),
+            userOrder: -1,
+            modifiedAt: .distantPast,
+            contentHash: nil
+        )
+        let repository = SnapshotDocumentRepository(documents: [main])
+        let applier = LocalSyncV2SnapshotApplier(
+            documentRepository: repository,
+            workspaceLocator: SnapshotWorkspaceLocator(root: root)
+        )
+        let path = "메인/001화.txt"
+        try await applier.apply(
+            localProjectID: projectID,
+            snapshot: makeSnapshot(
+                path: syncV2TreeOrderPath,
+                content:
+                    "{\"tree_order\":{\"<root>\":[\"001화.txt\"]},\"version\":1}",
+                revision: 1
+            )
+        )
+        let initialDocuments = try await repository.documents(in: projectID)
+        let placeholder = try XCTUnwrap(initialDocuments.first {
+            $0.relativePath.rawValue == path
+        })
+        let remoteID = UUID()
+        await applier.preparePull(
+            localProjectID: projectID,
+            remoteLiveDocumentPaths: [path]
+        )
+        try await applier.apply(
+            localProjectID: projectID,
+            snapshot: makeSnapshot(
+                id: remoteID,
+                path: path,
+                content: "",
+                revision: 1
+            )
+        )
+
+        await applier.rollback(
+            localProjectID: projectID,
+            documentID: remoteID
+        )
+
+        let removedRemote = try await repository.document(
+            id: DocumentID(rawValue: remoteID)
+        )
+        XCTAssertNil(removedRemote)
+        let restoredPlaceholder = try await repository.document(
+            id: placeholder.id
+        )
+        XCTAssertEqual(restoredPlaceholder, placeholder)
+        var isDirectory: ObjCBool = false
+        XCTAssertTrue(
+            FileManager.default.fileExists(
+                atPath: root.appendingPathComponent(path).path,
+                isDirectory: &isDirectory
+            )
+        )
+        XCTAssertTrue(isDirectory.boolValue)
     }
 
     /// 빈 폴더는 tree-order의 child name으로만 전달되므로 Windows의 이름 변경은
@@ -3644,6 +4039,63 @@ final class SyncV2SnapshotPullTests: XCTestCase {
         XCTAssertEqual(appliedCount, 0)
     }
 
+    @MainActor
+    func testWorkspaceDeliversAllAppliedSnapshotsAsOneBinderRefreshBatch()
+        async {
+        let previous = GlobalSyncPreference.isEnabled()
+        GlobalSyncPreference.setEnabled(true)
+        defer { GlobalSyncPreference.setEnabled(previous) }
+        let localProjectID = ProjectID(rawValue: UUID())
+        let snapshots = [
+            makeSnapshot(path: "메인/메모장/하나.txt", revision: 1),
+            makeSnapshot(path: "메인/메모장/둘.txt", revision: 1),
+            makeSnapshot(path: "메인/메모장/셋.txt", revision: 1),
+        ]
+        let puller = WorkspacePullerStub(
+            report: SyncV2SnapshotPullReport(
+                outcomes: snapshots.map {
+                    .applied(
+                        documentID: $0.documentID,
+                        revision: $0.revision,
+                        wasOpen: false
+                    )
+                },
+                appliedSnapshots: snapshots
+            )
+        )
+        let model = SyncV2WorkspaceSyncModel(
+            localProjectID: localProjectID,
+            puller: puller,
+            realtime: nil,
+            authenticationService: WorkspaceAuthenticationStub(
+                state: .authenticated(
+                    AuthenticatedAccount(userID: UUID(), maskedEmail: nil)
+                )
+            ),
+            projectBindingService: WorkspaceBindingStub(
+                binding: .connected(
+                    localProjectID: localProjectID,
+                    serverProjectID: UUID(),
+                    kind: .existingServerProject,
+                    projectName: "batched binder refresh",
+                    ownerSubject: UUID()
+                )
+            ),
+            periodicDelay: .seconds(600)
+        )
+        var deliveredBatches: [[UUID]] = []
+
+        await model.start(editingGuards: { [:] }) { batch in
+            deliveredBatches.append(batch.map(\.documentID))
+        }
+        for _ in 0..<500 where deliveredBatches.isEmpty {
+            await Task.yield()
+        }
+
+        XCTAssertEqual(deliveredBatches, [snapshots.map(\.documentID)])
+        await model.stop()
+    }
+
     func testRealtimeSubscriptionGateIgnoresInitialSubscription() {
         var gate = SyncV2RealtimeSubscriptionGate()
 
@@ -5186,15 +5638,26 @@ private func makeTrashPurgeFixture(
 
 private actor SnapshotTransportStub: SyncV2SnapshotTransporting {
     let snapshots: [SyncV2RemoteDocumentSnapshot]
+    let folders: [SyncV2RemoteFolder]
 
-    init(snapshots: [SyncV2RemoteDocumentSnapshot]) {
+    init(
+        snapshots: [SyncV2RemoteDocumentSnapshot],
+        folders: [SyncV2RemoteFolder] = []
+    ) {
         self.snapshots = snapshots
+        self.folders = folders
     }
 
     func fetchDocuments(
         projectID: UUID
     ) async throws -> [SyncV2RemoteDocumentSnapshot] {
         snapshots
+    }
+
+    func fetchFolders(
+        projectID: UUID
+    ) async throws -> [SyncV2RemoteFolder] {
+        folders
     }
 }
 
@@ -5255,6 +5718,59 @@ private actor SnapshotStateStoreStub: SyncV2SnapshotStateStoring {
     }
 
     func committedIDs() -> [UUID] { commits }
+}
+
+private actor EquivalentIdentityStateStoreStub:
+    SyncV2SnapshotStateStoring {
+    private let remoteDocumentID: UUID
+    private let path: String
+    private var adopted = false
+
+    init(remoteDocumentID: UUID, path: String) {
+        self.remoteDocumentID = remoteDocumentID
+        self.path = path
+    }
+
+    func snapshotState(
+        localProjectID: ProjectID,
+        serverProjectID: UUID,
+        documentID: UUID
+    ) -> SyncV2SnapshotLocalState? {
+        _ = (localProjectID, serverProjectID)
+        guard adopted, documentID == remoteDocumentID else { return nil }
+        return SyncV2SnapshotLocalState(
+            serverRevision: 1,
+            serverPath: path,
+            hasActiveOperation: false,
+            hasUnresolvedConflict: false,
+            blockingErrorCode: nil
+        )
+    }
+
+    func applySnapshotBaseline(
+        localProjectID: ProjectID,
+        serverProjectID: UUID,
+        snapshot: SyncV2RemoteDocumentSnapshot,
+        expectedRevision: Int64?
+    ) -> Bool {
+        _ = (localProjectID, serverProjectID, snapshot, expectedRevision)
+        return false
+    }
+
+    func adoptEquivalentInitialDocument(
+        localProjectID: ProjectID,
+        serverProjectID: UUID,
+        localDocumentID: UUID,
+        snapshot: SyncV2RemoteDocumentSnapshot
+    ) -> Bool {
+        _ = (localProjectID, serverProjectID, localDocumentID)
+        guard snapshot.documentID == remoteDocumentID,
+              snapshot.relativePath == path,
+              snapshot.revision == 1
+        else { return false }
+        adopted = true
+        return true
+    }
 }
 
 private actor BlockingSnapshotStateStore:
@@ -5412,7 +5928,9 @@ private actor SnapshotMergeStoreSpy: SyncV2SnapshotMergeStoring {
     }
 }
 
-private actor SnapshotDocumentRepository: DocumentRepository {
+private actor SnapshotDocumentRepository:
+    DocumentRepository,
+    DocumentIdentityReplacing {
     private var values: [DocumentID: DocumentNode]
     private var saveFailuresRemaining: Int
 
@@ -5444,6 +5962,47 @@ private actor SnapshotDocumentRepository: DocumentRepository {
 
     func removeMetadata(id: DocumentID) async throws {
         values[id] = nil
+    }
+
+    func replaceDocumentIdentity(
+        from oldID: DocumentID,
+        to newID: DocumentID,
+        in projectID: ProjectID
+    ) async throws {
+        guard values[newID] == nil,
+              let old = values[oldID],
+              old.projectID == projectID
+        else { throw SnapshotTestError.injectedMetadataFailure }
+        values[oldID] = nil
+        values[newID] = DocumentNode(
+            id: newID,
+            projectID: old.projectID,
+            kind: old.kind,
+            parentID: old.parentID,
+            relativePath: old.relativePath,
+            userOrder: old.userOrder,
+            modifiedAt: old.modifiedAt,
+            contentHash: old.contentHash,
+            deletionStatus: old.deletionStatus,
+            cursor: old.cursor,
+            isExpanded: old.isExpanded
+        )
+        let children = values.values.filter { $0.parentID == oldID }
+        for child in children {
+            values[child.id] = DocumentNode(
+                id: child.id,
+                projectID: child.projectID,
+                kind: child.kind,
+                parentID: newID,
+                relativePath: child.relativePath,
+                userOrder: child.userOrder,
+                modifiedAt: child.modifiedAt,
+                contentHash: child.contentHash,
+                deletionStatus: child.deletionStatus,
+                cursor: child.cursor,
+                isExpanded: child.isExpanded
+            )
+        }
     }
 
     func failNextSave() {
@@ -6342,6 +6901,58 @@ private actor BackgroundPullerStub: SyncV2SnapshotPulling {
 /// 폴더에 공유 UUID가 없는 채로 서버 폴더와 짝을 맞추게 되어, 모든 원격 폴더가
 /// "이 기기가 모르는 폴더"로 보이고 옮기는 대신 새로 만들어진다.
 final class SyncV2PullFolderWiringTests: XCTestCase {
+    func testRemoteFolderApplyWaitsForProjectStructureMutation()
+        async throws {
+        let localProjectID = ProjectID(rawValue: UUID())
+        let gate = SyncV2DocumentMutationGate()
+        let blocker = SequencedRealtimeGateOperation()
+        let holder = Task {
+            try await gate.withCriticalSection(
+                documentID: syncV2ProjectStructureMutationID(localProjectID)
+            ) {
+                await blocker.run()
+            }
+        }
+        await blocker.waitUntilStarted(1)
+
+        let order = FolderWiringOrderRecorder()
+        let service = SyncV2SnapshotPullService(
+            client: SnapshotClientStub(
+                snapshots: [],
+                folders: [
+                    SyncV2RemoteFolder(
+                        folderID: UUID(),
+                        parentFolderID: nil,
+                        name: "메인",
+                        revision: 1,
+                        isDeleted: false,
+                        updatedAt: Date(timeIntervalSince1970: 10)
+                    )
+                ]
+            ),
+            stateStore: SnapshotStateStoreStub(states: [:]),
+            localApplier: SnapshotApplierSpy(),
+            mergeStore: SnapshotMergeStoreSpy(),
+            folderApplier: FolderWiringApplierSpy(order: order),
+            mutationGate: gate
+        )
+        let pull = Task {
+            try await service.pull(
+                localProjectID: localProjectID,
+                serverProjectID: UUID()
+            )
+        }
+        for _ in 0..<100 { await Task.yield() }
+        let stepsWhileHeld = await order.steps()
+        XCTAssertTrue(stepsWhileHeld.isEmpty)
+
+        await blocker.releaseHungOperation()
+        _ = try await holder.value
+        _ = try await pull.value
+        let completedSteps = await order.steps()
+        XCTAssertEqual(completedSteps, ["apply"])
+    }
+
     func testMigrationRunsBeforeRemoteFoldersAreApplied() async throws {
         let localProjectID = ProjectID(rawValue: UUID())
         let serverProjectID = UUID()
@@ -6568,6 +7179,124 @@ final class SyncV2TreeOrderFolderBridgeTests: XCTestCase {
         XCTAssertEqual(published.first?.folderID, migratedID)
         XCTAssertEqual(published.first?.name, "새 이름")
         XCTAssertEqual(published.first?.parentFolderID, mainID)
+    }
+
+    func testTreeOrderRenameWithDocumentRemovesOldEmptyShellAndKeepsFolderID()
+        async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("WriterPad-Bridge-\(UUID())")
+        defer { try? FileManager.default.removeItem(at: root) }
+        try FileManager.default.createDirectory(
+            at: root.appendingPathComponent("메인/옛 이름"),
+            withIntermediateDirectories: true
+        )
+        try Data("본문".utf8).write(
+            to: root.appendingPathComponent("메인/옛 이름/문서.txt")
+        )
+        let projectID = ProjectID(rawValue: UUID())
+        let mainID = DocumentID(rawValue: UUID())
+        let folderID = DocumentID(rawValue: UUID())
+        let textID = DocumentID(rawValue: UUID())
+        let repository = SnapshotDocumentRepository(
+            documents: [
+                bridgeFolder(
+                    id: mainID,
+                    projectID: projectID,
+                    path: "메인",
+                    parent: nil
+                ),
+                bridgeFolder(
+                    id: folderID,
+                    projectID: projectID,
+                    path: "메인/옛 이름",
+                    parent: mainID
+                ),
+                DocumentNode(
+                    id: textID,
+                    projectID: projectID,
+                    kind: .text,
+                    parentID: folderID,
+                    relativePath: RelativeDocumentPath(
+                        rawValue: "메인/옛 이름/문서.txt"
+                    ),
+                    userOrder: 0,
+                    modifiedAt: .distantPast,
+                    contentHash: nil
+                ),
+            ]
+        )
+        let publisher = FolderIdentityPublisherSpy()
+        let applier = LocalSyncV2SnapshotApplier(
+            documentRepository: repository,
+            workspaceLocator: SnapshotWorkspaceLocator(root: root),
+            folderIdentityPublisher: publisher
+        )
+        await applier.preparePull(
+            localProjectID: projectID,
+            remoteLiveDocumentPaths: ["메인/새 이름/문서.txt"]
+        )
+        await applier.prepareRemoteFolders(
+            localProjectID: projectID,
+            remoteLiveFolderPaths: ["메인", "메인/옛 이름"]
+        )
+
+        try await applier.apply(
+            localProjectID: projectID,
+            snapshot: SyncV2RemoteDocumentSnapshot(
+                documentID: textID.rawValue,
+                relativePath: "메인/새 이름/문서.txt",
+                content: "본문",
+                revision: 2,
+                isDeleted: false,
+                deletedAt: nil,
+                updatedAt: Date(timeIntervalSince1970: 200)
+            )
+        )
+        XCTAssertTrue(
+            FileManager.default.fileExists(
+                atPath: root.appendingPathComponent("메인/옛 이름").path
+            )
+        )
+
+        try await applier.apply(
+            localProjectID: projectID,
+            snapshot: makeBridgeSnapshot(
+                content:
+                    "{\"tree_order\":{\"<root>\":[\"새 이름\"]},\"version\":1}"
+            )
+        )
+
+        let documents = try await repository.documents(in: projectID)
+        let topLevelFolders = documents.filter {
+            $0.kind == .folder && $0.parentID == mainID
+        }
+        XCTAssertEqual(topLevelFolders.count, 1)
+        XCTAssertEqual(topLevelFolders.first?.id, folderID)
+        XCTAssertEqual(
+            topLevelFolders.first?.relativePath.rawValue,
+            "메인/새 이름"
+        )
+        XCTAssertEqual(
+            documents.first { $0.id == textID }?.parentID,
+            folderID
+        )
+        XCTAssertFalse(
+            FileManager.default.fileExists(
+                atPath: root.appendingPathComponent("메인/옛 이름").path
+            )
+        )
+        XCTAssertEqual(
+            try String(
+                contentsOf: root.appendingPathComponent(
+                    "메인/새 이름/문서.txt"
+                ),
+                encoding: .utf8
+            ),
+            "본문"
+        )
+        let published = await publisher.published()
+        XCTAssertEqual(published.last?.folderID, folderID)
+        XCTAssertEqual(published.last?.name, "새 이름")
     }
 
     private func bridgeFolder(

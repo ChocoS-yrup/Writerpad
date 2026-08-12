@@ -577,6 +577,10 @@ protocol SyncV2DispatchStoring: Sendable {
         errorCode: String,
         detail: String?
     ) async throws
+    func rebaseFolderAfterRevisionConflict(
+        _ operation: SyncV2FolderDispatchOperation,
+        remote: SyncV2RemoteFolder
+    ) async throws
     func complete(
         _ operation: SyncV2DispatchOperation,
         result: SyncV2CommitDocumentResult
@@ -634,6 +638,14 @@ protocol SyncV2DispatchStoring: Sendable {
 }
 
 extension SyncV2DispatchStoring {
+    func rebaseFolderAfterRevisionConflict(
+        _ operation: SyncV2FolderDispatchOperation,
+        remote: SyncV2RemoteFolder
+    ) async throws {
+        _ = (operation, remote)
+        throw SyncV2DispatchStoreError.unavailable
+    }
+
     func recoverMissingRemoteDocument(
         _ operation: SyncV2DispatchOperation
     ) async throws {
@@ -1062,6 +1074,394 @@ actor SyncV2Store:
                     )
                     try stepDone(statement)
                 }
+            }
+            return true
+        }
+    }
+
+    func applyFolderSnapshotBaselines(
+        localProjectID: ProjectID,
+        serverProjectID: UUID,
+        folders: [SyncV2RemoteFolder],
+        excluding blockedFolderIDs: Set<UUID>
+    ) async throws {
+        let timestamp = Self.timestamp()
+        try transaction {
+            for folder in folders where
+                !blockedFolderIDs.contains(folder.folderID) {
+                let folderValue = folder.folderID.uuidString.lowercased()
+                let hasActiveOperation = try withStatement(
+                    """
+                    SELECT EXISTS(
+                        SELECT 1 FROM sync_operations
+                        WHERE folder_id = ?
+                          AND status NOT IN ('completed', 'cancelled')
+                    );
+                    """
+                ) { statement in
+                    try bind(folderValue, at: 1, to: statement)
+                    guard sqlite3_step(statement) == SQLITE_ROW else {
+                        throw SyncV2DispatchStoreError.integrityFailure
+                    }
+                    return sqlite3_column_int(statement, 0) == 1
+                }
+                guard !hasActiveOperation else { continue }
+
+                let existing = try withStatement(
+                    """
+                    SELECT local_project_id, project_id, server_revision
+                    FROM sync_folders
+                    WHERE folder_id = ?
+                    LIMIT 1;
+                    """
+                ) { statement -> (String, String, Int64)? in
+                    try bind(folderValue, at: 1, to: statement)
+                    let status = sqlite3_step(statement)
+                    if status == SQLITE_DONE { return nil }
+                    guard
+                        status == SQLITE_ROW,
+                        let localValue = columnText(statement, at: 0),
+                        let projectValue = columnText(statement, at: 1)
+                    else {
+                        throw SyncV2DispatchStoreError.integrityFailure
+                    }
+                    return (
+                        localValue,
+                        projectValue,
+                        sqlite3_column_int64(statement, 2)
+                    )
+                }
+                if let existing {
+                    guard
+                        existing.0 == localProjectID.rawValue.uuidString
+                            .lowercased(),
+                        existing.1 == serverProjectID.uuidString.lowercased()
+                    else {
+                        throw SyncV2DispatchStoreError.integrityFailure
+                    }
+                    guard folder.revision >= existing.2 else { continue }
+                    try withStatement(
+                        """
+                        UPDATE sync_folders
+                        SET parent_folder_id = ?,
+                            name = ?,
+                            server_revision = ?,
+                            is_deleted = ?,
+                            server_updated_at = ?,
+                            sync_state = 'synced',
+                            last_error_code = NULL,
+                            updated_at = ?
+                        WHERE folder_id = ?;
+                        """
+                    ) { statement in
+                        try bind(
+                            folder.parentFolderID?.uuidString.lowercased(),
+                            at: 1,
+                            to: statement
+                        )
+                        try bind(folder.name, at: 2, to: statement)
+                        try bind(folder.revision, at: 3, to: statement)
+                        try bind(folder.isDeleted ? 1 : 0, at: 4, to: statement)
+                        try bind(
+                            Self.timestamp(folder.updatedAt),
+                            at: 5,
+                            to: statement
+                        )
+                        try bind(timestamp, at: 6, to: statement)
+                        try bind(folderValue, at: 7, to: statement)
+                        try stepDone(statement)
+                    }
+                } else {
+                    try withStatement(
+                        """
+                        INSERT INTO sync_folders(
+                            folder_id, local_project_id, project_id,
+                            parent_folder_id, name, server_revision,
+                            is_deleted, server_updated_at, sync_state,
+                            next_folder_sequence, created_at, updated_at
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'synced', 1, ?, ?);
+                        """
+                    ) { statement in
+                        try bind(folderValue, at: 1, to: statement)
+                        try bind(
+                            localProjectID.rawValue.uuidString.lowercased(),
+                            at: 2,
+                            to: statement
+                        )
+                        try bind(
+                            serverProjectID.uuidString.lowercased(),
+                            at: 3,
+                            to: statement
+                        )
+                        try bind(
+                            folder.parentFolderID?.uuidString.lowercased(),
+                            at: 4,
+                            to: statement
+                        )
+                        try bind(folder.name, at: 5, to: statement)
+                        try bind(folder.revision, at: 6, to: statement)
+                        try bind(folder.isDeleted ? 1 : 0, at: 7, to: statement)
+                        try bind(
+                            Self.timestamp(folder.updatedAt),
+                            at: 8,
+                            to: statement
+                        )
+                        try bind(timestamp, at: 9, to: statement)
+                        try bind(timestamp, at: 10, to: statement)
+                        try stepDone(statement)
+                    }
+                }
+            }
+        }
+    }
+
+    func adoptEquivalentInitialDocument(
+        localProjectID: ProjectID,
+        serverProjectID: UUID,
+        localDocumentID: UUID,
+        snapshot: SyncV2RemoteDocumentSnapshot
+    ) async throws -> Bool {
+        guard localDocumentID != snapshot.documentID,
+              snapshot.revision == 1,
+              !snapshot.isDeleted,
+              snapshot.relativePath != syncV2TreeOrderPath,
+              snapshot.relativePath != syncV2TrashPurgePath
+        else { return false }
+
+        let localIdentifier = localDocumentID.uuidString.lowercased()
+        let remoteIdentifier = snapshot.documentID.uuidString.lowercased()
+        let supersededPath =
+            "__antigravity__/identity-superseded/\(localIdentifier).txt"
+        let hash = SHA256.hash(data: Data(snapshot.content.utf8))
+            .map { String(format: "%02x", $0) }
+            .joined()
+
+        return try transaction {
+            let remoteState = try snapshotState(
+                localProjectID: localProjectID,
+                serverProjectID: serverProjectID,
+                documentID: snapshot.documentID
+            )
+            if let remoteState,
+               remoteState.serverRevision == snapshot.revision,
+               remoteState.serverPath == snapshot.relativePath {
+                let oldPath = try withStatement(
+                    """
+                    SELECT local_path
+                    FROM sync_documents
+                    WHERE document_id = ?
+                      AND local_project_id = ?
+                      AND project_id = ?
+                    LIMIT 1;
+                    """
+                ) { statement -> String? in
+                    try bind(localIdentifier, at: 1, to: statement)
+                    try bind(
+                        localProjectID.rawValue.uuidString.lowercased(),
+                        at: 2,
+                        to: statement
+                    )
+                    try bind(
+                        serverProjectID.uuidString.lowercased(),
+                        at: 3,
+                        to: statement
+                    )
+                    guard sqlite3_step(statement) == SQLITE_ROW else {
+                        return nil
+                    }
+                    return columnText(statement, at: 0)
+                }
+                return oldPath == supersededPath
+            }
+            guard remoteState == nil else { return false }
+
+            let localRow = try withStatement(
+                """
+                SELECT server_revision, server_path
+                FROM sync_documents
+                WHERE document_id = ?
+                  AND local_project_id = ?
+                  AND project_id = ?
+                LIMIT 1;
+                """
+            ) { statement -> (Int64, String)? in
+                try bind(localIdentifier, at: 1, to: statement)
+                try bind(
+                    localProjectID.rawValue.uuidString.lowercased(),
+                    at: 2,
+                    to: statement
+                )
+                try bind(
+                    serverProjectID.uuidString.lowercased(),
+                    at: 3,
+                    to: statement
+                )
+                guard sqlite3_step(statement) == SQLITE_ROW,
+                      let serverPath = columnText(statement, at: 1)
+                else { return nil }
+                return (
+                    sqlite3_column_int64(statement, 0),
+                    serverPath
+                )
+            }
+            guard let localRow,
+                  localRow.0 == 0,
+                  localRow.1 == snapshot.relativePath
+            else { return false }
+
+            let hasHistoryOrConflict = try withStatement(
+                """
+                SELECT
+                    EXISTS(
+                        SELECT 1
+                        FROM sync_operations
+                        WHERE document_id = ?
+                          AND status = 'completed'
+                    ),
+                    EXISTS(
+                        SELECT 1
+                        FROM sync_conflicts
+                        WHERE document_id = ?
+                    );
+                """
+            ) { statement in
+                try bind(localIdentifier, at: 1, to: statement)
+                try bind(localIdentifier, at: 2, to: statement)
+                guard sqlite3_step(statement) == SQLITE_ROW else {
+                    throw sqliteError()
+                }
+                return sqlite3_column_int(statement, 0) == 1
+                    || sqlite3_column_int(statement, 1) == 1
+            }
+            guard !hasHistoryOrConflict else { return false }
+
+            let operationEligibility = try withStatement(
+                """
+                SELECT COUNT(*), COALESCE(SUM(
+                    CASE WHEN operation_kind = 'document_commit'
+                           AND base_revision = 0
+                           AND base_content = ''
+                           AND local_path = ?
+                           AND relative_path = ?
+                           AND content = ?
+                           AND content_hash = ?
+                           AND local_save_generation = 0
+                           AND is_deleted = 0
+                         THEN 1 ELSE 0 END
+                ), 0)
+                FROM sync_operations
+                WHERE document_id = ?
+                  AND status NOT IN ('completed', 'cancelled')
+                """
+            ) { statement -> (Int, Int) in
+                try bind(snapshot.relativePath, at: 1, to: statement)
+                try bind(snapshot.relativePath, at: 2, to: statement)
+                try bind(snapshot.content, at: 3, to: statement)
+                try bind(hash, at: 4, to: statement)
+                try bind(localIdentifier, at: 5, to: statement)
+                guard sqlite3_step(statement) == SQLITE_ROW else {
+                    throw sqliteError()
+                }
+                return (
+                    Int(sqlite3_column_int64(statement, 0)),
+                    Int(sqlite3_column_int64(statement, 1))
+                )
+            }
+            guard operationEligibility.0 > 0,
+                  operationEligibility.0 == operationEligibility.1
+            else { return false }
+            let affectedBatchIDs = try withStatement(
+                """
+                SELECT DISTINCT batch_id
+                FROM sync_operations
+                WHERE document_id = ?
+                  AND status NOT IN ('completed', 'cancelled');
+                """
+            ) { statement -> [UUID] in
+                try bind(localIdentifier, at: 1, to: statement)
+                var values: [UUID] = []
+                while true {
+                    let status = sqlite3_step(statement)
+                    if status == SQLITE_DONE { return values }
+                    guard status == SQLITE_ROW,
+                          let value = columnText(statement, at: 0),
+                          let identifier = UUID(uuidString: value)
+                    else { throw SyncV2StoreError.invalidStoredData }
+                    values.append(identifier)
+                }
+            }
+
+            let timestamp = Self.timestamp()
+            try withStatement(
+                """
+                UPDATE sync_operations
+                SET status = 'cancelled',
+                    last_error_code = 'SUPERSEDED_BY_SERVER_IDENTITY',
+                    last_error_detail = NULL,
+                    next_attempt_at = NULL,
+                    updated_at = ?
+                WHERE document_id = ?
+                  AND status NOT IN ('completed', 'cancelled');
+                """
+            ) { statement in
+                try bind(timestamp, at: 1, to: statement)
+                try bind(localIdentifier, at: 2, to: statement)
+                try stepDone(statement)
+            }
+            try withStatement(
+                """
+                UPDATE sync_documents
+                SET local_path = ?, is_deleted = 1,
+                    sync_state = 'synced', last_error_code = NULL,
+                    updated_at = ?
+                WHERE document_id = ?;
+                """
+            ) { statement in
+                try bind(supersededPath, at: 1, to: statement)
+                try bind(timestamp, at: 2, to: statement)
+                try bind(localIdentifier, at: 3, to: statement)
+                try stepDone(statement)
+                guard sqlite3_changes(connection.handle) == 1 else {
+                    throw SyncV2StoreError.invalidStoredData
+                }
+            }
+            try withStatement(
+                """
+                INSERT INTO sync_documents(
+                    document_id, local_project_id, project_id,
+                    local_path, server_path, server_revision,
+                    base_content, base_hash, is_deleted,
+                    server_updated_at, sync_state,
+                    next_document_sequence, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, ?, 'synced', 1, ?, ?);
+                """
+            ) { statement in
+                try bind(remoteIdentifier, at: 1, to: statement)
+                try bind(
+                    localProjectID.rawValue.uuidString.lowercased(),
+                    at: 2,
+                    to: statement
+                )
+                try bind(
+                    serverProjectID.uuidString.lowercased(),
+                    at: 3,
+                    to: statement
+                )
+                try bind(snapshot.relativePath, at: 4, to: statement)
+                try bind(snapshot.relativePath, at: 5, to: statement)
+                try bind(snapshot.revision, at: 6, to: statement)
+                try bind(snapshot.content, at: 7, to: statement)
+                try bind(hash, at: 8, to: statement)
+                try bind(Self.timestamp(snapshot.updatedAt), at: 9, to: statement)
+                try bind(timestamp, at: 10, to: statement)
+                try bind(timestamp, at: 11, to: statement)
+                try stepDone(statement)
+            }
+            for batchID in affectedBatchIDs {
+                try refreshBatchState(
+                    batchID: batchID,
+                    timestamp: timestamp
+                )
             }
             return true
         }
@@ -1723,6 +2123,53 @@ actor SyncV2Store:
                     localProjectID: nil,
                     timestamp: timestamp
                 )
+                // ensure_project는 서버 ensure RPC가 성공하고 binding이 저장된
+                // 뒤에 남기는 durable 감사 기록이다. 별도 dispatcher lane이
+                // 없으므로 pending으로 두면 같은 초기 batch의 tree-order를
+                // 영구히 막는다. 예전 빌드가 남긴 행도 완료로 정리한다.
+                try execute(
+                    """
+                    UPDATE sync_operations
+                    SET status = 'completed',
+                        last_error_code = NULL,
+                        last_error_detail = NULL,
+                        next_attempt_at = NULL,
+                        updated_at = strftime(
+                            '%Y-%m-%dT%H:%M:%fZ', 'now'
+                        )
+                    WHERE operation_kind = 'ensure_project'
+                      AND status NOT IN ('completed', 'cancelled')
+                      AND EXISTS (
+                          SELECT 1 FROM sync_projects p
+                          WHERE p.local_project_id =
+                                sync_operations.local_project_id
+                            AND p.server_project_id =
+                                sync_operations.project_id
+                            AND p.owner_subject =
+                                sync_operations.owner_subject
+                            AND p.binding_kind <> 'local_only'
+                      );
+                    """
+                )
+                // 폴더 revision 충돌은 최신 folders snapshot 위로 자동 rebase할
+                // 수 있다. 앱이 충돌을 기록한 직후 종료됐어도 다음 실행에서
+                // dispatcher가 다시 받아 영구 대기에 남지 않게 한다.
+                try execute(
+                    """
+                    UPDATE sync_operations
+                    SET status = 'pending',
+                        attempts = 0,
+                        last_error_code = NULL,
+                        last_error_detail = NULL,
+                        next_attempt_at = NULL,
+                        updated_at = strftime(
+                            '%Y-%m-%dT%H:%M:%fZ', 'now'
+                        )
+                    WHERE folder_id IS NOT NULL
+                      AND status = 'conflict'
+                      AND last_error_code = 'REVISION_CONFLICT';
+                    """
+                )
                 // 서버 프로젝트가 삭제 후 같은 UUID로 다시 만들어지는 등
                 // 로컬 revision 기준선만 남은 경우, 이전 실행에서
                 // DOCUMENT_NOT_FOUND로 막힌 첫 operation을 create로 되돌린다.
@@ -1901,6 +2348,52 @@ actor SyncV2Store:
                                 'completed', 'cancelled'
                             )
                       )
+                      AND (
+                          o.operation_kind = 'tree_order'
+                          OR NOT EXISTS (
+                              SELECT 1
+                              FROM sync_operations folderDependency
+                              WHERE folderDependency.batch_id = o.batch_id
+                                AND folderDependency.folder_id IS NOT NULL
+                                AND folderDependency.status NOT IN (
+                                    'completed', 'cancelled'
+                                )
+                          )
+                      )
+                      AND (
+                          o.operation_kind <> 'tree_order'
+                          OR NOT EXISTS (
+                              SELECT 1
+                              FROM sync_operations batchDependency
+                              WHERE batchDependency.batch_id = o.batch_id
+                                AND batchDependency.operation_id
+                                    <> o.operation_id
+                                AND batchDependency.status NOT IN (
+                                    'completed', 'cancelled'
+                                )
+                          )
+                      )
+                      AND (
+                          o.operation_kind <> 'tree_order'
+                          OR NOT EXISTS (
+                              SELECT 1
+                              FROM sync_operations structuralDependency
+                              JOIN sync_batches structuralBatch
+                                ON structuralBatch.batch_id
+                                    = structuralDependency.batch_id
+                              WHERE structuralDependency.local_project_id
+                                    = o.local_project_id
+                                AND structuralDependency.queue_id < o.queue_id
+                                AND structuralDependency.status NOT IN (
+                                    'completed', 'cancelled'
+                                )
+                                AND structuralBatch.batch_kind IN (
+                                    'structure_change', 'volume_creation',
+                                    'trash_change', 'backup_restore',
+                                    'windows_import'
+                                )
+                          )
+                      )
                   )
                   OR (
                       o.folder_id IS NOT NULL
@@ -1913,6 +2406,18 @@ actor SyncV2Store:
                             AND earlier.status NOT IN (
                                 'completed', 'cancelled'
                             )
+                      )
+                      AND (
+                          o.is_deleted = 1
+                          OR NOT EXISTS (
+                              SELECT 1
+                              FROM sync_operations parentOperation
+                              WHERE parentOperation.folder_id
+                                    = o.parent_folder_id
+                                AND parentOperation.status NOT IN (
+                                    'completed', 'cancelled'
+                                )
+                          )
                       )
                   )
               )
@@ -2171,11 +2676,24 @@ actor SyncV2Store:
                     AND earlier.status NOT IN ('completed', 'cancelled')
               )
               AND (
-                  o.is_deleted = 0
+                  (
+                      o.is_deleted = 0
+                      -- 생성·이동·복원은 부모 폴더의 현재
+                      -- 작업을 먼저 확정해 FOLDER_NOT_FOUND를 막는다.
+                      AND NOT EXISTS (
+                          SELECT 1
+                          FROM sync_operations parentOperation
+                          WHERE parentOperation.folder_id = o.parent_folder_id
+                            AND parentOperation.status NOT IN (
+                                'completed', 'cancelled'
+                            )
+                      )
+                  )
                   OR (
+                      o.is_deleted = 1
                       -- 바로 아래 폴더만 본다. 그 폴더도 자기 자식을 기다리므로
                       -- 가장 깊은 곳부터 차례로 풀린다.
-                      NOT EXISTS (
+                      AND NOT EXISTS (
                           SELECT 1
                           FROM sync_folders child
                           JOIN sync_operations childOperation
@@ -2532,6 +3050,94 @@ actor SyncV2Store:
             detail: detail,
             nextAttemptAt: nil
         )
+    }
+
+    func rebaseFolderAfterRevisionConflict(
+        _ operation: SyncV2FolderDispatchOperation,
+        remote: SyncV2RemoteFolder
+    ) async throws {
+        guard
+            remote.folderID == operation.folderID,
+            remote.revision > operation.baseRevision,
+            !remote.isDeleted || operation.isDeleted
+        else {
+            throw SyncV2DispatchStoreError.integrityFailure
+        }
+        let timestamp = Self.timestamp()
+        try transaction {
+            try withStatement(
+                """
+                UPDATE sync_operations
+                SET base_revision = ?,
+                    status = 'pending',
+                    attempts = 0,
+                    last_error_code = NULL,
+                    last_error_detail = NULL,
+                    next_attempt_at = NULL,
+                    updated_at = ?
+                WHERE operation_id = ?
+                  AND folder_id = ?
+                  AND status = 'inflight'
+                  AND attempts = ?;
+                """
+            ) { statement in
+                try bind(remote.revision, at: 1, to: statement)
+                try bind(timestamp, at: 2, to: statement)
+                try bind(
+                    operation.operationID.uuidString.lowercased(),
+                    at: 3,
+                    to: statement
+                )
+                try bind(
+                    operation.folderID.uuidString.lowercased(),
+                    at: 4,
+                    to: statement
+                )
+                try bind(operation.attempts, at: 5, to: statement)
+                try stepDone(statement)
+                guard sqlite3_changes(connection.handle) == 1 else {
+                    throw SyncV2DispatchStoreError.operationStateChanged
+                }
+            }
+            // name과 parent는 사용자가 막 바꾼 로컬 목표값이므로 유지한다.
+            // 여기서는 서버에서 확인한 기준 revision만 전진시킨다.
+            try withStatement(
+                """
+                UPDATE sync_folders
+                SET server_revision = ?,
+                    server_updated_at = ?,
+                    sync_state = 'pending',
+                    last_error_code = NULL,
+                    updated_at = ?
+                WHERE folder_id = ?
+                  AND local_project_id = ?
+                  AND project_id = ?;
+                """
+            ) { statement in
+                try bind(remote.revision, at: 1, to: statement)
+                try bind(Self.timestamp(remote.updatedAt), at: 2, to: statement)
+                try bind(timestamp, at: 3, to: statement)
+                try bind(
+                    operation.folderID.uuidString.lowercased(),
+                    at: 4,
+                    to: statement
+                )
+                try bind(
+                    operation.localProjectID.rawValue.uuidString.lowercased(),
+                    at: 5,
+                    to: statement
+                )
+                try bind(operation.projectID.uuidString.lowercased(), at: 6, to: statement)
+                try stepDone(statement)
+                guard sqlite3_changes(connection.handle) == 1 else {
+                    throw SyncV2DispatchStoreError.integrityFailure
+                }
+            }
+            try refreshBatchState(
+                batchID: operation.batchID,
+                timestamp: timestamp
+            )
+        }
     }
 
     private func recordFolderDispatchFailure(
@@ -4197,6 +4803,57 @@ actor SyncV2Store:
                     AND earlier.document_sequence < o.document_sequence
                     AND earlier.status NOT IN ('completed', 'cancelled')
               )
+              -- 구조 변경 batch의 문서 경로는 폴더 행이
+              -- 서버에 확정된 뒤에만 공개한다.
+              AND (
+                  o.operation_kind = 'tree_order'
+                  OR NOT EXISTS (
+                      SELECT 1
+                      FROM sync_operations folderDependency
+                      WHERE folderDependency.batch_id = o.batch_id
+                        AND folderDependency.folder_id IS NOT NULL
+                        AND folderDependency.status NOT IN (
+                            'completed', 'cancelled'
+                        )
+                  )
+              )
+              -- tree_order는 같은 batch의 폴더·문서가 모두
+              -- 확정된 뒤에만 최종 바인더 순서로 발행한다.
+              AND (
+                  o.operation_kind <> 'tree_order'
+                  OR NOT EXISTS (
+                      SELECT 1
+                      FROM sync_operations batchDependency
+                      WHERE batchDependency.batch_id = o.batch_id
+                        AND batchDependency.operation_id <> o.operation_id
+                        AND batchDependency.status NOT IN (
+                            'completed', 'cancelled'
+                        )
+                  )
+              )
+              -- 빠른 연속 변경에서는 앞 tree_order가 최신 snapshot으로
+              -- 합쳐진다. 최신 줄은 앞선 모든 구조 작업까지 기다려야 한다.
+              AND (
+                  o.operation_kind <> 'tree_order'
+                  OR NOT EXISTS (
+                      SELECT 1
+                      FROM sync_operations structuralDependency
+                      JOIN sync_batches structuralBatch
+                        ON structuralBatch.batch_id
+                            = structuralDependency.batch_id
+                      WHERE structuralDependency.local_project_id
+                            = o.local_project_id
+                        AND structuralDependency.queue_id < o.queue_id
+                        AND structuralDependency.status NOT IN (
+                            'completed', 'cancelled'
+                        )
+                        AND structuralBatch.batch_kind IN (
+                            'structure_change', 'volume_creation',
+                            'trash_change', 'backup_restore',
+                            'windows_import'
+                        )
+                  )
+              )
             ORDER BY o.queue_id
             """
         ) { statement in
@@ -4884,7 +5541,7 @@ actor SyncV2Store:
                 operation_id, batch_id, local_project_id, project_id,
                 owner_subject, operation_kind, project_name, status,
                 attempts, created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, 'ensure_project', ?, 'pending', 0, ?, ?);
+            ) VALUES (?, ?, ?, ?, ?, 'ensure_project', ?, 'completed', 0, ?, ?);
             """
         ) { statement in
             try bind(
@@ -4955,6 +5612,12 @@ actor SyncV2Store:
         if payload.kind == .treeOrder {
             try coalescePendingTreeOrderOperations(
                 documentID: payload.documentID,
+                preserveEarlierCheckpoint: batch.operations.contains {
+                    guard case let .document(document) = $0.payload else {
+                        return false
+                    }
+                    return document.kind != .treeOrder
+                },
                 timestamp: timestamp
             )
         }
@@ -5138,8 +5801,13 @@ actor SyncV2Store:
 
     private func coalescePendingTreeOrderOperations(
         documentID: UUID,
+        preserveEarlierCheckpoint: Bool,
         timestamp: String
     ) throws {
+        // 이번 batch에 일반 문서 경로 변경이 있으면 편집 lease 때문에 오래
+        // 기다릴 수 있다. 그 경우 앞선 빈 폴더용 체크포인트까지 취소하면
+        // 관련 없는 문서 하나가 빈 폴더 공개를 함께 막으므로 그대로 둔다.
+        guard !preserveEarlierCheckpoint else { return }
         let affectedBatchIDs = try withStatement(
             """
             SELECT DISTINCT batch_id
@@ -6676,6 +7344,40 @@ actor LazySyncV2ProjectBindingStore:
         )
     }
 
+    func applyFolderSnapshotBaselines(
+        localProjectID: ProjectID,
+        serverProjectID: UUID,
+        folders: [SyncV2RemoteFolder],
+        excluding blockedFolderIDs: Set<UUID>
+    ) async throws {
+        guard let store = await resolvedStore() else {
+            throw SyncV2DispatchStoreError.unavailable
+        }
+        try await store.applyFolderSnapshotBaselines(
+            localProjectID: localProjectID,
+            serverProjectID: serverProjectID,
+            folders: folders,
+            excluding: blockedFolderIDs
+        )
+    }
+
+    func adoptEquivalentInitialDocument(
+        localProjectID: ProjectID,
+        serverProjectID: UUID,
+        localDocumentID: UUID,
+        snapshot: SyncV2RemoteDocumentSnapshot
+    ) async throws -> Bool {
+        guard let store = await resolvedStore() else {
+            throw SyncV2DispatchStoreError.unavailable
+        }
+        return try await store.adoptEquivalentInitialDocument(
+            localProjectID: localProjectID,
+            serverProjectID: serverProjectID,
+            localDocumentID: localDocumentID,
+            snapshot: snapshot
+        )
+    }
+
     func claimReadyOperations(
         localProjectID: ProjectID,
         limit: Int,
@@ -6760,6 +7462,19 @@ actor LazySyncV2ProjectBindingStore:
             operation,
             errorCode: errorCode,
             detail: detail
+        )
+    }
+
+    func rebaseFolderAfterRevisionConflict(
+        _ operation: SyncV2FolderDispatchOperation,
+        remote: SyncV2RemoteFolder
+    ) async throws {
+        guard let store = await resolvedStore() else {
+            throw SyncV2DispatchStoreError.unavailable
+        }
+        try await store.rebaseFolderAfterRevisionConflict(
+            operation,
+            remote: remote
         )
     }
 
@@ -7239,13 +7954,17 @@ actor ProjectInitialSyncRecorder: InitialProjectSyncRecording {
                     }
                     return $0.relativePath.rawValue < $1.relativePath.rawValue
                 }
-            guard !children.isEmpty else { continue }
-            let key = parent.relativePath.rawValue == "메인"
+            let canonicalParentPath = SyncV2ServerPath.canonical(
+                parent.relativePath.rawValue
+            )
+            let key = canonicalParentPath == "메인"
                 ? "<root>"
-                : parent.relativePath.rawValue
+                : canonicalParentPath
             order[key] = children.map {
-                URL(fileURLWithPath: $0.relativePath.rawValue)
-                    .lastPathComponent
+                SyncV2ServerPath.canonical(
+                    URL(fileURLWithPath: $0.relativePath.rawValue)
+                        .lastPathComponent
+                )
             }
         }
         let data = try JSONSerialization.data(

@@ -1627,6 +1627,38 @@ final class SyncV2CommitFolderClientTests: XCTestCase {
         XCTAssertNil(result.name)
     }
 
+    func testFolderRenameResponseDecodesServerOperationKind() throws {
+        let folderID = UUID()
+        let versionID = UUID()
+        let operationID = UUID()
+        let json = """
+        {
+          "status": "committed",
+          "folder_id": "\(folderID.uuidString.lowercased())",
+          "version_id": "\(versionID.uuidString.lowercased())",
+          "operation_id": "\(operationID.uuidString.lowercased())",
+          "operation_kind": "rename",
+          "revision": 2,
+          "parent_folder_id": null,
+          "name": "가 나 다 바",
+          "is_deleted": false,
+          "committed_at": "2026-08-09T12:00:00Z"
+        }
+        """
+
+        let result = try JSONDecoder().decode(
+            SyncV2CommitFolderResult.self,
+            from: Data(json.utf8)
+        )
+
+        XCTAssertEqual(result.folderID, folderID)
+        XCTAssertEqual(result.versionID, versionID)
+        XCTAssertEqual(result.operationID, operationID)
+        XCTAssertEqual(result.operationKind, .rename)
+        XCTAssertEqual(result.serverRevision, 2)
+        XCTAssertEqual(result.name, "가 나 다 바")
+    }
+
     private func folderParameters(
         folderID: UUID,
         operationID: UUID,
@@ -2302,7 +2334,7 @@ final class SyncV2DispatcherTests: XCTestCase {
             name: syncV2TreeOrderPath
         )
         let localContent =
-            "{\"tree_order\":{\"메인/메모장\":[\"둘째.txt\",\"첫째.txt\"]},\"version\":1}"
+            "{\"tree_order\":{\"<root>\":[\"메모장\",\"휴지통\"],\"메인/메모장\":[\"둘째.txt\",\"첫째.txt\"]},\"version\":1}"
         let operation = SyncV2DispatchOperation(
             operationID: UUID(),
             batchID: UUID(),
@@ -2333,7 +2365,7 @@ final class SyncV2DispatcherTests: XCTestCase {
                     documentID: documentID,
                     path: syncV2TreeOrderPath,
                     content:
-                        "{\"tree_order\":{\"메인/메모장\":[\"첫째.txt\"]},\"version\":1}"
+                        "{\"folder_paths\":[\"메인/윈-빈폴더\",\"메인/윈-든폴더\"],\"tree_order\":{\"<root>\":[\"메모장\",\"윈-빈폴더\",\"윈-든폴더\",\"휴지통\"],\"메인/메모장\":[\"첫째.txt\"],\"메인/윈-빈폴더\":[],\"메인/윈-든폴더\":[\"윈-문서.txt\"]},\"version\":1}"
                 )
             )
         )
@@ -2353,8 +2385,27 @@ final class SyncV2DispatcherTests: XCTestCase {
         )
         XCTAssertFalse(conflicts.contains(operation.operationID))
         XCTAssertEqual(rebase?.remoteRevision, 4)
-        XCTAssertEqual(rebase?.mergedContent, localContent)
         XCTAssertEqual(rebase?.mergedPath, syncV2TreeOrderPath)
+        let mergedData = try? XCTUnwrap(
+            rebase?.mergedContent.data(using: .utf8)
+        )
+        let mergedObject = mergedData.flatMap {
+            try? JSONSerialization.jsonObject(with: $0)
+                as? [String: Any]
+        }
+        let mergedOrder = mergedObject?["tree_order"]
+            as? [String: [String]]
+        let folderPaths = mergedObject?["folder_paths"] as? [String]
+        XCTAssertEqual(
+            mergedOrder?["<root>"],
+            ["메모장", "윈-빈폴더", "윈-든폴더", "휴지통"]
+        )
+        XCTAssertEqual(mergedOrder?["메인/윈-빈폴더"], [])
+        XCTAssertEqual(
+            mergedOrder?["메인/윈-든폴더"],
+            ["윈-문서.txt"]
+        )
+        XCTAssertTrue(folderPaths?.contains("메인/윈-빈폴더") == true)
     }
 
     private func waitForRelease(

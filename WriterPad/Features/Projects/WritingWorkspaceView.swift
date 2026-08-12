@@ -319,7 +319,7 @@ struct WritingWorkspaceShell: View {
                 await workspaceSyncModel.start(
                     sceneIsActive: scenePhase == .active,
                     editingGuards: currentSyncEditingGuards,
-                    applyOpenSnapshot: applyOpenServerSnapshot
+                    applyOpenSnapshots: applyOpenServerSnapshots
                 )
                 await updateSceneActivity(scenePhase == .active)
             }
@@ -1886,25 +1886,29 @@ struct WritingWorkspaceShell: View {
         return result
     }
 
-    private func applyOpenServerSnapshot(
-        _ snapshot: SyncV2RemoteDocumentSnapshot
+    private func applyOpenServerSnapshots(
+        _ snapshots: [SyncV2RemoteDocumentSnapshot]
     ) {
+        guard !snapshots.isEmpty else { return }
+        for snapshot in snapshots {
+            applyRemoteBinderContentState(
+                snapshot,
+                to: &binderContentStateOverrides
+            )
+            let documentID = DocumentID(rawValue: snapshot.documentID)
+            _ = leftEditorModel.applyRemoteSnapshotIfClean(
+                documentID: documentID,
+                content: snapshot.content,
+                relativePath: snapshot.relativePath
+            )
+            _ = rightEditorModel.applyRemoteSnapshotIfClean(
+                documentID: documentID,
+                content: snapshot.content,
+                relativePath: snapshot.relativePath
+            )
+        }
+        // 한 번의 pull이 여러 문서를 적용해도 바인더 구조 조회는 한 번만 한다.
         binderSnapshotRefreshGeneration &+= 1
-        applyRemoteBinderContentState(
-            snapshot,
-            to: &binderContentStateOverrides
-        )
-        let documentID = DocumentID(rawValue: snapshot.documentID)
-        _ = leftEditorModel.applyRemoteSnapshotIfClean(
-            documentID: documentID,
-            content: snapshot.content,
-            relativePath: snapshot.relativePath
-        )
-        _ = rightEditorModel.applyRemoteSnapshotIfClean(
-            documentID: documentID,
-            content: snapshot.content,
-            relativePath: snapshot.relativePath
-        )
     }
 
     private func presentConflictResolution() async {
