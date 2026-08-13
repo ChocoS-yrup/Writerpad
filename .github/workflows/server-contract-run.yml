@@ -1,0 +1,110 @@
+name: Run Server Sync Contract Validation
+
+on:
+  workflow_call:
+    inputs:
+      checkout_sha:
+        description: Exact commit SHA to validate
+        required: true
+        type: string
+      validation_label:
+        description: Human-readable validation target
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  postgres-contract:
+    name: PostgreSQL migration and RPC conformance (${{ inputs.validation_label }})
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:17.6
+        env:
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: writerpad_stage7
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d writerpad_stage7"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+    env:
+      EXPECTED_CHECKOUT_SHA: ${{ inputs.checkout_sha }}
+      PGHOST: localhost
+      PGPORT: 5432
+      PGDATABASE: writerpad_stage7
+      PGUSER: postgres
+      PGPASSWORD: postgres
+    steps:
+      - name: Check out requested commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ env.EXPECTED_CHECKOUT_SHA }}
+          persist-credentials: false
+      - name: Confirm exact checkout SHA
+        run: >-
+          python -c "import os, subprocess;
+          actual = subprocess.check_output(['git', 'rev-parse', 'HEAD'], text=True).strip();
+          expected = os.environ['EXPECTED_CHECKOUT_SHA'];
+          print(f'Expected HEAD: {expected}'); print(f'Actual HEAD:   {actual}');
+          raise SystemExit(0 if actual == expected else 1)"
+      - name: Set up Python 3.12
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12.13"
+          cache: pip
+          cache-dependency-path: sync-contract/requirements-validation.txt
+      - name: Install pinned contract verifier
+        run: python -m pip install -r sync-contract/requirements-validation.txt
+      - name: Verify released contract and server pins
+        run: |
+          python sync-contract/scripts/verify_contract.py
+          python supabase/tests/verify_stage7_server.py
+      - name: Apply operational v2 snapshot to a blank PostgreSQL 17.6 database
+        shell: bash
+        run: |
+          psql -v ON_ERROR_STOP=1 -f supabase/tests/bootstrap_postgres.sql
+          psql -v ON_ERROR_STOP=1 -f supabase/migrations/20260811000000_operational_v2_schema_baseline_snapshot.sql
+          actual_catalog="$(psql -Atq -v ON_ERROR_STOP=1 -f supabase/tests/operational_v2_catalog_manifest.sql)"
+          expected_catalog="on|6c71ff36a90993dc327557b4a1a64c0dfb27b347134ed89e7f126dae76c6ff9a|49540"
+          echo "actual_catalog=$actual_catalog"
+          echo "expected_catalog=$expected_catalog"
+          if [ "$actual_catalog" != "$expected_catalog" ]; then
+            psql -v ON_ERROR_STOP=1 -f supabase/tests/operational_v2_catalog_diagnostics.sql
+          fi
+          test "$actual_catalog" = "$expected_catalog"
+      - name: Verify snapshot guard and failed-apply rollback
+        shell: bash
+        run: |
+          if psql -v ON_ERROR_STOP=1 -f supabase/migrations/20260811000000_operational_v2_schema_baseline_snapshot.sql > /tmp/snapshot-rerun.log 2>&1; then
+            echo "snapshot unexpectedly re-applied over an existing app schema"
+            exit 1
+          fi
+          grep -q "BASELINE_SNAPSHOT_REQUIRES_EMPTY_APP_SCHEMA" /tmp/snapshot-rerun.log
+          actual_catalog="$(psql -Atq -v ON_ERROR_STOP=1 -f supabase/tests/operational_v2_catalog_manifest.sql)"
+          echo "catalog_after_guard=$actual_catalog"
+          test "$actual_catalog" = "on|6c71ff36a90993dc327557b4a1a64c0dfb27b347134ed89e7f126dae76c6ff9a|49540"
+
+          createdb writerpad_snapshot_failure
+          if PGDATABASE=writerpad_snapshot_failure psql -v ON_ERROR_STOP=1 -f supabase/migrations/20260811000000_operational_v2_schema_baseline_snapshot.sql > /tmp/snapshot-failure.log 2>&1; then
+            echo "snapshot unexpectedly succeeded without Supabase auth prerequisites"
+            exit 1
+          fi
+          test "$(PGDATABASE=writerpad_snapshot_failure psql -Atq -c "select to_regclass('public.projects') is null and to_regnamespace('private') is null")" = "t"
+      - name: Apply and safely re-run server migrations
+        shell: bash
+        run: |
+          psql -v ON_ERROR_STOP=1 -f supabase/migrations/20260811010000_sync_contract_0_1_0_foundation.sql
+          psql -v ON_ERROR_STOP=1 -f supabase/migrations/20260811020000_sync_contract_0_1_0_rpcs.sql
+          psql -v ON_ERROR_STOP=1 -f supabase/migrations/20260813063251_sync_contract_0_3_0_storage_name_v2.sql
+          psql -v ON_ERROR_STOP=1 -f supabase/migrations/20260811010000_sync_contract_0_1_0_foundation.sql
+          psql -v ON_ERROR_STOP=1 -f supabase/migrations/20260811020000_sync_contract_0_1_0_rpcs.sql
+          psql -v ON_ERROR_STOP=1 -f supabase/migrations/20260813063251_sync_contract_0_3_0_storage_name_v2.sql
+      - name: Run atomic, replay, cancellation, and migration checks
+        run: psql -v ON_ERROR_STOP=1 -f supabase/tests/stage7_server_contract.sql
+      - name: Run storage-name-v2 server conformance
+        run: psql -v ON_ERROR_STOP=1 -f supabase/tests/storage_name_v2_server_contract.sql

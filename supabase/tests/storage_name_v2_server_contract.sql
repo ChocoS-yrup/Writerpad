@@ -183,4 +183,25 @@ begin
 end;
 $assert_validated_route$;
 
+-- The preceding DO statement committed its transaction. Its exact contract
+-- route must therefore no longer be selected here, and storage_name_v1_result
+-- must have returned to the legacy implementation before another request is
+-- validated. PostgreSQL may retain an empty custom-GUC placeholder after a
+-- SET LOCAL value is cleared, so the assertion rejects the released digest
+-- rather than requiring SQL NULL.
+do $assert_transaction_local_route_reset$
+declare
+  v_actual jsonb;
+begin
+  if pg_catalog.current_setting('writerpad.contract_sha256', true) is not distinct from
+     'abbd234c7b65d422c2e43d468f4f724e069ede26a3d24be22eb8b35cce8ebf2c' then
+    raise exception 'validated contract route leaked into the next transaction';
+  end if;
+  v_actual := private.storage_name_v1_result(U&'\E000');
+  if not (v_actual->>'valid')::boolean then
+    raise exception 'storage-name-v1 route did not reset after transaction: %', v_actual;
+  end if;
+end;
+$assert_transaction_local_route_reset$;
+
 select 'storage-name-v2 server conformance passed' as result;
