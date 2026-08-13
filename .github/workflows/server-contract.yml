@@ -54,7 +54,7 @@ jobs:
           cache-dependency-path: sync-contract/requirements-validation.txt
       - name: Install pinned contract verifier
         run: python -m pip install -r sync-contract/requirements-validation.txt
-      - name: Verify released contract and Stage 7 pins
+      - name: Verify released contract and server pins
         run: |
           python sync-contract/scripts/verify_contract.py
           python supabase/tests/verify_stage7_server.py
@@ -89,12 +89,16 @@ jobs:
             exit 1
           fi
           test "$(PGDATABASE=writerpad_snapshot_failure psql -Atq -c "select to_regclass('public.projects') is null and to_regnamespace('private') is null")" = "t"
-      - name: Apply and safely re-run Stage 7 migrations
+      - name: Apply and safely re-run server migrations
         shell: bash
         run: |
           psql -v ON_ERROR_STOP=1 -f supabase/migrations/20260811010000_sync_contract_0_1_0_foundation.sql
           psql -v ON_ERROR_STOP=1 -f supabase/migrations/20260811020000_sync_contract_0_1_0_rpcs.sql
+          psql -v ON_ERROR_STOP=1 -f supabase/migrations/20260813063251_sync_contract_0_3_0_storage_name_v2.sql
           psql -v ON_ERROR_STOP=1 -f supabase/migrations/20260811010000_sync_contract_0_1_0_foundation.sql
           psql -v ON_ERROR_STOP=1 -f supabase/migrations/20260811020000_sync_contract_0_1_0_rpcs.sql
+          psql -v ON_ERROR_STOP=1 -f supabase/migrations/20260813063251_sync_contract_0_3_0_storage_name_v2.sql
       - name: Run atomic, replay, cancellation, and migration checks
         run: psql -v ON_ERROR_STOP=1 -f supabase/tests/stage7_server_contract.sql
+      - name: Run storage-name-v2 server conformance
+        run: psql -v ON_ERROR_STOP=1 -f supabase/tests/storage_name_v2_server_contract.sql
