@@ -1,8 +1,8 @@
 {
   "$schema": "../storage-name-vectors.schema.json",
-  "contract_version": "0.2.0",
-  "algorithm_id": "storage-name-v1",
-  "unicode_version": "15.0.0",
+  "contract_version": "0.3.0",
+  "algorithm_id": "storage-name-v2",
+  "baseline_unicode_version": "14.0.0",
   "vectors": [
     {
       "vector_id": "SN-001",
@@ -103,6 +103,94 @@
       "input": "",
       "valid": false,
       "error_code": "STORAGE_NAME_INVALID"
+    },
+    {
+      "vector_id": "SN-016",
+      "input": "a／b",
+      "valid": false,
+      "error_code": "STORAGE_NAME_INVALID"
+    },
+    {
+      "vector_id": "SN-017",
+      "input": "℅",
+      "valid": false,
+      "error_code": "STORAGE_NAME_INVALID"
+    },
+    {
+      "vector_id": "SN-018",
+      "input": "﹨",
+      "valid": false,
+      "error_code": "STORAGE_NAME_INVALID"
+    },
+    {
+      "vector_id": "SN-019",
+      "input": "a\uE000b",
+      "valid": false,
+      "error_code": "STORAGE_NAME_UNSUPPORTED_SCALAR"
+    },
+    {
+      "vector_id": "SN-020",
+      "input": "\uDB40\uDC41",
+      "valid": false,
+      "error_code": "STORAGE_NAME_UNSUPPORTED_SCALAR"
+    },
+    {
+      "vector_id": "SN-021",
+      "input": "\uDB40\uDD00",
+      "valid": false,
+      "error_code": "STORAGE_NAME_UNSUPPORTED_SCALAR"
+    },
+    {
+      "vector_id": "SN-022",
+      "input": "\uD833\uDCD6",
+      "valid": false,
+      "error_code": "STORAGE_NAME_UNASSIGNED"
+    },
+    {
+      "vector_id": "SN-023",
+      "input": "\uD803\uDD50",
+      "valid": false,
+      "error_code": "STORAGE_NAME_UNASSIGNED"
+    },
+    {
+      "vector_id": "SN-024",
+      "input": "\uD80C\uDC46́",
+      "valid": false,
+      "error_code": "STORAGE_NAME_INVALID"
+    },
+    {
+      "vector_id": "SN-025",
+      "input": "\uD80C\uDC46ﾞ",
+      "valid": false,
+      "error_code": "STORAGE_NAME_INVALID"
+    },
+    {
+      "vector_id": "SN-026",
+      "input": "\uD80C\uDC46a",
+      "valid": true,
+      "normalized": "\uD80C\uDC46a",
+      "utf8_hex": "f093818661"
+    },
+    {
+      "vector_id": "SN-027",
+      "input": "🙂️",
+      "valid": true,
+      "normalized": "🙂️",
+      "utf8_hex": "f09f9982efb88f"
+    },
+    {
+      "vector_id": "SN-028",
+      "input": "ꭰ",
+      "valid": true,
+      "normalized": "Ꭰ",
+      "utf8_hex": "e18ea0"
+    },
+    {
+      "vector_id": "SN-029",
+      "input": "ᲀ",
+      "valid": true,
+      "normalized": "в",
+      "utf8_hex": "d0b2"
     }
   ]
 }

@@ -16,7 +16,7 @@ from jsonschema import Draft202012Validator, FormatChecker
 
 CONTRACT_DIR = Path(__file__).resolve().parents[1]
 EXPECTED_VECTOR_IDS = {f"TV-{index:03d}" for index in range(1, 13)}
-EXPECTED_STORAGE_VECTOR_IDS = {f"SN-{index:03d}" for index in range(1, 16)}
+EXPECTED_STORAGE_VECTOR_IDS = {f"SN-{index:03d}" for index in range(1, 30)}
 EXPECTED_ATOMIC_CASE_IDS = {f"ASC-{index:03d}" for index in range(1, 5)}
 EXPECTED_DOCUMENT_CASE_IDS = {f"DC-{index:03d}" for index in range(1, 8)}
 REQUIRED_SCHEMAS = {
@@ -245,11 +245,138 @@ def verify_state_model(protocol: dict[str, Any], vectors: list[dict[str, Any]]) 
             fail(f"TV-011 must cover {phrase}")
 
 
-def normalize_storage_name(value: str) -> tuple[str | None, str | None]:
-    if any(char in "/\\" or ord(char) <= 0x1F or ord(char) == 0x7F for char in value):
+def canonical_range_digest(table: dict[str, Any], label: str) -> str:
+    lines: list[str] = []
+    scalar_count = 0
+    for item in table.get("ranges", []):
+        if isinstance(item, list) and len(item) == 2:
+            start, end = item
+        elif isinstance(item, dict):
+            start, end = item.get("start"), item.get("end")
+        else:
+            fail(f"{label}: invalid range entry")
+        if not isinstance(start, int) or not isinstance(end, int) or start > end:
+            fail(f"{label}: invalid range bounds")
+        lines.append(f"{start:X}..{end:X}")
+        scalar_count += end - start + 1
+    if len(lines) != table.get("range_count"):
+        fail(f"{label}: range_count mismatch")
+    if scalar_count != table.get("scalar_count"):
+        fail(f"{label}: scalar_count mismatch")
+    return hashlib.sha256("\n".join(lines).encode("ascii")).hexdigest()
+
+
+def canonical_casefold_digest(table: dict[str, Any], label: str) -> str:
+    mappings = table.get("mappings")
+    if not isinstance(mappings, dict):
+        fail(f"{label}: mappings must be an object")
+    entries: list[str] = []
+    multi_scalar_count = 0
+    for source in sorted(mappings, key=lambda value: int(value, 16)):
+        targets = mappings[source]
+        if (
+            not isinstance(targets, list)
+            or not targets
+            or not all(isinstance(item, str) for item in targets)
+        ):
+            fail(f"{label}: invalid mapping for {source}")
+        if len(targets) > 1:
+            multi_scalar_count += 1
+        entries.append(f"{int(source, 16):X}>{','.join(f'{int(item, 16):X}' for item in targets)}")
+    if len(entries) != table.get("mapping_count"):
+        fail(f"{label}: mapping_count mismatch")
+    if multi_scalar_count != table.get("multi_scalar_mapping_count"):
+        fail(f"{label}: multi_scalar_mapping_count mismatch")
+    return hashlib.sha256(";".join(entries).encode("ascii")).hexdigest()
+
+
+def verify_frozen_unicode_assets(
+    protocol: dict[str, Any], lock: dict[str, Any]
+) -> dict[str, Any]:
+    expected_paths = {
+        "unicode/casefold-15.0.0.json",
+        "unicode/assigned-baseline-14.0.0.json",
+        "unicode/excluded-scalars.json",
+        "unicode/assigned-15.0.0.json",
+    }
+    locked_assets = lock.get("unicode_assets")
+    if not isinstance(locked_assets, dict) or set(locked_assets) != expected_paths:
+        fail("contract-lock unicode_assets set mismatch")
+
+    loaded: dict[str, dict[str, Any]] = {}
+    for relative_path, expected_digest in locked_assets.items():
+        path = CONTRACT_DIR / relative_path
+        raw = path.read_bytes()
+        if b"\r" in raw:
+            fail(f"{relative_path}: CR byte is forbidden")
+        table = require_object(json.loads(raw.decode("utf-8")), relative_path)
+        if "mappings" in table:
+            actual_digest = canonical_casefold_digest(table, relative_path)
+        else:
+            actual_digest = canonical_range_digest(table, relative_path)
+        if actual_digest != table.get("canonical_sha256"):
+            fail(f"{relative_path}: embedded canonical digest mismatch")
+        if actual_digest != expected_digest:
+            fail(f"{relative_path}: contract-lock canonical digest mismatch")
+        loaded[relative_path] = table
+
+    rules = protocol["storage_name_normalization"]
+    table_paths = rules["tables"]
+    if set(table_paths.values()) - set(loaded):
+        fail("storage-name-v2 references an unlocked Unicode asset")
+    baseline = loaded[table_paths["assigned_baseline"]]
+    if baseline.get("baseline_unicode_version") != rules["baseline_unicode_version"]:
+        fail("storage-name baseline version differs from frozen asset")
+
+    def ranges(table: dict[str, Any]) -> list[tuple[int, int]]:
+        result: list[tuple[int, int]] = []
+        for item in table["ranges"]:
+            if isinstance(item, list):
+                result.append((item[0], item[1]))
+            else:
+                result.append((item["start"], item["end"]))
+        return result
+
+    casefold_table = loaded[table_paths["casefold"]]
+    casefold = {
+        int(source, 16): "".join(chr(int(target, 16)) for target in targets)
+        for source, targets in casefold_table["mappings"].items()
+    }
+    return {
+        "baseline": ranges(baseline),
+        "excluded": ranges(loaded[table_paths["excluded_scalars"]]),
+        "casefold": casefold,
+    }
+
+
+def scalar_is_in_ranges(scalar: int, ranges: list[tuple[int, int]]) -> bool:
+    return any(start <= scalar <= end for start, end in ranges)
+
+
+def normalize_storage_name(
+    value: str, tables: dict[str, Any]
+) -> tuple[str | None, str | None]:
+    scalars = [ord(char) for char in value]
+    if any(not scalar_is_in_ranges(scalar, tables["baseline"]) for scalar in scalars):
+        return None, "STORAGE_NAME_UNASSIGNED"
+    if any(scalar_is_in_ranges(scalar, tables["excluded"]) for scalar in scalars):
+        return None, "STORAGE_NAME_UNSUPPORTED_SCALAR"
+    for current, following in zip(scalars, scalars[1:]):
+        dangerous_follower = (
+            unicodedata.combining(chr(following)) != 0
+            or following in {0xFF9E, 0xFF9F}
+        )
+        if current > 0xFFFF and dangerous_follower:
+            return None, "STORAGE_NAME_INVALID"
+
+    normalized = unicodedata.normalize("NFKC", value)
+    normalized = "".join(tables["casefold"].get(ord(char), char) for char in normalized)
+    normalized = unicodedata.normalize("NFKC", normalized)
+    if any(char in "/\\" or ord(char) <= 0x1F or ord(char) == 0x7F for char in normalized):
         return None, "STORAGE_NAME_INVALID"
-    normalized = unicodedata.normalize("NFKC", value).casefold()
-    normalized = unicodedata.normalize("NFKC", normalized).rstrip(" .")
+    if any(not scalar_is_in_ranges(ord(char), tables["baseline"]) for char in normalized):
+        return None, "STORAGE_NAME_UNASSIGNED"
+    normalized = normalized.rstrip(" .")
     if normalized in {"", ".", ".."}:
         return None, "STORAGE_NAME_INVALID"
     basename = normalized.split(".", 1)[0]
@@ -258,24 +385,24 @@ def normalize_storage_name(value: str) -> tuple[str | None, str | None]:
     return normalized, None
 
 
-def verify_storage_vectors(protocol: dict[str, Any], schema: dict[str, Any]) -> int:
+def verify_storage_vectors(
+    protocol: dict[str, Any], schema: dict[str, Any], tables: dict[str, Any]
+) -> int:
     path = CONTRACT_DIR / protocol["storage_name_normalization"]["conformance_vectors"]
     suite = require_object(load_json(path), str(path.name))
     validate_instance(suite, schema, str(path.name))
     if suite["contract_version"] != protocol["contract_version"]:
         fail("storage-name vector contract version differs from protocol")
-    if suite["unicode_version"] != protocol["storage_name_normalization"]["unicode_version"]:
-        fail("storage-name Unicode version differs from protocol")
-    if unicodedata.unidata_version != suite["unicode_version"]:
-        fail(
-            f"Python Unicode data version mismatch: expected {suite['unicode_version']}, "
-            f"got {unicodedata.unidata_version}"
-        )
+    if (
+        suite["baseline_unicode_version"]
+        != protocol["storage_name_normalization"]["baseline_unicode_version"]
+    ):
+        fail("storage-name baseline version differs from protocol")
     ids = {item["vector_id"] for item in suite["vectors"]}
     if ids != EXPECTED_STORAGE_VECTOR_IDS:
         fail("storage-name vector ID set mismatch")
     for item in suite["vectors"]:
-        normalized, error = normalize_storage_name(item["input"])
+        normalized, error = normalize_storage_name(item["input"], tables)
         if item["valid"]:
             if error is not None or normalized is None:
                 fail(f"{item['vector_id']}: expected valid but got {error}")
@@ -358,6 +485,7 @@ def verify_document_vectors(
     schema: dict[str, Any],
     canonical_digest: str,
     versions: dict[int, dict[str, Any]],
+    storage_tables: dict[str, Any],
 ) -> int:
     suite = require_object(
         load_json(CONTRACT_DIR / "conformance_vectors" / "document-commit.json"),
@@ -400,9 +528,9 @@ def verify_document_vectors(
             fail(f"{case_id}: document content exceeds the contract limit")
         if hashlib.sha256(content_bytes).hexdigest() != payload["content_sha256"]:
             fail(f"{case_id}: document content digest mismatch")
-        normalized, name_error = normalize_storage_name(payload["name"])
+        normalized, name_error = normalize_storage_name(payload["name"], storage_tables)
         if name_error is not None or normalized is None:
-            fail(f"{case_id}: document name violates storage-name-v1: {name_error}")
+            fail(f"{case_id}: document name violates storage-name-v2: {name_error}")
 
         if response["batch_id"] != batch["batch_id"]:
             fail(f"{case_id}: document response batch_id mismatch")
@@ -528,12 +656,19 @@ def main() -> None:
         fail(f"transition vector set mismatch: got {sorted(vector_ids)}")
     verify_state_model(protocol, vectors)
 
-    storage_count = verify_storage_vectors(protocol, schemas["storage-name-vectors.schema.json"])
+    storage_tables = verify_frozen_unicode_assets(protocol, lock)
+    storage_count = verify_storage_vectors(
+        protocol, schemas["storage-name-vectors.schema.json"], storage_tables
+    )
     atomic_count = verify_atomic_vectors(
         protocol, schemas["atomic-structure-commit.schema.json"], canonical_digest
     )
     document_count = verify_document_vectors(
-        protocol, schemas["document-commit.schema.json"], canonical_digest, versions
+        protocol,
+        schemas["document-commit.schema.json"],
+        canonical_digest,
+        versions,
+        storage_tables,
     )
     verify_traceability()
 
@@ -551,7 +686,11 @@ def main() -> None:
     print(f"Validated {len(schemas)} JSON schemas.")
     print(f"Validated released protocol contract {protocol['contract_version']}.")
     print(f"Validated {len(vector_paths)} transition vectors with cross-file semantics.")
-    print(f"Validated {storage_count} storage-name conformance vectors (Unicode {unicodedata.unidata_version}).")
+    print(
+        f"Validated {storage_count} storage-name-v2 conformance vectors "
+        f"(frozen baseline 14.0.0; host NFKC {unicodedata.unidata_version})."
+    )
+    print("Validated 4 frozen Unicode asset canonical digests.")
     print(f"Validated {atomic_count} atomic wire conformance cases.")
     print(f"Validated {document_count} document wire conformance cases.")
     print("Validated capability versions, operation creation, state derivation, batch provenance, immutable rebase, and legacy enforcement.")

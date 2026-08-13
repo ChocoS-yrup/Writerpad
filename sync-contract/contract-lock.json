@@ -1,16 +1,22 @@
 {
-  "contract_version": "0.2.0",
+  "contract_version": "0.3.0",
   "contract_status": "released",
   "protocol_path": "protocol.json",
   "canonicalization": "RFC 8785",
   "digest_algorithm": "SHA-256",
-  "canonical_byte_length": 23256,
-  "canonical_contract_sha256": "416c1b99edb9bda694731dee4b25688d9d82d1f32610aa23ddfda571ec3c7670",
+  "canonical_byte_length": 24777,
+  "canonical_contract_sha256": "abbd234c7b65d422c2e43d468f4f724e069ede26a3d24be22eb8b35cce8ebf2c",
   "schema_count": 7,
   "transition_vector_count": 12,
-  "storage_name_vector_count": 15,
+  "storage_name_vector_count": 29,
   "atomic_wire_case_count": 4,
   "document_wire_case_count": 7,
-  "previous_contract_git_commit": "45d18cff62cc48e29d0e6efcfc634fec96150198",
+  "unicode_assets": {
+    "unicode/casefold-15.0.0.json": "eac289d0d721c58867acb07af38d9a8e8ee374d328b33d93251ae6348e258439",
+    "unicode/assigned-baseline-14.0.0.json": "aed4e530cc5e0de638310db961f17f174d605282764a6657afd0f70e5515c85c",
+    "unicode/excluded-scalars.json": "f56ee73bca1690e842a189336ffdfabe7625128f7f314a7ac567755952571e86",
+    "unicode/assigned-15.0.0.json": "5a354149c4f2b58f7c2ffc5eab9fc92f6eab5a68292ebce626f4ba402f736e31"
+  },
+  "previous_contract_git_commit": "fcd99b7098b9a04bd93c585d89b16588aa482530",
   "contract_git_commit_binding": "The final Git commit is recorded externally in the stage handoff because a commit cannot contain its own SHA."
 }
