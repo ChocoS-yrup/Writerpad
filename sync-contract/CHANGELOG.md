@@ -4,6 +4,37 @@ All notable changes to the WriterPad shared sync contract package are recorded
 here. This file describes contract artifacts only; it is not an application or
 server release log.
 
+## 0.3.0 - 2026-08-13
+
+### Released
+
+- Replaced the runtime Unicode-version promise with `storage-name-v2` and
+  frozen assignment, exclusion, and full default casefold tables.
+- Added `STORAGE_NAME_UNASSIGNED` and
+  `STORAGE_NAME_UNSUPPORTED_SCALAR` and moved separator rejection after NFKC.
+- Added a pre-NFKC rejection for a supplementary scalar immediately followed
+  by a nonzero canonical combining-class scalar, U+FF9E, or U+FF9F.
+- Added a defensive post-normalization baseline check while retaining BMP
+  variation selectors U+FE00 through U+FE0F.
+- Expanded storage-name conformance coverage from SN-001..SN-015 to
+  SN-001..SN-029 and made the verifier consume and digest-check the frozen
+  assets instead of the host casefold implementation.
+- Preserved all accepted-name collision keys; the read-only iPad device scan at
+  commit `e7c9ff479e3f43f269fc22b20887a325e0a8fd2d` found no migration candidates.
+
+### Deployment boundary
+
+- This contract release does not change clients, server code, migrations,
+  allowlists, projects, or operational data.
+- Clients must retain the 0.2.0 pin until the server stage deploys
+  storage-name-v2 and allowlists this release digest.
+
+### Release identity
+
+- RFC 8785 canonical protocol bytes: `24777`.
+- Canonical SHA-256:
+  `abbd234c7b65d422c2e43d468f4f724e069ede26a3d24be22eb8b35cce8ebf2c`.
+
 ## 0.2.0 - 2026-08-11
 
 ### Released

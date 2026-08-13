@@ -1,6 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "urn:writerpad:sync-contract:document-commit:0.2.0",
+  "$id": "urn:writerpad:sync-contract:document-commit:0.3.0",
   "title": "WriterPad document_commit wire contract",
   "oneOf": [
     { "$ref": "#/$defs/request" },
@@ -44,7 +44,7 @@
         "writer_device_id": { "$ref": "#/$defs/uuid" },
         "client_build_id": { "type": "string", "minLength": 1 },
         "sync_protocol_version": { "const": 3 },
-        "contract_version": { "const": "0.2.0" },
+        "contract_version": { "const": "0.3.0" },
         "canonical_contract_sha256": { "$ref": "#/$defs/sha256" },
         "client_capabilities": { "$ref": "#/$defs/capabilitySet" },
         "batch_payload_sha256": { "$ref": "#/$defs/sha256" }

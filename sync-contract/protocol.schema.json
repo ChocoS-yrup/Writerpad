@@ -1,6 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "urn:writerpad:sync-contract:protocol-schema:0.2.0",
+  "$id": "urn:writerpad:sync-contract:protocol-schema:0.3.0",
   "title": "WriterPad Sync Contract Protocol",
   "type": "object",
   "additionalProperties": false,
@@ -32,7 +32,7 @@
       "const": "./protocol.schema.json"
     },
     "contract_version": {
-      "const": "0.2.0"
+      "const": "0.3.0"
     },
     "contract_status": {
       "const": "released"
@@ -824,10 +824,12 @@
       "additionalProperties": false,
       "required": [
         "algorithm_id",
-        "unicode_version",
+        "baseline_unicode_version",
+        "tables",
         "input_scope",
         "steps",
         "separator_policy",
+        "runtime_unicode_policy",
         "leading_space_policy",
         "internal_space_policy",
         "comparison_policy",
@@ -835,22 +837,45 @@
       ],
       "properties": {
         "algorithm_id": {
-          "const": "storage-name-v1"
+          "const": "storage-name-v2"
         },
-        "unicode_version": {
-          "const": "15.0.0"
+        "baseline_unicode_version": {
+          "const": "14.0.0"
+        },
+        "tables": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "assigned_baseline",
+            "excluded_scalars",
+            "casefold"
+          ],
+          "properties": {
+            "assigned_baseline": {
+              "const": "unicode/assigned-baseline-14.0.0.json"
+            },
+            "excluded_scalars": {
+              "const": "unicode/excluded-scalars.json"
+            },
+            "casefold": {
+              "const": "unicode/casefold-15.0.0.json"
+            }
+          }
         },
         "input_scope": {
           "$ref": "#/$defs/nonEmptyString"
         },
         "steps": {
           "type": "array",
-          "minItems": 8,
+          "minItems": 12,
           "items": {
             "$ref": "#/$defs/nonEmptyString"
           }
         },
         "separator_policy": {
+          "$ref": "#/$defs/nonEmptyString"
+        },
+        "runtime_unicode_policy": {
           "$ref": "#/$defs/nonEmptyString"
         },
         "leading_space_policy": {
@@ -863,7 +888,7 @@
           "$ref": "#/$defs/nonEmptyString"
         },
         "conformance_vectors": {
-          "const": "conformance_vectors/storage-name-v1.json"
+          "const": "conformance_vectors/storage-name-v2.json"
         }
       }
     },

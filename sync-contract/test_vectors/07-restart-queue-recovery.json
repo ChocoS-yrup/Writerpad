@@ -2,7 +2,7 @@
   "$schema": "../transition-vector.schema.json",
   "vector_id": "TV-007",
   "title": "Client termination and durable queue recovery",
-  "contract_version": "0.2.0",
+  "contract_version": "0.3.0",
   "minimum_protocol_version": 3,
   "tags": [
     "durability",
@@ -40,7 +40,7 @@
         "immutable_batch_contract_metadata",
         "operation_attempt_history",
         "operation_state_events",
-        "storage_name_v1",
+        "storage_name_v2",
         "document_commit_v1"
       ],
       "local_entities": [],

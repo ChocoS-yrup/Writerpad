@@ -1,0 +1,41 @@
+{
+ "table_id": "storage-name-excluded-v2",
+ "purpose": "Scalars that are assigned but must not appear in a storage name.",
+ "rule": "A storage name MUST be rejected (STORAGE_NAME_UNSUPPORTED_SCALAR) if it contains any scalar in these ranges. This is checked before NFKC, on the input scalars.",
+ "rationale": "Private Use is by definition a private agreement, so two clients have no guarantee of reading it the same way; it is unfit as collision-key material. Tags and the Variation Selectors Supplement are invisible and carry no naming intent.",
+ "not_excluded": {
+  "U+FE00..U+FE0F": "BMP variation selectors, including U+FE0F. IMEs insert U+FE0F automatically for emoji presentation; measurement found zero divergence for the whole emoji region. Excluding these would reject ordinary emoji folder names."
+ },
+ "range_count": 5,
+ "scalar_count": 137836,
+ "baseline_scalars_removed": 137805,
+ "canonical_form": "lines of '<START_HEX>..<END_HEX>', uppercase, no padding, LF separated, no trailing newline",
+ "canonical_sha256": "f56ee73bca1690e842a189336ffdfabe7625128f7f314a7ac567755952571e86",
+ "ranges": [
+  {
+   "start": 57344,
+   "end": 63743,
+   "block": "Private Use Area"
+  },
+  {
+   "start": 917504,
+   "end": 917631,
+   "block": "Tags"
+  },
+  {
+   "start": 917760,
+   "end": 917999,
+   "block": "Variation Selectors Supplement"
+  },
+  {
+   "start": 983040,
+   "end": 1048573,
+   "block": "Supplementary Private Use Area-A"
+  },
+  {
+   "start": 1048576,
+   "end": 1114109,
+   "block": "Supplementary Private Use Area-B"
+  }
+ ]
+}
