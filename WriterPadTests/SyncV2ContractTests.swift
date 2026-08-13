@@ -220,18 +220,98 @@ final class SyncV2ContractTests: XCTestCase {
         }
     }
 
-    /// 판이 갈릴 수 있는 문자는 92개뿐이고 나머지는 어느 판에서나 같다.
-    /// 아직 쓰기를 막지는 않고 알아보기만 한다.
-    func testUnicodeVersionDivergenceIsNarrow() {
+    /// 동결 표가 서버·Windows와 같은 표인지 본다.
+    ///
+    /// 세 구현이 같은 키를 내려면 같은 표를 봐야 한다. 정규형 SHA-256 하나로
+    /// 확인한다. 이 값이 흔들리면 표가 어딘가에서 손상된 것이므로 개수만 맞춰
+    /// 넘어가지 마라.
+    func testFrozenCasefoldTableIsIntact() {
+        XCTAssertEqual(SyncV2UnicodeCasefold.unicodeVersion, "15.0.0")
+        XCTAssertEqual(SyncV2UnicodeCasefold.mappingCount, 1_530)
+        XCTAssertEqual(SyncV2UnicodeCasefold.table.count, SyncV2UnicodeCasefold.mappingCount)
         XCTAssertEqual(
-            SyncV2StorageName.divergentScalars.reduce(0) { $0 + $1.count },
-            92
+            SyncV2UnicodeCasefold.tableSHA256,
+            "eac289d0d721c58867acb07af38d9a8e8ee374d328b33d93251ae6348e258439"
         )
-        XCTAssertFalse(SyncV2StorageName.containsUnicodeVersionDivergentScalar("첫 눈"))
-        XCTAssertFalse(SyncV2StorageName.containsUnicodeVersionDivergentScalar("Résumé"))
-        XCTAssertTrue(
-            SyncV2StorageName.containsUnicodeVersionDivergentScalar("\u{10D50}")
+
+        // 여러 스칼라로 접히는 항목도 제대로 풀렸는지 본다.
+        XCTAssertEqual(SyncV2UnicodeCasefold.table[0x00DF], "ss")
+        XCTAssertEqual(SyncV2UnicodeCasefold.table[0x0130], "i\u{0307}")
+    }
+
+    /// 접기를 동결 표로 옮긴 것이 베이스라인 안쪽 발산을 닫았는지 본다.
+    ///
+    /// 실측에서 베이스라인(Unicode 14.0.0 할당표) 안쪽 181개가 서버와 다른 키를
+    /// 냈다. 전부 접기 단계에서 갈리던 것이라 여기서 사라져야 한다. 이 시험이
+    /// 깨지면 접기가 다시 Foundation으로 돌아갔다는 뜻이다.
+    func testFrozenCasefoldClosesInsideBaselineDivergence() throws {
+        // Cherokee — 계약은 대문자 쪽으로 접는다. Foundation은 U+AB70을 냈다.
+        XCTAssertEqual(try SyncV2StorageName.normalize("\u{13A0}"), "\u{13A0}")
+        XCTAssertEqual(try SyncV2StorageName.normalize("\u{AB70}"), "\u{13A0}")
+        XCTAssertEqual(try SyncV2StorageName.normalize("\u{13F8}"), "\u{13F0}")
+
+        // Cyrillic — 계약은 U+1C80을 U+0432(в)로 접는다. Foundation은 접지 않아
+        // 충돌을 놓쳤다. 이제 같은 키로 수렴해야 한다.
+        XCTAssertEqual(
+            try SyncV2StorageName.normalize("\u{1C80}"),
+            try SyncV2StorageName.normalize("\u{0432}")
         )
+        XCTAssertEqual(try SyncV2StorageName.normalize("\u{1C88}"), "\u{A64B}")
+
+        for scalar in ["\u{13A0}", "\u{AB70}", "\u{13F8}", "\u{1C80}", "\u{1C88}"] {
+            XCTAssertFalse(
+                SyncV2StorageName.containsContractDivergentScalar(scalar),
+                scalar
+            )
+        }
+    }
+
+    /// 남은 발산 목록이 실측한 구성 그대로인지 본다.
+    ///
+    /// 예전에는 이 자리에서 개수가 92인지만 셌다. 그 92는 스캔 결과가 아니라
+    /// 손으로 적어 넣은 값이었고, 2026-08-13 전 코드포인트 실측으로 틀렸음이
+    /// 드러났다(실제 276). 접기를 동결 표로 옮겨 236개가 닫히고 40개가 남았다.
+    ///
+    /// 이 시험이 깨지면 목록을 실측으로 다시 뽑고 저장소 뿌리의 측정 자료도
+    /// 함께 갱신하라. 기대값만 숫자로 맞춰 넣지 마라.
+    func testDivergentScalarsMatchMeasurement() {
+        let total = SyncV2StorageName.divergentScalars.reduce(0) { $0 + $1.count }
+        XCTAssertEqual(total, 40)
+
+        // 남은 것은 전부 NFKC 단계의 판 차이다. 베이스라인 바깥이라 미할당 거부
+        // 규칙이 들어오면 닫힌다.
+        XCTAssertTrue(SyncV2StorageName.containsContractDivergentScalar("\u{1CCD6}"))
+        XCTAssertTrue(SyncV2StorageName.containsContractDivergentScalar("\u{16D68}"))
+
+        // 접기로 닫힌 것은 더 이상 걸리지 않는다.
+        XCTAssertFalse(SyncV2StorageName.containsContractDivergentScalar("\u{10D50}"))
+        // 흔한 이름은 애초에 걸리지 않는다.
+        XCTAssertFalse(SyncV2StorageName.containsContractDivergentScalar("첫 눈"))
+        XCTAssertFalse(SyncV2StorageName.containsContractDivergentScalar("Résumé"))
+    }
+
+    // 계약 storage-name-v1 위반. 현재 동작을 기록만 한다.
+    // Foundation NFKC를 동결 표 구현으로 갈아치우면 이 시험을 고치지 말고
+    // 삭제하라. 계약을 지키는 쪽의 시험은 벡터 하네스가 맡는다.
+    //
+    /// 발산 목록이 게이트로 쓸 수 없다는 것을 못 박는다.
+    ///
+    /// 상위면 스칼라 뒤에 결합문자가 오면 Foundation의 NFKC가 코드포인트를
+    /// 16비트로 잘라낸다. U+10041("𐁁")이 U+0041("A")로 읽혀 뒤따르는 U+0301과
+    /// 결합해 버린다. 계약대로라면 두 스칼라가 그대로 남아야 한다.
+    ///
+    /// 그 입력은 `divergentScalars`의 어느 범위에도 걸리지 않는다. 목록을
+    /// 통과했다고 안전하지 않다는 뜻이며, 이것이 목록을 진단용으로만 두는
+    /// 이유다.
+    func testSupplementaryPlaneNFKCTruncates_CONTRACT_VIOLATION_PINNED() throws {
+        let name = "\u{10041}\u{0301}"
+        XCTAssertFalse(SyncV2StorageName.containsContractDivergentScalar(name))
+
+        let normalized = try SyncV2StorageName.normalize(name)
+        XCTAssertEqual(normalized, "\u{00E1}")
+        XCTAssertEqual(SyncV2StorageName.utf8Hex(normalized), "c3a1")
+        // 서로 다른 두 이름이 같은 충돌 키로 수렴한다.
+        XCTAssertEqual(normalized, try SyncV2StorageName.normalize("\u{00C1}"))
     }
 
     // MARK: - 서버 호환성
