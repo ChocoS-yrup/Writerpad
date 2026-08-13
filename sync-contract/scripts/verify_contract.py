@@ -374,6 +374,8 @@ def normalize_storage_name(
     normalized = unicodedata.normalize("NFKC", normalized)
     if any(char in "/\\" or ord(char) <= 0x1F or ord(char) == 0x7F for char in normalized):
         return None, "STORAGE_NAME_INVALID"
+    # Defensive post-NFKC baseline recheck: normalization and frozen casefold
+    # output must not escape the assigned baseline accepted at input.
     if any(not scalar_is_in_ranges(ord(char), tables["baseline"]) for char in normalized):
         return None, "STORAGE_NAME_UNASSIGNED"
     normalized = normalized.rstrip(" .")
@@ -383,6 +385,22 @@ def normalize_storage_name(
     if basename in WINDOWS_RESERVED_BASENAMES:
         return None, "STORAGE_NAME_RESERVED"
     return normalized, None
+
+
+def verify_defensive_post_normalization_baseline(tables: dict[str, Any]) -> None:
+    # The released frozen baseline currently makes this branch unreachable for
+    # a single scalar. Narrow only the self-test baseline so U+AB70 passes the
+    # input check, then frozen casefold produces excluded U+13A0 after NFKC.
+    if tables["casefold"].get(0xAB70) != "\u13a0":
+        fail("defensive baseline self-test casefold precondition mismatch")
+    synthetic_tables = {
+        "baseline": [(0xAB70, 0xAB70)],
+        "excluded": [],
+        "casefold": tables["casefold"],
+    }
+    normalized, error = normalize_storage_name("\uab70", synthetic_tables)
+    if normalized is not None or error != "STORAGE_NAME_UNASSIGNED":
+        fail("defensive post-NFKC baseline self-test failed")
 
 
 def verify_storage_vectors(
@@ -657,6 +675,7 @@ def main() -> None:
     verify_state_model(protocol, vectors)
 
     storage_tables = verify_frozen_unicode_assets(protocol, lock)
+    verify_defensive_post_normalization_baseline(storage_tables)
     storage_count = verify_storage_vectors(
         protocol, schemas["storage-name-vectors.schema.json"], storage_tables
     )
@@ -690,6 +709,7 @@ def main() -> None:
         f"Validated {storage_count} storage-name-v2 conformance vectors "
         f"(frozen baseline 14.0.0; host NFKC {unicodedata.unidata_version})."
     )
+    print("Validated defensive post-NFKC baseline self-test.")
     print("Validated 4 frozen Unicode asset canonical digests.")
     print(f"Validated {atomic_count} atomic wire conformance cases.")
     print(f"Validated {document_count} document wire conformance cases.")
