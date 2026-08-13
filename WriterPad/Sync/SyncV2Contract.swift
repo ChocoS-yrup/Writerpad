@@ -265,13 +265,30 @@ extension SyncV2JSON {
 /// 아이패드는 자모가 분해된 이름을, Windows는 결합된 이름을 만들 수 있다. 두
 /// 이름이 같은 자리를 다투는지 알려면 같은 키로 수렴시켜야 한다.
 ///
-/// - Note: 계약은 Unicode 15.0.0 고정을 요구하지만 Foundation의 정규화는 OS가
-///   싣고 있는 판을 따르고(현재 17.0), Swift에는 판 번호를 알려 주는 API가
-///   없다. 다만 Unicode의 정규화·케이스폴딩 안정성 정책 덕분에 이미 배정된
-///   문자의 결과는 판이 올라가도 바뀌지 않으므로, 실제로 갈릴 수 있는 문자는
-///   `divergentScalars`에 적힌 92개뿐이다. 계약 벡터 15개는 이대로 전부
-///   통과한다. 판 고정을 fail-closed로 걸지 여부는 계약 개정 안건이라 아직
-///   막지 않는다.
+/// - Note: **이 구현은 아직 계약이 요구하는 키를 완전히 내지 못한다.**
+///   계약은 Unicode 15.0.0의 NFKC와 default case folding을 요구한다. 두 단계 중
+///   접기는 `SyncV2UnicodeCasefold`의 동결 표로 옮겨 계약과 맞췄고, NFKC는
+///   여전히 Foundation에 맡기고 있어 OS가 싣고 있는 ICU를 따른다
+///   (2026-08-13 실측 ICU 78.1 / Unicode 17.0.0).
+///
+///   이 자리에는 한때 "실제로 갈릴 수 있는 문자는 92개뿐"이라고 적혀 있었다.
+///   전 코드포인트를 실제로 훑어 보니 사실이 아니었다. 단독 스칼라만 세도
+///   276개가 갈렸고, 그중 181개는 Unicode 14.0.0 베이스라인 **안쪽**이었다.
+///   안정성 정책은 판이 올라갈 때 결과가 바뀌지 않는다고 보장할 뿐, 서로 다른
+///   구현이 같은 결과를 낸다고 보장하지 않는다. 갈리던 원인의 대부분은 판
+///   차이가 아니라 구현 차이 — 접기가 default case folding이 아니었던 것 —
+///   이었고, 그 236개가 동결 표로 닫혔다.
+///
+///   남은 것은 두 가지다. `divergentScalars`의 40개(전부 베이스라인 바깥)와,
+///   상위면 스칼라 바로 뒤에 결합문자가 올 때 Foundation의 NFKC가 코드포인트를
+///   16비트로 잘라 버리는 결함이다. 둘 다 계약 개정에서 규칙으로 막기로 했고
+///   여기서는 아직 손대지 않는다.
+///
+///   계약 벡터 15개는 접기 교체 전에도 후에도 전부 통과한다. 벡터가 짚지 않는
+///   영역에서 갈리기 때문이며, 그래서 벡터 통과는 적합성의 근거가 되지 못한다.
+///
+///   측정 결과와 스칼라 목록은 저장소 뿌리의 `윈도우세션_회신*.md`와
+///   `유니코드측정_*.json`에 있다.
 enum SyncV2StorageName {
     private static let reservedBasenames: Set<String> = {
         var names: Set<String> = ["con", "prn", "aux", "nul"]
@@ -295,8 +312,13 @@ enum SyncV2StorageName {
         // NFKC로 폭을 맞추고, 대소문자를 접고, 접은 결과를 다시 NFKC로 맞춘다.
         // 마지막 NFKC가 없으면 접는 과정에서 생긴 분해형이 남아 Windows와
         // 다른 키가 된다.
+        //
+        // 접기는 Foundation에 맡기지 않고 동결 표를 쓴다.
+        // `folding(options: [.caseInsensitive])`는 Unicode default case folding이
+        // 아니라서, 전 코드포인트 실측에서 베이스라인 안쪽 181개가 서버와 다른
+        // 키를 냈다. 자세한 것은 `SyncV2UnicodeCasefold`에 적어 두었다.
         var normalized = value.precomposedStringWithCompatibilityMapping
-        normalized = normalized.folding(options: [.caseInsensitive], locale: nil)
+        normalized = SyncV2UnicodeCasefold.apply(normalized)
         normalized = normalized.precomposedStringWithCompatibilityMapping
 
         // 끝의 공백과 마침표는 저장 매체가 조용히 잘라내는 곳이 있어 미리 뗀다.
@@ -323,26 +345,40 @@ enum SyncV2StorageName {
         Array(normalized.utf8).map { String(format: "%02x", $0) }.joined()
     }
 
-    /// Unicode 15.0 이후에 배정되어 판에 따라 정규화 결과가 갈릴 수 있는
-    /// 스칼라 전체다. 전 코드포인트를 훑어 뽑은 92개이며, 이 밖의 문자는
-    /// 어떤 판에서도 같은 결과를 낸다.
+    /// 이 구현이 계약(동결된 Unicode 15.0.0)과 아직 다른 키를 내는 스칼라 40개다.
+    /// 2026-08-13 전 코드포인트 실측이며 iPadOS 26.5와 macOS 26.5.2가 같은
+    /// 값을 냈다.
+    ///
+    /// 접기를 `SyncV2UnicodeCasefold`로 옮기기 전에는 276개였다. 그중 181개는
+    /// 베이스라인(Unicode 14.0.0 할당표) **안쪽**이라 미할당 거부 규칙으로는
+    /// 걸러지지 않는 것들이었다 — Cherokee 172개와 Cyrillic U+1C80..U+1C88
+    /// 9개. 접기가 동결 표로 바뀌면서 그 181개와, 바깥쪽 95개 중 55개가 함께
+    /// 사라졌다. 전부 접기 단계에서 갈리던 것이었기 때문이다.
+    ///
+    /// 남은 40개는 접기가 아니라 **NFKC 단계**에서 갈린다. Foundation의 NFKC가
+    /// 런타임 판(실측 Unicode 17.0.0)을 따르는데, 이 스칼라들은 Unicode 15.0.0
+    /// 시점에 미할당이라 계약 쪽에서는 아무 매핑도 받지 못한다. 전부 베이스라인
+    /// **바깥**이므로 "베이스라인에 없는 스칼라를 거부한다"는 규칙이 들어오면
+    /// 그때 닫힌다.
+    ///
+    /// - Important: **이 목록은 완전하지 않다.** 스칼라 하나를 단독으로 넣었을
+    ///   때 갈리는 것만 담는다. 상위면 스칼라 바로 뒤에 결합문자가 오면
+    ///   Foundation의 NFKC가 코드포인트를 16비트로 잘라 버리는데
+    ///   (U+10041 U+0301 -> U+00C1), 그 입력은 여기 걸리지 않는다. 여기 없는
+    ///   문자만 썼다고 안전하지 않다는 뜻이라, 이 목록은 게이트로 쓸 수 없다.
+    ///   그 결함은 배열에 대한 규칙으로 따로 막아야 한다.
     static let divergentScalars: [ClosedRange<UInt32>] = [
-        0x1C89...0x1C89,
-        0xA7CB...0xA7CC,
-        0xA7CE...0xA7CE,
-        0xA7D2...0xA7D2,
-        0xA7D4...0xA7D4,
-        0xA7DA...0xA7DA,
-        0xA7DC...0xA7DC,
         0xA7F1...0xA7F1,
-        0x10D50...0x10D65,
-        0x16EA0...0x16EB8,
+        0x16D68...0x16D6A,
         0x1CCD6...0x1CCF9,
     ]
 
-    /// 이름이 판에 따라 갈릴 수 있는 문자를 품고 있는지 본다. 아직 쓰기를 막지
+    /// 이름이 계약과 다르게 정규화되는 문자를 품고 있는지 본다. 쓰기를 막지
     /// 않고 진단에만 쓴다.
-    static func containsUnicodeVersionDivergentScalar(_ value: String) -> Bool {
+    ///
+    /// - Important: `divergentScalars`가 완전하지 않으므로 `false`는 안전하다는
+    ///   뜻이 아니다. 위 주석을 보라.
+    static func containsContractDivergentScalar(_ value: String) -> Bool {
         value.unicodeScalars.contains { scalar in
             divergentScalars.contains { $0.contains(scalar.value) }
         }
