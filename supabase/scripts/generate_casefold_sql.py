@@ -1,25 +1,38 @@
 #!/usr/bin/env python3
-"""Generate the immutable Unicode 15.0.0 full default case-fold table.
+"""Render the frozen Unicode tables into the Stage 7 migration.
 
-The generated rows are vendored into the Stage 7 migration so the database
-does not depend on its locale or on a server-specific ICU version. Run this
-script only with Python 3.12.13 / Unicode data 15.0.0.
+The tables themselves live in ``sync-contract/unicode/`` as contract assets.
+This script only formats them as SQL; it derives nothing.
+
+That direction is deliberate. This script used to read the host CPython's
+``unicodedata``, which meant the migration's contents depended on which Python
+happened to run it — pinned by an interpreter version check that would simply
+refuse to run anywhere else. Three implementations now have to agree on these
+tables byte for byte (Postgres, the Windows client, the iPad client), so the
+tables are the origin and every consumer is generated from them.
+
+Each asset carries a canonical SHA-256. This script verifies it before writing
+anything, so a table damaged in transit cannot reach the migration. That is not
+hypothetical: the baseline table first arrived over a Windows transfer with
+CRLF line endings and its digest did not match until the CR bytes were stripped.
+
+Usage:
+    generate_casefold_sql.py                      print the two generated blocks
+    generate_casefold_sql.py --rewrite MIGRATION  splice them into a migration
+    generate_casefold_sql.py --check MIGRATION    verify a migration matches
 """
 
 from __future__ import annotations
 
+import hashlib
+import json
 import sys
-import unicodedata
 from pathlib import Path
 
-
-EXPECTED_PYTHON = (3, 12, 13)
-EXPECTED_UNICODE = "15.0.0"
-
-
-def sql_text(value: str) -> str:
-    return " || ".join(f"pg_catalog.chr({ord(char)})" for char in value)
-
+REPO_ROOT = Path(__file__).resolve().parents[2]
+ASSET_DIR = REPO_ROOT / "sync-contract" / "unicode"
+CASEFOLD_ASSET = ASSET_DIR / "casefold-15.0.0.json"
+ASSIGNED_ASSET = ASSET_DIR / "assigned-15.0.0.json"
 
 ASSIGNED_BEGIN_MARKER = "-- BEGIN GENERATED UNICODE 15.0.0 ASSIGNED RANGES"
 ASSIGNED_END_MARKER = "-- END GENERATED UNICODE 15.0.0 ASSIGNED RANGES"
@@ -27,22 +40,54 @@ CASEFOLD_BEGIN_MARKER = "-- BEGIN GENERATED UNICODE 15.0.0 FULL DEFAULT CASEFOLD
 CASEFOLD_END_MARKER = "-- END GENERATED UNICODE 15.0.0 FULL DEFAULT CASEFOLD"
 
 
+def sql_text(value: str) -> str:
+    return " || ".join(f"pg_catalog.chr({ord(char)})" for char in value)
+
+
+def load_asset(path: Path) -> dict:
+    asset = json.loads(path.read_text(encoding="utf-8"))
+    if "\r" in path.read_text(encoding="utf-8"):
+        raise SystemExit(f"{path.name}: contains CR. Assets are LF only.")
+    return asset
+
+
 def assigned_ranges() -> list[tuple[int, int]]:
-    ranges: list[tuple[int, int]] = []
-    start: int | None = None
-    previous: int | None = None
-    for codepoint in range(sys.maxunicode + 1):
-        assigned = unicodedata.category(chr(codepoint)) != "Cn"
-        if assigned and start is None:
-            start = previous = codepoint
-        elif assigned:
-            previous = codepoint
-        elif start is not None and previous is not None:
-            ranges.append((start, previous))
-            start = previous = None
-    if start is not None and previous is not None:
-        ranges.append((start, previous))
+    """Unicode 15.0.0 assigned ranges, verified against the asset digest."""
+    asset = load_asset(ASSIGNED_ASSET)
+    ranges = [(int(start), int(end)) for start, end in asset["ranges"]]
+    canonical = "\n".join(f"{start:X}..{end:X}" for start, end in ranges)
+    digest = hashlib.sha256(canonical.encode()).hexdigest()
+    if digest != asset["canonical_sha256"]:
+        raise SystemExit(
+            f"{ASSIGNED_ASSET.name}: canonical digest mismatch\n"
+            f"  expected {asset['canonical_sha256']}\n  got      {digest}"
+        )
+    if len(ranges) != asset["range_count"]:
+        raise SystemExit(f"{ASSIGNED_ASSET.name}: range_count disagrees with ranges")
     return ranges
+
+
+def casefold_mappings() -> list[tuple[int, str]]:
+    """Unicode 15.0.0 full default case folding, verified against the asset digest."""
+    asset = load_asset(CASEFOLD_ASSET)
+    mappings = [
+        (int(source, 16), "".join(chr(int(piece, 16)) for piece in folded))
+        for source, folded in asset["mappings"].items()
+    ]
+    mappings.sort()
+    canonical = ";".join(
+        f"{source:X}>{','.join(f'{ord(char):X}' for char in folded)}"
+        for source, folded in mappings
+    )
+    digest = hashlib.sha256(canonical.encode()).hexdigest()
+    if digest != asset["canonical_sha256"]:
+        raise SystemExit(
+            f"{CASEFOLD_ASSET.name}: canonical digest mismatch\n"
+            f"  expected {asset['canonical_sha256']}\n  got      {digest}"
+        )
+    if len(mappings) != asset["mapping_count"]:
+        raise SystemExit(f"{CASEFOLD_ASSET.name}: mapping_count disagrees with mappings")
+    return mappings
 
 
 def render_assigned_sql() -> str:
@@ -61,11 +106,7 @@ def render_assigned_sql() -> str:
 
 
 def render_casefold_sql() -> str:
-    mappings = [
-        (codepoint, folded)
-        for codepoint in range(sys.maxunicode + 1)
-        if (folded := chr(codepoint).casefold()) != chr(codepoint)
-    ]
+    mappings = casefold_mappings()
     lines = [CASEFOLD_BEGIN_MARKER, "-- Generated by supabase/scripts/generate_casefold_sql.py."]
     for offset in range(0, len(mappings), 400):
         chunk = mappings[offset : offset + 400]
@@ -89,34 +130,34 @@ def replace_generated_block(source: str, begin_marker: str, end_marker: str, gen
     return source[:begin] + generated + source[line_end:]
 
 
-def main() -> None:
-    if sys.version_info[:3] != EXPECTED_PYTHON:
-        raise SystemExit(
-            f"Python {EXPECTED_PYTHON!r} required, got {sys.version_info[:3]!r}"
-        )
-    if unicodedata.unidata_version != EXPECTED_UNICODE:
-        raise SystemExit(
-            f"Unicode {EXPECTED_UNICODE} required, got {unicodedata.unidata_version}"
-        )
+def splice(source: str) -> str:
+    source = replace_generated_block(
+        source, ASSIGNED_BEGIN_MARKER, ASSIGNED_END_MARKER, render_assigned_sql()
+    )
+    return replace_generated_block(
+        source, CASEFOLD_BEGIN_MARKER, CASEFOLD_END_MARKER, render_casefold_sql()
+    )
 
-    assigned = render_assigned_sql()
-    casefold = render_casefold_sql()
-    if len(sys.argv) == 3 and sys.argv[1] == "--rewrite":
+
+def main() -> None:
+    if len(sys.argv) == 3 and sys.argv[1] in ("--rewrite", "--check"):
         path = Path(sys.argv[2])
         source = path.read_text(encoding="utf-8")
-        source = replace_generated_block(
-            source, ASSIGNED_BEGIN_MARKER, ASSIGNED_END_MARKER, assigned
-        )
-        source = replace_generated_block(
-            source, CASEFOLD_BEGIN_MARKER, CASEFOLD_END_MARKER, casefold
-        )
-        path.write_text(source, encoding="utf-8")
-        print(f"rewrote {path} with Unicode {EXPECTED_UNICODE} case-fold rows")
+        rendered = splice(source)
+        if sys.argv[1] == "--check":
+            if rendered != source:
+                raise SystemExit(f"{path}: generated blocks differ from the assets")
+            print(f"{path}: generated blocks match the contract assets byte for byte")
+            return
+        path.write_text(rendered, encoding="utf-8")
+        print(f"rewrote {path} from {ASSET_DIR}")
         return
     if len(sys.argv) != 1:
-        raise SystemExit("usage: generate_casefold_sql.py [--rewrite MIGRATION.sql]")
-    print(assigned)
-    print(casefold)
+        raise SystemExit(
+            "usage: generate_casefold_sql.py [--rewrite MIGRATION.sql | --check MIGRATION.sql]"
+        )
+    print(render_assigned_sql())
+    print(render_casefold_sql())
 
 
 if __name__ == "__main__":
