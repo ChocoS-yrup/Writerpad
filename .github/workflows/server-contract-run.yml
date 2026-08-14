@@ -45,6 +45,7 @@ jobs:
         with:
           ref: ${{ env.EXPECTED_CHECKOUT_SHA }}
           persist-credentials: false
+          fetch-depth: 2
       - name: Confirm exact checkout SHA
         run: >-
           python -c "import os, subprocess;
@@ -101,10 +102,16 @@ jobs:
           psql -v ON_ERROR_STOP=1 -f supabase/migrations/20260811010000_sync_contract_0_1_0_foundation.sql
           psql -v ON_ERROR_STOP=1 -f supabase/migrations/20260811020000_sync_contract_0_1_0_rpcs.sql
           psql -v ON_ERROR_STOP=1 -f supabase/migrations/20260813063251_sync_contract_0_3_0_storage_name_v2.sql
+          psql -v ON_ERROR_STOP=1 -f supabase/migrations/20260814182850_rpc_auth_error_envelope_corrective.sql
           psql -v ON_ERROR_STOP=1 -f supabase/migrations/20260811010000_sync_contract_0_1_0_foundation.sql
           psql -v ON_ERROR_STOP=1 -f supabase/migrations/20260811020000_sync_contract_0_1_0_rpcs.sql
           psql -v ON_ERROR_STOP=1 -f supabase/migrations/20260813063251_sync_contract_0_3_0_storage_name_v2.sql
+          psql -v ON_ERROR_STOP=1 -f supabase/migrations/20260814182850_rpc_auth_error_envelope_corrective.sql
       - name: Run atomic, replay, cancellation, and migration checks
         run: psql -v ON_ERROR_STOP=1 -f supabase/tests/stage7_server_contract.sql
       - name: Run storage-name-v2 server conformance
         run: psql -v ON_ERROR_STOP=1 -f supabase/tests/storage_name_v2_server_contract.sql
+      - name: Run RPC auth error-envelope conformance
+        run: psql -v ON_ERROR_STOP=1 -f supabase/tests/rpc_auth_error_envelope.sql
+      - name: Check patch whitespace
+        run: git diff --check "${EXPECTED_CHECKOUT_SHA}^1" "${EXPECTED_CHECKOUT_SHA}"
