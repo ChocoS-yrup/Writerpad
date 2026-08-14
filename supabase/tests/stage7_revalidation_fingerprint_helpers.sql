@@ -14,7 +14,7 @@ begin
   execute pg_catalog.format(
     $sql$
       select pg_catalog.md5(
-        pg_catalog.coalesce(
+        coalesce(
           pg_catalog.string_agg(v_row_json, E'\n' order by v_row_json),
           ''
         )

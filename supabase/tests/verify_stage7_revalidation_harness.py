@@ -121,6 +121,10 @@ def main() -> None:
         and "create or replace function private." not in helpers.lower(),
         "fingerprint helpers must not create persistent functions",
     )
+    require(
+        "pg_catalog.coalesce(" not in (lowered + helpers.lower()),
+        "COALESCE is special syntax and must not be schema-qualified",
+    )
 
     for marker in (
         "image: postgres:17.6",
