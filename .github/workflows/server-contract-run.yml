@@ -65,6 +65,7 @@ jobs:
         run: |
           python sync-contract/scripts/verify_contract.py
           python supabase/tests/verify_stage7_server.py
+          python supabase/tests/verify_stage7_revalidation_harness.py
       - name: Apply operational v2 snapshot to a blank PostgreSQL 17.6 database
         shell: bash
         run: |
@@ -113,5 +114,97 @@ jobs:
         run: psql -v ON_ERROR_STOP=1 -f supabase/tests/storage_name_v2_server_contract.sql
       - name: Run RPC auth error-envelope conformance
         run: psql -v ON_ERROR_STOP=1 -f supabase/tests/rpc_auth_error_envelope.sql
+      - name: Prepare local-only Stage 7 revalidation identities and allowlist
+        shell: bash
+        run: |
+          psql -v ON_ERROR_STOP=1 <<'SQL'
+          insert into auth.users(id) values
+            ('92000000-0000-4000-8000-000000000701'),
+            ('92000000-0000-4000-8000-000000000702')
+          on conflict (id) do nothing;
+
+          select set_config(
+            'request.jwt.claim.sub',
+            '92000000-0000-4000-8000-000000000701',
+            false
+          );
+          select public.ensure_project(
+            '02000000-0000-4000-8000-000000000703',
+            'Existing fixture fingerprint guard'
+          );
+
+          update private.sync_contract_allowlist set enabled = false;
+          update private.sync_contract_allowlist
+          set enabled = true
+          where contract_version = '0.3.0'
+            and canonical_contract_sha256 =
+              'abbd234c7b65d422c2e43d468f4f724e069ede26a3d24be22eb8b35cce8ebf2c'
+            and contract_git_commit =
+              '2705fcbda0be440a9d82a5e1919f2885c6166727'
+            and revoked_at is null;
+
+          do $assert$
+          begin
+            if (select count(*) from private.sync_contract_allowlist where enabled) <> 1
+               or not exists (
+                 select 1
+                 from private.sync_contract_allowlist
+                 where contract_version = '0.3.0'
+                   and canonical_contract_sha256 =
+                     'abbd234c7b65d422c2e43d468f4f724e069ede26a3d24be22eb8b35cce8ebf2c'
+                   and contract_git_commit =
+                     '2705fcbda0be440a9d82a5e1919f2885c6166727'
+                   and enabled
+                   and revoked_at is null
+               ) then
+              raise exception 'LOCAL_HARNESS_ALLOWLIST_PREP_FAILED';
+            end if;
+          end
+          $assert$;
+          SQL
+      - name: Verify authenticated harness transaction rollback
+        shell: bash
+        run: |
+          if psql -v ON_ERROR_STOP=1 <<'SQL'
+          begin;
+          select set_config(
+            'request.jwt.claim.sub',
+            '92000000-0000-4000-8000-000000000701',
+            true
+          );
+          set local role authenticated;
+          select public.ensure_project(
+            '02000000-0000-4000-8000-000000000706',
+            'Harness rollback probe'
+          );
+          select 1 / 0;
+          commit;
+          SQL
+          then
+            echo "rollback probe unexpectedly committed"
+            exit 1
+          fi
+
+          probe_counts="$(psql -Atq -v ON_ERROR_STOP=1 -c "
+            select
+              (select count(*) from public.projects
+               where project_id = '02000000-0000-4000-8000-000000000706'),
+              (select count(*) from public.project_members
+               where project_id = '02000000-0000-4000-8000-000000000706')
+          ")"
+          echo "rollback_probe_counts=$probe_counts"
+          test "$probe_counts" = "0|0"
+      - name: Run exact Stage 7 staging revalidation harness locally
+        run: >-
+          psql
+          -v ON_ERROR_STOP=1
+          -v test_run_id=02000000-0000-4000-8000-000000000705
+          -v server_project_id=02000000-0000-4000-8000-000000000704
+          -v client_build_id=ci-stage7-revalidation-harness
+          -v owner_user_id=92000000-0000-4000-8000-000000000701
+          -v unauthorized_user_id=92000000-0000-4000-8000-000000000702
+          -v existing_fixture_project_id=02000000-0000-4000-8000-000000000703
+          -v expected_existing_fixture_fingerprint=capture
+          -f supabase/tests/stage7_staging_revalidation_harness.sql
       - name: Check patch whitespace
         run: git diff --check "${EXPECTED_CHECKOUT_SHA}^1" "${EXPECTED_CHECKOUT_SHA}"
