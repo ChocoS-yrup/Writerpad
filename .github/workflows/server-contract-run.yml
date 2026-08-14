@@ -45,6 +45,7 @@ jobs:
         with:
           ref: ${{ env.EXPECTED_CHECKOUT_SHA }}
           persist-credentials: false
+          fetch-depth: 2
       - name: Confirm exact checkout SHA
         run: >-
           python -c "import os, subprocess;
