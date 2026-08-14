@@ -106,63 +106,78 @@ select public.document_commit($request$
 $request$::jsonb) as response \gset forbidden_document_
 reset role;
 
-do $assert_envelopes$
+select (
+  :'unauth_atomic_response'::jsonb->>'kind' = 'atomic_structure_commit_failure'
+  and :'unauth_atomic_response'::jsonb->>'batch_id' = '10000000-0000-4000-8000-000000009901'
+  and :'unauth_atomic_response'::jsonb->>'batch_payload_sha256' = repeat('a', 64)
+  and :'unauth_atomic_response'::jsonb->>'status' = 'rejected'
+  and not (:'unauth_atomic_response'::jsonb->>'applied')::boolean
+  and :'unauth_atomic_response'::jsonb->'error'->>'code' = 'AUTH_REQUIRED'
+  and :'unauth_atomic_response'::jsonb->'error'->>'message' <> ''
+  and :'unauth_atomic_response'::jsonb->'error'->>'failed_sequence' is null
+  and :'unauth_atomic_response'::jsonb->'results' = '[]'::jsonb
+) as passed \gset unauth_atomic_assert_
+\if :unauth_atomic_assert_passed
+\else
+  \echo 'unauthenticated atomic envelope invalid: ' :unauth_atomic_response
+  \quit 1
+\endif
+
+select (
+  :'unauth_document_response'::jsonb->>'kind' = 'document_commit_failure'
+  and :'unauth_document_response'::jsonb->>'batch_id' = '10000000-0000-4000-8000-000000009902'
+  and :'unauth_document_response'::jsonb->>'batch_payload_sha256' = repeat('b', 64)
+  and :'unauth_document_response'::jsonb->>'status' = 'rejected'
+  and not (:'unauth_document_response'::jsonb->>'applied')::boolean
+  and :'unauth_document_response'::jsonb->'error'->>'code' = 'AUTH_REQUIRED'
+  and :'unauth_document_response'::jsonb->'error'->>'message' <> ''
+  and :'unauth_document_response'::jsonb->'error'->>'failed_sequence' is null
+  and :'unauth_document_response'::jsonb->'results' = '[]'::jsonb
+) as passed \gset unauth_document_assert_
+\if :unauth_document_assert_passed
+\else
+  \echo 'unauthenticated document envelope invalid: ' :unauth_document_response
+  \quit 1
+\endif
+
+select (
+  :'forbidden_atomic_response'::jsonb->>'kind' = 'atomic_structure_commit_failure'
+  and :'forbidden_atomic_response'::jsonb->>'batch_id' = '10000000-0000-4000-8000-000000009903'
+  and :'forbidden_atomic_response'::jsonb->>'batch_payload_sha256' = repeat('c', 64)
+  and :'forbidden_atomic_response'::jsonb->>'status' = 'rejected'
+  and not (:'forbidden_atomic_response'::jsonb->>'applied')::boolean
+  and :'forbidden_atomic_response'::jsonb->'error'->>'code' = 'FORBIDDEN'
+  and :'forbidden_atomic_response'::jsonb->'error'->>'message' <> ''
+  and :'forbidden_atomic_response'::jsonb->'error'->>'failed_sequence' is null
+  and :'forbidden_atomic_response'::jsonb->'results' = '[]'::jsonb
+) as passed \gset forbidden_atomic_assert_
+\if :forbidden_atomic_assert_passed
+\else
+  \echo 'forbidden atomic envelope invalid: ' :forbidden_atomic_response
+  \quit 1
+\endif
+
+select (
+  :'forbidden_document_response'::jsonb->>'kind' = 'document_commit_failure'
+  and :'forbidden_document_response'::jsonb->>'batch_id' = '10000000-0000-4000-8000-000000009904'
+  and :'forbidden_document_response'::jsonb->>'batch_payload_sha256' = repeat('d', 64)
+  and :'forbidden_document_response'::jsonb->>'status' = 'rejected'
+  and not (:'forbidden_document_response'::jsonb->>'applied')::boolean
+  and :'forbidden_document_response'::jsonb->'error'->>'code' = 'FORBIDDEN'
+  and :'forbidden_document_response'::jsonb->'error'->>'message' <> ''
+  and :'forbidden_document_response'::jsonb->'error'->>'failed_sequence' is null
+  and :'forbidden_document_response'::jsonb->'results' = '[]'::jsonb
+) as passed \gset forbidden_document_assert_
+\if :forbidden_document_assert_passed
+\else
+  \echo 'forbidden document envelope invalid: ' :forbidden_document_response
+  \quit 1
+\endif
+
+do $assert_counts$
 declare
-  v_response jsonb;
   v_before record;
 begin
-  v_response := :'unauth_atomic_response'::jsonb;
-  if v_response->>'kind' <> 'atomic_structure_commit_failure'
-     or v_response->>'batch_id' <> '10000000-0000-4000-8000-000000009901'
-     or v_response->>'batch_payload_sha256' <> repeat('a', 64)
-     or v_response->>'status' <> 'rejected'
-     or (v_response->>'applied')::boolean
-     or v_response->'error'->>'code' <> 'AUTH_REQUIRED'
-     or v_response->'error'->>'message' = ''
-     or v_response->'error'->>'failed_sequence' is not null
-     or v_response->'results' <> '[]'::jsonb then
-    raise exception 'unauthenticated atomic envelope invalid: %', v_response;
-  end if;
-
-  v_response := :'unauth_document_response'::jsonb;
-  if v_response->>'kind' <> 'document_commit_failure'
-     or v_response->>'batch_id' <> '10000000-0000-4000-8000-000000009902'
-     or v_response->>'batch_payload_sha256' <> repeat('b', 64)
-     or v_response->>'status' <> 'rejected'
-     or (v_response->>'applied')::boolean
-     or v_response->'error'->>'code' <> 'AUTH_REQUIRED'
-     or v_response->'error'->>'message' = ''
-     or v_response->'error'->>'failed_sequence' is not null
-     or v_response->'results' <> '[]'::jsonb then
-    raise exception 'unauthenticated document envelope invalid: %', v_response;
-  end if;
-
-  v_response := :'forbidden_atomic_response'::jsonb;
-  if v_response->>'kind' <> 'atomic_structure_commit_failure'
-     or v_response->>'batch_id' <> '10000000-0000-4000-8000-000000009903'
-     or v_response->>'batch_payload_sha256' <> repeat('c', 64)
-     or v_response->>'status' <> 'rejected'
-     or (v_response->>'applied')::boolean
-     or v_response->'error'->>'code' <> 'FORBIDDEN'
-     or v_response->'error'->>'message' = ''
-     or v_response->'error'->>'failed_sequence' is not null
-     or v_response->'results' <> '[]'::jsonb then
-    raise exception 'forbidden atomic envelope invalid: %', v_response;
-  end if;
-
-  v_response := :'forbidden_document_response'::jsonb;
-  if v_response->>'kind' <> 'document_commit_failure'
-     or v_response->>'batch_id' <> '10000000-0000-4000-8000-000000009904'
-     or v_response->>'batch_payload_sha256' <> repeat('d', 64)
-     or v_response->>'status' <> 'rejected'
-     or (v_response->>'applied')::boolean
-     or v_response->'error'->>'code' <> 'FORBIDDEN'
-     or v_response->'error'->>'message' = ''
-     or v_response->'error'->>'failed_sequence' is not null
-     or v_response->'results' <> '[]'::jsonb then
-    raise exception 'forbidden document envelope invalid: %', v_response;
-  end if;
-
   select * into v_before from rpc_auth_before;
   if (select count(*) from public.sync_batches) <> v_before.batches
      or (select count(*) from public.sync_batch_results) <> v_before.batch_results
@@ -178,6 +193,6 @@ begin
     raise exception 'authorization rejection changed persistent state';
   end if;
 end;
-$assert_envelopes$;
+$assert_counts$;
 
 select 'rpc_auth_error_envelope: PASS' as result;
