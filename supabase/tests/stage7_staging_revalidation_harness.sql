@@ -505,426 +505,6 @@ select (
   \quit 1
 \endif
 commit;
-
-select
-  (select d.revision from public.documents as d
-   where d.document_id = :'h_normal_document_id'::uuid) as document_revision,
-  (select count(*) from public.document_versions as dv
-   where dv.document_id = :'h_normal_document_id'::uuid) as version_count,
-  (select count(*) from public.sync_batches as b
-   where b.project_id = :'server_project_id'::uuid) as batch_count,
-  (select count(*) from public.sync_operations as o
-   where o.project_id = :'server_project_id'::uuid) as operation_count
-\gset response_loss_before_
-
--- A second real connection replays the normal document request after the
--- original response could have been lost.
-\connect -reuse-previous=on
-\pset pager off
-\set ON_ERROR_STOP on
-set plpgsql.variable_conflict = error;
-select pg_catalog.set_config(
-  'request.jwt.claim.sub', :'owner_user_id', false
-);
-
-with payload as (
-  select pg_catalog.jsonb_build_object(
-    'parent_folder_id', null,
-    'name', 'Normal.md',
-    'content', :'normal_content',
-    'content_sha256', private.content_sha256(:'normal_content'),
-    'content_byte_count', pg_catalog.octet_length(:'normal_content'),
-    'is_deleted', false,
-    'structure_revision', 1
-  ) as value
-),
-intent as (
-  select pg_catalog.jsonb_build_object(
-    'sequence', 1,
-    'operation_id', :'h_normal_operation_id',
-    'batch_id', :'h_normal_batch_id',
-    'entity_kind', 'document',
-    'document_id', :'h_normal_document_id',
-    'intent_kind', 'create',
-    'base_revision', 0,
-    'payload_sha256', private.jsonb_rfc8785_sha256(p.value),
-    'payload', p.value
-  ) as value
-  from payload as p
-),
-intents as (
-  select pg_catalog.jsonb_build_array(i.value) as value from intent as i
-),
-batch as (
-  select pg_catalog.jsonb_build_object(
-    'batch_id', :'h_normal_batch_id',
-    'writer_device_id', :'h_writer_device_id',
-    'client_build_id', :'client_build_id',
-    'sync_protocol_version', 3,
-    'contract_version', :'contract_version',
-    'canonical_contract_sha256', :'contract_sha256',
-    'client_capabilities', :'client_capabilities_json'::jsonb,
-    'batch_payload_sha256', private.jsonb_rfc8785_sha256(i.value)
-  ) as value
-  from intents as i
-),
-request as (
-  select pg_catalog.jsonb_build_object(
-    'kind', 'document_commit_request',
-    'project_id', :'server_project_id',
-    'project_sync_mode', 'LEGACY',
-    'migration_epoch', 0,
-    'batch', b.value,
-    'ordered_intents', i.value
-  ) as value
-  from batch as b cross join intents as i
-)
-select public.document_commit(r.value) as response
-from request as r
-\gset response_loss_
-
-select (
-  :'response_loss_response'::jsonb->>'status' = 'replayed'
-  and (:'response_loss_response'::jsonb->>'applied')::boolean
-  and (select d.revision from public.documents as d
-       where d.document_id = :'h_normal_document_id'::uuid)
-      = :'response_loss_before_document_revision'::bigint
-  and (select count(*) from public.document_versions as dv
-       where dv.document_id = :'h_normal_document_id'::uuid)
-      = :'response_loss_before_version_count'::bigint
-  and (select count(*) from public.sync_batches as b
-       where b.project_id = :'server_project_id'::uuid)
-      = :'response_loss_before_batch_count'::bigint
-  and (select count(*) from public.sync_operations as o
-       where o.project_id = :'server_project_id'::uuid)
-      = :'response_loss_before_operation_count'::bigint
-) as passed
-\gset response_loss_assert_
-\if :response_loss_assert_passed
-\else
-  \echo 'separate-connection response-loss replay mismatch: ' :response_loss_response
-  \quit 1
-\endif
-
-select
-  (select count(*) from public.sync_batches as b
-   where b.project_id = :'server_project_id'::uuid) as batches,
-  (select count(*) from public.sync_batch_results as br
-   join public.sync_batches as b on b.batch_id = br.batch_id
-   where b.project_id = :'server_project_id'::uuid) as batch_results,
-  (select count(*) from public.sync_operations as o
-   where o.project_id = :'server_project_id'::uuid) as operations,
-  (select count(*) from public.sync_operation_attempts as a
-   join public.sync_operations as o on o.operation_id = a.operation_id
-   where o.project_id = :'server_project_id'::uuid) as attempts,
-  (select count(*) from public.sync_operation_events as e
-   join public.sync_operations as o on o.operation_id = e.operation_id
-   where o.project_id = :'server_project_id'::uuid) as events,
-  (select count(*) from public.folders as f
-   where f.project_id = :'server_project_id'::uuid) as folders,
-  (select count(*) from public.documents as d
-   where d.project_id = :'server_project_id'::uuid) as documents,
-  (select count(*) from public.document_versions as dv
-   where dv.project_id = :'server_project_id'::uuid) as document_versions,
-  (select count(*) from public.tree_orders as t
-   where t.project_id = :'server_project_id'::uuid) as tree_orders
-\gset auth_before_
-
--- Canonical AUTH_REQUIRED envelopes through the anon role.
-select pg_catalog.set_config('request.jwt.claim.sub', '', false);
-set role anon;
-select public.atomic_structure_commit(pg_catalog.jsonb_build_object(
-  'kind', 'atomic_structure_commit_request',
-  'project_id', :'server_project_id',
-  'project_sync_mode', 'LEGACY',
-  'migration_epoch', 0,
-  'batch', pg_catalog.jsonb_build_object(
-    'batch_id', :'h_auth_atomic_batch_id',
-    'batch_payload_sha256', pg_catalog.repeat('a', 64)
-  )
-)) as response
-\gset auth_atomic_
-reset role;
-
-select pg_catalog.set_config('request.jwt.claim.sub', '', false);
-set role anon;
-select public.document_commit(pg_catalog.jsonb_build_object(
-  'kind', 'document_commit_request',
-  'project_id', :'server_project_id',
-  'project_sync_mode', 'LEGACY',
-  'migration_epoch', 0,
-  'batch', pg_catalog.jsonb_build_object(
-    'batch_id', :'h_auth_document_batch_id',
-    'batch_payload_sha256', pg_catalog.repeat('b', 64)
-  )
-)) as response
-\gset auth_document_
-reset role;
-
--- Canonical FORBIDDEN envelopes through the authenticated role.
-select pg_catalog.set_config(
-  'request.jwt.claim.sub', :'unauthorized_user_id', false
-);
-set role authenticated;
-select public.atomic_structure_commit(pg_catalog.jsonb_build_object(
-  'kind', 'atomic_structure_commit_request',
-  'project_id', :'server_project_id',
-  'project_sync_mode', 'LEGACY',
-  'migration_epoch', 0,
-  'batch', pg_catalog.jsonb_build_object(
-    'batch_id', :'h_forbidden_atomic_batch_id',
-    'batch_payload_sha256', pg_catalog.repeat('c', 64)
-  )
-)) as response
-\gset forbidden_atomic_
-reset role;
-
-select pg_catalog.set_config(
-  'request.jwt.claim.sub', :'unauthorized_user_id', false
-);
-set role authenticated;
-select public.document_commit(pg_catalog.jsonb_build_object(
-  'kind', 'document_commit_request',
-  'project_id', :'server_project_id',
-  'project_sync_mode', 'LEGACY',
-  'migration_epoch', 0,
-  'batch', pg_catalog.jsonb_build_object(
-    'batch_id', :'h_forbidden_document_batch_id',
-    'writer_device_id', :'h_writer_device_id',
-    'client_build_id', :'client_build_id',
-    'sync_protocol_version', 3,
-    'contract_version', :'contract_version',
-    'canonical_contract_sha256', :'contract_sha256',
-    'client_capabilities', :'client_capabilities_json'::jsonb,
-    'batch_payload_sha256', pg_catalog.repeat('d', 64)
-  ),
-  'ordered_intents', pg_catalog.jsonb_build_array(
-    pg_catalog.jsonb_build_object(
-      'sequence', 1,
-      'operation_id', pg_catalog.gen_random_uuid(),
-      'batch_id', :'h_forbidden_document_batch_id',
-      'entity_kind', 'document',
-      'document_id', pg_catalog.gen_random_uuid(),
-      'intent_kind', 'create',
-      'base_revision', 0,
-      'payload_sha256', pg_catalog.repeat('e', 64),
-      'payload', pg_catalog.jsonb_build_object(
-        'parent_folder_id', null,
-        'name', 'forbidden.md',
-        'content', '',
-        'content_sha256',
-          'e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855',
-        'content_byte_count', 0,
-        'is_deleted', false,
-        'structure_revision', 1
-      )
-    )
-  )
-)) as response
-\gset forbidden_document_
-reset role;
-
-select (
-  :'auth_atomic_response'::jsonb->>'kind' = 'atomic_structure_commit_failure'
-  and :'auth_atomic_response'::jsonb->>'status' = 'rejected'
-  and not (:'auth_atomic_response'::jsonb->>'applied')::boolean
-  and :'auth_atomic_response'::jsonb->'error'->>'code' = 'AUTH_REQUIRED'
-  and :'auth_atomic_response'::jsonb->'error'->>'message' <> ''
-  and :'auth_atomic_response'::jsonb->'error'->>'failed_sequence' is null
-  and :'auth_atomic_response'::jsonb->'results' = '[]'::jsonb
-  and :'auth_document_response'::jsonb->>'kind' = 'document_commit_failure'
-  and :'auth_document_response'::jsonb->>'status' = 'rejected'
-  and not (:'auth_document_response'::jsonb->>'applied')::boolean
-  and :'auth_document_response'::jsonb->'error'->>'code' = 'AUTH_REQUIRED'
-  and :'auth_document_response'::jsonb->'error'->>'message' <> ''
-  and :'auth_document_response'::jsonb->'error'->>'failed_sequence' is null
-  and :'auth_document_response'::jsonb->'results' = '[]'::jsonb
-  and :'forbidden_atomic_response'::jsonb->>'kind'
-      = 'atomic_structure_commit_failure'
-  and :'forbidden_atomic_response'::jsonb->>'status' = 'rejected'
-  and not (:'forbidden_atomic_response'::jsonb->>'applied')::boolean
-  and :'forbidden_atomic_response'::jsonb->'error'->>'code' = 'FORBIDDEN'
-  and :'forbidden_atomic_response'::jsonb->'error'->>'message' <> ''
-  and :'forbidden_atomic_response'::jsonb->'error'->>'failed_sequence' is null
-  and :'forbidden_atomic_response'::jsonb->'results' = '[]'::jsonb
-  and :'forbidden_document_response'::jsonb->>'kind'
-      = 'document_commit_failure'
-  and :'forbidden_document_response'::jsonb->>'status' = 'rejected'
-  and not (:'forbidden_document_response'::jsonb->>'applied')::boolean
-  and :'forbidden_document_response'::jsonb->'error'->>'code' = 'FORBIDDEN'
-  and :'forbidden_document_response'::jsonb->'error'->>'message' <> ''
-  and :'forbidden_document_response'::jsonb->'error'->>'failed_sequence' is null
-  and :'forbidden_document_response'::jsonb->'results' = '[]'::jsonb
-) as passed
-\gset auth_envelopes_
-\if :auth_envelopes_passed
-\else
-  \echo 'canonical AUTH_REQUIRED or FORBIDDEN envelope mismatch'
-  \quit 1
-\endif
-
-select (
-  (select count(*) from public.sync_batches as b
-   where b.project_id = :'server_project_id'::uuid)
-    = :'auth_before_batches'::bigint
-  and (select count(*) from public.sync_batch_results as br
-       join public.sync_batches as b on b.batch_id = br.batch_id
-       where b.project_id = :'server_project_id'::uuid)
-    = :'auth_before_batch_results'::bigint
-  and (select count(*) from public.sync_operations as o
-       where o.project_id = :'server_project_id'::uuid)
-    = :'auth_before_operations'::bigint
-  and (select count(*) from public.sync_operation_attempts as a
-       join public.sync_operations as o on o.operation_id = a.operation_id
-       where o.project_id = :'server_project_id'::uuid)
-    = :'auth_before_attempts'::bigint
-  and (select count(*) from public.sync_operation_events as e
-       join public.sync_operations as o on o.operation_id = e.operation_id
-       where o.project_id = :'server_project_id'::uuid)
-    = :'auth_before_events'::bigint
-  and (select count(*) from public.folders as f
-       where f.project_id = :'server_project_id'::uuid)
-    = :'auth_before_folders'::bigint
-  and (select count(*) from public.documents as d
-       where d.project_id = :'server_project_id'::uuid)
-    = :'auth_before_documents'::bigint
-  and (select count(*) from public.document_versions as dv
-       where dv.project_id = :'server_project_id'::uuid)
-    = :'auth_before_document_versions'::bigint
-  and (select count(*) from public.tree_orders as t
-       where t.project_id = :'server_project_id'::uuid)
-    = :'auth_before_tree_orders'::bigint
-) as passed
-\gset unauthorized_writes_
-\if :unauthorized_writes_passed
-\else
-  \echo 'authorization rejection changed persistent state'
-  \quit 1
-\endif
-
--- Recreate only session-local helpers after the connection switch.
-\ir stage7_revalidation_fingerprint_helpers.sql
-select
-  pg_temp.writerpad_state_without_project(
-    :'server_project_id'::uuid
-  ) as existing_state_after,
-  pg_temp.writerpad_project_snapshot(
-    :'existing_fixture_project_id'::uuid
-  ) as existing_fixture_after,
-  pg_temp.writerpad_project_snapshot(
-    :'server_project_id'::uuid
-  ) as new_fixture_fingerprint
-\gset final_fingerprint_
-
-select (
-  :'final_fingerprint_existing_state_after'
-    = :'fingerprint_existing_state_before'
-  and :'final_fingerprint_existing_fixture_after'
-    = :'fingerprint_existing_fixture_before'
-  and (
-    :'expected_existing_fixture_fingerprint' = 'capture'
-    or :'final_fingerprint_existing_fixture_after'
-      = :'expected_existing_fixture_fingerprint'
-  )
-  and (select count(*) from private.sync_contract_allowlist as a
-       where a.contract_version = :'contract_version'
-         and a.canonical_contract_sha256 = :'contract_sha256'
-         and a.contract_git_commit = :'contract_git_commit'
-         and a.enabled
-         and a.revoked_at is null) = 1
-  and (select count(*) from private.sync_contract_allowlist as a
-       where a.enabled) = 1
-  and not exists (
-    select 1 from public.project_sync_settings as s
-    where s.project_id = :'server_project_id'::uuid
-  )
-  and not exists (
-    select 1 from public.project_sync_migrations as m
-    where m.project_id = :'server_project_id'::uuid
-  )
-  and not exists (
-    select 1 from public.project_sync_migrations as m
-    where m.completed_at is null
-  )
-  and (select count(*) from public.projects as p
-       where p.project_id = :'server_project_id'::uuid) = 1
-  and (select count(*) from public.project_members as pm
-       where pm.project_id = :'server_project_id'::uuid) = 1
-  and (select count(*) from public.folders as f
-       where f.project_id = :'server_project_id'::uuid) = 1
-  and (select count(*) from public.documents as d
-       where d.project_id = :'server_project_id'::uuid) = 2
-  and (select count(*) from public.document_versions as dv
-       where dv.project_id = :'server_project_id'::uuid) = 2
-  and (select count(*) from public.tree_orders as t
-       where t.project_id = :'server_project_id'::uuid) = 1
-  and (select count(*) from public.sync_batches as b
-       where b.project_id = :'server_project_id'::uuid) = 4
-  and (select count(*) from public.sync_batch_results as br
-       join public.sync_batches as b on b.batch_id = br.batch_id
-       where b.project_id = :'server_project_id'::uuid) = 4
-  and (select count(*) from public.sync_operations as o
-       where o.project_id = :'server_project_id'::uuid) = 6
-  and (select count(*) from public.sync_operation_attempts as a
-       join public.sync_operations as o on o.operation_id = a.operation_id
-       where o.project_id = :'server_project_id'::uuid) = 6
-  and (select count(*) from public.sync_operation_events as e
-       join public.sync_operations as o on o.operation_id = e.operation_id
-       where o.project_id = :'server_project_id'::uuid) = 18
-  and not exists (
-    select 1 from public.folders as f
-    where f.folder_id = :'h_rollback_folder_id'::uuid
-  )
-  and (select p.name from public.projects as p
-       where p.project_id = :'server_project_id'::uuid)
-      = 'Stage 7 storage-name-v2 revalidation ' || :'test_run_id'
-  and (select f.name from public.folders as f
-       where f.folder_id = :'h_atomic_folder_id'::uuid) = 'Atomic Folder'
-  and (select d.name from public.documents as d
-       where d.document_id = :'h_normal_document_id'::uuid) = 'Normal.md'
-  and (select d.name from public.documents as d
-       where d.document_id = :'h_empty_document_id'::uuid) = 'Empty.md'
-) as passed
-\gset final_audit_
-\if :final_audit_passed
-\else
-  \echo 'final Stage 7 harness audit mismatch'
-  \quit 1
-\endif
-
-select pg_catalog.jsonb_build_object(
-  'result', 'PASS',
-  'test_run_id', :'test_run_id',
-  'server_project_id', :'server_project_id',
-  'client_build_id', :'client_build_id',
-  'contract_version', :'contract_version',
-  'canonical_contract_sha256', :'contract_sha256',
-  'existing_state_fingerprint', :'final_fingerprint_existing_state_after',
-  'existing_fixture_fingerprint', :'final_fingerprint_existing_fixture_after',
-  'new_fixture_fingerprint', :'final_fingerprint_new_fixture_fingerprint',
-  'project_sync_mode', 'LEGACY',
-  'migration_epoch', 0,
-  'active_contract_sha256', null,
-  'automatic_project_migrations', 0,
-  'name_rewrites', 0,
-  'unauthorized_persistent_writes', 0,
-  'new_fixture_rows', pg_catalog.jsonb_build_object(
-    'projects', 1,
-    'project_members', 1,
-    'folders', 1,
-    'documents', 2,
-    'document_versions', 2,
-    'tree_orders', 1,
-    'sync_batches', 4,
-    'sync_batch_results', 4,
-    'sync_operations', 6,
-    'sync_operation_attempts', 6,
-    'sync_operation_events', 18,
-    'project_sync_settings', 0,
-    'project_sync_migrations', 0
-  )
-) as stage7_staging_revalidation;
-
 -- A real second connection proves the contract pin is transaction-local.
 \connect -reuse-previous=on
 \pset pager off
@@ -1478,3 +1058,422 @@ select (
   \quit 1
 \endif
 commit;
+
+select
+  (select d.revision from public.documents as d
+   where d.document_id = :'h_normal_document_id'::uuid) as document_revision,
+  (select count(*) from public.document_versions as dv
+   where dv.document_id = :'h_normal_document_id'::uuid) as version_count,
+  (select count(*) from public.sync_batches as b
+   where b.project_id = :'server_project_id'::uuid) as batch_count,
+  (select count(*) from public.sync_operations as o
+   where o.project_id = :'server_project_id'::uuid) as operation_count
+\gset response_loss_before_
+
+-- A second real connection replays the normal document request after the
+-- original response could have been lost.
+\connect -reuse-previous=on
+\pset pager off
+\set ON_ERROR_STOP on
+set plpgsql.variable_conflict = error;
+select pg_catalog.set_config(
+  'request.jwt.claim.sub', :'owner_user_id', false
+);
+
+with payload as (
+  select pg_catalog.jsonb_build_object(
+    'parent_folder_id', null,
+    'name', 'Normal.md',
+    'content', :'normal_content',
+    'content_sha256', private.content_sha256(:'normal_content'),
+    'content_byte_count', pg_catalog.octet_length(:'normal_content'),
+    'is_deleted', false,
+    'structure_revision', 1
+  ) as value
+),
+intent as (
+  select pg_catalog.jsonb_build_object(
+    'sequence', 1,
+    'operation_id', :'h_normal_operation_id',
+    'batch_id', :'h_normal_batch_id',
+    'entity_kind', 'document',
+    'document_id', :'h_normal_document_id',
+    'intent_kind', 'create',
+    'base_revision', 0,
+    'payload_sha256', private.jsonb_rfc8785_sha256(p.value),
+    'payload', p.value
+  ) as value
+  from payload as p
+),
+intents as (
+  select pg_catalog.jsonb_build_array(i.value) as value from intent as i
+),
+batch as (
+  select pg_catalog.jsonb_build_object(
+    'batch_id', :'h_normal_batch_id',
+    'writer_device_id', :'h_writer_device_id',
+    'client_build_id', :'client_build_id',
+    'sync_protocol_version', 3,
+    'contract_version', :'contract_version',
+    'canonical_contract_sha256', :'contract_sha256',
+    'client_capabilities', :'client_capabilities_json'::jsonb,
+    'batch_payload_sha256', private.jsonb_rfc8785_sha256(i.value)
+  ) as value
+  from intents as i
+),
+request as (
+  select pg_catalog.jsonb_build_object(
+    'kind', 'document_commit_request',
+    'project_id', :'server_project_id',
+    'project_sync_mode', 'LEGACY',
+    'migration_epoch', 0,
+    'batch', b.value,
+    'ordered_intents', i.value
+  ) as value
+  from batch as b cross join intents as i
+)
+select public.document_commit(r.value) as response
+from request as r
+\gset response_loss_
+
+select (
+  :'response_loss_response'::jsonb->>'status' = 'replayed'
+  and (:'response_loss_response'::jsonb->>'applied')::boolean
+  and (select d.revision from public.documents as d
+       where d.document_id = :'h_normal_document_id'::uuid)
+      = :'response_loss_before_document_revision'::bigint
+  and (select count(*) from public.document_versions as dv
+       where dv.document_id = :'h_normal_document_id'::uuid)
+      = :'response_loss_before_version_count'::bigint
+  and (select count(*) from public.sync_batches as b
+       where b.project_id = :'server_project_id'::uuid)
+      = :'response_loss_before_batch_count'::bigint
+  and (select count(*) from public.sync_operations as o
+       where o.project_id = :'server_project_id'::uuid)
+      = :'response_loss_before_operation_count'::bigint
+) as passed
+\gset response_loss_assert_
+\if :response_loss_assert_passed
+\else
+  \echo 'separate-connection response-loss replay mismatch: ' :response_loss_response
+  \quit 1
+\endif
+
+select
+  (select count(*) from public.sync_batches as b
+   where b.project_id = :'server_project_id'::uuid) as batches,
+  (select count(*) from public.sync_batch_results as br
+   join public.sync_batches as b on b.batch_id = br.batch_id
+   where b.project_id = :'server_project_id'::uuid) as batch_results,
+  (select count(*) from public.sync_operations as o
+   where o.project_id = :'server_project_id'::uuid) as operations,
+  (select count(*) from public.sync_operation_attempts as a
+   join public.sync_operations as o on o.operation_id = a.operation_id
+   where o.project_id = :'server_project_id'::uuid) as attempts,
+  (select count(*) from public.sync_operation_events as e
+   join public.sync_operations as o on o.operation_id = e.operation_id
+   where o.project_id = :'server_project_id'::uuid) as events,
+  (select count(*) from public.folders as f
+   where f.project_id = :'server_project_id'::uuid) as folders,
+  (select count(*) from public.documents as d
+   where d.project_id = :'server_project_id'::uuid) as documents,
+  (select count(*) from public.document_versions as dv
+   where dv.project_id = :'server_project_id'::uuid) as document_versions,
+  (select count(*) from public.tree_orders as t
+   where t.project_id = :'server_project_id'::uuid) as tree_orders
+\gset auth_before_
+
+-- Canonical AUTH_REQUIRED envelopes through the anon role.
+select pg_catalog.set_config('request.jwt.claim.sub', '', false);
+set role anon;
+select public.atomic_structure_commit(pg_catalog.jsonb_build_object(
+  'kind', 'atomic_structure_commit_request',
+  'project_id', :'server_project_id',
+  'project_sync_mode', 'LEGACY',
+  'migration_epoch', 0,
+  'batch', pg_catalog.jsonb_build_object(
+    'batch_id', :'h_auth_atomic_batch_id',
+    'batch_payload_sha256', pg_catalog.repeat('a', 64)
+  )
+)) as response
+\gset auth_atomic_
+reset role;
+
+select pg_catalog.set_config('request.jwt.claim.sub', '', false);
+set role anon;
+select public.document_commit(pg_catalog.jsonb_build_object(
+  'kind', 'document_commit_request',
+  'project_id', :'server_project_id',
+  'project_sync_mode', 'LEGACY',
+  'migration_epoch', 0,
+  'batch', pg_catalog.jsonb_build_object(
+    'batch_id', :'h_auth_document_batch_id',
+    'batch_payload_sha256', pg_catalog.repeat('b', 64)
+  )
+)) as response
+\gset auth_document_
+reset role;
+
+-- Canonical FORBIDDEN envelopes through the authenticated role.
+select pg_catalog.set_config(
+  'request.jwt.claim.sub', :'unauthorized_user_id', false
+);
+set role authenticated;
+select public.atomic_structure_commit(pg_catalog.jsonb_build_object(
+  'kind', 'atomic_structure_commit_request',
+  'project_id', :'server_project_id',
+  'project_sync_mode', 'LEGACY',
+  'migration_epoch', 0,
+  'batch', pg_catalog.jsonb_build_object(
+    'batch_id', :'h_forbidden_atomic_batch_id',
+    'batch_payload_sha256', pg_catalog.repeat('c', 64)
+  )
+)) as response
+\gset forbidden_atomic_
+reset role;
+
+select pg_catalog.set_config(
+  'request.jwt.claim.sub', :'unauthorized_user_id', false
+);
+set role authenticated;
+select public.document_commit(pg_catalog.jsonb_build_object(
+  'kind', 'document_commit_request',
+  'project_id', :'server_project_id',
+  'project_sync_mode', 'LEGACY',
+  'migration_epoch', 0,
+  'batch', pg_catalog.jsonb_build_object(
+    'batch_id', :'h_forbidden_document_batch_id',
+    'writer_device_id', :'h_writer_device_id',
+    'client_build_id', :'client_build_id',
+    'sync_protocol_version', 3,
+    'contract_version', :'contract_version',
+    'canonical_contract_sha256', :'contract_sha256',
+    'client_capabilities', :'client_capabilities_json'::jsonb,
+    'batch_payload_sha256', pg_catalog.repeat('d', 64)
+  ),
+  'ordered_intents', pg_catalog.jsonb_build_array(
+    pg_catalog.jsonb_build_object(
+      'sequence', 1,
+      'operation_id', pg_catalog.gen_random_uuid(),
+      'batch_id', :'h_forbidden_document_batch_id',
+      'entity_kind', 'document',
+      'document_id', pg_catalog.gen_random_uuid(),
+      'intent_kind', 'create',
+      'base_revision', 0,
+      'payload_sha256', pg_catalog.repeat('e', 64),
+      'payload', pg_catalog.jsonb_build_object(
+        'parent_folder_id', null,
+        'name', 'forbidden.md',
+        'content', '',
+        'content_sha256',
+          'e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855',
+        'content_byte_count', 0,
+        'is_deleted', false,
+        'structure_revision', 1
+      )
+    )
+  )
+)) as response
+\gset forbidden_document_
+reset role;
+
+select (
+  :'auth_atomic_response'::jsonb->>'kind' = 'atomic_structure_commit_failure'
+  and :'auth_atomic_response'::jsonb->>'status' = 'rejected'
+  and not (:'auth_atomic_response'::jsonb->>'applied')::boolean
+  and :'auth_atomic_response'::jsonb->'error'->>'code' = 'AUTH_REQUIRED'
+  and :'auth_atomic_response'::jsonb->'error'->>'message' <> ''
+  and :'auth_atomic_response'::jsonb->'error'->>'failed_sequence' is null
+  and :'auth_atomic_response'::jsonb->'results' = '[]'::jsonb
+  and :'auth_document_response'::jsonb->>'kind' = 'document_commit_failure'
+  and :'auth_document_response'::jsonb->>'status' = 'rejected'
+  and not (:'auth_document_response'::jsonb->>'applied')::boolean
+  and :'auth_document_response'::jsonb->'error'->>'code' = 'AUTH_REQUIRED'
+  and :'auth_document_response'::jsonb->'error'->>'message' <> ''
+  and :'auth_document_response'::jsonb->'error'->>'failed_sequence' is null
+  and :'auth_document_response'::jsonb->'results' = '[]'::jsonb
+  and :'forbidden_atomic_response'::jsonb->>'kind'
+      = 'atomic_structure_commit_failure'
+  and :'forbidden_atomic_response'::jsonb->>'status' = 'rejected'
+  and not (:'forbidden_atomic_response'::jsonb->>'applied')::boolean
+  and :'forbidden_atomic_response'::jsonb->'error'->>'code' = 'FORBIDDEN'
+  and :'forbidden_atomic_response'::jsonb->'error'->>'message' <> ''
+  and :'forbidden_atomic_response'::jsonb->'error'->>'failed_sequence' is null
+  and :'forbidden_atomic_response'::jsonb->'results' = '[]'::jsonb
+  and :'forbidden_document_response'::jsonb->>'kind'
+      = 'document_commit_failure'
+  and :'forbidden_document_response'::jsonb->>'status' = 'rejected'
+  and not (:'forbidden_document_response'::jsonb->>'applied')::boolean
+  and :'forbidden_document_response'::jsonb->'error'->>'code' = 'FORBIDDEN'
+  and :'forbidden_document_response'::jsonb->'error'->>'message' <> ''
+  and :'forbidden_document_response'::jsonb->'error'->>'failed_sequence' is null
+  and :'forbidden_document_response'::jsonb->'results' = '[]'::jsonb
+) as passed
+\gset auth_envelopes_
+\if :auth_envelopes_passed
+\else
+  \echo 'canonical AUTH_REQUIRED or FORBIDDEN envelope mismatch'
+  \quit 1
+\endif
+
+select (
+  (select count(*) from public.sync_batches as b
+   where b.project_id = :'server_project_id'::uuid)
+    = :'auth_before_batches'::bigint
+  and (select count(*) from public.sync_batch_results as br
+       join public.sync_batches as b on b.batch_id = br.batch_id
+       where b.project_id = :'server_project_id'::uuid)
+    = :'auth_before_batch_results'::bigint
+  and (select count(*) from public.sync_operations as o
+       where o.project_id = :'server_project_id'::uuid)
+    = :'auth_before_operations'::bigint
+  and (select count(*) from public.sync_operation_attempts as a
+       join public.sync_operations as o on o.operation_id = a.operation_id
+       where o.project_id = :'server_project_id'::uuid)
+    = :'auth_before_attempts'::bigint
+  and (select count(*) from public.sync_operation_events as e
+       join public.sync_operations as o on o.operation_id = e.operation_id
+       where o.project_id = :'server_project_id'::uuid)
+    = :'auth_before_events'::bigint
+  and (select count(*) from public.folders as f
+       where f.project_id = :'server_project_id'::uuid)
+    = :'auth_before_folders'::bigint
+  and (select count(*) from public.documents as d
+       where d.project_id = :'server_project_id'::uuid)
+    = :'auth_before_documents'::bigint
+  and (select count(*) from public.document_versions as dv
+       where dv.project_id = :'server_project_id'::uuid)
+    = :'auth_before_document_versions'::bigint
+  and (select count(*) from public.tree_orders as t
+       where t.project_id = :'server_project_id'::uuid)
+    = :'auth_before_tree_orders'::bigint
+) as passed
+\gset unauthorized_writes_
+\if :unauthorized_writes_passed
+\else
+  \echo 'authorization rejection changed persistent state'
+  \quit 1
+\endif
+
+-- Recreate only session-local helpers after the connection switch.
+\ir stage7_revalidation_fingerprint_helpers.sql
+select
+  pg_temp.writerpad_state_without_project(
+    :'server_project_id'::uuid
+  ) as existing_state_after,
+  pg_temp.writerpad_project_snapshot(
+    :'existing_fixture_project_id'::uuid
+  ) as existing_fixture_after,
+  pg_temp.writerpad_project_snapshot(
+    :'server_project_id'::uuid
+  ) as new_fixture_fingerprint
+\gset final_fingerprint_
+
+select (
+  :'final_fingerprint_existing_state_after'
+    = :'fingerprint_existing_state_before'
+  and :'final_fingerprint_existing_fixture_after'
+    = :'fingerprint_existing_fixture_before'
+  and (
+    :'expected_existing_fixture_fingerprint' = 'capture'
+    or :'final_fingerprint_existing_fixture_after'
+      = :'expected_existing_fixture_fingerprint'
+  )
+  and (select count(*) from private.sync_contract_allowlist as a
+       where a.contract_version = :'contract_version'
+         and a.canonical_contract_sha256 = :'contract_sha256'
+         and a.contract_git_commit = :'contract_git_commit'
+         and a.enabled
+         and a.revoked_at is null) = 1
+  and (select count(*) from private.sync_contract_allowlist as a
+       where a.enabled) = 1
+  and not exists (
+    select 1 from public.project_sync_settings as s
+    where s.project_id = :'server_project_id'::uuid
+  )
+  and not exists (
+    select 1 from public.project_sync_migrations as m
+    where m.project_id = :'server_project_id'::uuid
+  )
+  and not exists (
+    select 1 from public.project_sync_migrations as m
+    where m.completed_at is null
+  )
+  and (select count(*) from public.projects as p
+       where p.project_id = :'server_project_id'::uuid) = 1
+  and (select count(*) from public.project_members as pm
+       where pm.project_id = :'server_project_id'::uuid) = 1
+  and (select count(*) from public.folders as f
+       where f.project_id = :'server_project_id'::uuid) = 1
+  and (select count(*) from public.documents as d
+       where d.project_id = :'server_project_id'::uuid) = 2
+  and (select count(*) from public.document_versions as dv
+       where dv.project_id = :'server_project_id'::uuid) = 2
+  and (select count(*) from public.tree_orders as t
+       where t.project_id = :'server_project_id'::uuid) = 1
+  and (select count(*) from public.sync_batches as b
+       where b.project_id = :'server_project_id'::uuid) = 4
+  and (select count(*) from public.sync_batch_results as br
+       join public.sync_batches as b on b.batch_id = br.batch_id
+       where b.project_id = :'server_project_id'::uuid) = 4
+  and (select count(*) from public.sync_operations as o
+       where o.project_id = :'server_project_id'::uuid) = 6
+  and (select count(*) from public.sync_operation_attempts as a
+       join public.sync_operations as o on o.operation_id = a.operation_id
+       where o.project_id = :'server_project_id'::uuid) = 6
+  and (select count(*) from public.sync_operation_events as e
+       join public.sync_operations as o on o.operation_id = e.operation_id
+       where o.project_id = :'server_project_id'::uuid) = 18
+  and not exists (
+    select 1 from public.folders as f
+    where f.folder_id = :'h_rollback_folder_id'::uuid
+  )
+  and (select p.name from public.projects as p
+       where p.project_id = :'server_project_id'::uuid)
+      = 'Stage 7 storage-name-v2 revalidation ' || :'test_run_id'
+  and (select f.name from public.folders as f
+       where f.folder_id = :'h_atomic_folder_id'::uuid) = 'Atomic Folder'
+  and (select d.name from public.documents as d
+       where d.document_id = :'h_normal_document_id'::uuid) = 'Normal.md'
+  and (select d.name from public.documents as d
+       where d.document_id = :'h_empty_document_id'::uuid) = 'Empty.md'
+) as passed
+\gset final_audit_
+\if :final_audit_passed
+\else
+  \echo 'final Stage 7 harness audit mismatch'
+  \quit 1
+\endif
+
+select pg_catalog.jsonb_build_object(
+  'result', 'PASS',
+  'test_run_id', :'test_run_id',
+  'server_project_id', :'server_project_id',
+  'client_build_id', :'client_build_id',
+  'contract_version', :'contract_version',
+  'canonical_contract_sha256', :'contract_sha256',
+  'existing_state_fingerprint', :'final_fingerprint_existing_state_after',
+  'existing_fixture_fingerprint', :'final_fingerprint_existing_fixture_after',
+  'new_fixture_fingerprint', :'final_fingerprint_new_fixture_fingerprint',
+  'project_sync_mode', 'LEGACY',
+  'migration_epoch', 0,
+  'active_contract_sha256', null,
+  'automatic_project_migrations', 0,
+  'name_rewrites', 0,
+  'unauthorized_persistent_writes', 0,
+  'new_fixture_rows', pg_catalog.jsonb_build_object(
+    'projects', 1,
+    'project_members', 1,
+    'folders', 1,
+    'documents', 2,
+    'document_versions', 2,
+    'tree_orders', 1,
+    'sync_batches', 4,
+    'sync_batch_results', 4,
+    'sync_operations', 6,
+    'sync_operation_attempts', 6,
+    'sync_operation_events', 18,
+    'project_sync_settings', 0,
+    'project_sync_migrations', 0
+  )
+) as stage7_staging_revalidation;

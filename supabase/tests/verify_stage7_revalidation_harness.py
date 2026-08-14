@@ -42,6 +42,18 @@ def main() -> None:
         "do $" not in lowered and "\ndeclare\n" not in lowered,
         "main harness must remain declarative and contain no PL/pgSQL DO variables",
     )
+    ordered_sections = (
+        "A real second connection proves the contract pin is transaction-local.",
+        "All persistent functional cases share one transaction.",
+        "original response could have been lost.",
+        "Canonical AUTH_REQUIRED envelopes through the anon role.",
+        "final Stage 7 harness audit mismatch",
+    )
+    section_offsets = [harness.index(marker) for marker in ordered_sections]
+    require(
+        section_offsets == sorted(section_offsets),
+        "route reset, functional transaction, replay, auth, and final audit are out of order",
+    )
     require(
         re.search(r"\b([a-z_][a-z0-9_]*)\s*=\s*\1\b", lowered) is None,
         "self-comparison pattern can hide a variable/column collision",
