@@ -23,6 +23,7 @@ BASELINE_NAME = "20260811000000_operational_v2_schema_baseline_snapshot.sql"
 FOUNDATION_NAME = "20260811010000_sync_contract_0_1_0_foundation.sql"
 RPC_NAME = "20260811020000_sync_contract_0_1_0_rpcs.sql"
 STORAGE_V2_NAME = "20260813063251_sync_contract_0_3_0_storage_name_v2.sql"
+CORRECTIVE_NAME = "20260814182850_rpc_auth_error_envelope_corrective.sql"
 SOURCE_CATALOG_DIGEST = (
     "6c71ff36a90993dc327557b4a1a64c0dfb27b347134ed89e7f126dae76c6ff9a"
 )
@@ -57,8 +58,8 @@ def main() -> None:
     sql_paths = sorted(MIGRATIONS.glob("*.sql"))
     require(
         [path.name for path in sql_paths]
-        == [BASELINE_NAME, FOUNDATION_NAME, RPC_NAME, STORAGE_V2_NAME],
-        "the server chain must be snapshot, Stage 7 foundation/RPC, then storage-name-v2",
+        == [BASELINE_NAME, FOUNDATION_NAME, RPC_NAME, STORAGE_V2_NAME, CORRECTIVE_NAME],
+        "the server chain must end with the additive auth-envelope corrective migration",
     )
     for name, expected in IMMUTABLE_MIGRATION_DIGESTS.items():
         require(sha256(MIGRATIONS / name) == expected, f"historical migration changed: {name}")
@@ -66,6 +67,7 @@ def main() -> None:
     sql = "\n".join(path.read_text(encoding="utf-8") for path in sql_paths)
     baseline = (MIGRATIONS / BASELINE_NAME).read_text(encoding="utf-8")
     storage_v2 = (MIGRATIONS / STORAGE_V2_NAME).read_text(encoding="utf-8")
+    corrective = (MIGRATIONS / CORRECTIVE_NAME).read_text(encoding="utf-8")
 
     for marker in (
         "purpose: bootstrap blank staging/new environment",
@@ -107,6 +109,22 @@ def main() -> None:
         "storage_name_v2_casefold", "storage_name_v2_nonzero_ccc",
     ):
         require(name in sql, f"missing server object: {name}")
+
+    for marker in (
+        "atomic_structure_commit_legacy",
+        "document_commit_legacy",
+        "AUTH_REQUIRED",
+        "FORBIDDEN",
+        "grant execute on function public.atomic_structure_commit(jsonb)",
+        "grant execute on function public.document_commit(jsonb)",
+        "to anon, authenticated",
+        "set search_path = ''",
+    ):
+        require(marker in corrective, f"auth-envelope corrective guard missing: {marker}")
+    require(
+        "from public, anon, authenticated" in corrective,
+        "legacy RPC entry points must not remain callable by client roles",
+    )
 
     for guard in (
         "LEGACY_EPOCH_0", "CONTRACT_BATCH", "CONTRACT_NOT_ALLOWED",
