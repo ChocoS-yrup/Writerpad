@@ -113,4 +113,4 @@ jobs:
       - name: Run RPC auth error-envelope conformance
         run: psql -v ON_ERROR_STOP=1 -f supabase/tests/rpc_auth_error_envelope.sql
       - name: Check patch whitespace
-        run: git diff --check
+        run: git diff --check "${EXPECTED_CHECKOUT_SHA}^1" "${EXPECTED_CHECKOUT_SHA}"

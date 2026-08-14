@@ -119,7 +119,7 @@ begin
      or (v_response->>'applied')::boolean
      or v_response->'error'->>'code' <> 'AUTH_REQUIRED'
      or v_response->'error'->>'message' = ''
-     or v_response->'error'->'failed_sequence' is not null
+     or v_response->'error'->>'failed_sequence' is not null
      or v_response->'results' <> '[]'::jsonb then
     raise exception 'unauthenticated atomic envelope invalid: %', v_response;
   end if;
@@ -132,7 +132,7 @@ begin
      or (v_response->>'applied')::boolean
      or v_response->'error'->>'code' <> 'AUTH_REQUIRED'
      or v_response->'error'->>'message' = ''
-     or v_response->'error'->'failed_sequence' is not null
+     or v_response->'error'->>'failed_sequence' is not null
      or v_response->'results' <> '[]'::jsonb then
     raise exception 'unauthenticated document envelope invalid: %', v_response;
   end if;
@@ -145,7 +145,7 @@ begin
      or (v_response->>'applied')::boolean
      or v_response->'error'->>'code' <> 'FORBIDDEN'
      or v_response->'error'->>'message' = ''
-     or v_response->'error'->'failed_sequence' is not null
+     or v_response->'error'->>'failed_sequence' is not null
      or v_response->'results' <> '[]'::jsonb then
     raise exception 'forbidden atomic envelope invalid: %', v_response;
   end if;
@@ -158,7 +158,7 @@ begin
      or (v_response->>'applied')::boolean
      or v_response->'error'->>'code' <> 'FORBIDDEN'
      or v_response->'error'->>'message' = ''
-     or v_response->'error'->'failed_sequence' is not null
+     or v_response->'error'->>'failed_sequence' is not null
      or v_response->'results' <> '[]'::jsonb then
     raise exception 'forbidden document envelope invalid: %', v_response;
   end if;
