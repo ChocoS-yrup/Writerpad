@@ -17,6 +17,7 @@ final class AppEnvironment: ObservableObject {
     let exporter: any Exporting
     let backupStore: any BackupStoring
     let backupPolicyStore: any BackupPolicyStoring
+    let projectBackupCoordinator: ProjectBackupCoordinator
     let restoreCoordinator: DocumentRestoreCoordinator
     let clock: any AppClock
     let futureChangeNotifier: any FutureChangeNotifying
@@ -46,6 +47,7 @@ final class AppEnvironment: ObservableObject {
         searchService: any Searching,
         backupStore: any BackupStoring,
         backupPolicyStore: any BackupPolicyStoring,
+        projectBackupCoordinator: ProjectBackupCoordinator,
         restoreCoordinator: DocumentRestoreCoordinator,
         clock: any AppClock,
         futureChangeNotifier: any FutureChangeNotifying,
@@ -79,6 +81,7 @@ final class AppEnvironment: ObservableObject {
         )
         self.backupStore = backupStore
         self.backupPolicyStore = backupPolicyStore
+        self.projectBackupCoordinator = projectBackupCoordinator
         self.restoreCoordinator = restoreCoordinator
         self.clock = clock
         self.futureChangeNotifier = futureChangeNotifier
@@ -351,6 +354,11 @@ final class AppEnvironment: ObservableObject {
                 .appendingPathComponent(".writerpad-backup-policy.json"),
             legacyWorkspaceLocator: workspaceLocator
         )
+        let projectBackupCoordinator = ProjectBackupCoordinator(
+            projectRepository: repository,
+            documentRepository: repository,
+            workspaceLocator: workspaceLocator
+        )
         let binderCommands = LocalBinderCommandService(
             metadataStore: repository,
             workspaceStateRepository: repository,
@@ -385,6 +393,7 @@ final class AppEnvironment: ObservableObject {
             searchService: searchService,
             backupStore: backupStore,
             backupPolicyStore: backupPolicyStore,
+            projectBackupCoordinator: projectBackupCoordinator,
             restoreCoordinator: restoreCoordinator,
             clock: clock,
             futureChangeNotifier: futureChangeNotifier,

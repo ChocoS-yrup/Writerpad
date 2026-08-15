@@ -117,6 +117,76 @@ final class ProjectBackupStoreTests: XCTestCase {
         XCTAssertEqual(try files(at: restored), expectedFiles)
     }
 
+    @MainActor
+    func testCoordinatorBacksUpProjectFromLocalUUIDRepositories() async throws {
+        let fileManager = FileManager.default
+        let root = fileManager.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? fileManager.removeItem(at: root) }
+
+        let projectsRoot = root.appendingPathComponent("Projects", isDirectory: true)
+        let resolver = ProjectPathResolver(projectsRootURL: projectsRoot)
+        let paths = try resolver.createStandardStructure(forProjectNamed: "통합 시험")
+        let container = try WriterPadMetadataStore.makeContainer(isStoredInMemoryOnly: true)
+        let repository = SwiftDataMetadataRepository(modelContainer: container)
+        let locator = RepositoryProjectWorkspaceLocator(
+            projectRepository: repository,
+            pathResolver: resolver
+        )
+
+        let date = Date(timeIntervalSince1970: 1_700_000_000)
+        let projectID = projectID("3f2a0000-0000-4000-8000-000000000001")
+        let mainID = documentID("8c1d0000-0000-4000-8000-000000000001")
+        let draftID = documentID("b47e0000-0000-4000-8000-000000000001")
+        let chapterID = documentID("d90f0000-0000-4000-8000-000000000001")
+        let project = Project(
+            id: projectID,
+            name: "통합 시험",
+            createdAt: date,
+            modifiedAt: date
+        )
+        try await repository.save(project)
+        try await repository.save(node(mainID, projectID, .folder, nil, "메인", 0, date))
+        try await repository.save(
+            node(draftID, projectID, .folder, mainID, "메인/초안", 0, date)
+        )
+        try await repository.save(
+            node(chapterID, projectID, .text, draftID, "메인/초안/001화.txt", 0, date)
+        )
+
+        let draft = paths.workspaceRootURL
+            .appendingPathComponent("메인/초안", isDirectory: true)
+        try fileManager.createDirectory(at: draft, withIntermediateDirectories: true)
+        let originalBytes = Data([0xEF, 0xBB, 0xBF])
+            + Data("합성 문장\r\n둘째 줄\n".utf8)
+        try originalBytes.write(to: draft.appendingPathComponent("001화.txt"))
+        let originalTree = try tree(at: paths.workspaceRootURL)
+
+        let coordinator = ProjectBackupCoordinator(
+            projectRepository: repository,
+            documentRepository: repository,
+            workspaceLocator: locator
+        )
+        let package = root.appendingPathComponent("독립 백업", isDirectory: true)
+        let restored = root.appendingPathComponent("빈 복원 위치", isDirectory: true)
+
+        let backup = try await coordinator.createBackup(for: projectID, at: package)
+        let restore = try await coordinator.restoreBackup(at: package, to: restored)
+
+        XCTAssertEqual(try tree(at: paths.workspaceRootURL), originalTree)
+        XCTAssertEqual(restore.manifest, backup.manifest)
+        XCTAssertEqual(backup.manifest.project.uuid, projectID.rawValue.uuidString.lowercased())
+        XCTAssertEqual(
+            Set(backup.manifest.nodes.map(\.uuid)),
+            Set([mainID, draftID, chapterID].map { $0.rawValue.uuidString.lowercased() })
+        )
+        XCTAssertEqual(
+            try Data(contentsOf: restored.appendingPathComponent(
+                chapterID.rawValue.uuidString.lowercased()
+            )),
+            originalBytes
+        )
+    }
+
     private func projectID(_ value: String) -> ProjectID {
         ProjectID(rawValue: UUID(uuidString: value)!)
     }

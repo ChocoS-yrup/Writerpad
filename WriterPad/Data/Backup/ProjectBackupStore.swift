@@ -73,6 +73,57 @@ enum ProjectBackupError: Error, Equatable {
     case fileVerificationFailed(String)
 }
 
+enum ProjectBackupCoordinatorError: Error, Equatable {
+    case missingProject(ProjectID)
+}
+
+/// 로컬 UUID 메타데이터와 실제 집필모드 경로를 독립 프로젝트 백업에 연결한다.
+actor ProjectBackupCoordinator {
+    private let projectRepository: any ProjectRepository
+    private let documentRepository: any DocumentRepository
+    private let workspaceLocator: any ProjectWorkspaceLocating
+    private let backupStore: ProjectBackupStore
+
+    init(
+        projectRepository: any ProjectRepository,
+        documentRepository: any DocumentRepository,
+        workspaceLocator: any ProjectWorkspaceLocating,
+        backupStore: ProjectBackupStore = ProjectBackupStore()
+    ) {
+        self.projectRepository = projectRepository
+        self.documentRepository = documentRepository
+        self.workspaceLocator = workspaceLocator
+        self.backupStore = backupStore
+    }
+
+    func createBackup(
+        for projectID: ProjectID,
+        at packageURL: URL
+    ) async throws -> ProjectBackupReceipt {
+        guard let project = try await projectRepository.project(id: projectID) else {
+            throw ProjectBackupCoordinatorError.missingProject(projectID)
+        }
+        let documents = try await documentRepository.documents(in: projectID)
+        let workspace = try await workspaceLocator.workspaceRoot(for: projectID)
+        return try await backupStore.createBackup(
+            project: project,
+            documents: documents,
+            workspaceURL: workspace,
+            packageURL: packageURL
+        )
+    }
+
+    func restoreBackup(
+        at packageURL: URL,
+        to emptyWorkspaceURL: URL
+    ) async throws -> ProjectRestoreReceipt {
+        try await backupStore.restoreBackup(
+            at: packageURL,
+            to: emptyWorkspaceURL
+        )
+    }
+}
+
 /// 제목 기반 원본을 UUID 파일과 논리 트리 manifest로 독립 보존한다.
 actor ProjectBackupStore {
     static let manifestFileName = "manifest.json"
