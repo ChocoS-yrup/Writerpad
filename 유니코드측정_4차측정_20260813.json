@@ -1,0 +1,120 @@
+{
+ "measured_on": "2026-08-13",
+ "round": 4,
+ "runtime": {
+  "os": "iPadOS 26.5 simulator + macOS 26.5.2",
+  "icu": "78.1",
+  "icu_unicode": "17.0.0"
+ },
+ "S8_result": {
+  "verdict": "DEFECT FIRES — clause (b) is required",
+  "U+FF9E": {
+   "hybrid_divergent": 825,
+   "inside_baseline_pua_excluded": 96,
+   "truncation_type": 96,
+   "ordering_type": 0
+  },
+  "U+FF9F": {
+   "hybrid_divergent": 217,
+   "inside_baseline_pua_excluded": 20,
+   "truncation_type": 20,
+   "ordering_type": 0
+  },
+  "matches_windows_combining_partner_prediction": {
+   "U+3099": 96,
+   "U+309A": 20
+  },
+  "example": "U+13046 (EGYPTIAN HIEROGLYPH) + U+FF9E -> U+3094 (KATAKANA VU); correct is U+13046 U+3099"
+ },
+ "tibetan_three": {
+  "U+0F73": {
+   "hybrid_divergent": 53,
+   "inside_baseline_pua_excluded": 0
+  },
+  "U+0F75": {
+   "hybrid_divergent": 53,
+   "inside_baseline_pua_excluded": 0
+  },
+  "U+0F81": {
+   "hybrid_divergent": 53,
+   "inside_baseline_pua_excluded": 0
+  },
+  "verdict": "not needed in the rule — U+0F71 has 0 combining partners; residual divergence is all outside baseline"
+ },
+ "non_adjacent_shapes_with_FF9E": {
+  "N1 X+'a'+FF9E": {
+   "divergent": 39,
+   "inside_baseline_pua_excluded": 0
+  },
+  "N2 FF9E+X": {
+   "divergent": 41,
+   "inside_baseline_pua_excluded": 0
+  },
+  "N3 X+FF9E+FF9E": {
+   "divergent": 825,
+   "inside_baseline_pua_excluded": 96
+  },
+  "verdict": "adjacency remains a necessary condition for U+FF9E too"
+ },
+ "hangul_jamo_check": {
+  "rationale": "Hangul jamo have ccc=0 yet compose in NFKC; iPad produces decomposed jamo, so this is the highest-exposure case for this app",
+  "U+1161 (V jamo)": {
+   "hybrid_divergent": 39,
+   "inside_baseline_pua_excluded": 0
+  },
+  "U+11A8 (T jamo)": {
+   "hybrid_divergent": 39,
+   "inside_baseline_pua_excluded": 0
+  },
+  "verdict": "SAFE — algorithmic Hangul composition is not affected by the truncation defect",
+  "probe_note": "U+11100 & 0xFFFF = U+1100; had truncation fired, U+11100 U+1161 would have become U+AC00"
+ },
+ "independent_verification_of_windows_enumerations": {
+  "disguised_combining_marks": {
+   "claimed": 5,
+   "reproduced": 5,
+   "list": [
+    3955,
+    3957,
+    3969,
+    65438,
+    65439
+   ]
+  },
+  "bmp_to_supplementary_nfkc": {
+   "claimed": 7,
+   "reproduced": 7,
+   "list": [
+    64108,
+    64207,
+    64208,
+    64209,
+    64213,
+    64214,
+    64215
+   ]
+  },
+  "combining_partner_counts": {
+   "U+3099": 96,
+   "U+309A": 20,
+   "U+0F71": 0,
+   "U+0301": 278
+  }
+ },
+ "final_rule": {
+  "reject_before_nfkc": "a supplementary-plane scalar immediately followed by (a) a scalar with ccc != 0, or (b) U+FF9E / U+FF9F",
+  "not_included": [
+   3955,
+   3957,
+   3969,
+   64108,
+   64207,
+   64208,
+   64209,
+   64213,
+   64214,
+   64215
+  ],
+  "missed_cases": 0
+ }
+}

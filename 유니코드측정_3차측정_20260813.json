@@ -1,0 +1,136 @@
+{
+ "measured_on": "2026-08-13",
+ "round": 3,
+ "runtime": {
+  "os": "iPadOS 26.5 (23F77) simulator + macOS 26.5.2 (25F84)",
+  "icu": "78.1",
+  "icu_unicode": "17.0.0"
+ },
+ "digest_regime": {
+  "chosen": "%04X + ':' + result-or-error-code + LF, U+0000 ascending, surrogates skipped",
+  "windows_values_reproduced_by_ipad_reference": 4,
+  "contract_baseline_digest": "b9368cb675858781cc42633c87b5501aa784b28a7aba858124aef5e2861dc1af",
+  "ipad_current_implementation": "6c0a85edcaea6cfebd58dd8b29c72ea6a0c3c8461abcc36735d59f5004e4d31e",
+  "ipad_hybrid_frozen_casefold": "72d107e04a09413ec068328d4a737739e71e45136b7f89fb304db4dbdaf3021f",
+  "retired": "f651fbb1... (다른 규약: %X, 거부 없이 파이프라인 원본)",
+  "rejected_single_scalars_under_contract": 59
+ },
+ "divergence_vs_contract_baseline": {
+  "current_implementation": 276,
+  "hybrid": 40,
+  "hybrid_remaining_list": [
+   42993,
+   93544,
+   93545,
+   93546,
+   117974,
+   117975,
+   117976,
+   117977,
+   117978,
+   117979,
+   117980,
+   117981,
+   117982,
+   117983,
+   117984,
+   117985,
+   117986,
+   117987,
+   117988,
+   117989,
+   117990,
+   117991,
+   117992,
+   117993,
+   117994,
+   117995,
+   117996,
+   117997,
+   117998,
+   117999,
+   118000,
+   118001,
+   118002,
+   118003,
+   118004,
+   118005,
+   118006,
+   118007,
+   118008,
+   118009
+  ],
+  "hybrid_remaining_all_outside_baseline": true
+ },
+ "measurement_2_hybrid_vectors": {
+  "runtime": "iPadOS 26.5 simulator",
+  "passed": 15,
+  "failed": 0
+ },
+ "measurement_3_existing_names_ipad_side": {
+  "names_scanned": 1424,
+  "sources": 4,
+  "pua": 0,
+  "tag": 0,
+  "vs_supplement": 0,
+  "supplementary_plane": 0,
+  "vs_bmp": 0,
+  "scope_caveat": "repo working tree + simulator containers only; the physical iPad's own store is not reachable from this Mac"
+ },
+ "measurement_1_trigger_condition": {
+  "shapes": {
+   "S1": {
+    "desc": "X + mark (adjacent)",
+    "adjacent": true,
+    "divergent": 1960,
+    "inside_baseline": 550,
+    "inside_baseline_pua_excluded": 270
+   },
+   "S2": {
+    "desc": "X + 'a' + mark (non-adjacent)",
+    "adjacent": false,
+    "divergent": 86,
+    "inside_baseline": 0,
+    "inside_baseline_pua_excluded": 0
+   },
+   "S3": {
+    "desc": "'a' + X + mark (adjacent)",
+    "adjacent": true,
+    "divergent": 1966,
+    "inside_baseline": 550,
+    "inside_baseline_pua_excluded": 270
+   },
+   "S4": {
+    "desc": "X + mark + mark2 (adjacent)",
+    "adjacent": true,
+    "divergent": 2070,
+    "inside_baseline": 583,
+    "inside_baseline_pua_excluded": 285
+   },
+   "S5": {
+    "desc": "mark + X (mark precedes)",
+    "adjacent": false,
+    "divergent": 96,
+    "inside_baseline": 0,
+    "inside_baseline_pua_excluded": 0
+   },
+   "S6": {
+    "desc": "X + 'a' (no mark at all)",
+    "adjacent": false,
+    "divergent": 86,
+    "inside_baseline": 0,
+    "inside_baseline_pua_excluded": 0
+   },
+   "S7": {
+    "desc": "X + X + mark (first X non-adjacent)",
+    "adjacent": true,
+    "divergent": 1962,
+    "inside_baseline": 550,
+    "inside_baseline_pua_excluded": 270
+   }
+  },
+  "conclusion": "adjacency is necessary: every non-adjacent shape has 0 inside-baseline divergence",
+  "rule_3b_missed_cases": 0,
+  "caveat": "seven shapes with U+0301/U+0327; empirical, not a proof over all strings"
+ }
+}
