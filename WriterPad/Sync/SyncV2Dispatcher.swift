@@ -1033,6 +1033,27 @@ actor SyncV2Dispatcher {
             )
             try await store.complete(operation, result: result)
         } catch let error as SyncV2ClientError {
+            // 다른 기기가 먼저 이 폴더를 바꿔 서버 revision이 앞서 나갔다.
+            // 폴더에는 합칠 본문이 없으므로 문서처럼 3-way로 합칠 것이 없고,
+            // 기준선만 서버 값으로 옮겨 이 기기의 이름을 그대로 다시 보내면
+            // 된다. 늦게 커밋하는 쪽이 이기고 진 쪽은 pull로 따라간다.
+            if case let .remote(code, detail) = error,
+               code == .revisionConflict,
+               let serverRevision = Self.serverRevision(
+                   fromRevisionConflict: detail
+               ),
+               serverRevision > operation.baseRevision {
+                do {
+                    try await store.rebaseFolder(
+                        operation,
+                        serverRevision: serverRevision
+                    )
+                    return
+                } catch {
+                    // 기준선을 옮기지 못했으면 아래 기존 처리로 내려가 세운다.
+                    // 서버가 revision을 알려주지 않는 구버전에서도 같다.
+                }
+            }
             do {
                 switch handling(for: error) {
                 case let .retry(code, detail):
@@ -1078,6 +1099,27 @@ actor SyncV2Dispatcher {
                 nextAttemptAt: now.addingTimeInterval(delay)
             )
         }
+    }
+
+    /// 서버가 REVISION_CONFLICT와 함께 알려준 현재 revision을 읽는다.
+    ///
+    /// 배포된 `commit_folder`는 거절할 때 detail에 현재 revision과 서버가 들고
+    /// 있는 이름·부모를 함께 싣는다. 그 값을 쓰면 기준선을 맞추려고 서버에 다시
+    /// 물을 필요가 없다. 형식이 다르거나 값이 없으면 nil을 돌려주고 호출자가
+    /// 지금까지 하던 대로 세운다.
+    private static func serverRevision(
+        fromRevisionConflict detail: String?
+    ) -> Int64? {
+        guard let detail,
+              let data = detail.data(using: .utf8),
+              let object = try? JSONSerialization.jsonObject(
+                  with: data
+              ) as? [String: Any],
+              let revision = object["current_revision"] as? NSNumber
+        else {
+            return nil
+        }
+        return revision.int64Value
     }
 
     /// 서 있는 폴더 하나당 한 줄만 남긴다.

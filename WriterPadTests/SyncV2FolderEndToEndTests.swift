@@ -486,9 +486,9 @@ final class SyncV2FolderEndToEndTests: XCTestCase {
     }
 
     /// 두 기기가 같은 폴더의 이름을 앞뒤로 바꾸면 늦은 쪽은 REVISION_CONFLICT를
-    /// 받는다. 문서는 이 코드에서 자동 rebase를 타지만 폴더는 타지 않는다.
-    /// 특별한 조작이 아니라 두 기기를 쓰면 일상적으로 닿는 자리다.
-    func testConcurrentRenameFromTwoDevicesStallsTheLaterOne() async throws {
+    /// 받는다. 폴더에는 합칠 본문이 없으므로 기준선만 서버 값으로 옮겨 그대로
+    /// 다시 보낸다. 늦게 커밋하는 쪽이 이기고, 진 쪽은 pull로 따라간다.
+    func testConcurrentRenameFromTwoDevicesLetsTheLaterOneWin() async throws {
         let server = FakeFolderServer()
         let sender = try await FolderDeviceFixture(server: server)
         let folderID = UUID()
@@ -514,20 +514,193 @@ final class SyncV2FolderEndToEndTests: XCTestCase {
             name: "이 기기 이름"
         )
         await sender.drain(now: 20)
-        await sender.drain(now: 10_000)
-        await sender.drain(now: 1_000_000)
 
         let status = try await sender.store.operationStatus(
             operationID: renameID
         )
-        let attempts = try await sender.store.operationAttempts(
-            operationID: renameID
-        )
         let storedName = await server.name(of: folderID)
-        // 늦은 쪽 이름 변경은 영영 나가지 못한다.
-        XCTAssertEqual(status, "conflict")
-        XCTAssertEqual(attempts, 1)
-        XCTAssertEqual(storedName, "다른 기기 이름")
+        let revision = await server.revision(of: folderID)
+        XCTAssertEqual(status, "completed")
+        XCTAssertEqual(storedName, "이 기기 이름")
+        XCTAssertEqual(revision, 3)
+        await sender.close()
+    }
+
+    /// 기준선을 다시 잡아 지나간 폴더는 잠기지 않는다. 이후 작업도, 조상 폴더의
+    /// 삭제도 그대로 흐른다.
+    func testRebasedFolderLocksNeitherItsOwnWorkNorItsAncestorDeletion()
+        async throws {
+        let server = FakeFolderServer()
+        let sender = try await FolderDeviceFixture(server: server)
+        let parentID = UUID()
+        let childID = UUID()
+        let childDeleteID = UUID()
+        let parentDeleteID = UUID()
+
+        try await sender.enqueue(
+            operationID: UUID(),
+            folderID: parentID,
+            parentFolderID: nil,
+            name: "부모"
+        )
+        try await sender.enqueue(
+            operationID: UUID(),
+            folderID: childID,
+            parentFolderID: parentID,
+            name: "자식"
+        )
+        await sender.drain(now: 10)
+
+        // 다른 기기가 자식 이름을 먼저 바꾼다.
+        await server.applyOtherDeviceRename(
+            folderID: childID,
+            name: "다른 기기 자식"
+        )
+        try await sender.enqueue(
+            operationID: UUID(),
+            folderID: childID,
+            parentFolderID: parentID,
+            name: "이 기기 자식"
+        )
+        await sender.drain(now: 20)
+
+        // 그 뒤 사용자가 자식과 부모를 차례로 지운다.
+        try await sender.enqueue(
+            operationID: childDeleteID,
+            folderID: childID,
+            parentFolderID: parentID,
+            name: "이 기기 자식",
+            isDeleted: true
+        )
+        try await sender.enqueue(
+            operationID: parentDeleteID,
+            folderID: parentID,
+            parentFolderID: nil,
+            name: "부모",
+            isDeleted: true
+        )
+        await sender.drain(now: 30)
+
+        let childDelete = try await sender.store.operationStatus(
+            operationID: childDeleteID
+        )
+        let parentDelete = try await sender.store.operationStatus(
+            operationID: parentDeleteID
+        )
+        let childDeleted = await server.isDeleted(childID)
+        let parentDeleted = await server.isDeleted(parentID)
+        XCTAssertEqual(childDelete, "completed")
+        XCTAssertEqual(parentDelete, "completed")
+        XCTAssertEqual(childDeleted, true)
+        XCTAssertEqual(parentDeleted, true)
+        await sender.close()
+    }
+
+    /// 나가는 작업이 지나갔으므로 들어오는 변경도 얼지 않는다.
+    func testRebasedFolderNoLongerFreezesIncomingChanges() async throws {
+        let server = FakeFolderServer()
+        let sender = try await FolderDeviceFixture(server: server)
+        let folderID = UUID()
+
+        try await sender.enqueue(
+            operationID: UUID(),
+            folderID: folderID,
+            parentFolderID: nil,
+            name: "가 나 다"
+        )
+        await sender.drain(now: 10)
+        await server.applyOtherDeviceRename(
+            folderID: folderID,
+            name: "다른 기기 이름"
+        )
+        try await sender.enqueue(
+            operationID: UUID(),
+            folderID: folderID,
+            parentFolderID: nil,
+            name: "이 기기 이름"
+        )
+        await sender.drain(now: 20)
+
+        let blocked = try await sender.store.foldersWithPendingOperations(
+            localProjectID: sender.localProjectID
+        )
+        XCTAssertFalse(
+            blocked.contains(folderID),
+            "지나간 폴더는 미전송 작업 집합에 남지 않는다"
+        )
+
+        let receiver = try FolderReceiverFixture(
+            documents: [
+                receiverFolder(id: folderID, path: "가 나 다", parent: nil),
+            ]
+        )
+        try receiver.makeDirectory("가 나 다")
+        let report = await receiver.applier.applyRemoteFolders(
+            localProjectID: receiver.projectID,
+            remote: await server.folderList(),
+            blockedFolderIDs: blocked.map(DocumentID.init(rawValue:))
+                .reduce(into: Set<DocumentID>()) { $0.insert($1) }
+        )
+
+        XCTAssertEqual(report.rejectedNames.count, 0)
+        XCTAssertEqual(report.movedFolderIDs.count, 1)
+        XCTAssertTrue(receiver.exists("이 기기 이름"))
+        await sender.close()
+    }
+
+    /// 기준선을 다시 잡는 것이 폴더 줄의 순서 보장을 건드리면 안 된다. 부모를
+    /// 다시 잡느라 한 바퀴 더 도는 동안에도 자식이 부모를 앞지르지 않는다.
+    func testRebaseKeepsParentBeforeChildOrdering() async throws {
+        let server = FakeFolderServer()
+        let sender = try await FolderDeviceFixture(server: server)
+        let parentID = UUID()
+        let childID = UUID()
+        let parentRenameID = UUID()
+        let childCreateID = UUID()
+
+        try await sender.enqueue(
+            operationID: UUID(),
+            folderID: parentID,
+            parentFolderID: nil,
+            name: "부모"
+        )
+        await sender.drain(now: 10)
+        // 다른 기기가 부모 이름을 먼저 바꾼다.
+        await server.applyOtherDeviceRename(
+            folderID: parentID,
+            name: "다른 기기 부모"
+        )
+
+        // 부모 이름 변경과 그 아래 자식 생성을 같은 줄에 넣는다.
+        try await sender.enqueue(
+            operationID: parentRenameID,
+            folderID: parentID,
+            parentFolderID: nil,
+            name: "이 기기 부모"
+        )
+        try await sender.enqueue(
+            operationID: childCreateID,
+            folderID: childID,
+            parentFolderID: parentID,
+            name: "자식"
+        )
+        await sender.drain(now: 20)
+
+        let calls = await sender.client.folderOperationIDs()
+        guard let renameIndex = calls.lastIndex(of: parentRenameID),
+              let childIndex = calls.lastIndex(of: childCreateID)
+        else {
+            return XCTFail("두 작업 모두 서버에 닿아야 한다: \(calls)")
+        }
+        let parentName = await server.name(of: parentID)
+        let childName = await server.name(of: childID)
+        XCTAssertLessThan(
+            renameIndex,
+            childIndex,
+            "자식이 부모를 앞지르면 안 된다: \(calls)"
+        )
+        XCTAssertEqual(parentName, "이 기기 부모")
+        XCTAssertEqual(childName, "자식")
         await sender.close()
     }
 
@@ -652,9 +825,25 @@ private actor FakeFolderServer {
         }
         let current = rows[parameters.folderID]?.revision ?? 0
         guard current == parameters.baseServerRevision else {
-            throw SyncV2ClientError.remote(
-                code: .revisionConflict,
-                detail: nil
+            // 배포된 commit_folder는 거절하면서 현재 revision과 서버가 들고
+            // 있는 이름·부모를 detail에 함께 싣는다. 그 형태 그대로 흉내낸다.
+            let row = rows[parameters.folderID]
+            let detail: [String: Any] = [
+                "current_revision": current,
+                "parent_folder_id":
+                    row?.parentFolderID?.uuidString.lowercased() as Any,
+                "name": row?.name as Any,
+                "is_deleted": row?.isDeleted ?? false,
+            ]
+            let encoded = try JSONSerialization.data(
+                withJSONObject: detail.compactMapValues { $0 }
+            )
+            throw SyncV2Client.classify(
+                .postgrest(
+                    message: "REVISION_CONFLICT",
+                    postgresCode: "P0001",
+                    detail: String(decoding: encoded, as: UTF8.self)
+                )
             )
         }
         let revision = parameters.baseServerRevision + 1

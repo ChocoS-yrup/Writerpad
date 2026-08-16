@@ -577,6 +577,13 @@ protocol SyncV2DispatchStoring: Sendable {
         errorCode: String,
         detail: String?
     ) async throws
+    /// 다른 기기가 먼저 바꿔 서버 revision이 앞서 나갔을 때, 이 작업의 기준선만
+    /// 서버 값으로 다시 잡고 다시 보낼 수 있게 되돌린다. 폴더 대기열이 없는
+    /// 구현은 기본값을 그대로 쓴다.
+    func rebaseFolder(
+        _ operation: SyncV2FolderDispatchOperation,
+        serverRevision: Int64
+    ) async throws
     func complete(
         _ operation: SyncV2DispatchOperation,
         result: SyncV2CommitDocumentResult
@@ -634,6 +641,15 @@ protocol SyncV2DispatchStoring: Sendable {
 }
 
 extension SyncV2DispatchStoring {
+    func rebaseFolder(
+        _ operation: SyncV2FolderDispatchOperation,
+        serverRevision: Int64
+    ) async throws {
+        _ = operation
+        _ = serverRevision
+        throw SyncV2DispatchStoreError.unavailable
+    }
+
     func recoverMissingRemoteDocument(
         _ operation: SyncV2DispatchOperation
     ) async throws {
@@ -2591,6 +2607,77 @@ actor SyncV2Store:
             detail: detail,
             nextAttemptAt: nil
         )
+    }
+
+    /// 다른 기기가 먼저 이름을 바꿔 서버 revision이 앞서 나갔을 때, 이 작업의
+    /// 기준선만 서버 값으로 옮기고 다시 보낼 수 있게 되돌린다.
+    ///
+    /// 이름은 그대로 둔다. 폴더에는 합칠 본문이 없고 이름 하나뿐이라, 늦게
+    /// 커밋하는 쪽이 이기는 것이 양쪽이 합의한 계약이다. 진 쪽은 pull로 상대
+    /// 이름을 따라간다.
+    ///
+    /// 기준선이 반드시 커지므로 서버가 실제로 앞서 나간 만큼만 돈다. 호출자가
+    /// 그 조건을 확인하지만 여기서도 함께 막는다.
+    func rebaseFolder(
+        _ operation: SyncV2FolderDispatchOperation,
+        serverRevision: Int64
+    ) throws {
+        guard serverRevision > operation.baseRevision else {
+            throw SyncV2DispatchStoreError.integrityFailure
+        }
+        let timestamp = Self.timestamp()
+        try transaction {
+            try transitionInflightOperation(
+                operationID: operation.operationID,
+                attempts: operation.attempts,
+                status: .pending,
+                errorCode: nil,
+                detail: nil,
+                nextAttemptAt: nil,
+                timestamp: timestamp
+            )
+            try withStatement(
+                """
+                UPDATE sync_operations
+                SET base_revision = ?,
+                    updated_at = ?
+                WHERE operation_id = ?;
+                """
+            ) { statement in
+                try bind(serverRevision, at: 1, to: statement)
+                try bind(timestamp, at: 2, to: statement)
+                try bind(
+                    operation.operationID.uuidString.lowercased(),
+                    at: 3,
+                    to: statement
+                )
+                try stepDone(statement)
+            }
+            // 다음에 이 폴더로 들어오는 작업이 낡은 기준선을 집지 않게 한다.
+            try withStatement(
+                """
+                UPDATE sync_folders
+                SET server_revision = ?,
+                    sync_state = 'pending',
+                    last_error_code = NULL,
+                    updated_at = ?
+                WHERE folder_id = ?;
+                """
+            ) { statement in
+                try bind(serverRevision, at: 1, to: statement)
+                try bind(timestamp, at: 2, to: statement)
+                try bind(
+                    operation.folderID.uuidString.lowercased(),
+                    at: 3,
+                    to: statement
+                )
+                try stepDone(statement)
+            }
+            try refreshBatchState(
+                batchID: operation.batchID,
+                timestamp: timestamp
+            )
+        }
     }
 
     private func recordFolderDispatchFailure(
@@ -6832,6 +6919,19 @@ actor LazySyncV2ProjectBindingStore:
             operation,
             errorCode: errorCode,
             detail: detail
+        )
+    }
+
+    func rebaseFolder(
+        _ operation: SyncV2FolderDispatchOperation,
+        serverRevision: Int64
+    ) async throws {
+        guard let store = await resolvedStore() else {
+            throw SyncV2DispatchStoreError.unavailable
+        }
+        try await store.rebaseFolder(
+            operation,
+            serverRevision: serverRevision
         )
     }
 
