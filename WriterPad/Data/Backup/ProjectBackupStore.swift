@@ -11,6 +11,32 @@ struct ProjectBackupManifest: Codable, Equatable, Sendable {
         let uuid: String
         let title: String
         let order: Int
+
+        private enum CodingKeys: String, CodingKey {
+            case uuid
+            case title
+            case order
+        }
+
+        init(uuid: String, title: String, order: Int = 0) {
+            self.uuid = uuid
+            self.title = title
+            self.order = order
+        }
+
+        init(from decoder: Decoder) throws {
+            let container = try decoder.container(keyedBy: CodingKeys.self)
+            uuid = try container.decode(String.self, forKey: .uuid)
+            title = try container.decode(String.self, forKey: .title)
+            order = try container.decodeIfPresent(Int.self, forKey: .order) ?? 0
+        }
+
+        func encode(to encoder: Encoder) throws {
+            var container = encoder.container(keyedBy: CodingKeys.self)
+            try container.encode(uuid, forKey: .uuid)
+            try container.encode(title, forKey: .title)
+            try container.encode(order, forKey: .order)
+        }
     }
 
     struct Node: Codable, Equatable, Sendable {

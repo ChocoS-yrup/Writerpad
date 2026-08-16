@@ -342,6 +342,45 @@ final class ProjectBackupStoreTests: XCTestCase {
             }
         }
 
+        let missingProjectOrderPackage = root.appendingPathComponent("작품 순서 누락")
+        let legacyWithoutProjectOrder = ProjectBackupManifest(
+            formatVersion: 1,
+            project: .init(uuid: projectUUID, title: "작품 순서 누락"),
+            nodes: [
+                .init(
+                    uuid: firstID, kind: "folder", parentUUID: nil,
+                    path: "메인", title: "메인", order: 0,
+                    bytes: nil, sha256: nil
+                ),
+            ]
+        )
+        try writePackage(
+            legacyWithoutProjectOrder,
+            payloads: [:],
+            at: missingProjectOrderPackage
+        )
+        let missingOrderManifestURL = missingProjectOrderPackage.appendingPathComponent(
+            "manifest.json"
+        )
+        var missingOrderJSON = try XCTUnwrap(
+            JSONSerialization.jsonObject(
+                with: Data(contentsOf: missingOrderManifestURL)
+            ) as? [String: Any]
+        )
+        var missingOrderProject = try XCTUnwrap(
+            missingOrderJSON["project"] as? [String: Any]
+        )
+        missingOrderProject.removeValue(forKey: "order")
+        missingOrderJSON["project"] = missingOrderProject
+        try JSONSerialization.data(withJSONObject: missingOrderJSON).write(
+            to: missingOrderManifestURL,
+            options: [.atomic]
+        )
+        let decodedLegacyManifest = try await ProjectBackupStore().validatedManifest(
+            at: missingProjectOrderPackage
+        )
+        XCTAssertEqual(decodedLegacyManifest.project.order, 0)
+
         let cycle = ProjectBackupManifest(
             formatVersion: 1,
             project: .init(uuid: projectUUID, title: "순환 검증", order: 0),
