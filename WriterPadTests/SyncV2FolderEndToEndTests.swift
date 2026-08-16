@@ -287,6 +287,250 @@ final class SyncV2FolderEndToEndTests: XCTestCase {
         await sender.close()
     }
 
+    // MARK: - 굳은 폴더가 무엇을 잠그는지 재는 시험들
+    //
+    // 에러 코드 분류로 자동 재시도는 멈췄지만, claim 조건은 'completed'와
+    // 'cancelled'만 끝난 것으로 본다. conflict는 retry_wait와 똑같이 "아직
+    // 안 끝난 앞 작업"이다. 그래서 분류가 잠금까지 풀어 주지는 않는다는 것을
+    // 여기서 재현해 못 박는다.
+
+    /// 사용자가 굳은 폴더를 다시 조작해도 스스로 풀 수 없다. 이름을 바꾸든
+    /// 지우든 새 작업은 앞의 굳은 행 뒤에서 claim되지 않는다.
+    func testUserCannotClearAStalledFolderByOperatingOnItAgain()
+        async throws {
+        for followUpIsDeleted in [false, true] {
+            let server = FakeFolderServer()
+            let sender = try await FolderDeviceFixture(server: server)
+            let folderID = UUID()
+            let stalledID = UUID()
+            let followUpID = UUID()
+            await server.rejectCommits(
+                for: folderID,
+                message: "FOLDER_NAME_CONFLICT"
+            )
+
+            try await sender.enqueue(
+                operationID: stalledID,
+                folderID: folderID,
+                parentFolderID: nil,
+                name: "가 나 다"
+            )
+            await sender.drain(now: 10)
+
+            // 사용자가 같은 폴더를 다시 조작한다.
+            try await sender.enqueue(
+                operationID: followUpID,
+                folderID: folderID,
+                parentFolderID: nil,
+                name: followUpIsDeleted ? "가 나 다" : "라 마 바",
+                isDeleted: followUpIsDeleted
+            )
+            await sender.drain(now: 10_000)
+            await sender.drain(now: 1_000_000)
+
+            let stalled = try await sender.store.operationStatus(
+                operationID: stalledID
+            )
+            let followUp = try await sender.store.operationStatus(
+                operationID: followUpID
+            )
+            let commits = await server.commitCallCount()
+            let label = followUpIsDeleted ? "삭제" : "이름 변경"
+            XCTAssertEqual(stalled, "conflict", label)
+            XCTAssertEqual(followUp, "pending", label)
+            XCTAssertEqual(commits, 1, "\(label): 새 요청이 나가지 않는다")
+            await sender.close()
+        }
+    }
+
+    /// 앱을 껐다 켜도 풀리지 않는다. 저장소를 열 때 되살리는 목록에 폴더가
+    /// 받는 코드가 하나도 없다.
+    func testRestartDoesNotClearAStalledFolder() async throws {
+        let server = FakeFolderServer()
+        let sender = try await FolderDeviceFixture(server: server)
+        let folderID = UUID()
+        let stalledID = UUID()
+        await server.rejectCommits(
+            for: folderID,
+            message: "FOLDER_NAME_CONFLICT"
+        )
+
+        try await sender.enqueue(
+            operationID: stalledID,
+            folderID: folderID,
+            parentFolderID: nil,
+            name: "가 나 다"
+        )
+        await sender.drain(now: 10)
+        try await sender.restart()
+        await sender.drain(now: 1_000_000)
+
+        let stalled = try await sender.store.operationStatus(
+            operationID: stalledID
+        )
+        let commits = await server.commitCallCount()
+        XCTAssertEqual(stalled, "conflict")
+        XCTAssertEqual(commits, 1)
+        await sender.close()
+    }
+
+    /// 굳은 자식이 있으면 부모 폴더의 삭제가 claim되지 않는다. 서버는 live
+    /// 자식이 남은 폴더의 삭제를 거절하므로 대기 자체는 옳지만, 자식이 영영
+    /// 끝나지 않으면 부모도 영영 나가지 못한다.
+    func testStalledChildBlocksItsAncestorDeletion() async throws {
+        let server = FakeFolderServer()
+        let sender = try await FolderDeviceFixture(server: server)
+        let parentID = UUID()
+        let childID = UUID()
+        let parentDeleteID = UUID()
+
+        try await sender.enqueue(
+            operationID: UUID(),
+            folderID: parentID,
+            parentFolderID: nil,
+            name: "부모"
+        )
+        await sender.drain(now: 10)
+        // 자식은 처음부터 거절당해 굳는다.
+        await server.rejectCommits(
+            for: childID,
+            message: "FOLDER_NAME_CONFLICT"
+        )
+        try await sender.enqueue(
+            operationID: UUID(),
+            folderID: childID,
+            parentFolderID: parentID,
+            name: "자식"
+        )
+        await sender.drain(now: 20)
+        // 사용자가 부모를 지운다.
+        try await sender.enqueue(
+            operationID: parentDeleteID,
+            folderID: parentID,
+            parentFolderID: nil,
+            name: "부모",
+            isDeleted: true
+        )
+        await sender.drain(now: 1_000_000)
+
+        let parentDelete = try await sender.store.operationStatus(
+            operationID: parentDeleteID
+        )
+        let parentIsDeleted = await server.isDeleted(parentID)
+        XCTAssertEqual(parentDelete, "pending")
+        XCTAssertEqual(parentIsDeleted, false)
+        await sender.close()
+    }
+
+    /// 나가는 작업이 굳으면 들어오는 변경까지 함께 언다. 굳은 행이
+    /// `foldersWithPendingOperations`에 그대로 들어가고, 그 집합이 pull에서
+    /// `blockedFolderIDs`로 쓰이기 때문이다.
+    func testStalledFolderAlsoFreezesIncomingChangesForThatFolder()
+        async throws {
+        let server = FakeFolderServer()
+        let sender = try await FolderDeviceFixture(server: server)
+        let folderID = UUID()
+        await server.rejectCommits(
+            for: folderID,
+            message: "FOLDER_NAME_CONFLICT"
+        )
+
+        try await sender.enqueue(
+            operationID: UUID(),
+            folderID: folderID,
+            parentFolderID: nil,
+            name: "가 나 다"
+        )
+        await sender.drain(now: 10)
+
+        let blocked = try await sender.store.foldersWithPendingOperations(
+            localProjectID: sender.localProjectID
+        )
+        XCTAssertTrue(
+            blocked.contains(folderID),
+            "굳은 폴더가 미전송 작업 집합에 그대로 남는다"
+        )
+
+        // 다른 기기가 같은 폴더의 이름을 바꿔 보낸 상황을 받는 쪽에서 반영한다.
+        let receiver = try FolderReceiverFixture(
+            documents: [
+                receiverFolder(id: folderID, path: "가 나 다", parent: nil),
+            ]
+        )
+        try receiver.makeDirectory("가 나 다")
+        let report = await receiver.applier.applyRemoteFolders(
+            localProjectID: receiver.projectID,
+            remote: [
+                SyncV2RemoteFolder(
+                    folderID: folderID,
+                    parentFolderID: nil,
+                    name: "라 마 바",
+                    revision: 2,
+                    isDeleted: false,
+                    updatedAt: Date(timeIntervalSince1970: 200)
+                ),
+            ],
+            blockedFolderIDs: blocked.map(DocumentID.init(rawValue:))
+                .reduce(into: Set<DocumentID>()) { $0.insert($1) }
+        )
+
+        XCTAssertTrue(report.movedFolderIDs.isEmpty)
+        XCTAssertEqual(report.rejectedNames.count, 1)
+        XCTAssertEqual(
+            report.rejectedNames.first?.reason,
+            "pendingLocalOperation"
+        )
+        XCTAssertTrue(receiver.exists("가 나 다"))
+        XCTAssertFalse(receiver.exists("라 마 바"))
+        await sender.close()
+    }
+
+    /// 두 기기가 같은 폴더의 이름을 앞뒤로 바꾸면 늦은 쪽은 REVISION_CONFLICT를
+    /// 받는다. 문서는 이 코드에서 자동 rebase를 타지만 폴더는 타지 않는다.
+    /// 특별한 조작이 아니라 두 기기를 쓰면 일상적으로 닿는 자리다.
+    func testConcurrentRenameFromTwoDevicesStallsTheLaterOne() async throws {
+        let server = FakeFolderServer()
+        let sender = try await FolderDeviceFixture(server: server)
+        let folderID = UUID()
+        let renameID = UUID()
+
+        try await sender.enqueue(
+            operationID: UUID(),
+            folderID: folderID,
+            parentFolderID: nil,
+            name: "가 나 다"
+        )
+        await sender.drain(now: 10)
+
+        // 다른 기기가 먼저 이름을 바꾼다. 이 기기는 아직 모른다.
+        await server.applyOtherDeviceRename(
+            folderID: folderID,
+            name: "다른 기기 이름"
+        )
+        try await sender.enqueue(
+            operationID: renameID,
+            folderID: folderID,
+            parentFolderID: nil,
+            name: "이 기기 이름"
+        )
+        await sender.drain(now: 20)
+        await sender.drain(now: 10_000)
+        await sender.drain(now: 1_000_000)
+
+        let status = try await sender.store.operationStatus(
+            operationID: renameID
+        )
+        let attempts = try await sender.store.operationAttempts(
+            operationID: renameID
+        )
+        let storedName = await server.name(of: folderID)
+        // 늦은 쪽 이름 변경은 영영 나가지 못한다.
+        XCTAssertEqual(status, "conflict")
+        XCTAssertEqual(attempts, 1)
+        XCTAssertEqual(storedName, "다른 기기 이름")
+        await sender.close()
+    }
+
     private func receiverFolder(
         id: UUID,
         path: String,
@@ -456,6 +700,16 @@ private actor FakeFolderServer {
     }
 
     func name(of folderID: UUID) -> String? { rows[folderID]?.name }
+    func isDeleted(_ folderID: UUID) -> Bool? { rows[folderID]?.isDeleted }
+
+    /// 다른 기기가 같은 폴더를 먼저 바꾼 상황이다. revision이 올라가므로 이
+    /// 기기가 들고 있던 기준선은 낡은 값이 된다.
+    func applyOtherDeviceRename(folderID: UUID, name: String) {
+        guard var row = rows[folderID] else { return }
+        row.name = name
+        row.revision += 1
+        rows[folderID] = row
+    }
     func revision(of folderID: UUID) -> Int64? { rows[folderID]?.revision }
     func commitCallCount() -> Int { commits }
     func replayCount() -> Int { replays }
