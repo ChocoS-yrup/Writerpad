@@ -108,6 +108,14 @@ final class ProjectBackupStoreTests: XCTestCase {
             projectID.rawValue.uuidString.lowercased()
         )
         XCTAssertEqual(backup.manifest.project.title, "복원 시험")
+        XCTAssertEqual(backup.manifest.project.order, 0)
+        let encodedManifest = try XCTUnwrap(
+            JSONSerialization.jsonObject(
+                with: Data(contentsOf: package.appendingPathComponent("manifest.json"))
+            ) as? [String: Any]
+        )
+        let encodedProject = try XCTUnwrap(encodedManifest["project"] as? [String: Any])
+        XCTAssertEqual(encodedProject["order"] as? Int, 0)
         XCTAssertTrue(
             backup.manifest.nodes.allSatisfy {
                 $0.uuid == $0.uuid.lowercased()
@@ -231,6 +239,137 @@ final class ProjectBackupStoreTests: XCTestCase {
         )
     }
 
+    func testValidationRejectsUnexpectedPayloadWithoutCreatingDestination() async throws {
+        let fileManager = FileManager.default
+        let root = fileManager.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? fileManager.removeItem(at: root) }
+        let package = root.appendingPathComponent("패키지", isDirectory: true)
+        let destination = root.appendingPathComponent("복원 대상", isDirectory: true)
+        let manifest = ProjectBackupManifest(
+            formatVersion: 1,
+            project: .init(
+                uuid: UUID().uuidString.lowercased(),
+                title: "검증 작품",
+                order: 0
+            ),
+            nodes: [
+                .init(
+                    uuid: UUID().uuidString.lowercased(),
+                    kind: "folder",
+                    parentUUID: nil,
+                    path: "메인",
+                    title: "메인",
+                    order: 0,
+                    bytes: nil,
+                    sha256: nil
+                )
+            ]
+        )
+        try writePackage(manifest, payloads: [:], at: package)
+        try Data("계약 밖 파일".utf8).write(
+            to: package.appendingPathComponent("workspace/extra")
+        )
+
+        do {
+            _ = try await ProjectBackupStore().restoreBackup(
+                at: package,
+                to: destination
+            )
+            XCTFail("manifest에 없는 payload를 허용하면 안 됩니다.")
+        } catch let error as ProjectBackupError {
+            guard case .unexpectedPackageEntry = error else {
+                return XCTFail("예상하지 못한 오류: \(error)")
+            }
+        }
+        XCTAssertFalse(fileManager.fileExists(atPath: destination.path))
+    }
+
+    func testValidationRejectsDuplicateSiblingOrderAndCycle() async throws {
+        let fileManager = FileManager.default
+        let root = fileManager.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? fileManager.removeItem(at: root) }
+        let projectUUID = UUID().uuidString.lowercased()
+        let firstID = UUID().uuidString.lowercased()
+        let secondID = UUID().uuidString.lowercased()
+        let duplicateOrder = ProjectBackupManifest(
+            formatVersion: 1,
+            project: .init(uuid: projectUUID, title: "순서 검증", order: 0),
+            nodes: [
+                .init(
+                    uuid: firstID, kind: "folder", parentUUID: nil,
+                    path: "메인", title: "메인", order: 0,
+                    bytes: nil, sha256: nil
+                ),
+                .init(
+                    uuid: secondID, kind: "folder", parentUUID: nil,
+                    path: "다른 루트", title: "다른 루트", order: 0,
+                    bytes: nil, sha256: nil
+                ),
+            ]
+        )
+        let duplicatePackage = root.appendingPathComponent("중복 순서")
+        try writePackage(duplicateOrder, payloads: [:], at: duplicatePackage)
+        do {
+            _ = try await ProjectBackupStore().validatedManifest(at: duplicatePackage)
+            XCTFail("같은 부모 아래 중복 order를 허용하면 안 됩니다.")
+        } catch let error as ProjectBackupError {
+            guard case .invalidManifest = error else {
+                return XCTFail("예상하지 못한 오류: \(error)")
+            }
+        }
+
+        let invalidProjectOrder = ProjectBackupManifest(
+            formatVersion: 1,
+            project: .init(uuid: projectUUID, title: "작품 순서 검증", order: 1),
+            nodes: [
+                .init(
+                    uuid: firstID, kind: "folder", parentUUID: nil,
+                    path: "메인", title: "메인", order: 0,
+                    bytes: nil, sha256: nil
+                ),
+            ]
+        )
+        let invalidProjectOrderPackage = root.appendingPathComponent("잘못된 작품 순서")
+        try writePackage(invalidProjectOrder, payloads: [:], at: invalidProjectOrderPackage)
+        do {
+            _ = try await ProjectBackupStore().validatedManifest(
+                at: invalidProjectOrderPackage
+            )
+            XCTFail("project.order 0 이외의 값을 허용하면 안 됩니다.")
+        } catch let error as ProjectBackupError {
+            guard case .invalidManifest = error else {
+                return XCTFail("예상하지 못한 오류: \(error)")
+            }
+        }
+
+        let cycle = ProjectBackupManifest(
+            formatVersion: 1,
+            project: .init(uuid: projectUUID, title: "순환 검증", order: 0),
+            nodes: [
+                .init(
+                    uuid: firstID, kind: "folder", parentUUID: secondID,
+                    path: "참고/A", title: "A", order: 0,
+                    bytes: nil, sha256: nil
+                ),
+                .init(
+                    uuid: secondID, kind: "folder", parentUUID: firstID,
+                    path: "참고/B", title: "B", order: 0,
+                    bytes: nil, sha256: nil
+                ),
+            ]
+        )
+        let cyclePackage = root.appendingPathComponent("순환")
+        try writePackage(cycle, payloads: [:], at: cyclePackage)
+        do {
+            _ = try await ProjectBackupStore().validatedManifest(at: cyclePackage)
+            XCTFail("순환 parent_uuid를 허용하면 안 됩니다.")
+        } catch let error as ProjectBackupError {
+            guard case .invalidManifest = error else {
+                return XCTFail("예상하지 못한 오류: \(error)")
+            }
+        }
+    }
+
     private func projectID(_ value: String) -> ProjectID {
         ProjectID(rawValue: UUID(uuidString: value)!)
     }
@@ -273,6 +412,27 @@ final class ProjectBackupStoreTests: XCTestCase {
         return try Dictionary(uniqueKeysWithValues: urls.map {
             ($0.lastPathComponent, try Data(contentsOf: $0))
         })
+    }
+
+    private func writePackage(
+        _ manifest: ProjectBackupManifest,
+        payloads: [String: Data],
+        at package: URL
+    ) throws {
+        let workspace = package.appendingPathComponent("workspace", isDirectory: true)
+        try FileManager.default.createDirectory(
+            at: workspace,
+            withIntermediateDirectories: true
+        )
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+        try encoder.encode(manifest).write(
+            to: package.appendingPathComponent("manifest.json"),
+            options: [.atomic]
+        )
+        for (name, data) in payloads {
+            try data.write(to: workspace.appendingPathComponent(name), options: [.atomic])
+        }
     }
 
     private func tree(at root: URL) throws -> [String: Data?] {

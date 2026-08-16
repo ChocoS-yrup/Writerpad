@@ -83,6 +83,48 @@ final class AppEnvironmentTests: XCTestCase {
     }
 
     @MainActor
+    func testProjectListModelRestoresWriterPadBackupThroughProductManager() async throws {
+        let environment = try AppEnvironment.testing()
+        let project = try await environment.projectManager.createProject(
+            named: "제품 복원 진입점"
+        )
+        let package = FileManager.default.temporaryDirectory.appendingPathComponent(
+            "WriterPad-ModelRestore-\(UUID().uuidString)",
+            isDirectory: true
+        )
+        defer { try? FileManager.default.removeItem(at: package) }
+        _ = try await environment.projectBackupCoordinator.createBackup(
+            for: project.id,
+            at: package
+        )
+
+        let pending = try await environment.projectManager.prepareDeletion(id: project.id)
+        try await environment.projectManager.confirmDeletion(pending)
+        let deleted = try await environment.projectManager.prepareMoveToDeletedList(
+            id: project.id
+        )
+        _ = try await environment.projectManager.moveToDeletedList(deleted)
+        let permanent = try await environment.projectManager.preparePermanentDeletion(
+            id: project.id
+        )
+        _ = try await environment.projectManager.permanentlyDelete(permanent)
+
+        let model = ProjectListModel(
+            projectManager: environment.projectManager,
+            projectImporter: environment.projectImporter
+        )
+        await model.restoreBackup(at: package)
+
+        XCTAssertNil(model.errorMessage)
+        XCTAssertEqual(model.selectedProjectID, project.id)
+        XCTAssertEqual(model.selectedProject?.name, "제품 복원 진입점")
+        XCTAssertEqual(
+            model.importSuccessMessage,
+            "‘제품 복원 진입점’ WriterPad 백업을 복원했습니다."
+        )
+    }
+
+    @MainActor
     func testProjectListModelWaitsForBindingBeforeOpeningNewWorkspace()
         async throws {
         let previous = GlobalSyncPreference.isEnabled()

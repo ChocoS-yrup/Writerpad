@@ -592,6 +592,230 @@ final class LocalProjectManagerTests: XCTestCase {
         )
     }
 
+    func testRestoreProjectBackupRegistersExactIdentityTreeAndRawBytes() async throws {
+        let harness = try makeHarness()
+        let fixture = try await makeBackupFixture(in: harness)
+        let packageBefore = try directoryFingerprint(fixture.packageURL)
+
+        let restored = try await harness.manager.restoreProjectBackup(
+            at: fixture.packageURL
+        )
+
+        XCTAssertEqual(restored.id, fixture.project.id)
+        XCTAssertEqual(restored.name, fixture.project.name)
+        let storedNodes = try await harness.repository.documents(in: restored.id)
+        XCTAssertEqual(Set(storedNodes.map(\.id)), Set(fixture.nodes.map(\.id)))
+        for expected in fixture.nodes {
+            let actual = try XCTUnwrap(storedNodes.first { $0.id == expected.id })
+            XCTAssertEqual(actual.parentID, expected.parentID)
+            XCTAssertEqual(actual.relativePath, expected.relativePath)
+            XCTAssertEqual(actual.userOrder, expected.userOrder)
+            XCTAssertEqual(actual.kind, expected.kind)
+        }
+        let restoredTrash = try XCTUnwrap(storedNodes.first {
+            $0.relativePath.rawValue == "메인/휴지통/삭제 초안.txt"
+        })
+        guard case let .trashed(fallbackPath, _) = restoredTrash.deletionStatus else {
+            return XCTFail("휴지통 항목은 복원 후에도 휴지통 상태여야 합니다.")
+        }
+        XCTAssertEqual(fallbackPath, restoredTrash.relativePath)
+
+        let workspace = try harness.resolver.standardPaths(
+            forProjectNamed: fixture.project.name
+        ).workspaceRootURL
+        for (path, expectedBytes) in fixture.documentBytes {
+            XCTAssertEqual(
+                try Data(contentsOf: workspace.appendingPathComponent(path)),
+                expectedBytes
+            )
+        }
+        XCTAssertTrue(
+            FileManager.default.fileExists(
+                atPath: workspace.appendingPathComponent("메인/원고/2권").path
+            )
+        )
+        let trashRecordURL = workspace.appendingPathComponent(
+            ".writerpad-trash-"
+                + restoredTrash.id.rawValue.uuidString.lowercased()
+                + ".json"
+        )
+        let trashDecoder = JSONDecoder()
+        trashDecoder.dateDecodingStrategy = .iso8601
+        let trashRecord = try trashDecoder.decode(
+            TrashRecord.self,
+            from: Data(contentsOf: trashRecordURL)
+        )
+        XCTAssertEqual(trashRecord.documentID, restoredTrash.id)
+        XCTAssertEqual(trashRecord.originalPath, restoredTrash.relativePath)
+        XCTAssertEqual(try directoryFingerprint(fixture.packageURL), packageBefore)
+        XCTAssertFalse(
+            try rootItems(harness).contains {
+                $0.contains("writerpad-restore") || $0.contains("transaction")
+            }
+        )
+    }
+
+    func testRestoreProjectBackupRejectsDuplicateProjectUUIDWithoutMutation() async throws {
+        let harness = try makeHarness()
+        let fixture = try await makeBackupFixture(in: harness)
+        _ = try await harness.manager.restoreProjectBackup(at: fixture.packageURL)
+        let workspace = try harness.resolver.standardPaths(
+            forProjectNamed: fixture.project.name
+        ).workspaceRootURL
+        let before = try directoryFingerprint(workspace)
+
+        do {
+            _ = try await harness.manager.restoreProjectBackup(at: fixture.packageURL)
+            XCTFail("같은 project UUID를 다시 복원하면 안 됩니다.")
+        } catch let error as ProjectManagerError {
+            XCTAssertEqual(error, .projectAlreadyExists(fixture.project.id))
+        }
+
+        XCTAssertEqual(try directoryFingerprint(workspace), before)
+        let storedProjects = try await harness.repository.projects()
+        XCTAssertEqual(storedProjects.count, 1)
+    }
+
+    func testRestoreProjectBackupRejectsExistingDestinationEvenWhenEmpty() async throws {
+        let harness = try makeHarness()
+        let fixture = try await makeBackupFixture(in: harness)
+        let destination = try harness.resolver.standardPaths(
+            forProjectNamed: fixture.project.name
+        ).projectContainerURL
+        try FileManager.default.createDirectory(
+            at: destination,
+            withIntermediateDirectories: true
+        )
+
+        do {
+            _ = try await harness.manager.restoreProjectBackup(at: fixture.packageURL)
+            XCTFail("빈 목적지도 덮어쓰면 안 됩니다.")
+        } catch let error as PathPolicyError {
+            guard case .nameCollision = error else {
+                return XCTFail("예상하지 못한 오류: \(error)")
+            }
+        }
+
+        let storedProjects = try await harness.repository.projects()
+        XCTAssertTrue(storedProjects.isEmpty)
+        XCTAssertTrue(try FileManager.default.contentsOfDirectory(atPath: destination.path).isEmpty)
+    }
+
+    func testRestoreProjectBackupUsesUUIDParentTreeNotReferencePath() async throws {
+        let harness = try makeHarness()
+        let fixture = try await makeBackupFixture(in: harness)
+        let manifestURL = fixture.packageURL.appendingPathComponent("manifest.json")
+        var object = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: Data(contentsOf: manifestURL))
+                as? [String: Any]
+        )
+        var nodes = try XCTUnwrap(object["nodes"] as? [[String: Any]])
+        let index = try XCTUnwrap(nodes.firstIndex {
+            $0["path"] as? String == "메인/원고/1권/001화.txt"
+        })
+        nodes[index]["path"] = "참고용/실제 복원에 쓰지 않는 경로.txt"
+        object["nodes"] = nodes
+        try JSONSerialization.data(
+            withJSONObject: object,
+            options: [.prettyPrinted, .sortedKeys]
+        ).write(to: manifestURL, options: [.atomic])
+
+        let restored = try await harness.manager.restoreProjectBackup(
+            at: fixture.packageURL
+        )
+        let storedNodes = try await harness.repository.documents(in: restored.id)
+
+        XCTAssertNotNil(storedNodes.first {
+            $0.relativePath.rawValue == "메인/원고/1권/001화.txt"
+        })
+        XCTAssertNil(storedNodes.first {
+            $0.relativePath.rawValue == "참고용/실제 복원에 쓰지 않는 경로.txt"
+        })
+    }
+
+    func testRestartCompletesInterruptedBackupRestoreWithManifestUUIDs() async throws {
+        let harness = try makeHarness(
+            faultPlan: ProjectManagerFaultPlan(
+                point: .afterRestoreMetadataSave,
+                leavesTransactionForRecovery: true
+            )
+        )
+        let fixture = try await makeBackupFixture(in: harness)
+        do {
+            _ = try await harness.manager.restoreProjectBackup(at: fixture.packageURL)
+            XCTFail("복원 메타데이터 저장 뒤 중단돼야 합니다.")
+        } catch let error as ProjectManagerError {
+            XCTAssertEqual(error, .injectedFailure(recoveryPending: true))
+        }
+
+        let restarted = makeManager(from: harness)
+        let recovered = try await restarted.projects()
+        let project = try XCTUnwrap(recovered.first)
+        let nodes = try await harness.repository.documents(in: project.id)
+
+        XCTAssertEqual(project.id, fixture.project.id)
+        XCTAssertEqual(Set(nodes.map(\.id)), Set(fixture.nodes.map(\.id)))
+        XCTAssertFalse(
+            try rootItems(harness).contains {
+                $0.contains("writerpad-restore") || $0.contains("transaction")
+            }
+        )
+    }
+
+    func testRestartRollsBackRestoreInterruptedBeforePackageCopy() async throws {
+        let harness = try makeHarness(
+            faultPlan: ProjectManagerFaultPlan(
+                point: .afterRestoreJournalWrite,
+                leavesTransactionForRecovery: true
+            )
+        )
+        let fixture = try await makeBackupFixture(in: harness)
+        do {
+            _ = try await harness.manager.restoreProjectBackup(at: fixture.packageURL)
+            XCTFail("복원 journal 기록 뒤 중단돼야 합니다.")
+        } catch let error as ProjectManagerError {
+            XCTAssertEqual(error, .injectedFailure(recoveryPending: true))
+        }
+
+        let restarted = makeManager(from: harness)
+        let recovered = try await restarted.projects()
+        XCTAssertTrue(recovered.isEmpty)
+        XCTAssertFalse(
+            try rootItems(harness).contains {
+                $0.contains("writerpad-restore") || $0.contains("transaction")
+            }
+        )
+    }
+
+    func testRestartBuildsRestoreFromStagedPackageWithSameUUIDs() async throws {
+        let harness = try makeHarness(
+            faultPlan: ProjectManagerFaultPlan(
+                point: .afterRestorePackageCopy,
+                leavesTransactionForRecovery: true
+            )
+        )
+        let fixture = try await makeBackupFixture(in: harness)
+        do {
+            _ = try await harness.manager.restoreProjectBackup(at: fixture.packageURL)
+            XCTFail("패키지 내부 복사 뒤 중단돼야 합니다.")
+        } catch let error as ProjectManagerError {
+            XCTAssertEqual(error, .injectedFailure(recoveryPending: true))
+        }
+
+        let restarted = makeManager(from: harness)
+        let recovered = try await restarted.projects()
+        let project = try XCTUnwrap(recovered.first)
+        let nodes = try await harness.repository.documents(in: project.id)
+
+        XCTAssertEqual(project.id, fixture.project.id)
+        XCTAssertEqual(Set(nodes.map(\.id)), Set(fixture.nodes.map(\.id)))
+        XCTAssertFalse(
+            try rootItems(harness).contains {
+                $0.contains("writerpad-restore") || $0.contains("transaction")
+            }
+        )
+    }
+
     private struct Harness {
         let root: URL
         let container: ModelContainer
@@ -599,6 +823,13 @@ final class LocalProjectManagerTests: XCTestCase {
         let resolver: ProjectPathResolver
         let clock: FixedClock
         let manager: LocalProjectManager
+    }
+
+    private struct BackupFixture {
+        let packageURL: URL
+        let project: Project
+        let nodes: [DocumentNode]
+        let documentBytes: [String: Data]
     }
 
     private struct FixedClock: AppClock {
@@ -650,6 +881,143 @@ final class LocalProjectManagerTests: XCTestCase {
             clock: harness.clock,
             faultPlan: faultPlan
         )
+    }
+
+    private func makeBackupFixture(in harness: Harness) async throws -> BackupFixture {
+        let fileManager = FileManager.default
+        let source = harness.root.appendingPathComponent("BackupSource", isDirectory: true)
+        let workspace = source.appendingPathComponent("집필모드", isDirectory: true)
+        let mainID = DocumentID(rawValue: UUID())
+        let project = Project(
+            id: ProjectID(rawValue: UUID()),
+            name: "교차 복원 합성 작품",
+            createdAt: harness.clock.date,
+            modifiedAt: harness.clock.date
+        )
+        var nodes: [DocumentNode] = [
+            DocumentNode(
+                id: mainID,
+                projectID: project.id,
+                kind: .folder,
+                parentID: nil,
+                relativePath: RelativeDocumentPath(rawValue: "메인"),
+                userOrder: 0,
+                modifiedAt: harness.clock.date,
+                contentHash: nil
+            )
+        ]
+        var categoryIDs: [BinderFixedCategory: DocumentID] = [:]
+        for category in BinderFixedCategory.allCases {
+            let id = DocumentID(rawValue: UUID())
+            categoryIDs[category] = id
+            nodes.append(
+                DocumentNode(
+                    id: id,
+                    projectID: project.id,
+                    kind: .folder,
+                    parentID: mainID,
+                    relativePath: category.relativePath,
+                    userOrder: category.fixedOrder,
+                    modifiedAt: harness.clock.date,
+                    contentHash: nil
+                )
+            )
+        }
+        let manuscriptID = try XCTUnwrap(categoryIDs[.manuscript])
+        let settingsID = try XCTUnwrap(categoryIDs[.settings])
+        let volume1ID = DocumentID(rawValue: UUID())
+        let volume2ID = DocumentID(rawValue: UUID())
+        let chapter1ID = DocumentID(rawValue: UUID())
+        let chapter2ID = DocumentID(rawValue: UUID())
+        let personID = DocumentID(rawValue: UUID())
+        let trashID = try XCTUnwrap(categoryIDs[.trash])
+        let trashedDraftID = DocumentID(rawValue: UUID())
+        nodes += [
+            DocumentNode(
+                id: volume1ID, projectID: project.id, kind: .folder,
+                parentID: manuscriptID,
+                relativePath: RelativeDocumentPath(rawValue: "메인/원고/1권"),
+                userOrder: 0, modifiedAt: harness.clock.date, contentHash: nil
+            ),
+            DocumentNode(
+                id: volume2ID, projectID: project.id, kind: .folder,
+                parentID: manuscriptID,
+                relativePath: RelativeDocumentPath(rawValue: "메인/원고/2권"),
+                userOrder: 1, modifiedAt: harness.clock.date, contentHash: nil
+            ),
+            DocumentNode(
+                id: chapter1ID, projectID: project.id, kind: .text,
+                parentID: volume1ID,
+                relativePath: RelativeDocumentPath(rawValue: "메인/원고/1권/001화.txt"),
+                userOrder: 0, modifiedAt: harness.clock.date, contentHash: nil
+            ),
+            DocumentNode(
+                id: chapter2ID, projectID: project.id, kind: .text,
+                parentID: volume1ID,
+                relativePath: RelativeDocumentPath(rawValue: "메인/원고/1권/002화.txt"),
+                userOrder: 1, modifiedAt: harness.clock.date, contentHash: nil
+            ),
+            DocumentNode(
+                id: personID, projectID: project.id, kind: .text,
+                parentID: settingsID,
+                relativePath: RelativeDocumentPath(rawValue: "메인/설정집/인물.txt"),
+                userOrder: 0, modifiedAt: harness.clock.date, contentHash: nil
+            ),
+            DocumentNode(
+                id: trashedDraftID, projectID: project.id, kind: .text,
+                parentID: trashID,
+                relativePath: RelativeDocumentPath(rawValue: "메인/휴지통/삭제 초안.txt"),
+                userOrder: 0, modifiedAt: harness.clock.date, contentHash: nil,
+                deletionStatus: .trashed(
+                    originalPath: RelativeDocumentPath(rawValue: "메인/메모장/삭제 초안.txt"),
+                    deletedAt: harness.clock.date
+                )
+            ),
+        ]
+        for node in nodes where node.kind == .folder {
+            try fileManager.createDirectory(
+                at: workspace.appendingPathComponent(node.relativePath.rawValue),
+                withIntermediateDirectories: true
+            )
+        }
+        let chapterBytes = Data([0xEF, 0xBB, 0xBF])
+            + Data("합성 첫 문장\r\n합성 둘째 문장\n".utf8)
+        let documentBytes = [
+            "메인/원고/1권/001화.txt": chapterBytes,
+            "메인/원고/1권/002화.txt": Data(),
+            "메인/설정집/인물.txt": Data("합성 인물\n".utf8),
+            "메인/휴지통/삭제 초안.txt": Data("삭제 전 합성 원고\n".utf8),
+        ]
+        for (path, data) in documentBytes {
+            try data.write(to: workspace.appendingPathComponent(path), options: [.atomic])
+        }
+        let package = harness.root.appendingPathComponent("InputBackup", isDirectory: true)
+        _ = try await ProjectBackupStore().createBackup(
+            project: project,
+            documents: nodes,
+            workspaceURL: workspace,
+            packageURL: package
+        )
+        return BackupFixture(
+            packageURL: package,
+            project: project,
+            nodes: nodes,
+            documentBytes: documentBytes
+        )
+    }
+
+    private func directoryFingerprint(_ root: URL) throws -> [String: Data?] {
+        guard let enumerator = FileManager.default.enumerator(
+            at: root,
+            includingPropertiesForKeys: [.isDirectoryKey]
+        ) else { return [:] }
+        var result: [String: Data?] = [:]
+        for case let url as URL in enumerator {
+            let values = try url.resourceValues(forKeys: [.isDirectoryKey])
+            let relative = String(url.path.dropFirst(root.path.count + 1))
+            result[relative] = values.isDirectory == true ? nil : try Data(contentsOf: url)
+        }
+        return result
     }
 
     private func rootItems(_ harness: Harness) throws -> [String] {

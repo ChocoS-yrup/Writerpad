@@ -3,6 +3,7 @@ import Foundation
 protocol ProjectManaging: Sendable {
     func projects() async throws -> [ManagedProject]
     func createProject(named name: String) async throws -> ManagedProject
+    func restoreProjectBackup(at packageURL: URL) async throws -> ManagedProject
     func restoreLastProject() async throws -> ManagedProject?
     func selectProject(id: ProjectID) async throws
     func renameProject(id: ProjectID, to newName: String) async throws -> ManagedProject
