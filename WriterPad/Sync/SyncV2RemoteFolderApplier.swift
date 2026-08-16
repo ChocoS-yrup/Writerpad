@@ -98,8 +98,10 @@ actor SyncV2RemoteFolderApplier: SyncV2RemoteFolderApplying {
                     report: &report
                 )
             case let .conflict(_, path, reason):
+                // 목적지 점유·미전송 작업·부모 없음·고리. 넷 다 이름 문제가
+                // 아니다.
                 report.rejectedNames.append(
-                    rejection(path: path, reason: reason)
+                    rejection(path: path, reason: reason, kind: .notApplied)
                 )
             }
         }
@@ -119,7 +121,12 @@ actor SyncV2RemoteFolderApplier: SyncV2RemoteFolderApplying {
         else { return documents }
         guard isNameAllowed(to) else {
             report.rejectedNames.append(
-                rejection(path: to, reason: nil, detail: "허용되지 않는 이름")
+                rejection(
+                    path: to,
+                    reason: nil,
+                    detail: "허용되지 않는 이름",
+                    kind: .unusableName
+                )
             )
             return documents
         }
@@ -131,7 +138,8 @@ actor SyncV2RemoteFolderApplier: SyncV2RemoteFolderApplying {
             report.rejectedNames.append(
                 rejection(
                     path: to,
-                    reason: .destinationOccupied
+                    reason: .destinationOccupied,
+                    kind: .notApplied
                 )
             )
             return documents
@@ -153,7 +161,12 @@ actor SyncV2RemoteFolderApplier: SyncV2RemoteFolderApplying {
             }
         } catch {
             report.rejectedNames.append(
-                rejection(path: to, reason: nil, detail: "옮길 수 없음")
+                rejection(
+                    path: to,
+                    reason: nil,
+                    detail: "옮길 수 없음",
+                    kind: .notApplied
+                )
             )
             return documents
         }
@@ -203,7 +216,12 @@ actor SyncV2RemoteFolderApplier: SyncV2RemoteFolderApplying {
     ) async -> [DocumentNode] {
         guard isNameAllowed(path) else {
             report.rejectedNames.append(
-                rejection(path: path, reason: nil, detail: "허용되지 않는 이름")
+                rejection(
+                    path: path,
+                    reason: nil,
+                    detail: "허용되지 않는 이름",
+                    kind: .unusableName
+                )
             )
             return documents
         }
@@ -215,7 +233,12 @@ actor SyncV2RemoteFolderApplier: SyncV2RemoteFolderApplying {
             )
         } catch {
             report.rejectedNames.append(
-                rejection(path: path, reason: nil, detail: "만들 수 없음")
+                rejection(
+                    path: path,
+                    reason: nil,
+                    detail: "만들 수 없음",
+                    kind: .notApplied
+                )
             )
             return documents
         }
@@ -255,7 +278,8 @@ actor SyncV2RemoteFolderApplier: SyncV2RemoteFolderApplying {
                 rejection(
                     path: path,
                     reason: nil,
-                    detail: "아직 내용이 남아 있어 지우지 않음"
+                    detail: "아직 내용이 남아 있어 지우지 않음",
+                    kind: .notApplied
                 )
             )
             return documents
@@ -273,7 +297,8 @@ actor SyncV2RemoteFolderApplier: SyncV2RemoteFolderApplying {
                     rejection(
                         path: path,
                         reason: nil,
-                        detail: "아직 내용이 남아 있어 지우지 않음"
+                        detail: "아직 내용이 남아 있어 지우지 않음",
+                        kind: .notApplied
                     )
                 )
                 return documents
@@ -308,7 +333,8 @@ actor SyncV2RemoteFolderApplier: SyncV2RemoteFolderApplying {
     private func rejection(
         path: RelativeDocumentPath?,
         reason: SyncV2RemoteFolderPlanner.ConflictReason?,
-        detail: String? = nil
+        detail: String? = nil,
+        kind: SyncV2RejectedStructureKind
     ) -> SyncV2RejectedStructureName {
         let value = path?.rawValue ?? ""
         let components = value.split(
@@ -318,7 +344,8 @@ actor SyncV2RemoteFolderApplier: SyncV2RemoteFolderApplying {
         return SyncV2RejectedStructureName(
             name: components.last.map(String.init) ?? value,
             parent: components.dropLast().joined(separator: "/"),
-            reason: detail ?? reason?.rawValue ?? "unknown"
+            reason: detail ?? reason?.rawValue ?? "unknown",
+            kind: kind
         )
     }
 

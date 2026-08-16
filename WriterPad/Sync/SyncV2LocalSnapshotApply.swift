@@ -1315,7 +1315,9 @@ actor LocalSyncV2SnapshotApplier: SyncV2LocalSnapshotApplying {
             SyncV2RejectedStructureName(
                 name: name,
                 parent: parent,
-                reason: reason
+                reason: reason,
+                // 이름 정책이 막은 것이므로 이름을 고치면 풀린다.
+                kind: .unusableName
             )
         )
     }
