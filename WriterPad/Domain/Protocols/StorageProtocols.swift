@@ -8,6 +8,14 @@ protocol ProjectRepository: Sendable {
     func remove(id: ProjectID) async throws
 }
 
+/// 새 작품과 생성 시점의 고정 바인더 UUID를 한 번의 로컬 메타데이터 저장으로 확정한다.
+protocol ProjectCreationMetadataStoring: Sendable {
+    func saveProjectCreation(
+        _ project: Project,
+        standardNodes: [DocumentNode]
+    ) async throws
+}
+
 /// 바인더 문서 메타데이터 저장 구현이 따라야 하는 경계다.
 protocol DocumentRepository: Sendable {
     func documents(in projectID: ProjectID) async throws -> [DocumentNode]

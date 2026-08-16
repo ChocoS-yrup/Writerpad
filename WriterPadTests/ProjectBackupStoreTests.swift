@@ -3,6 +3,50 @@ import XCTest
 @testable import WriterPad
 
 final class ProjectBackupStoreTests: XCTestCase {
+    @MainActor
+    func testFreshProjectBackupIncludesCreationTimeTrashIdentity() async throws {
+        let fileManager = FileManager.default
+        let root = fileManager.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? fileManager.removeItem(at: root) }
+
+        let resolver = ProjectPathResolver(
+            projectsRootURL: root.appendingPathComponent("Projects", isDirectory: true)
+        )
+        let container = try WriterPadMetadataStore.makeContainer(isStoredInMemoryOnly: true)
+        let repository = SwiftDataMetadataRepository(modelContainer: container)
+        let manager = LocalProjectManager(
+            projectRepository: repository,
+            creationMetadataStore: repository,
+            workspaceStateRepository: repository,
+            pathResolver: resolver,
+            clock: TestClock(date: Date(timeIntervalSince1970: 1_700_000_000))
+        )
+        let project = try await manager.createProject(named: "생성 즉시 백업")
+        let locator = RepositoryProjectWorkspaceLocator(
+            projectRepository: repository,
+            pathResolver: resolver
+        )
+        let coordinator = ProjectBackupCoordinator(
+            projectRepository: repository,
+            documentRepository: repository,
+            workspaceLocator: locator
+        )
+
+        let backup = try await coordinator.createBackup(
+            for: project.id,
+            at: root.appendingPathComponent("독립 백업", isDirectory: true)
+        )
+        let main = try XCTUnwrap(backup.manifest.nodes.first { $0.path == "메인" })
+        let trash = try XCTUnwrap(
+            backup.manifest.nodes.first { $0.path == "메인/휴지통" }
+        )
+
+        XCTAssertEqual(backup.manifest.nodes.count, 10)
+        XCTAssertEqual(trash.kind, "folder")
+        XCTAssertEqual(trash.parentUUID, main.uuid)
+        XCTAssertEqual(trash.order, BinderFixedCategory.trash.fixedOrder)
+    }
+
     func testBackupRestoresUUIDFilesBytesHashesAndLogicalTree() async throws {
         let fileManager = FileManager.default
         let root = fileManager.temporaryDirectory.appendingPathComponent(UUID().uuidString)
@@ -189,6 +233,11 @@ final class ProjectBackupStoreTests: XCTestCase {
 
     private func projectID(_ value: String) -> ProjectID {
         ProjectID(rawValue: UUID(uuidString: value)!)
+    }
+
+    private struct TestClock: AppClock {
+        let date: Date
+        func now() -> Date { date }
     }
 
     private func documentID(_ value: String) -> DocumentID {

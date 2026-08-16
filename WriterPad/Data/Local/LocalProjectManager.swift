@@ -41,6 +41,7 @@ enum ProjectManagerError: Error, Equatable, LocalizedError, Sendable {
 }
 
 enum ProjectManagerFaultPoint: Equatable, Sendable {
+    case afterCreationJournalWrite
     case afterStaging
     case afterMetadataSave
     case afterFileMove
@@ -95,6 +96,7 @@ private struct ProjectTransactionJournal: Codable {
     let oldProject: Project?
     let newProject: Project
     let stagingFolderName: String?
+    let standardNodes: [DocumentNode]?
 
     private enum CodingKeys: String, CodingKey {
         case transactionID = "transaction_id"
@@ -103,6 +105,7 @@ private struct ProjectTransactionJournal: Codable {
         case oldProject = "old_project"
         case newProject = "new_project"
         case stagingFolderName = "staging_folder_name"
+        case standardNodes = "standard_nodes"
     }
 }
 
@@ -113,6 +116,7 @@ actor LocalProjectManager: ProjectManaging {
     private static let journalSuffix = ".json"
 
     private let projectRepository: any ProjectRepository
+    private let creationMetadataStore: any ProjectCreationMetadataStoring
     private let workspaceStateRepository: any WorkspaceStateRepository
     private let pathResolver: ProjectPathResolver
     private let clock: any AppClock
@@ -121,6 +125,7 @@ actor LocalProjectManager: ProjectManaging {
 
     init(
         projectRepository: any ProjectRepository,
+        creationMetadataStore: any ProjectCreationMetadataStoring,
         workspaceStateRepository: any WorkspaceStateRepository,
         pathResolver: ProjectPathResolver,
         clock: any AppClock,
@@ -128,6 +133,7 @@ actor LocalProjectManager: ProjectManaging {
         faultPlan: ProjectManagerFaultPlan? = nil
     ) {
         self.projectRepository = projectRepository
+        self.creationMetadataStore = creationMetadataStore
         self.workspaceStateRepository = workspaceStateRepository
         self.pathResolver = pathResolver
         self.clock = clock
@@ -161,6 +167,7 @@ actor LocalProjectManager: ProjectManaging {
             createdAt: now,
             modifiedAt: now
         )
+        let standardNodes = makeStandardNodes(projectID: project.id, at: now)
         let transactionID = UUID()
         let stagingFolderName = ".writerpad-create-\(transactionID.uuidString).tmp"
         let stagingURL = pathResolver.projectsRootURL
@@ -172,19 +179,24 @@ actor LocalProjectManager: ProjectManaging {
             phase: .staged,
             oldProject: nil,
             newProject: project,
-            stagingFolderName: stagingFolderName
+            stagingFolderName: stagingFolderName,
+            standardNodes: standardNodes
         )
         let journalURL = transactionJournalURL(transactionID)
 
         do {
+            try writeJournal(journal, to: journalURL)
+            try inject(.afterCreationJournalWrite)
             _ = try pathResolver.createStandardStructure(
                 atProjectContainer: stagingURL,
                 projectName: name
             )
-            try writeJournal(journal, to: journalURL)
             try inject(.afterStaging)
 
-            try await projectRepository.save(project)
+            try await creationMetadataStore.saveProjectCreation(
+                project,
+                standardNodes: standardNodes
+            )
             journal.phase = .metadataSaved
             try writeJournal(journal, to: journalURL)
             try inject(.afterMetadataSave)
@@ -285,7 +297,8 @@ actor LocalProjectManager: ProjectManaging {
             phase: .staged,
             oldProject: oldProject,
             newProject: renamed,
-            stagingFolderName: nil
+            stagingFolderName: nil,
+            standardNodes: nil
         )
         let journalURL = transactionJournalURL(transactionID)
 
@@ -509,7 +522,8 @@ actor LocalProjectManager: ProjectManaging {
             phase: .staged,
             oldProject: nil,
             newProject: project,
-            stagingFolderName: quarantineFolderName
+            stagingFolderName: quarantineFolderName,
+            standardNodes: nil
         )
         let journalURL = transactionJournalURL(transactionID)
 
@@ -596,28 +610,67 @@ actor LocalProjectManager: ProjectManaging {
         let hasStaging = fileManager.fileExists(atPath: stagingURL.path)
         let hasFinal = fileManager.fileExists(atPath: finalURL.path)
         let hasMetadata = try await projectRepository.project(id: project.id) != nil
-
+        guard let standardNodes = journal.standardNodes, !standardNodes.isEmpty,
+              !(hasStaging && hasFinal)
+        else {
+            throw ProjectManagerError.recoveryRequired(journalURL.path)
+        }
         if hasFinal {
-            if hasStaging { try removeIfExists(stagingURL) }
-            if !hasMetadata { try await projectRepository.save(project) }
-            var catalog = try loadCatalog()
-            appendCatalogEntryIfNeeded(for: project.id, to: &catalog)
-            try saveCatalog(catalog)
-            try removeIfExists(journalURL)
-            return
-        }
-        if hasStaging, hasMetadata {
+            guard hasMetadata else {
+                throw ProjectManagerError.recoveryRequired(journalURL.path)
+            }
+            try await creationMetadataStore.saveProjectCreation(
+                project,
+                standardNodes: standardNodes
+            )
+        } else {
+            if !hasStaging {
+                _ = try pathResolver.createStandardStructure(
+                    atProjectContainer: stagingURL,
+                    projectName: project.name
+                )
+            }
+            try await creationMetadataStore.saveProjectCreation(
+                project,
+                standardNodes: standardNodes
+            )
             try fileManager.moveItem(at: stagingURL, to: finalURL)
-            var catalog = try loadCatalog()
-            appendCatalogEntryIfNeeded(for: project.id, to: &catalog)
-            try saveCatalog(catalog)
-            try removeIfExists(journalURL)
-            return
         }
-        if hasStaging { try removeIfExists(stagingURL) }
-        if hasMetadata { try await projectRepository.remove(id: project.id) }
-        try removeCatalogEntry(project.id)
+        var catalog = try loadCatalog()
+        appendCatalogEntryIfNeeded(for: project.id, to: &catalog)
+        try saveCatalog(catalog)
+        try await workspaceStateRepository.setLastProjectID(project.id)
         try removeIfExists(journalURL)
+    }
+
+    private func makeStandardNodes(
+        projectID: ProjectID,
+        at date: Date
+    ) -> [DocumentNode] {
+        let mainID = DocumentID(rawValue: UUID())
+        let main = DocumentNode(
+            id: mainID,
+            projectID: projectID,
+            kind: .folder,
+            parentID: nil,
+            relativePath: BinderHierarchyPolicy.topLevelPath,
+            userOrder: 0,
+            modifiedAt: date,
+            contentHash: nil
+        )
+        let children = BinderFixedCategory.allCases.map { category in
+            DocumentNode(
+                id: DocumentID(rawValue: UUID()),
+                projectID: projectID,
+                kind: .folder,
+                parentID: mainID,
+                relativePath: category.relativePath,
+                userOrder: category.fixedOrder,
+                modifiedAt: date,
+                contentHash: nil
+            )
+        }
+        return [main] + children
     }
 
     private func recoverRename(

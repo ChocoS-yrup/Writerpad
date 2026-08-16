@@ -17,10 +17,31 @@ final class LocalProjectManagerTests: XCTestCase {
         let harness = try makeHarness()
 
         let first = try await harness.manager.createProject(named: "나의 작품")
+        let firstNodes = try await harness.repository.documents(in: first.id)
         let second = try await harness.manager.createProject(named: "나의 작품")
+        let secondNodes = try await harness.repository.documents(in: second.id)
         let paths = try harness.resolver.standardPaths(forProjectNamed: "나의 작품")
 
         XCTAssertEqual(first.id, second.id)
+        XCTAssertEqual(firstNodes, secondNodes)
+        XCTAssertEqual(firstNodes.count, 10)
+        XCTAssertEqual(Set(firstNodes.map(\.id)).count, 10)
+        let main = try XCTUnwrap(firstNodes.first {
+            $0.relativePath == BinderHierarchyPolicy.topLevelPath
+        })
+        XCTAssertNil(main.parentID)
+        XCTAssertEqual(main.userOrder, 0)
+        for category in BinderFixedCategory.allCases {
+            let node = try XCTUnwrap(firstNodes.first {
+                $0.relativePath == category.relativePath
+            })
+            XCTAssertEqual(node.parentID, main.id)
+            XCTAssertEqual(node.userOrder, category.fixedOrder)
+        }
+        XCTAssertEqual(
+            firstNodes.filter { $0.parentID == main.id }.map(\.userOrder).sorted(),
+            BinderFixedCategory.allCases.map(\.fixedOrder).sorted()
+        )
         let storedProjects = try await harness.repository.projects()
         XCTAssertEqual(storedProjects.count, 1)
         for directory in paths.requiredDirectories {
@@ -120,6 +141,139 @@ final class LocalProjectManagerTests: XCTestCase {
             )
         )
         XCTAssertFalse(try rootItems(harness).contains { $0.contains("transaction") })
+    }
+
+    func testCreationJournalPreallocatesStandardUUIDsAndRecoveryReusesThem() async throws {
+        let harness = try makeHarness(
+            faultPlan: ProjectManagerFaultPlan(
+                point: .afterStaging,
+                leavesTransactionForRecovery: true
+            )
+        )
+        do {
+            _ = try await harness.manager.createProject(named: "UUID 선기록")
+            XCTFail("staging 직후 테스트 중단이 발생해야 합니다.")
+        } catch let error as ProjectManagerError {
+            XCTAssertEqual(error, .injectedFailure(recoveryPending: true))
+        }
+
+        let projectsBeforeRecovery = try await harness.repository.projects()
+        XCTAssertTrue(projectsBeforeRecovery.isEmpty)
+        let journalName = try XCTUnwrap(
+            rootItems(harness).first { $0.contains("project-transaction") }
+        )
+        let journalURL = harness.resolver.projectsRootURL.appendingPathComponent(journalName)
+        let object = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: Data(contentsOf: journalURL))
+                as? [String: Any]
+        )
+        let projectObject = try XCTUnwrap(object["new_project"] as? [String: Any])
+        let journalProjectID = try XCTUnwrap(projectObject["project_id"] as? String)
+        let nodeObjects = try XCTUnwrap(object["standard_nodes"] as? [[String: Any]])
+        let journalNodeIDs = Set(try nodeObjects.map {
+            try XCTUnwrap($0["document_id"] as? String)
+        })
+        XCTAssertEqual(journalNodeIDs.count, 10)
+
+        let restarted = makeManager(from: harness)
+        let recoveredProjects = try await restarted.projects()
+        let recovered = try XCTUnwrap(recoveredProjects.first)
+        let recoveredNodes = try await harness.repository.documents(in: recovered.id)
+
+        XCTAssertEqual(recovered.id.rawValue.uuidString, journalProjectID)
+        XCTAssertEqual(
+            Set(recoveredNodes.map { $0.id.rawValue.uuidString }),
+            journalNodeIDs
+        )
+        XCTAssertFalse(try rootItems(harness).contains { $0.contains("transaction") })
+    }
+
+    func testRecoveryCreatesStagingWithJournalUUIDsWhenInterruptedBeforeDiskCreation() async throws {
+        let harness = try makeHarness(
+            faultPlan: ProjectManagerFaultPlan(
+                point: .afterCreationJournalWrite,
+                leavesTransactionForRecovery: true
+            )
+        )
+        do {
+            _ = try await harness.manager.createProject(named: "파일 전 중단")
+            XCTFail("journal 기록 직후 테스트 중단이 발생해야 합니다.")
+        } catch let error as ProjectManagerError {
+            XCTAssertEqual(error, .injectedFailure(recoveryPending: true))
+        }
+
+        let rootNames = try rootItems(harness)
+        XCTAssertFalse(rootNames.contains { $0.hasSuffix(".tmp") })
+        let journalName = try XCTUnwrap(
+            rootNames.first { $0.contains("project-transaction") }
+        )
+        let journalURL = harness.resolver.projectsRootURL.appendingPathComponent(journalName)
+        let object = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: Data(contentsOf: journalURL))
+                as? [String: Any]
+        )
+        let nodeObjects = try XCTUnwrap(object["standard_nodes"] as? [[String: Any]])
+        let journalNodeIDs = Set(try nodeObjects.map {
+            try XCTUnwrap($0["document_id"] as? String)
+        })
+
+        let restarted = makeManager(from: harness)
+        let projects = try await restarted.projects()
+        let project = try XCTUnwrap(projects.first)
+        let recoveredNodes = try await harness.repository.documents(in: project.id)
+
+        XCTAssertEqual(
+            Set(recoveredNodes.map { $0.id.rawValue.uuidString }),
+            journalNodeIDs
+        )
+        XCTAssertTrue(
+            FileManager.default.fileExists(
+                atPath: try harness.resolver.standardPaths(
+                    forProjectNamed: project.name
+                ).projectContainerURL.path
+            )
+        )
+        XCTAssertFalse(try rootItems(harness).contains { $0.contains("transaction") })
+    }
+
+    func testCreationJournalWithoutStandardUUIDsRequiresManualRecovery() async throws {
+        let harness = try makeHarness(
+            faultPlan: ProjectManagerFaultPlan(
+                point: .afterStaging,
+                leavesTransactionForRecovery: true
+            )
+        )
+        do {
+            _ = try await harness.manager.createProject(named: "구형 journal")
+            XCTFail("staging 직후 테스트 중단이 발생해야 합니다.")
+        } catch let error as ProjectManagerError {
+            XCTAssertEqual(error, .injectedFailure(recoveryPending: true))
+        }
+
+        let journalName = try XCTUnwrap(
+            rootItems(harness).first { $0.contains("project-transaction") }
+        )
+        let journalURL = harness.resolver.projectsRootURL.appendingPathComponent(journalName)
+        var object = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: Data(contentsOf: journalURL))
+                as? [String: Any]
+        )
+        object.removeValue(forKey: "standard_nodes")
+        try JSONSerialization.data(withJSONObject: object).write(
+            to: journalURL,
+            options: .atomic
+        )
+
+        let restarted = makeManager(from: harness)
+        do {
+            _ = try await restarted.projects()
+            XCTFail("UUID가 없는 생성 journal은 자동 완료하면 안 됩니다.")
+        } catch let error as ProjectManagerError {
+            XCTAssertEqual(error, .recoveryRequired(journalURL.path))
+        }
+        let storedProjects = try await harness.repository.projects()
+        XCTAssertTrue(storedProjects.isEmpty)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: journalURL.path))
     }
 
     func testRenameUpdatesFolderSettingsAndMetadata() async throws {
@@ -468,6 +622,7 @@ final class LocalProjectManagerTests: XCTestCase {
         let clock = FixedClock(date: Date(timeIntervalSince1970: 1_234_567))
         let manager = LocalProjectManager(
             projectRepository: repository,
+            creationMetadataStore: repository,
             workspaceStateRepository: repository,
             pathResolver: resolver,
             clock: clock,
@@ -489,6 +644,7 @@ final class LocalProjectManagerTests: XCTestCase {
     ) -> LocalProjectManager {
         LocalProjectManager(
             projectRepository: harness.repository,
+            creationMetadataStore: harness.repository,
             workspaceStateRepository: harness.repository,
             pathResolver: harness.resolver,
             clock: harness.clock,

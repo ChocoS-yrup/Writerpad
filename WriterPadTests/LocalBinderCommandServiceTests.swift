@@ -1746,6 +1746,7 @@ final class LocalBinderCommandServiceTests: XCTestCase {
         let clock = FixedClock()
         let manager = LocalProjectManager(
             projectRepository: repository,
+            creationMetadataStore: repository,
             workspaceStateRepository: repository,
             pathResolver: resolver,
             clock: clock

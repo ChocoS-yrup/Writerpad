@@ -122,6 +122,7 @@ final class AppEnvironment: ObservableObject {
         let clock = SystemClock()
         let projectManager = LocalProjectManager(
             projectRepository: repository,
+            creationMetadataStore: repository,
             workspaceStateRepository: repository,
             pathResolver: pathResolver,
             clock: clock
