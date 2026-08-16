@@ -2919,6 +2919,13 @@ final class SyncV2SnapshotPullTests: XCTestCase {
             ),
             (
                 saved,
+                .idle,
+                .init(lastResult: .notApplied(detail: "적용하지 않음")),
+                .localOnly,
+                "적용하지 않은 항목 있음"
+            ),
+            (
+                saved,
                 .queued(generation: 1, operationIDs: [UUID()]),
                 .init(lastResult: .conflictRequired(detail: "보존된 충돌")),
                 .localOnly,
@@ -3488,7 +3495,8 @@ final class SyncV2SnapshotPullTests: XCTestCase {
                     SyncV2RejectedStructureName(
                         name: "가 나 다 라 ",
                         parent: "메인",
-                        reason: "이름은 공백이나 마침표로 끝날 수 없습니다."
+                        reason: "이름은 공백이나 마침표로 끝날 수 없습니다.",
+                        kind: .unusableName
                     ),
                 ]
             )
@@ -3533,6 +3541,173 @@ final class SyncV2SnapshotPullTests: XCTestCase {
             "왜 막혔는지도 함께 나와야 한다: \(detail)"
         )
         await model.stop()
+    }
+
+    /// 폴더 거부와 문서 이름 거부가 같은 pull에 있으면, 이름을 고치라는 문장에는
+    /// 이름 문제인 항목만 들어가야 한다. 목록 순서상 폴더 거부가 앞에 붙으므로
+    /// 첫 항목을 그냥 집으면 사용자가 손댈 필요 없는 폴더 이름을 고치러 간다.
+    @MainActor
+    func testNameGuidanceNeverBorrowsAFolderThatWasMerelyNotApplied()
+        async throws {
+        let model = try await folderRejectionModel(
+            outcomes: [
+                .mergeRequired(
+                    documentID: UUID(),
+                    revision: 2,
+                    reason: .invalidLocalHierarchy
+                ),
+            ],
+            rejectedStructureNames: [
+                SyncV2RejectedStructureName(
+                    name: "버린 초안",
+                    parent: "메인/휴지통",
+                    reason: "아직 내용이 남아 있어 지우지 않음",
+                    kind: .notApplied
+                ),
+                SyncV2RejectedStructureName(
+                    name: "설정집 ",
+                    parent: "메인",
+                    reason: "이름은 공백이나 마침표로 끝날 수 없습니다.",
+                    kind: .unusableName
+                ),
+            ]
+        )
+
+        guard case let .structuralConflict(detail) = model.state.lastResult
+        else {
+            return XCTFail("구조 충돌 상태여야 한다.")
+        }
+        XCTAssertTrue(
+            detail.contains("설정집 "),
+            "이름 문제인 항목이 문구에 나와야 한다: \(detail)"
+        )
+        XCTAssertFalse(
+            detail.contains("버린 초안"),
+            "이름 문제가 아닌 항목이 이름 안내문에 끼면 안 된다: \(detail)"
+        )
+        XCTAssertFalse(
+            detail.contains("아직 내용이 남아 있어"),
+            "적용하지 않은 사유가 이름 안내문에 끼면 안 된다: \(detail)"
+        )
+        await model.stop()
+    }
+
+    /// 폴더 거부만 있었던 pull이 아무 일도 없었던 것처럼 끝나면, 서버와 화면이
+    /// 다른 이유를 사용자가 알 수 없다.
+    @MainActor
+    func testFolderOnlyRejectionDoesNotFinishAsSynced() async throws {
+        let model = try await folderRejectionModel(
+            outcomes: [],
+            rejectedStructureNames: [
+                SyncV2RejectedStructureName(
+                    name: "버린 초안",
+                    parent: "메인/휴지통",
+                    reason: "아직 내용이 남아 있어 지우지 않음",
+                    kind: .notApplied
+                ),
+            ]
+        )
+
+        guard case let .notApplied(detail) = model.state.lastResult else {
+            return XCTFail(
+                "적용하지 않은 항목이 있으면 동기화됨으로 끝나면 안 된다: "
+                    + "\(model.state.lastResult)"
+            )
+        }
+        XCTAssertTrue(
+            detail.contains("버린 초안"),
+            "무엇을 적용하지 않았는지 나와야 한다: \(detail)"
+        )
+        XCTAssertTrue(
+            detail.contains("아직 내용이 남아 있어 지우지 않음"),
+            "왜 적용하지 않았는지도 나와야 한다: \(detail)"
+        )
+        XCTAssertFalse(
+            detail.contains("이름을 고친"),
+            "이름을 고치라고 하면 안 된다: \(detail)"
+        )
+
+        // 제목·severity·버튼 셋 다 사실이어야 한다. 실패가 아니고, 눌러서
+        // 풀리는 상태도 아니다.
+        let presentation = WorkspaceSyncStatusReducer.presentation(
+            saveState: .saved(
+                generation: 1,
+                savedAt: Date(timeIntervalSince1970: 1),
+                contentHash: ContentHash(
+                    rawValue: String(repeating: "a", count: 64)
+                )!
+            ),
+            handoffState: .idle,
+            workspaceState: model.state,
+            leaseState: .localOnly
+        )
+        XCTAssertEqual(presentation.label, "적용하지 않은 항목 있음")
+        XCTAssertEqual(presentation.severity, .neutral)
+        XCTAssertFalse(presentation.allowsRetry)
+        await model.stop()
+    }
+
+    /// 표시를 더하다 멀쩡한 경로의 문구를 바꾸면 그것도 거짓이다.
+    @MainActor
+    func testOrdinaryPullStillFinishesAsSynced() async throws {
+        let model = try await folderRejectionModel(
+            outcomes: [
+                .applied(documentID: UUID(), revision: 3, wasOpen: false),
+            ],
+            rejectedStructureNames: []
+        )
+
+        guard case .synced = model.state.lastResult else {
+            return XCTFail(
+                "거부가 없는 pull은 지금과 같아야 한다: "
+                    + "\(model.state.lastResult)"
+            )
+        }
+        await model.stop()
+    }
+
+    @MainActor
+    private func folderRejectionModel(
+        outcomes: [SyncV2SnapshotPullOutcome],
+        rejectedStructureNames: [SyncV2RejectedStructureName]
+    ) async throws -> SyncV2WorkspaceSyncModel {
+        let previous = GlobalSyncPreference.isEnabled()
+        GlobalSyncPreference.setEnabled(true)
+        addTeardownBlock { GlobalSyncPreference.setEnabled(previous) }
+        let localProjectID = ProjectID(rawValue: UUID())
+        let puller = WorkspacePullerStub(
+            report: SyncV2SnapshotPullReport(
+                outcomes: outcomes,
+                appliedSnapshots: [],
+                rejectedStructureNames: rejectedStructureNames
+            )
+        )
+        let model = SyncV2WorkspaceSyncModel(
+            localProjectID: localProjectID,
+            puller: puller,
+            realtime: nil,
+            authenticationService: WorkspaceAuthenticationStub(
+                state: .authenticated(
+                    AuthenticatedAccount(
+                        userID: UUID(),
+                        maskedEmail: "u***@example.com"
+                    )
+                )
+            ),
+            projectBindingService: WorkspaceBindingStub(
+                binding: .connected(
+                    localProjectID: localProjectID,
+                    serverProjectID: UUID(),
+                    kind: .existingServerProject,
+                    projectName: "거부 표시",
+                    ownerSubject: UUID()
+                )
+            ),
+            periodicDelay: .seconds(600)
+        )
+        await model.start(editingGuards: { [:] }) { _ in }
+        try await Task.sleep(for: .milliseconds(50))
+        return model
     }
 
     @MainActor

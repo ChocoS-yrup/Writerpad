@@ -145,6 +145,7 @@ private extension SyncV2WorkspaceState.Result {
         case .automaticallyMerged: "automaticallyMerged"
         case .conflictRequired: "conflictRequired"
         case .structuralConflict: "structuralConflict"
+        case .notApplied: "notApplied"
         case .failed: "failed"
         }
     }

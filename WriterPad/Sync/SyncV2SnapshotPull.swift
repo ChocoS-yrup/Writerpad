@@ -774,6 +774,13 @@ struct SyncV2WorkspaceState: Equatable, Sendable {
         case automaticallyMerged
         case conflictRequired(detail: String)
         case structuralConflict(detail: String)
+        /// 서버가 알린 구조 변경 중 일부를 일부러 적용하지 않았다.
+        ///
+        /// 실패가 아니라 의도한 안전 동작이다. 이름을 고쳐서 풀리는 상태도
+        /// 아니고, 다시 시도해서 풀리는 상태도 아니다. 그래서
+        /// `structuralConflict`와 같은 자리에 둘 수 없다. 저쪽 제목과 재시도
+        /// 버튼이 이 상태에서는 전부 거짓이 된다.
+        case notApplied(detail: String)
         case failed(detail: String)
     }
 
@@ -2019,6 +2026,26 @@ final class SyncV2WorkspaceSyncModel: ObservableObject {
         }
     }
 
+    /// 이름을 고치면 풀리는 항목만 고른다.
+    private static func unusableName(
+        in report: SyncV2SnapshotPullReport
+    ) -> SyncV2RejectedStructureName? {
+        report.rejectedStructureNames.first { $0.kind == .unusableName }
+    }
+
+    /// 이름 문제가 아니어서 적용하지 않은 항목만 고른다.
+    private static func notAppliedItem(
+        in report: SyncV2SnapshotPullReport
+    ) -> SyncV2RejectedStructureName? {
+        report.rejectedStructureNames.first { $0.kind == .notApplied }
+    }
+
+    private static func notAppliedCount(
+        in report: SyncV2SnapshotPullReport
+    ) -> Int {
+        report.rejectedStructureNames.filter { $0.kind == .notApplied }.count
+    }
+
     private func complete(_ report: SyncV2SnapshotPullReport) {
         report.appliedSnapshots.forEach {
             applyOpenSnapshot?($0)
@@ -2049,8 +2076,12 @@ final class SyncV2WorkspaceSyncModel: ObservableObject {
             // 빠져나올 수 없다. 실기기에서 폴더 이름 끝의 공백 하나로 구조
             // 동기화가 멈췄고, 화면에는 원인이 드러나지 않았다. 이름을 알아낸
             // 경우에는 그 이름을 그대로 보여준다.
+            //
+            // 이름 문제인 항목만 고른다. 목록에는 이름과 무관한 거부도 함께
+            // 들어 있고, 그것을 이 문장에 끼우면 사용자가 손댈 필요 없는
+            // 이름을 고치러 간다.
             lastResult = .structuralConflict(
-                detail: report.rejectedStructureNames.first.map { rejected in
+                detail: Self.unusableName(in: report).map { rejected in
                     """
                     \(rejected.parent) 안의 '\(rejected.name)' \
                     이름을 iPad에 적용할 수 없습니다. \
@@ -2059,6 +2090,19 @@ final class SyncV2WorkspaceSyncModel: ObservableObject {
                     로컬 TXT는 덮어쓰지 않았습니다.
                     """
                 } ?? "서버의 폴더나 문서 제목 중 iPad에서 쓸 수 없는 이름이 있어 구조를 적용하지 못했습니다. 이름 끝의 공백과 마침표를 지우고 < > : \" / \\ | ? * 문자를 뺀 뒤 다시 동기화해 주세요. 로컬 TXT는 덮어쓰지 않았습니다."
+            )
+        } else if let skipped = Self.notAppliedItem(in: report) {
+            // 덮어쓰지 않으려고 적용하지 않은 항목이다. 아무 일도 없었던 것처럼
+            // 끝나면 사용자는 서버와 화면이 다른 이유를 알 수 없다. 이름을
+            // 고치라고도, 다시 시도하라고도 하지 않는다.
+            let others = Self.notAppliedCount(in: report) - 1
+            let tail = others > 0 ? " 외 \(others)건." : ""
+            lastResult = .notApplied(
+                detail: """
+                \(skipped.parent) 안의 '\(skipped.name)'을(를) \
+                적용하지 않았습니다. \(skipped.reason).\(tail) \
+                로컬 TXT는 그대로입니다.
+                """
             )
         } else if !mergeOutcomes.isEmpty {
             lastResult = .waiting
