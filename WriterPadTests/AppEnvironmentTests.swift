@@ -5,6 +5,25 @@ import XCTest
 @testable import WriterPad
 
 final class AppEnvironmentTests: XCTestCase {
+    func testCloudStartupDoesNotRestoreAuthenticationWhenSyncIsDisabled()
+        async {
+        let authentication = CloudStartupAuthenticationSpy()
+        let identity = CloudStartupDeviceIdentitySpy()
+
+        await WriterPadCloudStartup.start(
+            syncEnabled: false,
+            authenticationService: authentication,
+            deviceIdentityService: identity,
+            syncDispatcher: nil,
+            backgroundSyncCoordinator: nil
+        )
+
+        let restoreCalls = await authentication.restoreCallCount()
+        let prepareCalls = await identity.prepareCallCount()
+        XCTAssertEqual(restoreCalls, 0)
+        XCTAssertEqual(prepareCalls, 1)
+    }
+
     @MainActor
     func testWorkspaceStorageCoordinatorFindsAndRestoresManuscriptState() async throws {
         let environment = try AppEnvironment.testing()
@@ -80,6 +99,48 @@ final class AppEnvironmentTests: XCTestCase {
         )
         await libraryModel.load(opensLastProject: false)
         XCTAssertNil(libraryModel.selectedProjectID)
+    }
+
+    @MainActor
+    func testProjectListModelRestoresWriterPadBackupThroughProductManager() async throws {
+        let environment = try AppEnvironment.testing()
+        let project = try await environment.projectManager.createProject(
+            named: "제품 복원 진입점"
+        )
+        let package = FileManager.default.temporaryDirectory.appendingPathComponent(
+            "WriterPad-ModelRestore-\(UUID().uuidString)",
+            isDirectory: true
+        )
+        defer { try? FileManager.default.removeItem(at: package) }
+        _ = try await environment.projectBackupCoordinator.createBackup(
+            for: project.id,
+            at: package
+        )
+
+        let pending = try await environment.projectManager.prepareDeletion(id: project.id)
+        try await environment.projectManager.confirmDeletion(pending)
+        let deleted = try await environment.projectManager.prepareMoveToDeletedList(
+            id: project.id
+        )
+        _ = try await environment.projectManager.moveToDeletedList(deleted)
+        let permanent = try await environment.projectManager.preparePermanentDeletion(
+            id: project.id
+        )
+        _ = try await environment.projectManager.permanentlyDelete(permanent)
+
+        let model = ProjectListModel(
+            projectManager: environment.projectManager,
+            projectImporter: environment.projectImporter
+        )
+        await model.restoreBackup(at: package)
+
+        XCTAssertNil(model.errorMessage)
+        XCTAssertEqual(model.selectedProjectID, project.id)
+        XCTAssertEqual(model.selectedProject?.name, "제품 복원 진입점")
+        XCTAssertEqual(
+            model.importSuccessMessage,
+            "‘제품 복원 진입점’ WriterPad 백업을 복원했습니다."
+        )
     }
 
     @MainActor
@@ -4337,6 +4398,43 @@ private actor AlwaysAuthenticatedService: AuthenticationServicing {
         state
     }
     func signOut() -> AuthenticationState { .signedOut(.userInitiated) }
+}
+
+private actor CloudStartupAuthenticationSpy: AuthenticationServicing {
+    private var restoreCalls = 0
+
+    func restoreCallCount() -> Int { restoreCalls }
+    func currentState() -> AuthenticationState { .signedOut(.noStoredSession) }
+    func restoreSession() -> AuthenticationState {
+        restoreCalls += 1
+        return .signedOut(.noStoredSession)
+    }
+    func refreshSession(force: Bool) -> AuthenticationState {
+        _ = force
+        return .signedOut(.noStoredSession)
+    }
+    func signIn(
+        email: String,
+        password: String
+    ) -> AuthenticationState {
+        _ = email
+        _ = password
+        return .signedOut(.noStoredSession)
+    }
+    func signOut() -> AuthenticationState { .signedOut(.userInitiated) }
+}
+
+private actor CloudStartupDeviceIdentitySpy: DeviceIdentityProviding {
+    private var prepareCalls = 0
+
+    func prepareCallCount() -> Int { prepareCalls }
+    func currentState() -> DeviceIdentityState { .uninitialized }
+    func currentIdentifier() async throws -> DeviceIdentifier {
+        throw DeviceIdentityFailure.keychainAccess
+    }
+    func prepareIdentity() async {
+        prepareCalls += 1
+    }
 }
 
 private actor DelayedNewProjectBindingService: ProjectBindingServicing {

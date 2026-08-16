@@ -207,6 +207,37 @@ final class SupabaseProjectBindingServiceTests: XCTestCase {
         XCTAssertEqual(calls[1].batchKind, .windowsImport)
     }
 
+    func testFailedInitialSnapshotIsNotReportedConnectedAndRecoversOnLookup()
+        async {
+        let project = makeProject(
+            id: "00000000-0000-0000-0000-000000000496",
+            name: "중단 복구"
+        )
+        let recorder = InitialSyncRecorderSpy(
+            results: [
+                .localSavedButNotQueued(reason: "injected"),
+                .queued(operationIDs: [UUID()]),
+            ]
+        )
+        let fixture = makeFixture(
+            projects: [project],
+            initialSyncRecorder: recorder
+        )
+
+        let first = await fixture.service.createServerProject(for: project.id)
+
+        XCTAssertEqual(first, .failed(.initialSnapshotNotQueued))
+        let storedAfterFailure = await fixture.store.binding(for: project.id)
+        XCTAssertNotNil(storedAfterFailure)
+
+        // 앱 재시작/dispatcher 뒤 coordinator가 수행하는 binding 조회가
+        // 별도 사용자 재호출 없이 남은 initial handoff를 복구한다.
+        let recovered = await fixture.service.currentBinding(for: project.id)
+        XCTAssertEqual(recovered?.localProjectID, project.id)
+        let calls = await recorder.calls()
+        XCTAssertEqual(calls.count, 2)
+    }
+
     private func serverDocument(
         path: String,
         isDeleted: Bool = false
@@ -688,6 +719,11 @@ private actor InitialSyncRecorderSpy: InitialProjectSyncRecording {
     }
 
     private var values: [Call] = []
+    private var results: [DurableRecordResult]
+
+    init(results: [DurableRecordResult] = []) {
+        self.results = results
+    }
 
     func recordInitialSnapshot(
         projectID: ProjectID,
@@ -701,7 +737,10 @@ private actor InitialSyncRecorderSpy: InitialProjectSyncRecording {
                 batchKind: batchKind
             )
         )
-        return .queued(operationIDs: [])
+        guard !results.isEmpty else {
+            return .queued(operationIDs: [])
+        }
+        return results.removeFirst()
     }
 
     func calls() -> [Call] {

@@ -390,6 +390,7 @@ final class LocalBinderRepositoryTests: XCTestCase {
         let clock = FixedClock(date: Date(timeIntervalSince1970: 4_000))
         let manager = LocalProjectManager(
             projectRepository: repository,
+            creationMetadataStore: repository,
             workspaceStateRepository: repository,
             pathResolver: resolver,
             clock: clock

@@ -399,6 +399,8 @@ final class SyncSettingsModel: ObservableObject {
             return "서버가 예상과 다른 작품 정보를 반환했습니다."
         case .serverRejected:
             return "서버가 작품 연결을 처리하지 못했습니다."
+        case .initialSnapshotNotQueued:
+            return "최초 작품 snapshot을 안전하게 기록하지 못했습니다. 앱을 다시 열면 자동으로 재시도합니다."
         case .notBound:
             return "아직 서버에 연결되지 않은 작품입니다."
         }

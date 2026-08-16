@@ -747,7 +747,7 @@ final class SyncV2StoreTests: XCTestCase {
         let firstAttempts = await durable.batches
         let first = try XCTUnwrap(firstAttempts.first)
         XCTAssertEqual(first.kind, .windowsImport)
-        XCTAssertEqual(first.mutations.count, 3)
+        XCTAssertEqual(first.mutations.count, 5)
 
         try Data("후속 변경".utf8).write(to: liveURL)
         _ = await recorder.recordInitialSnapshot(
@@ -759,7 +759,18 @@ final class SyncV2StoreTests: XCTestCase {
         let recorded = await durable.batches
         XCTAssertEqual(recorded, [first, first])
         XCTAssertFalse(FileManager.default.fileExists(atPath: marker.path))
-        guard case let .documentSnapshot(
+        let completedReplay = await recorder.recordInitialSnapshot(
+            projectID: projectID,
+            projectName: "Windows 작품",
+            batchKind: .windowsImport
+        )
+        XCTAssertEqual(completedReplay, .notNeeded)
+        let attemptsAfterCompletion = await durable.batches
+        XCTAssertEqual(attemptsAfterCompletion, [first, first])
+        guard let liveMutation = first.mutations.first(where: {
+            if case .documentSnapshot = $0 { return true }
+            return false
+        }), case let .documentSnapshot(
             _,
             documentID,
             _,
@@ -767,7 +778,7 @@ final class SyncV2StoreTests: XCTestCase {
             _,
             _,
             _
-        ) = first.mutations[1] else {
+        ) = liveMutation else {
             return XCTFail("가져온 TXT snapshot이 없습니다.")
         }
         XCTAssertEqual(documentID, liveID)
@@ -840,7 +851,10 @@ final class SyncV2StoreTests: XCTestCase {
         let batches = await durable.batches
         let batch = try XCTUnwrap(batches.first)
         XCTAssertEqual(batch.kind, .projectBinding)
-        guard case let .documentSnapshot(
+        guard let liveMutation = batch.mutations.first(where: {
+            if case .documentSnapshot = $0 { return true }
+            return false
+        }), case let .documentSnapshot(
             _,
             recordedDocumentID,
             recordedPath,
@@ -848,7 +862,7 @@ final class SyncV2StoreTests: XCTestCase {
             _,
             _,
             _
-        ) = batch.mutations[1] else {
+        ) = liveMutation else {
             return XCTFail("연결 전 로컬 문서 snapshot이 없습니다.")
         }
         XCTAssertEqual(recordedDocumentID, documentID)
@@ -861,6 +875,328 @@ final class SyncV2StoreTests: XCTestCase {
                 ).path
             )
         )
+    }
+
+    func testInitialSnapshotPreservesLiveIdentitiesAndSkipsTrashedFolders()
+        async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent(
+                "WriterPad-NativeFolderIdentity-\(UUID().uuidString)",
+                isDirectory: true
+            )
+        try FileManager.default.createDirectory(
+            at: root.appendingPathComponent("메인/메모장"),
+            withIntermediateDirectories: true
+        )
+        addTeardownBlock { try? FileManager.default.removeItem(at: root) }
+
+        let projectID = ProjectID(rawValue: UUID())
+        let mainID = DocumentID(rawValue: UUID())
+        let standardNames = [
+            "원고", "캐릭터", "설정집", "메모장", "스토리 플롯",
+            "흐름정리", "복선", "장소", "휴지통",
+        ]
+        let standardIDs = Dictionary(
+            uniqueKeysWithValues: standardNames.map {
+                ($0, DocumentID(rawValue: UUID()))
+            }
+        )
+        let date = Date(timeIntervalSince1970: 1)
+        var nodes = [
+            DocumentNode(
+                id: mainID,
+                projectID: projectID,
+                kind: .folder,
+                parentID: nil,
+                relativePath: .init(rawValue: "메인"),
+                userOrder: 0,
+                modifiedAt: date,
+                contentHash: nil
+            ),
+        ]
+        for (order, name) in standardNames.enumerated() {
+            nodes.append(
+                DocumentNode(
+                    id: standardIDs[name]!,
+                    projectID: projectID,
+                    kind: .folder,
+                    parentID: mainID,
+                    relativePath: .init(rawValue: "메인/\(name)"),
+                    userOrder: order,
+                    modifiedAt: date,
+                    contentHash: nil
+                )
+            )
+        }
+        let decomposedName = "가"
+        let userFolderID = DocumentID(rawValue: UUID())
+        let emptyFolderID = DocumentID(rawValue: UUID())
+        let trashedFolderID = DocumentID(rawValue: UUID())
+        nodes.append(
+            contentsOf: [
+                DocumentNode(
+                    id: userFolderID,
+                    projectID: projectID,
+                    kind: .folder,
+                    parentID: standardIDs["메모장"],
+                    relativePath: .init(
+                        rawValue: "메인/메모장/\(decomposedName)"
+                    ),
+                    userOrder: 0,
+                    modifiedAt: date,
+                    contentHash: nil
+                ),
+                DocumentNode(
+                    id: emptyFolderID,
+                    projectID: projectID,
+                    kind: .folder,
+                    parentID: standardIDs["설정집"],
+                    relativePath: .init(rawValue: "메인/설정집/빈 폴더"),
+                    userOrder: 0,
+                    modifiedAt: date,
+                    contentHash: nil
+                ),
+                DocumentNode(
+                    id: trashedFolderID,
+                    projectID: projectID,
+                    kind: .folder,
+                    parentID: standardIDs["휴지통"],
+                    relativePath: .init(rawValue: "메인/휴지통/삭제 폴더"),
+                    userOrder: 0,
+                    modifiedAt: date,
+                    contentHash: nil,
+                    deletionStatus: .trashed(
+                        originalPath: .init(rawValue: "메인/메모장/삭제 폴더"),
+                        deletedAt: date
+                    )
+                ),
+            ]
+        )
+        let liveID = DocumentID(rawValue: UUID())
+        let deletedID = DocumentID(rawValue: UUID())
+        let livePath = RelativeDocumentPath(
+            rawValue: "메인/메모장/원본.txt"
+        )
+        let originalBytes = Data("원본\r\n가".utf8)
+        try originalBytes.write(to: root.appendingPathComponent(livePath.rawValue))
+        nodes.append(
+            contentsOf: [
+                DocumentNode(
+                    id: liveID,
+                    projectID: projectID,
+                    kind: .text,
+                    parentID: standardIDs["메모장"],
+                    relativePath: livePath,
+                    userOrder: 1,
+                    modifiedAt: date,
+                    contentHash: nil
+                ),
+                DocumentNode(
+                    id: deletedID,
+                    projectID: projectID,
+                    kind: .text,
+                    parentID: standardIDs["휴지통"],
+                    relativePath: .init(rawValue: "메인/휴지통/삭제.txt"),
+                    userOrder: 1,
+                    modifiedAt: date,
+                    contentHash: nil,
+                    deletionStatus: .trashed(
+                        originalPath: .init(rawValue: "메인/메모장/삭제.txt"),
+                        deletedAt: date
+                    )
+                ),
+            ]
+        )
+        // 저장소 반환 순서가 identity wire order에 영향을 주지 않아야 한다.
+        nodes.reverse()
+        let durable = ScriptedDurableChangeRecorder(
+            results: [.queued(operationIDs: [])]
+        )
+        let recorder = ProjectInitialSyncRecorder(
+            documentRepository: InitialSnapshotDocumentRepository(nodes),
+            workspaceLocator: FixedWorkspaceLocator(root: root),
+            durableChangeRecorder: durable
+        )
+
+        _ = await recorder.recordInitialSnapshot(
+            projectID: projectID,
+            projectName: "identity",
+            batchKind: .projectBinding
+        )
+
+        let recordedBatches = await durable.batches
+        let batch = try XCTUnwrap(recordedBatches.first)
+        var snapshots: [DocumentID: (DocumentID?, String, Bool, Int)] = [:]
+        for (index, mutation) in batch.mutations.enumerated() {
+            if case let .folderSnapshot(
+                _, folderID, parentID, name, isDeleted
+            ) = mutation {
+                snapshots[folderID] = (parentID, name, isDeleted, index)
+            }
+        }
+        XCTAssertEqual(snapshots.count, 12)
+        XCTAssertEqual(
+            Set(snapshots.keys),
+            Set(nodes.filter {
+                $0.kind == .folder && $0.id != trashedFolderID
+            }.map(\.id))
+        )
+        XCTAssertEqual(snapshots[mainID]?.0, nil)
+        XCTAssertEqual(snapshots[standardIDs["휴지통"]!]?.0, mainID)
+        XCTAssertEqual(snapshots[userFolderID]?.0, standardIDs["메모장"])
+        XCTAssertEqual(snapshots[userFolderID]?.1, "가")
+        XCTAssertEqual(snapshots[emptyFolderID]?.0, standardIDs["설정집"])
+        // base_revision 0의 삭제 폴더는 서버가 INVALID_ARGUMENT로 거절한다.
+        // 고정 휴지통은 live로 보내되 그 아래 폴더 operation은 만들지 않는다.
+        XCTAssertFalse(snapshots[standardIDs["휴지통"]!]?.2 ?? true)
+        XCTAssertNil(snapshots[trashedFolderID])
+        XCTAssertNotEqual(
+            userFolderID,
+            SyncV2FolderIdentity.derived(
+                serverProjectID: projectID.rawValue,
+                relativePath: "메인/메모장/\(decomposedName)"
+            )
+        )
+
+        let documentMutations = batch.mutations.compactMap { mutation ->
+            (DocumentID, String, ContentHash)? in
+            guard case let .documentSnapshot(
+                _, id, _, content, hash, _, _
+            ) = mutation else { return nil }
+            return (id, content, hash)
+        }
+        XCTAssertEqual(documentMutations.count, 1)
+        XCTAssertEqual(documentMutations.first?.0, liveID)
+        XCTAssertEqual(Data(documentMutations.first!.1.utf8), originalBytes)
+        XCTAssertEqual(
+            documentMutations.first?.2,
+            SHA256ContentHasher().sha256(for: originalBytes)
+        )
+        XCTAssertFalse(documentMutations.contains { $0.0 == deletedID })
+
+        guard case let .treeOrder(_, content, _) = batch.mutations.last else {
+            return XCTFail("tree_order가 마지막 mutation이어야 합니다.")
+        }
+        let object = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: Data(content.utf8))
+                as? [String: Any]
+        )
+        let tree = try XCTUnwrap(object["tree_order"] as? [String: [String]])
+        XCTAssertEqual(tree["<root>"], standardNames)
+        XCTAssertEqual(tree["메인/메모장"], ["가", "원본.txt"])
+        XCTAssertEqual(tree["메인/설정집"], ["빈 폴더"])
+        XCTAssertEqual(Set(tree["<root>"] ?? []).count, 9)
+    }
+
+    func testMarkerlessInitialSnapshotStateFailureNeverGuessesNewIDs()
+        async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent(
+                "WriterPad-MarkerlessInitial-\(UUID().uuidString)",
+                isDirectory: true
+            )
+        try FileManager.default.createDirectory(
+            at: root,
+            withIntermediateDirectories: true
+        )
+        addTeardownBlock { try? FileManager.default.removeItem(at: root) }
+        let projectID = ProjectID(rawValue: UUID())
+        let durable = UnavailableInitialSnapshotStateRecorder()
+        let recorder = ProjectInitialSyncRecorder(
+            documentRepository: InitialSnapshotDocumentRepository([]),
+            workspaceLocator: FixedWorkspaceLocator(root: root),
+            durableChangeRecorder: durable
+        )
+
+        let result = await recorder.recordInitialSnapshot(
+            projectID: projectID,
+            projectName: "불일치",
+            batchKind: .projectBinding
+        )
+
+        XCTAssertEqual(
+            result,
+            .localSavedButNotQueued(
+                reason: "초기 작품 동기화 완료 상태를 확인할 수 없습니다."
+            )
+        )
+        let recordCallCount = await durable.recordCallCount()
+        XCTAssertEqual(recordCallCount, 0)
+        XCTAssertFalse(
+            FileManager.default.fileExists(
+                atPath: root.appendingPathComponent(
+                    ProjectInitialSyncRecorder.newProjectMarkerName
+                ).path
+            )
+        )
+    }
+
+    func testEnqueuedInitialSnapshotWithUnclearedMarkerReplaysSameIDs()
+        async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent(
+                "WriterPad-EnqueuedInitialInterruption-\(UUID().uuidString)",
+                isDirectory: true
+            )
+        try FileManager.default.createDirectory(
+            at: root,
+            withIntermediateDirectories: true
+        )
+        addTeardownBlock { try? FileManager.default.removeItem(at: root) }
+        let projectID = ProjectID(rawValue: UUID())
+        let mainID = DocumentID(rawValue: UUID())
+        let repository = InitialSnapshotDocumentRepository([
+            DocumentNode(
+                id: mainID,
+                projectID: projectID,
+                kind: .folder,
+                parentID: nil,
+                relativePath: .init(rawValue: "메인"),
+                userOrder: 0,
+                modifiedAt: Date(timeIntervalSince1970: 1),
+                contentHash: nil
+            ),
+        ])
+        let durable = ScriptedDurableChangeRecorder(
+            results: [
+                .queued(operationIDs: []),
+                .queued(operationIDs: []),
+            ]
+        )
+        let interrupted = ProjectInitialSyncRecorder(
+            documentRepository: repository,
+            workspaceLocator: FixedWorkspaceLocator(root: root),
+            durableChangeRecorder: durable,
+            fileManager: FailingMarkerRemovalFileManager()
+        )
+
+        _ = await interrupted.recordInitialSnapshot(
+            projectID: projectID,
+            projectName: "enqueue 뒤 중단",
+            batchKind: .projectBinding
+        )
+
+        let marker = root.appendingPathComponent(
+            ProjectInitialSyncRecorder.newProjectMarkerName
+        )
+        XCTAssertTrue(FileManager.default.fileExists(atPath: marker.path))
+        let firstAttempts = await durable.batches
+        let first = try XCTUnwrap(firstAttempts.first)
+
+        let restarted = ProjectInitialSyncRecorder(
+            documentRepository: repository,
+            workspaceLocator: FixedWorkspaceLocator(root: root),
+            durableChangeRecorder: durable
+        )
+        _ = await restarted.recordInitialSnapshot(
+            projectID: projectID,
+            projectName: "enqueue 뒤 중단",
+            batchKind: .projectBinding
+        )
+
+        let attempts = await durable.batches
+        XCTAssertEqual(attempts, [first, first])
+        XCTAssertFalse(FileManager.default.fileExists(atPath: marker.path))
     }
 
     func testSQLiteBindingUniqueIndexRejectsSecondLocalProject()
@@ -898,6 +1234,57 @@ final class SyncV2StoreTests: XCTestCase {
             forServerProjectID: serverID
         )
         XCTAssertEqual(preserved, first)
+        await store.close()
+    }
+
+    func testNativeBindingAtomicallyCompletesFolderMigrationButLegacyDoesNot()
+        async throws {
+        let store = try await openStore(at: databaseURL())
+        let owner = UUID()
+        let nativeID = ProjectID(rawValue: UUID())
+        let windowsID = ProjectID(rawValue: UUID())
+        let legacyID = ProjectID(rawValue: UUID())
+
+        try await store.save(
+            .connected(
+                localProjectID: nativeID,
+                serverProjectID: nativeID.rawValue,
+                kind: .newServerProject,
+                projectName: "native",
+                ownerSubject: owner
+            )
+        )
+        try await store.save(
+            .connected(
+                localProjectID: windowsID,
+                serverProjectID: UUID(),
+                kind: .windowsImport,
+                projectName: "windows",
+                ownerSubject: owner
+            )
+        )
+        try await store.save(
+            .connected(
+                localProjectID: legacyID,
+                serverProjectID: UUID(),
+                kind: .existingServerProject,
+                projectName: "legacy",
+                ownerSubject: owner
+            )
+        )
+
+        let nativeCompleted = try await store.isFolderMigrationCompleted(
+            localProjectID: nativeID
+        )
+        let windowsCompleted = try await store.isFolderMigrationCompleted(
+            localProjectID: windowsID
+        )
+        let legacyCompleted = try await store.isFolderMigrationCompleted(
+            localProjectID: legacyID
+        )
+        XCTAssertTrue(nativeCompleted)
+        XCTAssertTrue(windowsCompleted)
+        XCTAssertFalse(legacyCompleted)
         await store.close()
     }
 
@@ -4113,13 +4500,15 @@ final class SyncV2StoreTests: XCTestCase {
         await store.close()
     }
 
-    func testParentTombstoneWaitsForItsChildFolder() async throws {
+    func testThreeLevelFolderTombstonesCommitDeepestFirst() async throws {
         let url = try databaseURL()
         let context = QueueAPIContext()
         let store = try await connectedStore(at: url, context: context)
         let childID = UUID()
+        let grandchildID = UUID()
         let parentDeleteID = UUID()
         let childDeleteID = UUID()
+        let grandchildDeleteID = UUID()
 
         _ = try await store.enqueue(
             context.batch(
@@ -4134,6 +4523,12 @@ final class SyncV2StoreTests: XCTestCase {
                         folderID: childID,
                         parentFolderID: context.folderID,
                         name: "자식"
+                    ),
+                    context.folderMutation(
+                        operationID: UUID(),
+                        folderID: grandchildID,
+                        parentFolderID: childID,
+                        name: "손자"
                     ),
                 ]
             )
@@ -4165,18 +4560,38 @@ final class SyncV2StoreTests: XCTestCase {
                         name: "자식",
                         isDeleted: true
                     ),
+                    context.folderMutation(
+                        operationID: grandchildDeleteID,
+                        folderID: grandchildID,
+                        parentFolderID: childID,
+                        name: "손자",
+                        isDeleted: true
+                    ),
                 ]
             )
         )
 
-        let ready = try await store.claimReadyFolderOperations(
-            limit: 10,
-            now: Date(timeIntervalSince1970: 20)
-        )
+        var committed: [UUID] = []
+        for timestamp in [20.0, 30.0, 40.0] {
+            let ready = try await store.claimReadyFolderOperations(
+                limit: 10,
+                now: Date(timeIntervalSince1970: timestamp)
+            )
+            let operation = try XCTUnwrap(ready.first)
+            XCTAssertEqual(ready.count, 1)
+            committed.append(operation.operationID)
+            try await store.complete(
+                operation,
+                result: folderCommitResult(for: operation)
+            )
+        }
 
-        // 서버는 내용이 있는 폴더의 삭제를 FOLDER_NOT_EMPTY로 거부한다. 자식이
-        // 먼저 나가고 부모는 그 뒤에야 나갈 수 있다.
-        XCTAssertEqual(ready.map(\.operationID), [childDeleteID])
+        // A/B/C를 부모 우선으로 enqueue해도 서버에는 C/B/A만 나갈 수 있다.
+        // A가 먼저 나가면 live 자식 때문에 FOLDER_NOT_EMPTY가 된다.
+        XCTAssertEqual(
+            committed,
+            [grandchildDeleteID, childDeleteID, parentDeleteID]
+        )
         await store.close()
     }
 
@@ -4657,6 +5072,44 @@ private final class RawSQLite {
 
 private struct RawSQLiteError: Error {
     let code: Int32
+}
+
+private final class FailingMarkerRemovalFileManager: FileManager,
+    @unchecked Sendable {
+    override func removeItem(at URL: URL) throws {
+        _ = URL
+        throw CocoaError(.fileWriteUnknown)
+    }
+}
+
+private actor UnavailableInitialSnapshotStateRecorder:
+    DurableLocalChangeRecording {
+    private struct InjectedError: Error {}
+    private var calls = 0
+
+    func requirement(
+        for projectID: ProjectID
+    ) async -> DurableRecordingRequirement {
+        _ = projectID
+        return .durableQueue
+    }
+
+    func hasRecordedInitialSnapshot(
+        for projectID: ProjectID,
+        kind: DurableLocalBatchKind
+    ) async throws -> Bool {
+        _ = projectID
+        _ = kind
+        throw InjectedError()
+    }
+
+    func record(_ batch: LocalMutationBatch) async -> DurableRecordResult {
+        _ = batch
+        calls += 1
+        return .queued(operationIDs: [])
+    }
+
+    func recordCallCount() -> Int { calls }
 }
 
 private actor InitialSnapshotDocumentRepository: DocumentRepository {

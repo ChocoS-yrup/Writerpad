@@ -309,6 +309,7 @@ final class WindowsProjectImporterTests: XCTestCase {
         let clock = FixedClock(date: Date(timeIntervalSince1970: 1_234_567))
         let manager = LocalProjectManager(
             projectRepository: repository,
+            creationMetadataStore: repository,
             workspaceStateRepository: repository,
             pathResolver: resolver,
             clock: clock

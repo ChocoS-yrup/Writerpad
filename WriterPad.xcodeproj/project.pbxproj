@@ -77,6 +77,8 @@
 		A10000000000000000000044 /* AppearanceSettingsView.swift in Sources */ = {isa = PBXBuildFile; fileRef = B10000000000000000000049 /* AppearanceSettingsView.swift */; };
 		A10000000000000000000045 /* LocalBackupStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = B1000000000000000000004D /* LocalBackupStore.swift */; };
 		A10000000000000000000046 /* LocalBackupStoreTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = B1000000000000000000004E /* LocalBackupStoreTests.swift */; };
+		D20000000000000000000001 /* ProjectBackupStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = D21000000000000000000001 /* ProjectBackupStore.swift */; };
+		D20000000000000000000002 /* ProjectBackupStoreTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = D21000000000000000000002 /* ProjectBackupStoreTests.swift */; };
 		A10000000000000000000047 /* BackupHistoryView.swift in Sources */ = {isa = PBXBuildFile; fileRef = B1000000000000000000004F /* BackupHistoryView.swift */; };
 		A10000000000000000000048 /* TrashManagementView.swift in Sources */ = {isa = PBXBuildFile; fileRef = B10000000000000000000050 /* TrashManagementView.swift */; };
 		A1000000000000000000004D /* BinderHierarchyPolicy.swift in Sources */ = {isa = PBXBuildFile; fileRef = B10000000000000000000051 /* BinderHierarchyPolicy.swift */; };
@@ -244,6 +246,8 @@
 		B1000000000000000000004C /* malgunsl.ttf */ = {isa = PBXFileReference; lastKnownFileType = file; path = malgunsl.ttf; sourceTree = SOURCE_ROOT; };
 		B1000000000000000000004D /* LocalBackupStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LocalBackupStore.swift; sourceTree = "<group>"; };
 		B1000000000000000000004E /* LocalBackupStoreTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LocalBackupStoreTests.swift; sourceTree = "<group>"; };
+		D21000000000000000000001 /* ProjectBackupStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ProjectBackupStore.swift; sourceTree = "<group>"; };
+		D21000000000000000000002 /* ProjectBackupStoreTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ProjectBackupStoreTests.swift; sourceTree = "<group>"; };
 		B1000000000000000000004F /* BackupHistoryView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ../../Features/Backup/BackupHistoryView.swift; sourceTree = "<group>"; };
 		B10000000000000000000050 /* TrashManagementView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ../../Features/Binder/TrashManagementView.swift; sourceTree = "<group>"; };
 		B10000000000000000000051 /* BinderHierarchyPolicy.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BinderHierarchyPolicy.swift; sourceTree = "<group>"; };
@@ -529,6 +533,7 @@
 				B1000000000000000000002C /* LocalDocumentStoreTests.swift */,
 				B1000000000000000000002D /* LocalDocumentStoreRecoveryTests.swift */,
 				B1000000000000000000004E /* LocalBackupStoreTests.swift */,
+				D21000000000000000000002 /* ProjectBackupStoreTests.swift */,
 				B10000000000000000000053 /* ProjectSearchServiceTests.swift */,
 				B10000000000000000000055 /* LocalManuscriptExporterTests.swift */,
 				B10000000000000000000062 /* LocalPerformanceBaselineTests.swift */,
@@ -625,6 +630,7 @@
 			isa = PBXGroup;
 			children = (
 				B1000000000000000000004D /* LocalBackupStore.swift */,
+				D21000000000000000000001 /* ProjectBackupStore.swift */,
 				B1000000000000000000004F /* BackupHistoryView.swift */,
 			);
 			path = Backup;
@@ -897,6 +903,7 @@
 				A10000000000000000000043 /* TextRuleEngine.swift in Sources */,
 				A10000000000000000000044 /* AppearanceSettingsView.swift in Sources */,
 				A10000000000000000000045 /* LocalBackupStore.swift in Sources */,
+				D20000000000000000000001 /* ProjectBackupStore.swift in Sources */,
 				A10000000000000000000047 /* BackupHistoryView.swift in Sources */,
 				A10000000000000000000048 /* TrashManagementView.swift in Sources */,
 				A10000000000000000000016 /* WriterPadMetadataSchema.swift in Sources */,
@@ -969,6 +976,7 @@
 				A10000000000000000000028 /* LocalDocumentStoreTests.swift in Sources */,
 				A10000000000000000000029 /* LocalDocumentStoreRecoveryTests.swift in Sources */,
 				A10000000000000000000046 /* LocalBackupStoreTests.swift in Sources */,
+				D20000000000000000000002 /* ProjectBackupStoreTests.swift in Sources */,
 				A1000000000000000000004F /* ProjectSearchServiceTests.swift in Sources */,
 				A10000000000000000000051 /* LocalManuscriptExporterTests.swift in Sources */,
 				A1000000000000000000005E /* LocalPerformanceBaselineTests.swift in Sources */,

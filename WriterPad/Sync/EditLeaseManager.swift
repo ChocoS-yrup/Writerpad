@@ -1031,7 +1031,8 @@ actor EditLeaseManager: EditLeaseManaging {
             case .forbidden, .invalidArgument,
                  .documentAlreadyExists, .revisionConflict,
                  .operationIDReused, .leaseRequired, .pathConflict,
-                 .folderNotFound, .folderAlreadyExists, .folderNotEmpty:
+                 .folderNotFound, .folderAlreadyExists, .folderNotEmpty,
+                 .parentFolderNotFound, .folderNameConflict, .folderCycle:
                 // 편집 점유는 문서에만 있다. 폴더 코드는 여기로 오지 않는다.
                 return .unavailable
             }

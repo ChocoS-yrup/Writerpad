@@ -146,6 +146,10 @@ enum DurableRecordingRequirement: Equatable, Sendable {
 
 protocol DurableLocalChangeRecording: Sendable {
     func requirement(for projectID: ProjectID) async -> DurableRecordingRequirement
+    func hasRecordedInitialSnapshot(
+        for projectID: ProjectID,
+        kind: DurableLocalBatchKind
+    ) async throws -> Bool
     func record(_ batch: LocalMutationBatch) async -> DurableRecordResult
     func preservedResult(
         for projectID: ProjectID,
@@ -156,6 +160,15 @@ protocol DurableLocalChangeRecording: Sendable {
 extension DurableLocalChangeRecording {
     func requirement(for projectID: ProjectID) async -> DurableRecordingRequirement {
         .durableQueue
+    }
+
+    func hasRecordedInitialSnapshot(
+        for projectID: ProjectID,
+        kind: DurableLocalBatchKind
+    ) async throws -> Bool {
+        _ = projectID
+        _ = kind
+        return false
     }
 
     func preservedResult(
