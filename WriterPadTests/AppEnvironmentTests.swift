@@ -5,6 +5,25 @@ import XCTest
 @testable import WriterPad
 
 final class AppEnvironmentTests: XCTestCase {
+    func testCloudStartupDoesNotRestoreAuthenticationWhenSyncIsDisabled()
+        async {
+        let authentication = CloudStartupAuthenticationSpy()
+        let identity = CloudStartupDeviceIdentitySpy()
+
+        await WriterPadCloudStartup.start(
+            syncEnabled: false,
+            authenticationService: authentication,
+            deviceIdentityService: identity,
+            syncDispatcher: nil,
+            backgroundSyncCoordinator: nil
+        )
+
+        let restoreCalls = await authentication.restoreCallCount()
+        let prepareCalls = await identity.prepareCallCount()
+        XCTAssertEqual(restoreCalls, 0)
+        XCTAssertEqual(prepareCalls, 1)
+    }
+
     @MainActor
     func testWorkspaceStorageCoordinatorFindsAndRestoresManuscriptState() async throws {
         let environment = try AppEnvironment.testing()
@@ -4379,6 +4398,43 @@ private actor AlwaysAuthenticatedService: AuthenticationServicing {
         state
     }
     func signOut() -> AuthenticationState { .signedOut(.userInitiated) }
+}
+
+private actor CloudStartupAuthenticationSpy: AuthenticationServicing {
+    private var restoreCalls = 0
+
+    func restoreCallCount() -> Int { restoreCalls }
+    func currentState() -> AuthenticationState { .signedOut(.noStoredSession) }
+    func restoreSession() -> AuthenticationState {
+        restoreCalls += 1
+        return .signedOut(.noStoredSession)
+    }
+    func refreshSession(force: Bool) -> AuthenticationState {
+        _ = force
+        return .signedOut(.noStoredSession)
+    }
+    func signIn(
+        email: String,
+        password: String
+    ) -> AuthenticationState {
+        _ = email
+        _ = password
+        return .signedOut(.noStoredSession)
+    }
+    func signOut() -> AuthenticationState { .signedOut(.userInitiated) }
+}
+
+private actor CloudStartupDeviceIdentitySpy: DeviceIdentityProviding {
+    private var prepareCalls = 0
+
+    func prepareCallCount() -> Int { prepareCalls }
+    func currentState() -> DeviceIdentityState { .uninitialized }
+    func currentIdentifier() async throws -> DeviceIdentifier {
+        throw DeviceIdentityFailure.keychainAccess
+    }
+    func prepareIdentity() async {
+        prepareCalls += 1
+    }
 }
 
 private actor DelayedNewProjectBindingService: ProjectBindingServicing {
