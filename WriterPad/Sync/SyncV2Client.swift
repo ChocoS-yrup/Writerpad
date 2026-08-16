@@ -19,6 +19,14 @@ enum SyncV2RemoteErrorCode: String, Codable, Error, CaseIterable, Sendable {
     /// 내용이 있는 폴더는 바로 지울 수 없다. 문서와 하위 폴더를 먼저 보내고
     /// 부모를 마지막에 보내야 한다.
     case folderNotEmpty = "FOLDER_NOT_EMPTY"
+    /// 부모가 서버에 없거나 이미 삭제됐다. 폴더 줄을 claim 순서대로 직렬로
+    /// 비우는 지금 이 코드가 온다면 도착 순서 문제가 아니라 트리 불일치다.
+    case parentFolderNotFound = "PARENT_FOLDER_NOT_FOUND"
+    /// 같은 부모 아래 같은 이름을 다른 identity가 이미 차지했다. 사용자가
+    /// 이름을 바꾸기 전에는 몇 번을 보내도 같은 답이 온다.
+    case folderNameConflict = "FOLDER_NAME_CONFLICT"
+    /// 자기 자손을 부모로 삼는 트리다. 구조적으로 성립하지 않는다.
+    case folderCycle = "FOLDER_CYCLE"
 }
 
 struct SyncV2RemoteRejection: Equatable, Sendable {

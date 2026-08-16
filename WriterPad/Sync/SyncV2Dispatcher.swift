@@ -1053,12 +1053,14 @@ actor SyncV2Dispatcher {
                         errorCode: code,
                         detail: detail
                     )
+                    Self.reportStalledFolder(operation, code: code)
                 case let .blocked(code, detail):
                     try await store.markBlocked(
                         operation,
                         errorCode: code,
                         detail: detail
                     )
+                    Self.reportStalledFolder(operation, code: code)
                 }
             } catch {
                 // 서버 응답과 SQLite 반영 사이에서 끊기면 inflight 복구가 같은
@@ -1078,6 +1080,23 @@ actor SyncV2Dispatcher {
         }
     }
 
+    /// 서 있는 폴더 하나당 한 줄만 남긴다.
+    ///
+    /// operation_id를 싣지 않는다. 같은 폴더가 같은 이유로 서 있는 것은 한
+    /// 상태이지 매번 새로 발견한 사건이 아니다. operation_id를 넣으면 사용자가
+    /// 같은 조작을 다시 시도할 때마다 새 발견처럼 보인다.
+    private static func reportStalledFolder(
+        _ operation: SyncV2FolderDispatchOperation,
+        code: String
+    ) {
+        SyncV2Diagnostics.stalledFolderOperation(
+            folderID: operation.folderID,
+            parentFolderID: operation.parentFolderID,
+            name: operation.name,
+            code: code
+        )
+    }
+
     private static func isAutomaticRebaseCandidate(
         _ error: SyncV2ClientError
     ) -> Bool {
@@ -1088,7 +1107,8 @@ actor SyncV2Dispatcher {
         case .documentNotFound, .operationIDReused, .pathConflict,
              .authRequired, .leaseRequired, .leaseConflict,
              .leaseExpired, .forbidden, .invalidArgument,
-             .folderNotFound, .folderAlreadyExists, .folderNotEmpty:
+             .folderNotFound, .folderAlreadyExists, .folderNotEmpty,
+             .parentFolderNotFound, .folderNameConflict, .folderCycle:
             // 자동 rebase는 본문을 3-way로 합치는 일이다. 폴더는 합칠 본문이
             // 없으므로 여기로 오지 않는다.
             return false
@@ -1122,9 +1142,15 @@ actor SyncV2Dispatcher {
             case .documentNotFound, .documentAlreadyExists,
                  .revisionConflict, .operationIDReused,
                  .pathConflict, .folderNotFound, .folderAlreadyExists,
-                 .folderNotEmpty:
-                // FOLDER_NOT_EMPTY는 순서를 잘못 잡았다는 뜻이라 그대로 다시
-                // 보내면 계속 거절당한다. 자동 재시도로 돌리지 않고 세워 둔다.
+                 .folderNotEmpty, .parentFolderNotFound,
+                 .folderNameConflict, .folderCycle:
+                // 시간이 지나서 저절로 풀리는 상태가 아니라 사람이 트리나
+                // 이름을 고쳐야 바뀌는 상태다. FOLDER_NOT_EMPTY는 순서를
+                // 잘못 잡았다는 뜻이고, PARENT_FOLDER_NOT_FOUND는 직렬
+                // 전송에서도 나왔다면 트리 불일치라는 뜻이며,
+                // FOLDER_NAME_CONFLICT는 사용자가 이름을 바꾸기 전에는 같은
+                // 답이 온다. 그대로 다시 보내면 계속 거절당하므로 자동
+                // 재시도로 돌리지 않고 세워 둔다.
                 return .conflict(code: code.rawValue, detail: detail)
             }
         }

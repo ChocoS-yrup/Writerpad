@@ -42,6 +42,23 @@ enum SyncV2Diagnostics {
         )
     }
 
+    /// 재시도로는 풀리지 않아 세워 둔 폴더 작업이다.
+    ///
+    /// 이 줄은 서 있는 상태 하나를 가리킨다. 세워 둔 작업은 다시 claim되지
+    /// 않으므로 한 상태에 한 줄만 남는다. operation_id는 일부러 싣지 않는다.
+    /// 그것까지 넣으면 사용자가 같은 조작을 다시 시도할 때마다 서로 다른 줄이
+    /// 되어, 하나의 상태가 여러 사건처럼 보인다.
+    static func stalledFolderOperation(
+        folderID: UUID,
+        parentFolderID: UUID?,
+        name: String,
+        code: String
+    ) {
+        syncV2Logger.error(
+            "event=stalledFolderOperation folderID=\(folderID.uuidString, privacy: .public) parentFolderID=\(parentFolderID?.uuidString ?? "none", privacy: .public) name=\(name, privacy: .public) code=\(code, privacy: .public)"
+        )
+    }
+
     static func task(
         scope: String,
         localProjectID: ProjectID? = nil,

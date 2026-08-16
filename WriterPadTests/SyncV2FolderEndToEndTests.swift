@@ -144,6 +144,149 @@ final class SyncV2FolderEndToEndTests: XCTestCase {
         await sender.close()
     }
 
+    /// 이 셋은 시간이 지나서 저절로 풀리는 상태가 아니다. 부모가 없거나, 이름을
+    /// 다른 identity가 차지했거나, 트리가 고리를 이룬 것이라 사람이 고쳐야 한다.
+    /// 재시도 큐에 남으면 상한 5분마다 영원히 같은 거절을 다시 받는다.
+    private static let stableFolderRejectionMessages = [
+        "PARENT_FOLDER_NOT_FOUND",
+        "FOLDER_NAME_CONFLICT",
+        "FOLDER_CYCLE",
+    ]
+
+    func testStableFolderRejectionsNeverReturnToTheRetryQueue() async throws {
+        for message in Self.stableFolderRejectionMessages {
+            let server = FakeFolderServer()
+            let sender = try await FolderDeviceFixture(server: server)
+            let folderID = UUID()
+            let operationID = UUID()
+            await server.rejectCommits(for: folderID, message: message)
+
+            try await sender.enqueue(
+                operationID: operationID,
+                folderID: folderID,
+                parentFolderID: nil,
+                name: "가 나 다"
+            )
+            // 시각을 크게 벌린다. 재시도로 분류됐다면 대기가 끝나 다시 잡힌다.
+            await sender.drain(now: 10)
+            await sender.drain(now: 10_000)
+            await sender.drain(now: 1_000_000)
+
+            let status = try await sender.store.operationStatus(
+                operationID: operationID
+            )
+            let attempts = try await sender.store.operationAttempts(
+                operationID: operationID
+            )
+            let calls = await sender.client.folderOperationIDs()
+            XCTAssertEqual(status, "conflict", message)
+            XCTAssertEqual(attempts, 1, message)
+            XCTAssertEqual(
+                calls.filter { $0 == operationID }.count,
+                1,
+                message
+            )
+            await sender.close()
+        }
+    }
+
+    /// 폴더 줄은 claim 순서대로 하나씩 비운다. 맨 앞이 영구히 거절당해도 그
+    /// 뒤가 함께 서면 안 된다.
+    func testOtherFolderWorkKeepsFlowingPastAStableRejection() async throws {
+        let server = FakeFolderServer()
+        let sender = try await FolderDeviceFixture(server: server)
+        let stalledID = UUID()
+        let parentID = UUID()
+        let childID = UUID()
+        await server.rejectCommits(
+            for: stalledID,
+            message: "FOLDER_NAME_CONFLICT"
+        )
+
+        let stalledOperationID = UUID()
+        try await sender.enqueue(
+            operationID: stalledOperationID,
+            folderID: stalledID,
+            parentFolderID: nil,
+            name: "가"
+        )
+        try await sender.enqueue(
+            operationID: UUID(),
+            folderID: parentID,
+            parentFolderID: nil,
+            name: "나"
+        )
+        try await sender.enqueue(
+            operationID: UUID(),
+            folderID: childID,
+            parentFolderID: parentID,
+            name: "다"
+        )
+        await sender.drain(now: 10)
+
+        let stalledName = await server.name(of: stalledID)
+        let parentName = await server.name(of: parentID)
+        let childName = await server.name(of: childID)
+        let liveCount = await server.liveFolderCount()
+        let stalledStatus = try await sender.store.operationStatus(
+            operationID: stalledOperationID
+        )
+        // 막힌 작업은 재시도 대기가 아니라 세워 둔 상태여야 한다. 재시도
+        // 대기로 남으면 다음 배수에서 같은 거절을 다시 받는다.
+        XCTAssertEqual(stalledStatus, "conflict")
+        XCTAssertNil(stalledName)
+        XCTAssertEqual(parentName, "나")
+        XCTAssertEqual(childName, "다")
+        XCTAssertEqual(liveCount, 2)
+        await sender.close()
+    }
+
+    /// 세워 둔 작업은 다시 claim되지 않으므로 한 상태에 진단 한 줄만 남는다.
+    /// 사용자가 같은 조작을 다시 해도 새 요청이 서버로 나가지 않는다.
+    func testRepeatedStableRejectionLeavesASingleStalledState() async throws {
+        let server = FakeFolderServer()
+        let sender = try await FolderDeviceFixture(server: server)
+        let folderID = UUID()
+        let firstAttemptID = UUID()
+        let secondAttemptID = UUID()
+        await server.rejectCommits(
+            for: folderID,
+            message: "FOLDER_NAME_CONFLICT"
+        )
+
+        try await sender.enqueue(
+            operationID: firstAttemptID,
+            folderID: folderID,
+            parentFolderID: nil,
+            name: "가 나 다"
+        )
+        await sender.drain(now: 10)
+        // 사용자가 같은 조작을 한 번 더 한다.
+        try await sender.enqueue(
+            operationID: secondAttemptID,
+            folderID: folderID,
+            parentFolderID: nil,
+            name: "가 나 다"
+        )
+        await sender.drain(now: 10_000)
+        await sender.drain(now: 1_000_000)
+
+        let first = try await sender.store.operationStatus(
+            operationID: firstAttemptID
+        )
+        let second = try await sender.store.operationStatus(
+            operationID: secondAttemptID
+        )
+        let commits = await server.commitCallCount()
+        XCTAssertEqual(first, "conflict")
+        XCTAssertEqual(commits, 1)
+        // 뒤따르는 작업은 앞의 굳은 작업 뒤에서 기다린다. 이 잠금을 푸는 것은
+        // 이번 범위가 아니라 별도 작업이다. 여기서는 세워 둔 상태가 여전히
+        // 하나뿐이라는 것만 못 박는다.
+        XCTAssertEqual(second, "pending")
+        await sender.close()
+    }
+
     private func receiverFolder(
         id: UUID,
         path: String,
@@ -223,8 +366,15 @@ private actor FakeFolderServer {
 
     private var rows: [UUID: Row] = [:]
     private var applied: [UUID: SyncV2CommitFolderResult] = [:]
+    private var stableRejections: [UUID: String] = [:]
     private var commits = 0
     private var replays = 0
+
+    /// 사람이 트리나 이름을 고치기 전에는 몇 번을 보내도 같은 답이 오는 상태를
+    /// 만든다. 배포된 commit_folder는 이 문구들을 errcode P0001로 raise한다.
+    func rejectCommits(for folderID: UUID, message: String) {
+        stableRejections[folderID] = message
+    }
 
     func commitFolder(
         _ parameters: SyncV2CommitFolderParameters
@@ -243,6 +393,17 @@ private actor FakeFolderServer {
                 name: previous.name,
                 isDeleted: previous.isDeleted,
                 committedAt: previous.committedAt
+            )
+        }
+        // 서버는 트리를 건드리기 전에 raise한다. 실패한 요청은 아무것도
+        // 바꾸지 않으므로 다음 요청도 같은 답을 받는다.
+        if let message = stableRejections[parameters.folderID] {
+            throw SyncV2Client.classify(
+                .postgrest(
+                    message: message,
+                    postgresCode: "P0001",
+                    detail: nil
+                )
             )
         }
         let current = rows[parameters.folderID]?.revision ?? 0
