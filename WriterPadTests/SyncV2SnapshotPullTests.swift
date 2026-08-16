@@ -6421,6 +6421,105 @@ final class SyncV2PullFolderWiringTests: XCTestCase {
         let blocked = await applier.blockedFolderIDs()
         XCTAssertEqual(blocked, [DocumentID(rawValue: blockedID)])
     }
+
+    func testNativeIdentityMarkerPreventsFirstPullFromRewritingUUIDs()
+        async throws {
+        let projectID = ProjectID(rawValue: UUID())
+        let serverProjectID = projectID.rawValue
+        let mainID = DocumentID(rawValue: UUID())
+        let childID = DocumentID(rawValue: UUID())
+        let documentID = DocumentID(rawValue: UUID())
+        let date = Date(timeIntervalSince1970: 1)
+        let original = [
+            DocumentNode(
+                id: mainID,
+                projectID: projectID,
+                kind: .folder,
+                parentID: nil,
+                relativePath: .init(rawValue: "메인"),
+                userOrder: 0,
+                modifiedAt: date,
+                contentHash: nil
+            ),
+            DocumentNode(
+                id: childID,
+                projectID: projectID,
+                kind: .folder,
+                parentID: mainID,
+                relativePath: .init(rawValue: "메인/메모장"),
+                userOrder: 0,
+                modifiedAt: date,
+                contentHash: nil
+            ),
+            DocumentNode(
+                id: documentID,
+                projectID: projectID,
+                kind: .text,
+                parentID: childID,
+                relativePath: .init(rawValue: "메인/메모장/원고.txt"),
+                userOrder: 0,
+                modifiedAt: date,
+                contentHash: nil
+            ),
+        ]
+        let repository = NativeIdentityRepositoryStub(nodes: original)
+        let marker = FolderWiringMarkerStub(pendingFolderIDs: [])
+        await marker.markFolderMigrationCompleted(localProjectID: projectID)
+        let order = FolderWiringOrderRecorder()
+        let service = SyncV2SnapshotPullService(
+            client: SnapshotClientStub(
+                snapshots: [],
+                folders: [
+                    SyncV2RemoteFolder(
+                        folderID: mainID.rawValue,
+                        parentFolderID: nil,
+                        name: "메인",
+                        revision: 1,
+                        isDeleted: false,
+                        updatedAt: date
+                    ),
+                    SyncV2RemoteFolder(
+                        folderID: childID.rawValue,
+                        parentFolderID: mainID.rawValue,
+                        name: "메모장",
+                        revision: 1,
+                        isDeleted: false,
+                        updatedAt: date
+                    ),
+                ]
+            ),
+            stateStore: SnapshotStateStoreStub(states: [:]),
+            localApplier: SnapshotApplierSpy(),
+            mergeStore: SnapshotMergeStoreSpy(),
+            folderApplier: FolderWiringApplierSpy(order: order),
+            folderMigration: SyncV2FolderMigration(
+                documentRepository: repository,
+                marker: marker,
+                changeRecorder: FolderWiringRecorderStub()
+            ),
+            folderMarker: marker,
+            folderDocuments: repository
+        )
+
+        _ = try await service.pull(
+            localProjectID: projectID,
+            serverProjectID: serverProjectID
+        )
+
+        let after = await repository.documents(in: projectID)
+        XCTAssertEqual(after.map(\.id), original.map(\.id))
+        XCTAssertEqual(after.map(\.parentID), original.map(\.parentID))
+        let writes = await repository.writeCounts()
+        XCTAssertEqual(writes.saves, 0)
+        XCTAssertEqual(writes.removes, 0)
+        XCTAssertNotEqual(
+            childID,
+            SyncV2FolderIdentity.derived(
+                serverProjectID: serverProjectID,
+                relativePath: "메인/메모장"
+            )
+        )
+    }
 }
 
 private actor FolderWiringOrderRecorder {
@@ -6469,6 +6568,37 @@ private actor FolderWiringRepositoryStub: DocumentRepository {
     func document(id: DocumentID) throws -> DocumentNode? { nil }
     func save(_ document: DocumentNode) throws {}
     func removeMetadata(id: DocumentID) throws {}
+}
+
+private actor NativeIdentityRepositoryStub: DocumentRepository {
+    private var nodes: [DocumentNode]
+    private var saves = 0
+    private var removes = 0
+
+    init(nodes: [DocumentNode]) { self.nodes = nodes }
+
+    func documents(in projectID: ProjectID) -> [DocumentNode] {
+        nodes.filter { $0.projectID == projectID }
+    }
+
+    func document(id: DocumentID) -> DocumentNode? {
+        nodes.first { $0.id == id }
+    }
+
+    func save(_ document: DocumentNode) {
+        saves += 1
+        nodes.removeAll { $0.id == document.id }
+        nodes.append(document)
+    }
+
+    func removeMetadata(id: DocumentID) {
+        removes += 1
+        nodes.removeAll { $0.id == id }
+    }
+
+    func writeCounts() -> (saves: Int, removes: Int) {
+        (saves, removes)
+    }
 }
 
 private actor FolderWiringMarkerStub: SyncV2FolderMigrationMarking {

@@ -1163,16 +1163,35 @@ actor SyncV2Store:
         }
 
         let now = Self.timestamp()
+        // 생성 시점 UUID가 정본인 연결은 binding이 보이는 순간부터 legacy
+        // 경로 기반 이관이 완료된 상태여야 한다. 같은 INSERT/UPSERT 안에서
+        // 표식을 세워 binding 관찰과 첫 pull 사이의 race를 없앤다.
+        let nativeFolderIdentityAt: String? = switch binding.kind {
+        case .newServerProject, .windowsImport:
+            now
+        case .localOnly, .existingServerProject:
+            nil
+        }
         let sql = """
         INSERT INTO sync_projects(
             local_project_id, server_project_id, binding_kind, project_name,
-            owner_subject, created_at, updated_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?)
+            owner_subject, created_at, updated_at,
+            folder_migration_completed_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(local_project_id) DO UPDATE SET
             server_project_id = excluded.server_project_id,
             binding_kind = excluded.binding_kind,
             project_name = excluded.project_name,
             owner_subject = excluded.owner_subject,
+            folder_migration_completed_at = CASE
+                WHEN excluded.binding_kind IN (
+                    'new_server_project', 'windows_import'
+                ) THEN COALESCE(
+                    sync_projects.folder_migration_completed_at,
+                    excluded.folder_migration_completed_at
+                )
+                ELSE sync_projects.folder_migration_completed_at
+            END,
             updated_at = excluded.updated_at;
         """
         do {
@@ -1196,6 +1215,7 @@ actor SyncV2Store:
                 )
                 try bind(now, at: 6, to: statement)
                 try bind(now, at: 7, to: statement)
+                try bind(nativeFolderIdentityAt, at: 8, to: statement)
                 try stepDone(statement)
             }
         } catch let error as SyncV2StoreError {
@@ -1207,6 +1227,45 @@ actor SyncV2Store:
             throw ProjectBindingStoreError.invalidBinding
         } catch {
             throw ProjectBindingStoreError.unavailable
+        }
+    }
+
+    func hasRecordedInitialSnapshot(
+        for projectID: ProjectID,
+        kind: DurableLocalBatchKind
+    ) throws -> Bool {
+        guard kind == .projectBinding || kind == .windowsImport else {
+            return false
+        }
+        let batchKind: SyncV2BatchKind
+        switch kind {
+        case .projectBinding:
+            batchKind = .projectBinding
+        case .windowsImport:
+            batchKind = .windowsImport
+        default:
+            return false
+        }
+        return try withStatement(
+            """
+            SELECT EXISTS(
+                SELECT 1
+                FROM sync_batches
+                WHERE local_project_id = ?
+                  AND batch_kind = ?
+            );
+            """
+        ) { statement in
+            try bind(
+                projectID.rawValue.uuidString.lowercased(),
+                at: 1,
+                to: statement
+            )
+            try bind(batchKind.rawValue, at: 2, to: statement)
+            guard sqlite3_step(statement) == SQLITE_ROW else {
+                throw sqliteError()
+            }
+            return sqlite3_column_int(statement, 0) == 1
         }
     }
 
@@ -6423,6 +6482,19 @@ actor LazySyncV2ProjectBindingStore:
         }
     }
 
+    func hasRecordedInitialSnapshot(
+        for projectID: ProjectID,
+        kind: DurableLocalBatchKind
+    ) async throws -> Bool {
+        guard let store = await resolvedStore() else {
+            throw SyncV2StoreError.invalidStoredData
+        }
+        return try await store.hasRecordedInitialSnapshot(
+            for: projectID,
+            kind: kind
+        )
+    }
+
     func record(
         _ batch: LocalMutationBatch
     ) async -> DurableRecordResult {
@@ -7130,6 +7202,24 @@ actor ProjectInitialSyncRecorder: InitialProjectSyncRecording {
                     )
                 }
             } else {
+                // 성공한 handoff는 marker를 지운 뒤에도 sync_batches에 남는다.
+                // 이를 확인하지 않고 새 batch를 만들면 재시작마다 operation ID가
+                // 바뀐다. 반대로 조회 실패를 미시작으로 추측해서도 안 된다.
+                let alreadyRecorded: Bool
+                do {
+                    alreadyRecorded = try await durableChangeRecorder
+                        .hasRecordedInitialSnapshot(
+                            for: projectID,
+                            kind: batchKind
+                        )
+                } catch {
+                    return .localSavedButNotQueued(
+                        reason: "초기 작품 동기화 완료 상태를 확인할 수 없습니다."
+                    )
+                }
+                if alreadyRecorded {
+                    return .notNeeded
+                }
                 batch = try await makeBatch(
                     projectID: projectID,
                     projectName: projectName,
@@ -7166,6 +7256,7 @@ actor ProjectInitialSyncRecorder: InitialProjectSyncRecording {
         batchKind: DurableLocalBatchKind
     ) async throws -> LocalMutationBatch {
         let documents = try await documentRepository.documents(in: projectID)
+        let folders = try foldersInStableParentFirstOrder(documents)
         let live = documents.filter {
             if case .active = $0.deletionStatus {
                 let key = $0.relativePath.rawValue
@@ -7174,6 +7265,9 @@ actor ProjectInitialSyncRecorder: InitialProjectSyncRecording {
                 let trash = BinderFixedCategory.trash.relativePath.rawValue
                     .precomposedStringWithCanonicalMapping
                     .lowercased()
+                if $0.kind == .folder, key == trash {
+                    return true
+                }
                 return key != trash && !key.hasPrefix(trash + "/")
             }
             return false
@@ -7184,6 +7278,24 @@ actor ProjectInitialSyncRecorder: InitialProjectSyncRecording {
                 name: projectName
             ),
         ]
+        for folder in folders {
+            mutations.append(
+                .folderSnapshot(
+                    operationID: uuidGenerator.makeUUID(),
+                    folderID: folder.id,
+                    parentFolderID: folder.parentID,
+                    name: SyncV2FolderMigration.folderName(
+                        folder.relativePath
+                    ),
+                    isDeleted: {
+                        if case .trashed = folder.deletionStatus {
+                            return true
+                        }
+                        return false
+                    }()
+                )
+            )
+        }
         for document in live
             .filter({ $0.kind == .text })
             .sorted(by: { $0.relativePath.rawValue < $1.relativePath.rawValue }) {
@@ -7225,6 +7337,61 @@ actor ProjectInitialSyncRecorder: InitialProjectSyncRecording {
         )
     }
 
+    private func foldersInStableParentFirstOrder(
+        _ documents: [DocumentNode]
+    ) throws -> [DocumentNode] {
+        let folders = documents.filter { $0.kind == .folder }
+        let pairs = folders.map { ($0.id, $0) }
+        guard Dictionary(pairs, uniquingKeysWith: { first, _ in first }).count
+                == folders.count
+        else {
+            throw SyncV2EnqueueError.invalidMutation
+        }
+        let byID = Dictionary(uniqueKeysWithValues: pairs)
+        var depths: [DocumentID: Int] = [:]
+
+        func depth(
+            of folderID: DocumentID,
+            visiting: Set<DocumentID>
+        ) throws -> Int {
+            if let known = depths[folderID] { return known }
+            guard !visiting.contains(folderID),
+                  let folder = byID[folderID] else {
+                throw SyncV2EnqueueError.invalidMutation
+            }
+            guard let parentID = folder.parentID else {
+                depths[folderID] = 0
+                return 0
+            }
+            guard byID[parentID] != nil else {
+                throw SyncV2EnqueueError.invalidMutation
+            }
+            var next = visiting
+            next.insert(folderID)
+            let value = try depth(of: parentID, visiting: next) + 1
+            depths[folderID] = value
+            return value
+        }
+
+        for folder in folders {
+            _ = try depth(of: folder.id, visiting: [])
+        }
+        return folders.sorted { lhs, rhs in
+            let leftDepth = depths[lhs.id] ?? 0
+            let rightDepth = depths[rhs.id] ?? 0
+            if leftDepth != rightDepth { return leftDepth < rightDepth }
+            if lhs.userOrder != rhs.userOrder {
+                return lhs.userOrder < rhs.userOrder
+            }
+            let leftPath = lhs.relativePath.rawValue
+                .precomposedStringWithCanonicalMapping
+            let rightPath = rhs.relativePath.rawValue
+                .precomposedStringWithCanonicalMapping
+            if leftPath != rightPath { return leftPath < rightPath }
+            return lhs.id.rawValue.uuidString < rhs.id.rawValue.uuidString
+        }
+    }
+
     private func treeOrderContent(
         _ documents: [DocumentNode]
     ) throws -> String {
@@ -7242,10 +7409,13 @@ actor ProjectInitialSyncRecorder: InitialProjectSyncRecording {
             guard !children.isEmpty else { continue }
             let key = parent.relativePath.rawValue == "메인"
                 ? "<root>"
-                : parent.relativePath.rawValue
+                : SyncV2FolderIdentity.canonicalPath(
+                    parent.relativePath.rawValue
+                )
             order[key] = children.map {
                 URL(fileURLWithPath: $0.relativePath.rawValue)
                     .lastPathComponent
+                    .precomposedStringWithCanonicalMapping
             }
         }
         let data = try JSONSerialization.data(
