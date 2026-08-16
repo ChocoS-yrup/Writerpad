@@ -877,7 +877,7 @@ final class SyncV2StoreTests: XCTestCase {
         )
     }
 
-    func testInitialSnapshotPreservesEveryFolderAndDocumentIdentity()
+    func testInitialSnapshotPreservesLiveIdentitiesAndSkipsTrashedFolders()
         async throws {
         let root = FileManager.default.temporaryDirectory
             .appendingPathComponent(
@@ -1034,21 +1034,22 @@ final class SyncV2StoreTests: XCTestCase {
                 snapshots[folderID] = (parentID, name, isDeleted, index)
             }
         }
-        XCTAssertEqual(snapshots.count, 13)
-        XCTAssertEqual(Set(snapshots.keys), Set(nodes.filter {
-            $0.kind == .folder
-        }.map(\.id)))
+        XCTAssertEqual(snapshots.count, 12)
+        XCTAssertEqual(
+            Set(snapshots.keys),
+            Set(nodes.filter {
+                $0.kind == .folder && $0.id != trashedFolderID
+            }.map(\.id))
+        )
         XCTAssertEqual(snapshots[mainID]?.0, nil)
         XCTAssertEqual(snapshots[standardIDs["휴지통"]!]?.0, mainID)
         XCTAssertEqual(snapshots[userFolderID]?.0, standardIDs["메모장"])
         XCTAssertEqual(snapshots[userFolderID]?.1, "가")
         XCTAssertEqual(snapshots[emptyFolderID]?.0, standardIDs["설정집"])
-        XCTAssertEqual(snapshots[trashedFolderID]?.0, standardIDs["휴지통"])
-        XCTAssertEqual(snapshots[trashedFolderID]?.2, true)
-        XCTAssertLessThan(
-            snapshots[standardIDs["휴지통"]!]!.3,
-            snapshots[trashedFolderID]!.3
-        )
+        // base_revision 0의 삭제 폴더는 서버가 INVALID_ARGUMENT로 거절한다.
+        // 고정 휴지통은 live로 보내되 그 아래 폴더 operation은 만들지 않는다.
+        XCTAssertFalse(snapshots[standardIDs["휴지통"]!]?.2 ?? true)
+        XCTAssertNil(snapshots[trashedFolderID])
         XCTAssertNotEqual(
             userFolderID,
             SyncV2FolderIdentity.derived(
@@ -4499,13 +4500,15 @@ final class SyncV2StoreTests: XCTestCase {
         await store.close()
     }
 
-    func testParentTombstoneWaitsForItsChildFolder() async throws {
+    func testThreeLevelFolderTombstonesCommitDeepestFirst() async throws {
         let url = try databaseURL()
         let context = QueueAPIContext()
         let store = try await connectedStore(at: url, context: context)
         let childID = UUID()
+        let grandchildID = UUID()
         let parentDeleteID = UUID()
         let childDeleteID = UUID()
+        let grandchildDeleteID = UUID()
 
         _ = try await store.enqueue(
             context.batch(
@@ -4520,6 +4523,12 @@ final class SyncV2StoreTests: XCTestCase {
                         folderID: childID,
                         parentFolderID: context.folderID,
                         name: "자식"
+                    ),
+                    context.folderMutation(
+                        operationID: UUID(),
+                        folderID: grandchildID,
+                        parentFolderID: childID,
+                        name: "손자"
                     ),
                 ]
             )
@@ -4551,18 +4560,38 @@ final class SyncV2StoreTests: XCTestCase {
                         name: "자식",
                         isDeleted: true
                     ),
+                    context.folderMutation(
+                        operationID: grandchildDeleteID,
+                        folderID: grandchildID,
+                        parentFolderID: childID,
+                        name: "손자",
+                        isDeleted: true
+                    ),
                 ]
             )
         )
 
-        let ready = try await store.claimReadyFolderOperations(
-            limit: 10,
-            now: Date(timeIntervalSince1970: 20)
-        )
+        var committed: [UUID] = []
+        for timestamp in [20.0, 30.0, 40.0] {
+            let ready = try await store.claimReadyFolderOperations(
+                limit: 10,
+                now: Date(timeIntervalSince1970: timestamp)
+            )
+            let operation = try XCTUnwrap(ready.first)
+            XCTAssertEqual(ready.count, 1)
+            committed.append(operation.operationID)
+            try await store.complete(
+                operation,
+                result: folderCommitResult(for: operation)
+            )
+        }
 
-        // 서버는 내용이 있는 폴더의 삭제를 FOLDER_NOT_EMPTY로 거부한다. 자식이
-        // 먼저 나가고 부모는 그 뒤에야 나갈 수 있다.
-        XCTAssertEqual(ready.map(\.operationID), [childDeleteID])
+        // A/B/C를 부모 우선으로 enqueue해도 서버에는 C/B/A만 나갈 수 있다.
+        // A가 먼저 나가면 live 자식 때문에 FOLDER_NOT_EMPTY가 된다.
+        XCTAssertEqual(
+            committed,
+            [grandchildDeleteID, childDeleteID, parentDeleteID]
+        )
         await store.close()
     }
 

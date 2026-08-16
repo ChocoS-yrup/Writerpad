@@ -7256,7 +7256,6 @@ actor ProjectInitialSyncRecorder: InitialProjectSyncRecording {
         batchKind: DurableLocalBatchKind
     ) async throws -> LocalMutationBatch {
         let documents = try await documentRepository.documents(in: projectID)
-        let folders = try foldersInStableParentFirstOrder(documents)
         let live = documents.filter {
             if case .active = $0.deletionStatus {
                 let key = $0.relativePath.rawValue
@@ -7272,6 +7271,10 @@ actor ProjectInitialSyncRecorder: InitialProjectSyncRecording {
             }
             return false
         }
+        // 서버 commit_folder는 존재하지 않는 폴더의 tombstone 생성을 받지
+        // 않는다. 최초 연결 전에 이미 휴지통에 있던 폴더는 보내지 않고,
+        // live인 메인/휴지통 고정 폴더 자체만 다른 고정 폴더와 함께 올린다.
+        let folders = try foldersInStableParentFirstOrder(live)
         var mutations: [DurableLocalMutation] = [
             .ensureProject(
                 operationID: uuidGenerator.makeUUID(),

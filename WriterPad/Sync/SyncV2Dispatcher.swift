@@ -780,8 +780,13 @@ actor SyncV2Dispatcher {
                         )
                     }
                 }
-                for operation in folderOperations {
-                    group.addTask {
+                // 한 batch의 폴더 작업은 생성·복원은 부모부터, 삭제는 자식부터
+                // queue에 들어온다. 여러 요청을 동시에 보내면 서버 도착 순서가
+                // 뒤집혀 PARENT_FOLDER_NOT_FOUND 또는 FOLDER_NOT_EMPTY가 될 수
+                // 있으므로 폴더 줄은 claim 순서대로 하나씩 비운다. 문서 줄은
+                // 별도 task로 계속 나란히 흐른다.
+                group.addTask {
+                    for operation in folderOperations {
                         await Self.dispatchFolder(
                             operation,
                             store: store,
