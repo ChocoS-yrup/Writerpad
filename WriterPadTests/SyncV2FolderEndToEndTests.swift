@@ -704,6 +704,69 @@ final class SyncV2FolderEndToEndTests: XCTestCase {
         await sender.close()
     }
 
+    /// 화면이 읽어 갈 목록에 굳은 폴더가 실제로 담기는지 본다. 대기열과 화면
+    /// 사이가 끊겨 있으면 문구를 아무리 고쳐도 드러나지 않는다.
+    func testStalledFolderChangeIsReadableForTheScreen() async throws {
+        let server = FakeFolderServer()
+        let sender = try await FolderDeviceFixture(server: server)
+        let folderID = UUID()
+        await server.rejectCommits(
+            for: folderID,
+            message: "FOLDER_NAME_CONFLICT"
+        )
+
+        try await sender.enqueue(
+            operationID: UUID(),
+            folderID: folderID,
+            parentFolderID: nil,
+            name: "설정집"
+        )
+        await sender.drain(now: 10)
+        let stalled = try await sender.store.stalledFolderChanges(
+            localProjectID: sender.localProjectID
+        )
+        XCTAssertEqual(stalled.count, 1)
+        XCTAssertEqual(stalled.first?.name, "설정집")
+        XCTAssertEqual(stalled.first?.errorCode, "FOLDER_NAME_CONFLICT")
+
+        // 화면은 dispatcher를 거쳐 읽는다. 그 경로도 같은 답이어야 한다.
+        let throughDispatcher = await sender.stalledFolderChanges()
+        XCTAssertEqual(throughDispatcher, stalled)
+        await sender.close()
+    }
+
+    /// 기준선을 다시 잡아 지나간 폴더는 화면에 올릴 것이 없다.
+    func testRebasedFolderLeavesNothingForTheScreenToReport() async throws {
+        let server = FakeFolderServer()
+        let sender = try await FolderDeviceFixture(server: server)
+        let folderID = UUID()
+
+        try await sender.enqueue(
+            operationID: UUID(),
+            folderID: folderID,
+            parentFolderID: nil,
+            name: "가 나 다"
+        )
+        await sender.drain(now: 10)
+        await server.applyOtherDeviceRename(
+            folderID: folderID,
+            name: "다른 기기 이름"
+        )
+        try await sender.enqueue(
+            operationID: UUID(),
+            folderID: folderID,
+            parentFolderID: nil,
+            name: "이 기기 이름"
+        )
+        await sender.drain(now: 20)
+
+        let stalled = try await sender.store.stalledFolderChanges(
+            localProjectID: sender.localProjectID
+        )
+        XCTAssertTrue(stalled.isEmpty)
+        await sender.close()
+    }
+
     private func receiverFolder(
         id: UUID,
         path: String,
@@ -1024,6 +1087,14 @@ private final class FolderDeviceFixture {
                 now: Date(timeIntervalSince1970: seconds)
             )
         }
+    }
+
+    /// 화면이 실제로 쓰는 경로다. dispatcher가 들고 있는 저장소를 거친다.
+    func stalledFolderChanges() async -> [SyncV2StalledFolderChange] {
+        let dispatcher = SyncV2Dispatcher(store: store, client: client)
+        return await dispatcher.stalledFolderChanges(
+            localProjectID: localProjectID
+        )
     }
 
     func setOffline(_ value: Bool) async {

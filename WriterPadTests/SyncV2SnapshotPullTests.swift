@@ -3666,10 +3666,120 @@ final class SyncV2SnapshotPullTests: XCTestCase {
         await model.stop()
     }
 
+    /// 이 기기가 한 폴더 변경이 서버에 올라가지 못했는데 화면이 "동기화됨"이라고
+    /// 하면 그것도 거짓이다. pull 보고서에는 나가는 쪽 굳음이 들어 있지 않다.
+    @MainActor
+    func testStalledOutboundFolderChangeIsNotReportedAsSynced() async throws {
+        let model = try await folderRejectionModel(
+            outcomes: [
+                .applied(documentID: UUID(), revision: 3, wasOpen: false),
+            ],
+            rejectedStructureNames: [],
+            stalled: [
+                SyncV2StalledFolderChange(
+                    name: "설정집",
+                    errorCode: "FOLDER_NAME_CONFLICT"
+                ),
+            ]
+        )
+
+        guard case let .notPublished(detail) = model.state.lastResult else {
+            return XCTFail(
+                "서버에 못 올린 변경이 있으면 동기화됨으로 끝나면 안 된다: "
+                    + "\(model.state.lastResult)"
+            )
+        }
+        XCTAssertTrue(
+            detail.contains("설정집"),
+            "무엇이 못 올라갔는지 나와야 한다: \(detail)"
+        )
+        XCTAssertTrue(
+            detail.contains("FOLDER_NAME_CONFLICT"),
+            "왜 못 올라갔는지도 나와야 한다: \(detail)"
+        )
+
+        let presentation = WorkspaceSyncStatusReducer.presentation(
+            saveState: .saved(
+                generation: 1,
+                savedAt: Date(timeIntervalSince1970: 1),
+                contentHash: ContentHash(
+                    rawValue: String(repeating: "a", count: 64)
+                )!
+            ),
+            handoffState: .idle,
+            workspaceState: model.state,
+            leaseState: .localOnly
+        )
+        XCTAssertEqual(presentation.label, "서버에 못 올린 변경 있음")
+        XCTAssertEqual(presentation.severity, .warning)
+        // 세워 둔 작업은 다시 claim되지 않는다. 눌러도 바뀌지 않는 버튼을 달면
+        // 그것이 또 하나의 거짓이 된다.
+        XCTAssertFalse(presentation.allowsRetry)
+        await model.stop()
+    }
+
+    /// 나가는 쪽 굳음과 들어오는 쪽 미적용은 방향이 반대라 문장이 섞이면 안 된다.
+    @MainActor
+    func testOutboundStallAndInboundSkipDoNotBorrowEachOthersWording()
+        async throws {
+        let model = try await folderRejectionModel(
+            outcomes: [],
+            rejectedStructureNames: [
+                SyncV2RejectedStructureName(
+                    name: "버린 초안",
+                    parent: "메인/휴지통",
+                    reason: "아직 내용이 남아 있어 지우지 않음",
+                    kind: .notApplied
+                ),
+            ],
+            stalled: [
+                SyncV2StalledFolderChange(
+                    name: "설정집",
+                    errorCode: "FOLDER_NAME_CONFLICT"
+                ),
+            ]
+        )
+
+        guard case let .notPublished(detail) = model.state.lastResult else {
+            return XCTFail(
+                "내 변경이 못 올라간 것이 먼저다: \(model.state.lastResult)"
+            )
+        }
+        XCTAssertFalse(
+            detail.contains("버린 초안"),
+            "들어오는 쪽 항목이 나가는 쪽 문장에 끼면 안 된다: \(detail)"
+        )
+        XCTAssertFalse(
+            detail.contains("적용하지 않았습니다"),
+            "미적용 문구가 섞이면 안 된다: \(detail)"
+        )
+        await model.stop()
+    }
+
+    /// 굳은 것이 없으면 지금과 같아야 한다.
+    @MainActor
+    func testPullWithoutStalledChangesStillFinishesAsSynced() async throws {
+        let model = try await folderRejectionModel(
+            outcomes: [
+                .applied(documentID: UUID(), revision: 3, wasOpen: false),
+            ],
+            rejectedStructureNames: [],
+            stalled: []
+        )
+
+        guard case .synced = model.state.lastResult else {
+            return XCTFail(
+                "굳은 것이 없으면 지금과 같아야 한다: \(model.state.lastResult)"
+            )
+        }
+        await model.stop()
+    }
+
     @MainActor
     private func folderRejectionModel(
         outcomes: [SyncV2SnapshotPullOutcome],
-        rejectedStructureNames: [SyncV2RejectedStructureName]
+        rejectedStructureNames: [SyncV2RejectedStructureName],
+        stalled: [SyncV2StalledFolderChange] = []
     ) async throws -> SyncV2WorkspaceSyncModel {
         let previous = GlobalSyncPreference.isEnabled()
         GlobalSyncPreference.setEnabled(true)
@@ -3703,6 +3813,7 @@ final class SyncV2SnapshotPullTests: XCTestCase {
                     ownerSubject: UUID()
                 )
             ),
+            readStalledFolderChanges: { _ in stalled },
             periodicDelay: .seconds(600)
         )
         await model.start(editingGuards: { [:] }) { _ in }
