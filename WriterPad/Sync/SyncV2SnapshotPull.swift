@@ -781,6 +781,12 @@ struct SyncV2WorkspaceState: Equatable, Sendable {
         /// `structuralConflict`와 같은 자리에 둘 수 없다. 저쪽 제목과 재시도
         /// 버튼이 이 상태에서는 전부 거짓이 된다.
         case notApplied(detail: String)
+        /// 이 기기가 한 폴더 변경이 서버에 올라가지 못한 채 서 있다.
+        ///
+        /// 들어오는 변경을 적용하지 않은 `notApplied`와 방향이 반대다. 저쪽은
+        /// 서버 것을 안 받은 것이고 이쪽은 내 것을 못 보낸 것이라, 같은 문장으로
+        /// 말하면 둘 다 틀린다. 재시도로는 풀리지 않으므로 버튼을 달지 않는다.
+        case notPublished(detail: String)
         case failed(detail: String)
     }
 
@@ -793,6 +799,10 @@ typealias SyncV2WorkspaceSleep =
     @Sendable (Duration) async throws -> Void
 typealias SyncV2WorkspaceDispatchRetry =
     @Sendable () async -> Void
+/// 서버가 거절해 세워 둔 폴더 변경을 읽는다. 화면이 pull 결과만 보고 상태를
+/// 정하므로, 이것이 없으면 나가는 쪽 굳음은 드러나지 않는다.
+typealias SyncV2WorkspaceStalledFolderReader =
+    @Sendable (ProjectID) async -> [SyncV2StalledFolderChange]
 
 private actor SyncV2WorkspaceAuthenticationOutcome {
     private var state: AuthenticationState?
@@ -852,6 +862,8 @@ final class SyncV2WorkspaceSyncModel: ObservableObject {
     private let authenticationService: any AuthenticationServicing
     private let projectBindingService: any ProjectBindingServicing
     private let requestDispatchRetry: SyncV2WorkspaceDispatchRetry?
+    private let readStalledFolderChanges:
+        SyncV2WorkspaceStalledFolderReader?
     private let sleep: SyncV2WorkspaceSleep
     private let debounceDelay: Duration
     private let periodicDelay: Duration
@@ -915,6 +927,8 @@ final class SyncV2WorkspaceSyncModel: ObservableObject {
         authenticationService: any AuthenticationServicing,
         projectBindingService: any ProjectBindingServicing,
         requestDispatchRetry: SyncV2WorkspaceDispatchRetry? = nil,
+        readStalledFolderChanges:
+            SyncV2WorkspaceStalledFolderReader? = nil,
         debounceDelay: Duration = SyncV2Timing.standard.debounceDelay,
         // Realtime 누락에 대비한 저빈도 안전망이다. 실제 재연결 복구는
         // reachability 이벤트가 즉시 시작하므로 이 주기를 기다리지 않는다.
@@ -955,6 +969,7 @@ final class SyncV2WorkspaceSyncModel: ObservableObject {
         self.authenticationService = authenticationService
         self.projectBindingService = projectBindingService
         self.requestDispatchRetry = requestDispatchRetry
+        self.readStalledFolderChanges = readStalledFolderChanges
         self.debounceDelay = debounceDelay
         self.periodicDelay = periodicDelay
         self.authenticationTimeout = authenticationTimeout
@@ -1966,10 +1981,13 @@ final class SyncV2WorkspaceSyncModel: ObservableObject {
             state.progress = .idle
             return
         }
+        // 나가는 쪽이 굳었는지는 pull 보고서에 없다. 화면을 정하기 직전에
+        // 대기열에서 읽어 와야 "동기화됨"이 거짓이 되지 않는다.
+        let stalled = await readStalledFolderChanges?(localProjectID) ?? []
         switch outcome {
         case .success(let report):
             pullRetryAttempt = 0
-            complete(report)
+            complete(report, stalled: stalled)
         case .clientError(let error):
             complete(error)
             schedulePullRetry()
@@ -2046,7 +2064,10 @@ final class SyncV2WorkspaceSyncModel: ObservableObject {
         report.rejectedStructureNames.filter { $0.kind == .notApplied }.count
     }
 
-    private func complete(_ report: SyncV2SnapshotPullReport) {
+    private func complete(
+        _ report: SyncV2SnapshotPullReport,
+        stalled: [SyncV2StalledFolderChange] = []
+    ) {
         report.appliedSnapshots.forEach {
             applyOpenSnapshot?($0)
         }
@@ -2090,6 +2111,18 @@ final class SyncV2WorkspaceSyncModel: ObservableObject {
                     로컬 TXT는 덮어쓰지 않았습니다.
                     """
                 } ?? "서버의 폴더나 문서 제목 중 iPad에서 쓸 수 없는 이름이 있어 구조를 적용하지 못했습니다. 이름 끝의 공백과 마침표를 지우고 < > : \" / \\ | ? * 문자를 뺀 뒤 다시 동기화해 주세요. 로컬 TXT는 덮어쓰지 않았습니다."
+            )
+        } else if let stalledChange = stalled.first {
+            // 사용자가 한 조작이 서버에 없는데 화면이 조용하면 그것도 거짓이다.
+            // 이름을 고치라고 단정하지 않는다 — 코드마다 할 일이 다르다.
+            let others = stalled.count - 1
+            let tail = others > 0 ? " 외 \(others)건." : ""
+            lastResult = .notPublished(
+                detail: """
+                '\(stalledChange.name)' 폴더 변경이 서버에 올라가지 \
+                못했습니다. (\(stalledChange.errorCode))\(tail) \
+                로컬 TXT는 그대로입니다.
+                """
             )
         } else if let skipped = Self.notAppliedItem(in: report) {
             // 덮어쓰지 않으려고 적용하지 않은 항목이다. 아무 일도 없었던 것처럼

@@ -143,6 +143,11 @@ struct WritingWorkspaceShell: View {
                 projectBindingService: projectBindingService,
                 requestDispatchRetry: {
                     await syncDispatcher?.userRequestedRetry()
+                },
+                readStalledFolderChanges: { localProjectID in
+                    await syncDispatcher?.stalledFolderChanges(
+                        localProjectID: localProjectID
+                    ) ?? []
                 }
             )
         )

@@ -290,6 +290,15 @@ enum SyncV2RejectedStructureKind: Equatable, Sendable {
     case notApplied
 }
 
+/// 서버가 거절해 세워 둔 폴더 변경이다.
+///
+/// 이 기기가 한 조작이 서버에 올라가지 못한 상태다. 들어오는 변경을 적용하지
+/// 않은 것과 방향이 반대라 같은 목록에 담지 않는다.
+struct SyncV2StalledFolderChange: Equatable, Sendable {
+    let name: String
+    let errorCode: String
+}
+
 struct SyncV2RejectedStructureName: Equatable, Sendable {
     let name: String
     let parent: String

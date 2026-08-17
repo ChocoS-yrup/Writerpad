@@ -3057,6 +3057,13 @@ private actor AutomaticRebaseSnapshotClientStub:
 }
 
 private actor AutomaticRebaseStoreStub: SyncV2DispatchStoring {
+    func stalledFolderChanges(
+        localProjectID: ProjectID
+    ) async throws -> [SyncV2StalledFolderChange] {
+        _ = localProjectID
+        return []
+    }
+
     struct Recorded: Equatable {
         let remote: SyncV2RemoteDocumentSnapshot
         let local: SyncV2RebaseLocalSnapshot
@@ -3301,6 +3308,13 @@ private actor AutomaticRebaseOpenProviderStub:
 }
 
 private actor DispatcherStoreStub: SyncV2DispatchStoring {
+    func stalledFolderChanges(
+        localProjectID: ProjectID
+    ) async throws -> [SyncV2StalledFolderChange] {
+        _ = localProjectID
+        return []
+    }
+
     enum Status {
         case pending
         case inflight

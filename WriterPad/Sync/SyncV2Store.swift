@@ -577,6 +577,11 @@ protocol SyncV2DispatchStoring: Sendable {
         errorCode: String,
         detail: String?
     ) async throws
+    /// 서버가 거절해 세워 둔 폴더 변경이다. 화면이 나가는 쪽 굳음을 말할 수
+    /// 있으려면 이것을 읽어야 한다. 폴더 대기열이 없는 구현은 빈 목록이다.
+    func stalledFolderChanges(
+        localProjectID: ProjectID
+    ) async throws -> [SyncV2StalledFolderChange]
     /// 다른 기기가 먼저 바꿔 서버 revision이 앞서 나갔을 때, 이 작업의 기준선만
     /// 서버 값으로 다시 잡고 다시 보낼 수 있게 되돌린다. 폴더 대기열이 없는
     /// 구현은 기본값을 그대로 쓴다.
@@ -1316,6 +1321,53 @@ actor SyncV2Store:
                 throw SyncV2StoreError.invalidStoredData
             }
             return sqlite3_column_int(statement, 0) == 1
+        }
+    }
+
+    /// 서버가 거절해 세워 둔 폴더 변경이다.
+    ///
+    /// 화면은 pull 결과만 보고 상태를 정하므로, 나가는 쪽이 굳으면 아무 일도
+    /// 없었던 것처럼 "동기화됨"이 된다. 사용자가 한 조작이 서버에 없는데 화면이
+    /// 조용하면 그것도 거짓이라, 굳은 것들을 읽어 갈 수 있게 연다.
+    func stalledFolderChanges(
+        localProjectID: ProjectID
+    ) throws -> [SyncV2StalledFolderChange] {
+        guard availability() == .available else {
+            throw SyncV2StoreError.invalidStoredData
+        }
+        return try withStatement(
+            """
+            SELECT folder_name, last_error_code
+            FROM sync_operations
+            WHERE folder_id IS NOT NULL
+              AND local_project_id = ?
+              AND status IN ('conflict', 'blocked')
+            ORDER BY queue_id;
+            """
+        ) { statement in
+            try bind(
+                localProjectID.rawValue.uuidString.lowercased(),
+                at: 1,
+                to: statement
+            )
+            var changes: [SyncV2StalledFolderChange] = []
+            while true {
+                let status = sqlite3_step(statement)
+                if status == SQLITE_DONE {
+                    return changes
+                }
+                guard status == SQLITE_ROW,
+                      let name = columnText(statement, at: 0)
+                else {
+                    throw SyncV2StoreError.invalidStoredData
+                }
+                changes.append(
+                    SyncV2StalledFolderChange(
+                        name: name,
+                        errorCode: columnText(statement, at: 1) ?? "UNKNOWN"
+                    )
+                )
+            }
         }
     }
 
@@ -6966,6 +7018,17 @@ actor LazySyncV2ProjectBindingStore:
             throw SyncV2StoreError.invalidStoredData
         }
         return try await store.foldersWithPendingOperations(
+            localProjectID: localProjectID
+        )
+    }
+
+    func stalledFolderChanges(
+        localProjectID: ProjectID
+    ) async throws -> [SyncV2StalledFolderChange] {
+        guard let store = await resolvedStore() else {
+            throw SyncV2StoreError.invalidStoredData
+        }
+        return try await store.stalledFolderChanges(
             localProjectID: localProjectID
         )
     }

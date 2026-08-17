@@ -588,6 +588,18 @@ actor SyncV2Dispatcher {
         await immediateRetryOpportunity()
     }
 
+    /// 서버가 거절해 세워 둔 폴더 변경을 화면 쪽에서 읽어 간다.
+    ///
+    /// 읽지 못하면 빈 목록으로 답한다. 진단을 읽다 실패한 것 때문에 동기화
+    /// 상태 표시가 무너지면 안 된다.
+    func stalledFolderChanges(
+        localProjectID: ProjectID
+    ) async -> [SyncV2StalledFolderChange] {
+        (try? await store.stalledFolderChanges(
+            localProjectID: localProjectID
+        )) ?? []
+    }
+
     /// 사용자가 동기화 상세 화면에서 명시적으로 재시도를 선택할 때 호출한다.
     func userRequestedRetry() async {
         await immediateRetryOpportunity()
