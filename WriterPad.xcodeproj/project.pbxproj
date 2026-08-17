@@ -1106,7 +1106,7 @@
 				INFOPLIST_FILE = WriterPad/Info.plist;
 				IPHONEOS_DEPLOYMENT_TARGET = 17.6;
 				MARKETING_VERSION = 0.1.0;
-				PRODUCT_BUNDLE_IDENTIFIER = com.chocos.writerpad;
+				PRODUCT_BUNDLE_IDENTIFIER = "com.chocos.writerpad$(WRITERPAD_BUNDLE_SUFFIX)";
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				SUPPORTED_PLATFORMS = "iphoneos iphonesimulator";
 				SUPPORTS_MACCATALYST = YES;
@@ -1137,7 +1137,7 @@
 				INFOPLIST_FILE = WriterPad/Info.plist;
 				IPHONEOS_DEPLOYMENT_TARGET = 17.6;
 				MARKETING_VERSION = 0.1.0;
-				PRODUCT_BUNDLE_IDENTIFIER = com.chocos.writerpad;
+				PRODUCT_BUNDLE_IDENTIFIER = "com.chocos.writerpad$(WRITERPAD_BUNDLE_SUFFIX)";
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				SUPPORTED_PLATFORMS = "iphoneos iphonesimulator";
 				SUPPORTS_MACCATALYST = YES;
