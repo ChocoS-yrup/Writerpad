@@ -1857,6 +1857,172 @@ final class SyncV2SnapshotPullTests: XCTestCase {
     /// 이름을 보내도 그 폴더 하나만 보류되어야 하고 pull 전체가 죽으면 안 된다.
     /// pull은 SyncV2LocalSnapshotApplyError만 보류로 바꾸므로, 다른 오류가 새면
     /// 원고를 포함한 모든 동기화가 멈춘다.
+    /// tree_order의 자식 이름은 형제 순서만 담는다. 무엇이 폴더인지는 담지
+    /// 않는다. 문서 이름을 폴더로 지어내면, 서버에 대응 행이 없어 tombstone이
+    /// 영영 오지 않는 유령이 남는다.
+    func testTreeOrderChildNameNeverBecomesAFolder() async throws {
+        let fixture = try await treeOrderFixture()
+        defer { fixture.cleanUp() }
+
+        try await fixture.applier.apply(
+            localProjectID: fixture.projectID,
+            snapshot: makeSnapshot(
+                path: syncV2TreeOrderPath,
+                content: """
+                {"tree_order":{"메인/설정집/구세계":["마법체계.txt"],\
+                "메인/설정집":["구세계"]},"version":1}
+                """,
+                revision: 1
+            )
+        )
+
+        let documents = try await fixture.repository.documents(
+            in: fixture.projectID
+        )
+        XCTAssertNil(
+            documents.first {
+                $0.relativePath.rawValue == "메인/설정집/구세계/마법체계.txt"
+            },
+            "문서 이름이 폴더가 되면 안 된다"
+        )
+        XCTAssertNil(
+            documents.first {
+                $0.relativePath.rawValue == "메인/설정집/구세계"
+            },
+            "tree_order의 부모 키도 폴더 존재의 근거가 아니다"
+        )
+    }
+
+    /// 서버 폴더 행이 아직 오지 않은 부모 키를 만나면 던지지 않는다. 없는
+    /// 노드에 매길 순서는 없으므로 건너뛰고 다음 pull에서 정확히 적용한다.
+    func testUnknownTreeOrderParentIsSkippedInsteadOfFailingThePull()
+        async throws {
+        let fixture = try await treeOrderFixture()
+        defer { fixture.cleanUp() }
+
+        try await fixture.applier.apply(
+            localProjectID: fixture.projectID,
+            snapshot: makeSnapshot(
+                path: syncV2TreeOrderPath,
+                content: """
+                {"tree_order":{"메인/아직 없는 폴더":["가","나"]},"version":1}
+                """,
+                revision: 1
+            )
+        )
+    }
+
+    /// 실제 폴더가 있는 경우의 순서 적용은 그대로여야 한다.
+    func testTreeOrderStillOrdersChildrenOfRealFolders() async throws {
+        let fixture = try await treeOrderFixture()
+        defer { fixture.cleanUp() }
+        let first = DocumentNode(
+            id: DocumentID(rawValue: UUID()),
+            projectID: fixture.projectID,
+            kind: .folder,
+            parentID: fixture.settingsID,
+            relativePath: RelativeDocumentPath(rawValue: "메인/설정집/가"),
+            userOrder: 0,
+            modifiedAt: .distantPast,
+            contentHash: nil
+        )
+        let second = DocumentNode(
+            id: DocumentID(rawValue: UUID()),
+            projectID: fixture.projectID,
+            kind: .folder,
+            parentID: fixture.settingsID,
+            relativePath: RelativeDocumentPath(rawValue: "메인/설정집/나"),
+            userOrder: 1,
+            modifiedAt: .distantPast,
+            contentHash: nil
+        )
+        try await fixture.repository.save(first)
+        try await fixture.repository.save(second)
+
+        try await fixture.applier.apply(
+            localProjectID: fixture.projectID,
+            snapshot: makeSnapshot(
+                path: syncV2TreeOrderPath,
+                content: """
+                {"tree_order":{"메인/설정집":["나","가"]},"version":1}
+                """,
+                revision: 1
+            )
+        )
+
+        let documents = try await fixture.repository.documents(
+            in: fixture.projectID
+        )
+        let orderedFirst = try XCTUnwrap(documents.first { $0.id == first.id })
+        let orderedSecond = try XCTUnwrap(documents.first { $0.id == second.id })
+        XCTAssertLessThan(orderedSecond.userOrder, orderedFirst.userOrder)
+    }
+
+    private struct TreeOrderFixture {
+        let projectID: ProjectID
+        let settingsID: DocumentID
+        let repository: SnapshotDocumentRepository
+        let applier: LocalSyncV2SnapshotApplier
+        let root: URL
+
+        func cleanUp() {
+            try? FileManager.default.removeItem(at: root)
+        }
+    }
+
+    /// 서버 폴더 행을 받은 pull이다. 실제 pull은 folders 표를 먼저 읽고 이
+    /// 값을 넘긴다.
+    private func treeOrderFixture(
+        hasRemoteFolderProjection: Bool = true
+    ) async throws -> TreeOrderFixture {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("WriterPad-TreeOrder-\(UUID())")
+        try FileManager.default.createDirectory(
+            at: root.appendingPathComponent("메인/설정집"),
+            withIntermediateDirectories: true
+        )
+        let projectID = ProjectID(rawValue: UUID())
+        let main = DocumentNode(
+            id: DocumentID(rawValue: UUID()),
+            projectID: projectID,
+            kind: .folder,
+            parentID: nil,
+            relativePath: RelativeDocumentPath(rawValue: "메인"),
+            userOrder: -1,
+            modifiedAt: .distantPast,
+            contentHash: nil
+        )
+        let settings = DocumentNode(
+            id: DocumentID(rawValue: UUID()),
+            projectID: projectID,
+            kind: .folder,
+            parentID: main.id,
+            relativePath: RelativeDocumentPath(rawValue: "메인/설정집"),
+            userOrder: 0,
+            modifiedAt: .distantPast,
+            contentHash: nil
+        )
+        let repository = SnapshotDocumentRepository(
+            documents: [main, settings]
+        )
+        let applier = LocalSyncV2SnapshotApplier(
+            documentRepository: repository,
+            workspaceLocator: SnapshotWorkspaceLocator(root: root)
+        )
+        await applier.preparePull(
+            localProjectID: projectID,
+            remoteLiveDocumentPaths: [],
+            hasRemoteFolderProjection: hasRemoteFolderProjection
+        )
+        return TreeOrderFixture(
+            projectID: projectID,
+            settingsID: settings.id,
+            repository: repository,
+            applier: applier,
+            root: root
+        )
+    }
+
     func testTreeOrderRejectsUnsafeFolderNameAsApplyErrorNotRawPolicyError()
         async throws {
         let root = FileManager.default.temporaryDirectory

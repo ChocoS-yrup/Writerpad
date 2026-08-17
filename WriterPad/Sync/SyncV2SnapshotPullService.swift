@@ -78,22 +78,28 @@ actor SyncV2SnapshotPullService: SyncV2SnapshotPulling {
             $0.relativePath != syncV2TreeOrderPath
                 && $0.relativePath != syncV2TrashPurgePath
         }
+        // 폴더 행을 받았는지 먼저 안다. 받았다면 tree_order 이름으로 폴더를
+        // 추측하지 않는다.
+        let remoteFolders = folderApplier == nil
+            ? []
+            : ((try? await client.fetchFolders(
+                projectID: serverProjectID
+            )) ?? [])
         await localApplier.preparePull(
             localProjectID: localProjectID,
             remoteLiveDocumentPaths: Set(
                 ordinarySnapshots
                     .filter { !$0.isDeleted }
                     .map(\.relativePath)
-            )
+            ),
+            hasRemoteFolderProjection: !remoteFolders.isEmpty
         )
         // 폴더를 문서보다 먼저 제자리에 놓는다. 이름이 바뀐 폴더에 문서가 먼저
         // 도착하면 옛 경로에 자리를 잡아, 뒤이은 폴더 이동이 목적지 충돌로
         // 막힌다.
         var folderRejections: [SyncV2RejectedStructureName] = []
         if let folderApplier {
-            let folders = try await client.fetchFolders(
-                projectID: serverProjectID
-            )
+            let folders = remoteFolders
             // 이관을 먼저 돌린다. 기존 폴더에 공유 UUID가 붙어 있어야 서버가
             // 보낸 폴더와 짝이 맞는다. 그러지 않으면 모든 원격 폴더가 "이 기기가
             // 모르는 폴더"로 보여 옮기는 대신 새로 만들게 된다.

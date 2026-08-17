@@ -18,9 +18,13 @@ extension SyncV2SnapshotMergeStoring {
 }
 
 protocol SyncV2LocalSnapshotApplying: Sendable {
+    /// `hasRemoteFolderProjection`은 이번 pull에서 서버 폴더 행을 받았는지다.
+    /// 받았다면 폴더의 존재는 그 표가 정하므로 tree_order 이름으로 폴더를
+    /// 추측하지 않는다.
     func preparePull(
         localProjectID: ProjectID,
-        remoteLiveDocumentPaths: Set<String>
+        remoteLiveDocumentPaths: Set<String>,
+        hasRemoteFolderProjection: Bool
     ) async
     func apply(
         localProjectID: ProjectID,
@@ -54,7 +58,8 @@ protocol SyncV2LocalSnapshotApplying: Sendable {
 extension SyncV2LocalSnapshotApplying {
     func preparePull(
         localProjectID: ProjectID,
-        remoteLiveDocumentPaths: Set<String>
+        remoteLiveDocumentPaths: Set<String>,
+        hasRemoteFolderProjection projection: Bool = false
     ) async {}
 
     func finish(
@@ -259,6 +264,8 @@ actor LocalSyncV2SnapshotApplier: SyncV2LocalSnapshotApplying {
     /// tree_order로 받은 폴더 이름 변경을 폴더 기록에도 올린다.
     private let folderIdentityPublisher: (any SyncV2FolderIdentityPublishing)?
     private var remoteLiveDocumentPaths: [ProjectID: Set<String>] = [:]
+    /// 서버 폴더 행을 받은 작품이다. 받았다면 폴더의 존재는 그 표가 정한다.
+    private var hasRemoteFolderProjection: [ProjectID: Bool] = [:]
 
     init(
         documentRepository: any DocumentRepository,
@@ -276,7 +283,8 @@ actor LocalSyncV2SnapshotApplier: SyncV2LocalSnapshotApplying {
 
     func preparePull(
         localProjectID: ProjectID,
-        remoteLiveDocumentPaths: Set<String>
+        remoteLiveDocumentPaths: Set<String>,
+        hasRemoteFolderProjection projection: Bool = false
     ) async {
         if let root = try? await workspaceLocator.workspaceRoot(
             for: localProjectID
@@ -298,6 +306,7 @@ actor LocalSyncV2SnapshotApplier: SyncV2LocalSnapshotApplying {
         self.remoteLiveDocumentPaths[localProjectID] = Set(
             remoteLiveDocumentPaths.map(normalized)
         )
+        self.hasRemoteFolderProjection[localProjectID] = projection
     }
 
     func apply(
@@ -1018,7 +1027,18 @@ actor LocalSyncV2SnapshotApplier: SyncV2LocalSnapshotApplying {
                     && normalized($0.relativePath.rawValue)
                         == normalized(parentPath.rawValue)
             }) else {
-                throw SyncV2LocalSnapshotApplyError.invalidHierarchy
+                // 그 자리를 활성 문서가 차지했으면 진짜 구조 충돌이다.
+                if documents.contains(where: {
+                    $0.kind != .folder
+                        && isActive($0)
+                        && normalized($0.relativePath.rawValue)
+                            == normalized(parentPath.rawValue)
+                }) {
+                    throw SyncV2LocalSnapshotApplyError.invalidHierarchy
+                }
+                // 서버 폴더 행이 아직 오지 않았을 뿐이다. 없는 노드에 매길
+                // 순서는 없으므로 건너뛰고 다음 pull에서 정확히 적용한다.
+                continue
             }
             let children = documents.filter {
                 $0.parentID == parent.id && isActive($0)
@@ -1345,6 +1365,19 @@ actor LocalSyncV2SnapshotApplier: SyncV2LocalSnapshotApplying {
     ) throws -> EnsuredFolderHierarchy {
         var folderPaths = Set<String>()
         let remotePaths = remoteLiveDocumentPaths[localProjectID] ?? []
+        // 서버 folders 표를 받았다면 폴더의 존재는 그 표가 정한다. tree_order의
+        // 자식 배열은 형제 순서만 담고 무엇이 폴더인지는 담지 않으므로, 여기서
+        // 이름만 보고 폴더를 지어내면 문서 이름이 폴더가 된다. 문서가
+        // tombstone이 되는 순간 그 이름은 "살아 있는 원격 문서" 목록에서 빠지고
+        // 로컬 노드도 활성이 아니게 되어, 남는 근거가 이름 하나뿐이 된다.
+        // 그렇게 생긴 폴더는 서버에 대응 행이 없어 tombstone이 영영 오지 않아
+        // 사용자가 직접 지우기 전에는 사라지지 않고, 그 안에 있다는 이유로
+        // 진짜 폴더의 삭제까지 막는다.
+        //
+        // 폴더 행도 folder_paths도 없는 옛 payload에서만 이름으로 추측한다.
+        // Windows도 같은 조건으로 추측을 멈춘다.
+        let mayInferFolders =
+            !(hasRemoteFolderProjection[localProjectID] ?? false)
 
         for key in payload.treeOrder.keys.sorted() {
             guard let names = payload.treeOrder[key] else { continue }
@@ -1362,7 +1395,7 @@ actor LocalSyncV2SnapshotApplier: SyncV2LocalSnapshotApplying {
                     throw SyncV2LocalSnapshotApplyError.invalidHierarchy
                 }
                 parentValue = key
-                if !isInTrash(parentPath) {
+                if mayInferFolders, !isInTrash(parentPath) {
                     folderPaths.insert(key)
                 }
             }
@@ -1395,7 +1428,8 @@ actor LocalSyncV2SnapshotApplier: SyncV2LocalSnapshotApplying {
                 } catch {
                     throw SyncV2LocalSnapshotApplyError.unsafePath
                 }
-                guard !isInTrash(childPath),
+                guard mayInferFolders,
+                      !isInTrash(childPath),
                       !remotePaths.contains(normalized(childValue))
                 else { continue }
                 if let existing = initialDocuments.first(where: {
