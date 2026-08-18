@@ -4289,6 +4289,75 @@ final class SyncV2StoreTests: XCTestCase {
         await store.close()
     }
 
+    /// 되감기는 상태를 바꾸는 durable 경로다. 사건 열에 남기지 않으면
+    /// status 칸과 사건이 말하는 상태가 갈라진다.
+    ///
+    /// 장치(`operationStateDivergences`)는 있었지만 되감기 뒤를 보는 시험이
+    /// 없었다. 교차검증 3라운드에서 지적받아 넣는다.
+    func testFolderRebaseLeavesNoStateDivergence() async throws {
+        let url = try databaseURL()
+        let context = QueueAPIContext()
+        let store = try await connectedStore(at: url, context: context)
+        try await store.applyFolderSnapshotBaselines(
+            localProjectID: context.localProjectID,
+            serverProjectID: context.serverProjectID,
+            folders: [
+                SyncV2RemoteFolder(
+                    folderID: context.folderID,
+                    parentFolderID: nil,
+                    name: "서버 revision 2",
+                    revision: 2,
+                    isDeleted: false,
+                    updatedAt: Date(timeIntervalSince1970: 20)
+                )
+            ],
+            excluding: []
+        )
+        let renameID = UUID()
+        _ = try await store.enqueue(
+            context.batch(
+                kind: .structureChange,
+                mutations: [
+                    context.folderMutation(
+                        operationID: renameID,
+                        name: "이 기기 이름"
+                    )
+                ]
+            )
+        )
+        let claims = try await store.claimReadyFolderOperations(
+            limit: 1,
+            now: Date(timeIntervalSince1970: 30)
+        )
+        let claimed = try XCTUnwrap(claims.first)
+        let baseline = try await store.operationStateDivergences()
+        XCTAssertEqual(baseline, [])
+
+        try await store.rebaseFolderAfterRevisionConflict(
+            claimed,
+            remote: SyncV2RemoteFolder(
+                folderID: context.folderID,
+                parentFolderID: nil,
+                name: "다른 기기 이름",
+                revision: 3,
+                isDeleted: false,
+                updatedAt: Date(timeIntervalSince1970: 40)
+            )
+        )
+
+        let divergences = try await store.operationStateDivergences()
+        let events = try await store.operationEvents(operationID: renameID)
+        await store.close()
+
+        XCTAssertEqual(divergences, [], "되감기 뒤 상태가 사건과 갈라지면 안 된다")
+        // 서버가 왜 거절했는지가 이력에 남아야 사후에 셀 수 있다.
+        XCTAssertEqual(events.last?.type, .enqueued)
+        XCTAssertTrue(
+            events.contains { $0.type == .conflictDetected },
+            "REVISION_CONFLICT 가 이력에 남아야 한다"
+        )
+    }
+
     func testFolderRevisionConflictRebasesSameFIFOOperation()
         async throws {
         let url = try databaseURL()

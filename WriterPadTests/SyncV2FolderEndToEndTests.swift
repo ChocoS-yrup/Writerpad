@@ -488,6 +488,60 @@ final class SyncV2FolderEndToEndTests: XCTestCase {
     /// 두 기기가 같은 폴더의 이름을 앞뒤로 바꾸면 늦은 쪽은 REVISION_CONFLICT를
     /// 받는다. 폴더에는 합칠 본문이 없으므로 기준선만 서버 값으로 옮겨 그대로
     /// 다시 보낸다. 늦게 커밋하는 쪽이 이기고, 진 쪽은 pull로 따라간다.
+    /// 되감기에는 상한이 있어야 한다.
+    ///
+    /// 폴더는 늦게 커밋하는 쪽이 이기므로, 두 기기가 모두 이름 변경을 들고
+    /// 있으면 서로 되감기를 주고받는다. 지연만 있고 횟수 상한이 없으면 멈출
+    /// 근거가 사용자가 이름을 그만 바꾸는 것뿐인데 그것은 장치가 아니다.
+    ///
+    /// 실기기 검증(검증06)에서 8회를 손으로 채우는 것은 비현실적이라
+    /// 상한 동작은 여기서만 확인된다.
+    func testEndlessRevisionConflictStopsAtTheRebaseCeiling() async throws {
+        let server = FakeFolderServer()
+        let sender = try await FolderDeviceFixture(server: server)
+        let folderID = UUID()
+        let renameID = UUID()
+
+        try await sender.enqueue(
+            operationID: UUID(),
+            folderID: folderID,
+            parentFolderID: nil,
+            name: "가 나 다"
+        )
+        await sender.drain(now: 10)
+
+        // 다른 기기가 멈추지 않는다. 되감아도 서버가 또 앞서 있다.
+        await server.keepAdvancing(folderID: folderID)
+        try await sender.enqueue(
+            operationID: renameID,
+            folderID: folderID,
+            parentFolderID: nil,
+            name: "이 기기 이름"
+        )
+
+        var status: String?
+        for round in 1 ... 8 {
+            await sender.drain(now: TimeInterval(20 + round * 10))
+            status = try await sender.store.operationStatus(
+                operationID: renameID
+            )
+            if status == "conflict" { break }
+        }
+
+        let stalled = await sender.stalledFolderChanges()
+        await sender.close()
+
+        // 영원히 되감지 않고 세운다.
+        XCTAssertEqual(status, "conflict")
+        // 세웠으면 화면이 말할 수 있어야 한다. 조용히 굳으면 사용자는 모른다.
+        XCTAssertTrue(
+            stalled.contains {
+                $0.name == "이 기기 이름" && $0.errorCode == "AUTO_REBASE_LIMIT"
+            },
+            "상한에 닿은 폴더는 화면이 말할 수 있어야 한다: \(stalled)"
+        )
+    }
+
     func testConcurrentRenameFromTwoDevicesLetsTheLaterOneWin() async throws {
         let server = FakeFolderServer()
         let sender = try await FolderDeviceFixture(server: server)
@@ -847,11 +901,16 @@ private actor FakeFolderServer {
     private var rows: [UUID: Row] = [:]
     private var applied: [UUID: SyncV2CommitFolderResult] = [:]
     private var stableRejections: [UUID: String] = [:]
+    /// 거절할 때마다 revision을 한 칸 더 올린다. 다른 기기가 이름을 계속
+    /// 바꾸고 있는 상황이다 — 되감아도 또 뒤처진다.
+    private var keepsAdvancing: Set<UUID> = []
     private var commits = 0
     private var replays = 0
 
     /// 사람이 트리나 이름을 고치기 전에는 몇 번을 보내도 같은 답이 오는 상태를
     /// 만든다. 배포된 commit_folder는 이 문구들을 errcode P0001로 raise한다.
+    func keepAdvancing(folderID: UUID) { keepsAdvancing.insert(folderID) }
+
     func rejectCommits(for folderID: UUID, message: String) {
         stableRejections[folderID] = message
     }
@@ -885,6 +944,13 @@ private actor FakeFolderServer {
                     detail: nil
                 )
             )
+        }
+        // 되감기는 서버를 다시 읽어 따라잡는다. 그 사이에 또 바뀌어야
+        // 영원히 뒤처진다. 그래서 읽은 뒤가 아니라 매 커밋 직전에 올린다.
+        // 읽기와 쓰기를 한 식에 겹치면 배타적 접근 위반으로 죽는다.
+        if keepsAdvancing.contains(parameters.folderID),
+           let advanced = rows[parameters.folderID]?.revision {
+            rows[parameters.folderID]?.revision = advanced + 1
         }
         let current = rows[parameters.folderID]?.revision ?? 0
         guard current == parameters.baseServerRevision else {

@@ -3371,6 +3371,26 @@ actor SyncV2Store:
                     throw SyncV2DispatchStoreError.integrityFailure
                 }
             }
+            // 상태를 바꾸는 durable 경로는 사건 열에 남아야 한다. 남기지
+            // 않으면 status 칸은 pending인데 사건이 말하는 상태는 inflight로
+            // 갈라지고, `operationStateDivergences()`가 그것을 잡는다.
+            //
+            // Windows(`rebase_clean_merge`)는 여기서 셋을 남긴다 —
+            // 원본 conflict, 승계 행 enqueued, 원본 superseded.
+            // iPad는 아직 제자리 UPDATE라 승계 행이 없으므로 둘만 남긴다.
+            // 승계 행이 생기면(되감기 불변성 작업) 나머지 하나가 채워진다.
+            try appendOperationEvent(
+                operationID: operation.operationID.uuidString.lowercased(),
+                type: .conflictDetected,
+                errorCode: "REVISION_CONFLICT",
+                timestamp: timestamp
+            )
+            try appendOperationEvent(
+                operationID: operation.operationID.uuidString.lowercased(),
+                type: .enqueued,
+                errorCode: nil,
+                timestamp: timestamp
+            )
             try refreshBatchState(
                 batchID: operation.batchID,
                 timestamp: timestamp
