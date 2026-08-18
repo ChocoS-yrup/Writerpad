@@ -48,6 +48,34 @@ final class LocalBinderRepositoryTests: XCTestCase {
     }
 
     @MainActor
+    func testMissingEmptyFixedTrashIsRecreatedWithoutChangingOtherItems()
+        async throws {
+        let harness = try await makeHarness(projectName: "빈 고정 폴더 복구")
+        try writeText(
+            "그대로 남아야 함",
+            workspace: harness.workspace,
+            path: "메인/메모장/보존.txt"
+        )
+        let preservedURL = harness.workspace
+            .appendingPathComponent("메인/메모장/보존.txt")
+        let preservedBefore = try Data(contentsOf: preservedURL)
+        let trashURL = harness.workspace.appendingPathComponent("메인/휴지통")
+        try FileManager.default.removeItem(at: trashURL)
+
+        let roots = try await harness.binder.rootNodes(in: harness.project.id)
+
+        XCTAssertNotNil(roots.first { $0.fixedCategory == .trash })
+        XCTAssertTrue(FileManager.default.fileExists(atPath: trashURL.path))
+        XCTAssertEqual(try Data(contentsOf: preservedURL), preservedBefore)
+        let storedTrash = try await harness.repository
+            .documents(in: harness.project.id)
+            .first {
+                $0.relativePath == BinderFixedCategory.trash.relativePath
+            }
+        XCTAssertEqual(storedTrash?.kind, .folder)
+    }
+
+    @MainActor
     func testThousandChapterProjectInitiallyScansOnlyMainAndShowsNineFixedRoots() async throws {
         let harness = try await makeHarness(projectName: "천화 작품")
         let manuscript = harness.workspace.appendingPathComponent("메인/원고/1권")
@@ -209,6 +237,54 @@ final class LocalBinderRepositoryTests: XCTestCase {
     }
 
     @MainActor
+    func testBackgroundReloadKeepsVisibleRowsAndSelectionUntilReplacementIsReady()
+        async throws {
+        let harness = try await makeHarness(projectName: "무깜빡임 갱신")
+        try writeText(
+            "기존 본문",
+            workspace: harness.workspace,
+            path: "메인/메모장/기존.txt"
+        )
+        let roots = try await harness.binder.rootNodes(in: harness.project.id)
+        let notes = try XCTUnwrap(roots.first { $0.fixedCategory == .notes })
+        try await harness.binder.setExpanded(true, for: notes.id)
+
+        let repository = BlockingBinderRepository(base: harness.binder)
+        let model = BinderViewModel(
+            repository: repository,
+            commands: harness.commands
+        )
+        await model.load(projectID: harness.project.id)
+        let existing = try XCTUnwrap(
+            model.visibleRows.first { $0.node.displayName == "기존" }?.node
+        )
+        model.select(existing)
+        let rowsBeforeRefresh = model.visibleRows
+
+        await repository.blockNextRootLoad()
+        let refresh = Task { @MainActor in
+            await model.load(projectID: harness.project.id)
+        }
+        await repository.waitUntilRootLoadIsBlocked()
+
+        XCTAssertEqual(model.visibleRows, rowsBeforeRefresh)
+        XCTAssertEqual(model.selectedNodeID, existing.id)
+
+        try writeText(
+            "서버에서 추가된 본문",
+            workspace: harness.workspace,
+            path: "메인/메모장/추가.txt"
+        )
+        await repository.resumeRootLoad()
+        await refresh.value
+
+        XCTAssertNotNil(
+            model.visibleRows.first { $0.node.displayName == "추가" }
+        )
+        XCTAssertEqual(model.selectedNodeID, existing.id)
+    }
+
+    @MainActor
     func testCreateRefreshesOnlyParentBranchAndKeepsOtherExpandedBranches() async throws {
         let harness = try await makeHarness(projectName: "부분 생성 갱신")
         try writeText("본문", workspace: harness.workspace, path: "메인/원고/1권/001화.txt")
@@ -260,6 +336,66 @@ final class LocalBinderRepositoryTests: XCTestCase {
         XCTAssertEqual(
             model.selectedNodeID,
             model.roots.first { $0.displayName == "자료" }?.id
+        )
+    }
+
+    @MainActor
+    func testBinderScanAndEmptyFolderCreationShareProjectStructureGate()
+        async throws {
+        let harness = try await makeHarness(projectName: "구조 경쟁 방지")
+        let roots = try await harness.binder.rootNodes(in: harness.project.id)
+        let notes = try XCTUnwrap(
+            roots.first { $0.fixedCategory == .notes }
+        )
+        await harness.scanner.resetMetrics()
+        let blocker = SequencedBinderStructureOperation()
+        let structureID = syncV2ProjectStructureMutationID(harness.project.id)
+        let holder = Task {
+            try await harness.mutationGate.withCriticalSection(
+                documentID: structureID
+            ) {
+                await blocker.run()
+            }
+        }
+        await blocker.waitUntilStarted()
+
+        let reload = Task {
+            try await harness.binder.rootNodes(in: harness.project.id)
+        }
+        let create = Task {
+            try await harness.commands.create(
+                kind: .folder,
+                named: "동시 생성",
+                in: notes.id,
+                projectID: harness.project.id
+            )
+        }
+        for _ in 0..<100 { await Task.yield() }
+
+        let metricsWhileHeld = await harness.scanner.metrics()
+        XCTAssertTrue(metricsWhileHeld.relativeDirectories.isEmpty)
+        XCTAssertFalse(
+            FileManager.default.fileExists(
+                atPath: harness.workspace
+                    .appendingPathComponent("메인/메모장/동시 생성")
+                    .path
+            )
+        )
+
+        await blocker.release()
+        _ = try await holder.value
+        let reloadedRoots = try await reload.value
+        _ = try await create.value
+
+        XCTAssertNotNil(
+            reloadedRoots.first { $0.fixedCategory == .trash }
+        )
+        XCTAssertTrue(
+            FileManager.default.fileExists(
+                atPath: harness.workspace
+                    .appendingPathComponent("메인/메모장/동시 생성")
+                    .path
+            )
         )
     }
 
@@ -368,8 +504,70 @@ final class LocalBinderRepositoryTests: XCTestCase {
         let scanner: LocalBinderDirectoryScanner
         let binder: LocalBinderRepository
         let commands: LocalBinderCommandService
+        let mutationGate: SyncV2DocumentMutationGate
         let project: ManagedProject
         let workspace: URL
+    }
+
+    private actor BlockingBinderRepository: BinderRepository {
+        private let base: any BinderRepository
+        private var shouldBlockNextRootLoad = false
+        private var rootLoadIsBlocked = false
+        private var blockedWaiters: [CheckedContinuation<Void, Never>] = []
+        private var rootLoadContinuation: CheckedContinuation<Void, Never>?
+
+        init(base: any BinderRepository) {
+            self.base = base
+        }
+
+        func blockNextRootLoad() {
+            shouldBlockNextRootLoad = true
+        }
+
+        func waitUntilRootLoadIsBlocked() async {
+            guard !rootLoadIsBlocked else { return }
+            await withCheckedContinuation { continuation in
+                blockedWaiters.append(continuation)
+            }
+        }
+
+        func resumeRootLoad() {
+            rootLoadContinuation?.resume()
+            rootLoadContinuation = nil
+        }
+
+        func rootContainerID(in projectID: ProjectID) async throws -> DocumentID {
+            try await base.rootContainerID(in: projectID)
+        }
+
+        func rootNodes(in projectID: ProjectID) async throws -> [BinderNode] {
+            if shouldBlockNextRootLoad {
+                shouldBlockNextRootLoad = false
+                rootLoadIsBlocked = true
+                let waiters = blockedWaiters
+                blockedWaiters.removeAll()
+                waiters.forEach { $0.resume() }
+                await withCheckedContinuation { continuation in
+                    rootLoadContinuation = continuation
+                }
+                rootLoadIsBlocked = false
+            }
+            return try await base.rootNodes(in: projectID)
+        }
+
+        func children(
+            of folderID: DocumentID,
+            in projectID: ProjectID
+        ) async throws -> [BinderNode] {
+            try await base.children(of: folderID, in: projectID)
+        }
+
+        func setExpanded(
+            _ isExpanded: Bool,
+            for folderID: DocumentID
+        ) async throws {
+            try await base.setExpanded(isExpanded, for: folderID)
+        }
     }
 
     private struct FixedClock: AppClock {
@@ -401,20 +599,23 @@ final class LocalBinderRepositoryTests: XCTestCase {
             pathResolver: resolver
         )
         let scanner = LocalBinderDirectoryScanner(pathResolver: resolver)
+        let mutationGate = SyncV2DocumentMutationGate()
         let binder = LocalBinderRepository(
             metadataStore: repository,
             workspaceStateRepository: repository,
             workspaceLocator: locator,
             scanner: scanner,
             pathPolicy: resolver.policy,
-            clock: clock
+            clock: clock,
+            syncMutationGate: mutationGate
         )
         let commands = LocalBinderCommandService(
             metadataStore: repository,
             workspaceStateRepository: repository,
             workspaceLocator: locator,
             pathPolicy: resolver.policy,
-            clock: clock
+            clock: clock,
+            syncMutationGate: mutationGate
         )
         let workspace = try resolver.standardPaths(
             forProjectNamed: projectName
@@ -427,6 +628,7 @@ final class LocalBinderRepositoryTests: XCTestCase {
             scanner: scanner,
             binder: binder,
             commands: commands,
+            mutationGate: mutationGate,
             project: project,
             workspace: workspace
         )
@@ -439,5 +641,33 @@ final class LocalBinderRepositoryTests: XCTestCase {
             withIntermediateDirectories: true
         )
         try Data(text.utf8).write(to: url, options: .atomic)
+    }
+}
+
+private actor SequencedBinderStructureOperation {
+    private var started = false
+    private var startWaiters: [CheckedContinuation<Void, Never>] = []
+    private var releaseContinuation: CheckedContinuation<Void, Never>?
+
+    func run() async {
+        started = true
+        let waiters = startWaiters
+        startWaiters.removeAll()
+        waiters.forEach { $0.resume() }
+        await withCheckedContinuation { continuation in
+            releaseContinuation = continuation
+        }
+    }
+
+    func waitUntilStarted() async {
+        guard !started else { return }
+        await withCheckedContinuation { continuation in
+            startWaiters.append(continuation)
+        }
+    }
+
+    func release() {
+        releaseContinuation?.resume()
+        releaseContinuation = nil
     }
 }

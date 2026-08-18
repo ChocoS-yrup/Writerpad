@@ -837,6 +837,7 @@ final class LocalBinderCommandServiceTests: XCTestCase {
         XCTAssertEqual(result.chapterIDs.count, 25)
         XCTAssertEqual(result.firstChapterID, result.chapterIDs.first)
         XCTAssertTrue(result.shouldRefreshBinder)
+        XCTAssertEqual(result.manuscriptFolderID, manuscript.id)
         XCTAssertEqual(result.folderToExpandID, result.volumeID)
         XCTAssertEqual(result.documentToOpenID, result.firstChapterID)
         XCTAssertTrue(fileExists("메인/원고/1권/001화.txt", harness: harness))
@@ -1180,9 +1181,66 @@ final class LocalBinderCommandServiceTests: XCTestCase {
             ["서버 빈 폴더"]
         )
         XCTAssertEqual(
+            treeOrder[notes.relativePath.rawValue + "/서버 빈 폴더"],
+            []
+        )
+        XCTAssertEqual(
             created.relativePath.rawValue,
             notes.relativePath.rawValue + "/서버 빈 폴더"
         )
+    }
+
+    func testTreeOrderNormalizesDecomposedFolderNamesAndIncludesEmptyLists()
+        async throws {
+        let harness = try await makeHarness()
+        let notes = try await fixedRoot(.notes, harness: harness)
+        _ = try await harness.commands.create(
+            kind: .folder,
+            named: "한글 빈폴더",
+            in: notes.id,
+            projectID: harness.project.id
+        )
+        let documents = try await harness.repository.documents(
+            in: harness.project.id
+        )
+        let decomposedDocuments = documents.map { document in
+            DocumentNode(
+                id: document.id,
+                projectID: document.projectID,
+                kind: document.kind,
+                parentID: document.parentID,
+                relativePath: RelativeDocumentPath(
+                    rawValue: document.relativePath.rawValue
+                        .decomposedStringWithCanonicalMapping
+                ),
+                userOrder: document.userOrder,
+                modifiedAt: document.modifiedAt,
+                contentHash: document.contentHash,
+                deletionStatus: document.deletionStatus,
+                cursor: document.cursor,
+                isExpanded: document.isExpanded
+            )
+        }
+
+        let content = try await harness.commands.treeOrderContent(
+            documents: decomposedDocuments
+        )
+        let object = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: Data(content.utf8))
+                as? [String: Any]
+        )
+        let treeOrder = try XCTUnwrap(
+            object["tree_order"] as? [String: [String]]
+        )
+
+        XCTAssertEqual(treeOrder["메인/메모장"], ["한글 빈폴더"])
+        XCTAssertEqual(treeOrder["메인/메모장/한글 빈폴더"], [])
+        XCTAssertTrue(treeOrder.keys.allSatisfy {
+            $0 == $0.precomposedStringWithCanonicalMapping
+        })
+        XCTAssertTrue(treeOrder.values.flatMap { $0 }.allSatisfy {
+            $0 == $0.precomposedStringWithCanonicalMapping
+        })
     }
 
     func testStructureTrashRestoreAndPurgeCaptureCorrectSnapshots() async throws {

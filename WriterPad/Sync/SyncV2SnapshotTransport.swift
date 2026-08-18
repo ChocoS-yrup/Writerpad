@@ -16,6 +16,7 @@ protocol SyncV2SnapshotTransporting: Sendable {
         projectID: UUID,
         documentID: UUID
     ) async throws -> SyncV2RemoteDocumentSnapshot?
+    func fetchFolders(projectID: UUID) async throws -> [SyncV2RemoteFolder]
 }
 
 extension SyncV2SnapshotTransporting {
@@ -360,4 +361,3 @@ actor SyncV2SnapshotClient: SyncV2SnapshotClienting {
         }
     }
 }
-

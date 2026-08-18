@@ -148,6 +148,7 @@ enum SyncV2RemoteOperationKind: String, Decodable, Equatable, Sendable {
     case create
     case update
     case move
+    case rename
     case delete
     case restore
 }

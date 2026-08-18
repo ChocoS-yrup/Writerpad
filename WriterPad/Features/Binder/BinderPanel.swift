@@ -180,7 +180,10 @@ struct BinderPanel: View {
         ) { prompt in
             TextField(prompt.placeholder, text: $promptName)
                 .id(prompt.id)
+                .submitLabel(.done)
+                .onSubmit(submitNamePrompt)
             Button("취소", role: .cancel) { namePrompt = nil }
+                .keyboardShortcut(.cancelAction)
             Button("확인") { submitNamePrompt() }
                 .disabled(prompt.requiresTypedName && promptName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
         } message: { prompt in
@@ -1205,9 +1208,11 @@ private struct ChapterRenameSheet: View {
             .toolbar {
                 ToolbarItem(placement: .cancellationAction) {
                     Button("취소", action: onCancel)
+                        .keyboardShortcut(.cancelAction)
                 }
                 ToolbarItem(placement: .confirmationAction) {
                     Button("저장", action: onSave)
+                        .keyboardShortcut(.defaultAction)
                 }
             }
         }

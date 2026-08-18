@@ -369,6 +369,7 @@ extension LocalBinderCommandService {
             chapterIDs: chapters.map(\.id),
             volumePath: volumePath,
             shouldRefreshBinder: true,
+            manuscriptFolderID: manuscript.id,
             folderToExpandID: volumeID,
             documentToOpenID: firstChapter.id
         )
@@ -466,9 +467,15 @@ extension LocalBinderCommandService {
         _ originalJournal: BinderCommandJournal,
         workspaceRoot: URL
     ) async throws {
-        let documentIDs = (originalJournal.oldNodes + originalJournal.newNodes)
+        var documentIDs = (originalJournal.oldNodes + originalJournal.newNodes)
             .filter { $0.kind == .text }
             .map { $0.id.rawValue }
+        // 빈 폴더는 text UUID가 없어 기존 코드에서는 Gate를
+        // 그냥 통과했다. 원격 폴더 반영과 새 폴더 생성이
+        // 충돌하지 않도록 작품별 구조 키도 함께 사용한다.
+        documentIDs.append(
+            syncV2ProjectStructureMutationID(originalJournal.projectID)
+        )
         try await syncMutationGate.withCriticalSections(
             documentIDs: documentIDs
         ) { [self] in
@@ -856,11 +863,20 @@ extension LocalBinderCommandService {
                     }
                     return $0.relativePath.rawValue < $1.relativePath.rawValue
                 }
-            guard !children.isEmpty else { continue }
-            let key = hierarchyPolicy.isTopLevelContainer(parent)
+            let rawKey = hierarchyPolicy.isTopLevelContainer(parent)
                 ? "<root>"
                 : parent.relativePath.rawValue
-            order[key] = children.map { storedName(of: $0.relativePath) }
+            let key = rawKey == "<root>"
+                ? rawKey
+                : SyncV2ServerPath.canonical(rawKey)
+            // iOS 파일시스템은 한글 경로를 NFD로 되돌려줄 수
+            // 있다. folders 행은 NFC로 보내므로 tree_order도 같은
+            // 바이트 규약을 써야 Windows가 같은 폴더로 인식한다.
+            // 빈 폴더도 []로 명시해 문서 경로 없이 구조가
+            // 완전하게 전달되도록 한다.
+            order[key] = children.map {
+                SyncV2ServerPath.canonical(storedName(of: $0.relativePath))
+            }
         }
         return try canonicalJSON([
             "version": 1,

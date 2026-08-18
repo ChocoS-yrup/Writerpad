@@ -24,6 +24,17 @@ protocol DocumentRepository: Sendable {
     func removeMetadata(id: DocumentID) async throws
 }
 
+/// 로컬에서 임시로 만든 문서 UUID를 서버가 이미 채택한 UUID로
+/// 바꾸는 경계다. 본문과 경로를 검증하는 일은 동기화 층이 담당하고,
+/// 저장소는 자식·편집창 참조까지 하나의 저장으로 바꾼다.
+protocol DocumentIdentityReplacing: Sendable {
+    func replaceDocumentIdentity(
+        from oldID: DocumentID,
+        to newID: DocumentID,
+        in projectID: ProjectID
+    ) async throws
+}
+
 /// 마지막 작품과 작품별 화면 상태를 복원하는 메타데이터 경계다.
 protocol WorkspaceStateRepository: Sendable {
     func lastProjectID() async throws -> ProjectID?

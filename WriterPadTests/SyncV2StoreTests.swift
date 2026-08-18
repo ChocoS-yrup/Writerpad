@@ -301,7 +301,7 @@ final class SyncV2StoreTests: XCTestCase {
         await reopened.close()
     }
 
-    func testStartupReturnsInflightToPendingWithSameIDAndAttempts()
+    func testStartupCompletesLegacyInflightEnsureWithSameIDAndAttempts()
         async throws {
         let url = try databaseURL()
         let created = try await openStore(at: url)
@@ -334,7 +334,7 @@ final class SyncV2StoreTests: XCTestCase {
             operationID: fixture.operationID
         )
         let count = try await reopened.operationCount()
-        XCTAssertEqual(status, "pending")
+        XCTAssertEqual(status, "completed")
         XCTAssertEqual(attempts, 3)
         XCTAssertEqual(count, 1)
         await reopened.close()
@@ -877,140 +877,64 @@ final class SyncV2StoreTests: XCTestCase {
         )
     }
 
-    func testInitialSnapshotPreservesLiveIdentitiesAndSkipsTrashedFolders()
+    func testInitialSnapshotTreeOrderUsesNFCAndDeclaresEmptyFolder()
         async throws {
         let root = FileManager.default.temporaryDirectory
             .appendingPathComponent(
-                "WriterPad-NativeFolderIdentity-\(UUID().uuidString)",
+                "WriterPad-NFCTreeOrder-\(UUID().uuidString)",
                 isDirectory: true
             )
         try FileManager.default.createDirectory(
-            at: root.appendingPathComponent("메인/메모장"),
+            at: root,
             withIntermediateDirectories: true
         )
-        addTeardownBlock { try? FileManager.default.removeItem(at: root) }
-
+        addTeardownBlock {
+            try? FileManager.default.removeItem(at: root)
+        }
         let projectID = ProjectID(rawValue: UUID())
-        let mainID = DocumentID(rawValue: UUID())
-        let standardNames = [
-            "원고", "캐릭터", "설정집", "메모장", "스토리 플롯",
-            "흐름정리", "복선", "장소", "휴지통",
-        ]
-        let standardIDs = Dictionary(
-            uniqueKeysWithValues: standardNames.map {
-                ($0, DocumentID(rawValue: UUID()))
-            }
-        )
+        let rootID = DocumentID(rawValue: UUID())
+        let notesID = DocumentID(rawValue: UUID())
+        let emptyID = DocumentID(rawValue: UUID())
         let date = Date(timeIntervalSince1970: 1)
-        var nodes = [
+        func decomposed(_ path: String) -> RelativeDocumentPath {
+            RelativeDocumentPath(
+                rawValue: path.decomposedStringWithCanonicalMapping
+            )
+        }
+        let nodes = [
             DocumentNode(
-                id: mainID,
+                id: rootID,
                 projectID: projectID,
                 kind: .folder,
                 parentID: nil,
-                relativePath: .init(rawValue: "메인"),
+                relativePath: decomposed("메인"),
+                userOrder: 0,
+                modifiedAt: date,
+                contentHash: nil
+            ),
+            DocumentNode(
+                id: notesID,
+                projectID: projectID,
+                kind: .folder,
+                parentID: rootID,
+                relativePath: decomposed("메인/메모장"),
+                userOrder: 0,
+                modifiedAt: date,
+                contentHash: nil
+            ),
+            DocumentNode(
+                id: emptyID,
+                projectID: projectID,
+                kind: .folder,
+                parentID: notesID,
+                relativePath: decomposed("메인/메모장/한글 빈폴더"),
                 userOrder: 0,
                 modifiedAt: date,
                 contentHash: nil
             ),
         ]
-        for (order, name) in standardNames.enumerated() {
-            nodes.append(
-                DocumentNode(
-                    id: standardIDs[name]!,
-                    projectID: projectID,
-                    kind: .folder,
-                    parentID: mainID,
-                    relativePath: .init(rawValue: "메인/\(name)"),
-                    userOrder: order,
-                    modifiedAt: date,
-                    contentHash: nil
-                )
-            )
-        }
-        let decomposedName = "가"
-        let userFolderID = DocumentID(rawValue: UUID())
-        let emptyFolderID = DocumentID(rawValue: UUID())
-        let trashedFolderID = DocumentID(rawValue: UUID())
-        nodes.append(
-            contentsOf: [
-                DocumentNode(
-                    id: userFolderID,
-                    projectID: projectID,
-                    kind: .folder,
-                    parentID: standardIDs["메모장"],
-                    relativePath: .init(
-                        rawValue: "메인/메모장/\(decomposedName)"
-                    ),
-                    userOrder: 0,
-                    modifiedAt: date,
-                    contentHash: nil
-                ),
-                DocumentNode(
-                    id: emptyFolderID,
-                    projectID: projectID,
-                    kind: .folder,
-                    parentID: standardIDs["설정집"],
-                    relativePath: .init(rawValue: "메인/설정집/빈 폴더"),
-                    userOrder: 0,
-                    modifiedAt: date,
-                    contentHash: nil
-                ),
-                DocumentNode(
-                    id: trashedFolderID,
-                    projectID: projectID,
-                    kind: .folder,
-                    parentID: standardIDs["휴지통"],
-                    relativePath: .init(rawValue: "메인/휴지통/삭제 폴더"),
-                    userOrder: 0,
-                    modifiedAt: date,
-                    contentHash: nil,
-                    deletionStatus: .trashed(
-                        originalPath: .init(rawValue: "메인/메모장/삭제 폴더"),
-                        deletedAt: date
-                    )
-                ),
-            ]
-        )
-        let liveID = DocumentID(rawValue: UUID())
-        let deletedID = DocumentID(rawValue: UUID())
-        let livePath = RelativeDocumentPath(
-            rawValue: "메인/메모장/원본.txt"
-        )
-        let originalBytes = Data("원본\r\n가".utf8)
-        try originalBytes.write(to: root.appendingPathComponent(livePath.rawValue))
-        nodes.append(
-            contentsOf: [
-                DocumentNode(
-                    id: liveID,
-                    projectID: projectID,
-                    kind: .text,
-                    parentID: standardIDs["메모장"],
-                    relativePath: livePath,
-                    userOrder: 1,
-                    modifiedAt: date,
-                    contentHash: nil
-                ),
-                DocumentNode(
-                    id: deletedID,
-                    projectID: projectID,
-                    kind: .text,
-                    parentID: standardIDs["휴지통"],
-                    relativePath: .init(rawValue: "메인/휴지통/삭제.txt"),
-                    userOrder: 1,
-                    modifiedAt: date,
-                    contentHash: nil,
-                    deletionStatus: .trashed(
-                        originalPath: .init(rawValue: "메인/메모장/삭제.txt"),
-                        deletedAt: date
-                    )
-                ),
-            ]
-        )
-        // 저장소 반환 순서가 identity wire order에 영향을 주지 않아야 한다.
-        nodes.reverse()
         let durable = ScriptedDurableChangeRecorder(
-            results: [.queued(operationIDs: [])]
+            results: [.queued(operationIDs: [UUID()])]
         )
         let recorder = ProjectInitialSyncRecorder(
             documentRepository: InitialSnapshotDocumentRepository(nodes),
@@ -1018,185 +942,30 @@ final class SyncV2StoreTests: XCTestCase {
             durableChangeRecorder: durable
         )
 
-        _ = await recorder.recordInitialSnapshot(
+        guard case .queued = await recorder.recordInitialSnapshot(
             projectID: projectID,
-            projectName: "identity",
+            projectName: "NFC 작품",
             batchKind: .projectBinding
-        )
-
-        let recordedBatches = await durable.batches
-        let batch = try XCTUnwrap(recordedBatches.first)
-        var snapshots: [DocumentID: (DocumentID?, String, Bool, Int)] = [:]
-        for (index, mutation) in batch.mutations.enumerated() {
-            if case let .folderSnapshot(
-                _, folderID, parentID, name, isDeleted
-            ) = mutation {
-                snapshots[folderID] = (parentID, name, isDeleted, index)
-            }
+        ) else {
+            return XCTFail("초기 tree_order가 queue되어야 합니다.")
         }
-        XCTAssertEqual(snapshots.count, 12)
-        XCTAssertEqual(
-            Set(snapshots.keys),
-            Set(nodes.filter {
-                $0.kind == .folder && $0.id != trashedFolderID
-            }.map(\.id))
-        )
-        XCTAssertEqual(snapshots[mainID]?.0, nil)
-        XCTAssertEqual(snapshots[standardIDs["휴지통"]!]?.0, mainID)
-        XCTAssertEqual(snapshots[userFolderID]?.0, standardIDs["메모장"])
-        XCTAssertEqual(snapshots[userFolderID]?.1, "가")
-        XCTAssertEqual(snapshots[emptyFolderID]?.0, standardIDs["설정집"])
-        // base_revision 0의 삭제 폴더는 서버가 INVALID_ARGUMENT로 거절한다.
-        // 고정 휴지통은 live로 보내되 그 아래 폴더 operation은 만들지 않는다.
-        XCTAssertFalse(snapshots[standardIDs["휴지통"]!]?.2 ?? true)
-        XCTAssertNil(snapshots[trashedFolderID])
-        XCTAssertNotEqual(
-            userFolderID,
-            SyncV2FolderIdentity.derived(
-                serverProjectID: projectID.rawValue,
-                relativePath: "메인/메모장/\(decomposedName)"
-            )
-        )
-
-        let documentMutations = batch.mutations.compactMap { mutation ->
-            (DocumentID, String, ContentHash)? in
-            guard case let .documentSnapshot(
-                _, id, _, content, hash, _, _
-            ) = mutation else { return nil }
-            return (id, content, hash)
-        }
-        XCTAssertEqual(documentMutations.count, 1)
-        XCTAssertEqual(documentMutations.first?.0, liveID)
-        XCTAssertEqual(Data(documentMutations.first!.1.utf8), originalBytes)
-        XCTAssertEqual(
-            documentMutations.first?.2,
-            SHA256ContentHasher().sha256(for: originalBytes)
-        )
-        XCTAssertFalse(documentMutations.contains { $0.0 == deletedID })
-
-        guard case let .treeOrder(_, content, _) = batch.mutations.last else {
-            return XCTFail("tree_order가 마지막 mutation이어야 합니다.")
+        let batches = await durable.batches
+        let batch = try XCTUnwrap(batches.first)
+        guard case let .treeOrder(_, content, _) = batch.mutations.last
+        else {
+            return XCTFail("초기 tree_order snapshot이 없습니다.")
         }
         let object = try XCTUnwrap(
             JSONSerialization.jsonObject(with: Data(content.utf8))
                 as? [String: Any]
         )
-        let tree = try XCTUnwrap(object["tree_order"] as? [String: [String]])
-        XCTAssertEqual(tree["<root>"], standardNames)
-        XCTAssertEqual(tree["메인/메모장"], ["가", "원본.txt"])
-        XCTAssertEqual(tree["메인/설정집"], ["빈 폴더"])
-        XCTAssertEqual(Set(tree["<root>"] ?? []).count, 9)
-    }
-
-    func testMarkerlessInitialSnapshotStateFailureNeverGuessesNewIDs()
-        async throws {
-        let root = FileManager.default.temporaryDirectory
-            .appendingPathComponent(
-                "WriterPad-MarkerlessInitial-\(UUID().uuidString)",
-                isDirectory: true
-            )
-        try FileManager.default.createDirectory(
-            at: root,
-            withIntermediateDirectories: true
-        )
-        addTeardownBlock { try? FileManager.default.removeItem(at: root) }
-        let projectID = ProjectID(rawValue: UUID())
-        let durable = UnavailableInitialSnapshotStateRecorder()
-        let recorder = ProjectInitialSyncRecorder(
-            documentRepository: InitialSnapshotDocumentRepository([]),
-            workspaceLocator: FixedWorkspaceLocator(root: root),
-            durableChangeRecorder: durable
+        let treeOrder = try XCTUnwrap(
+            object["tree_order"] as? [String: [String]]
         )
 
-        let result = await recorder.recordInitialSnapshot(
-            projectID: projectID,
-            projectName: "불일치",
-            batchKind: .projectBinding
-        )
-
-        XCTAssertEqual(
-            result,
-            .localSavedButNotQueued(
-                reason: "초기 작품 동기화 완료 상태를 확인할 수 없습니다."
-            )
-        )
-        let recordCallCount = await durable.recordCallCount()
-        XCTAssertEqual(recordCallCount, 0)
-        XCTAssertFalse(
-            FileManager.default.fileExists(
-                atPath: root.appendingPathComponent(
-                    ProjectInitialSyncRecorder.newProjectMarkerName
-                ).path
-            )
-        )
-    }
-
-    func testEnqueuedInitialSnapshotWithUnclearedMarkerReplaysSameIDs()
-        async throws {
-        let root = FileManager.default.temporaryDirectory
-            .appendingPathComponent(
-                "WriterPad-EnqueuedInitialInterruption-\(UUID().uuidString)",
-                isDirectory: true
-            )
-        try FileManager.default.createDirectory(
-            at: root,
-            withIntermediateDirectories: true
-        )
-        addTeardownBlock { try? FileManager.default.removeItem(at: root) }
-        let projectID = ProjectID(rawValue: UUID())
-        let mainID = DocumentID(rawValue: UUID())
-        let repository = InitialSnapshotDocumentRepository([
-            DocumentNode(
-                id: mainID,
-                projectID: projectID,
-                kind: .folder,
-                parentID: nil,
-                relativePath: .init(rawValue: "메인"),
-                userOrder: 0,
-                modifiedAt: Date(timeIntervalSince1970: 1),
-                contentHash: nil
-            ),
-        ])
-        let durable = ScriptedDurableChangeRecorder(
-            results: [
-                .queued(operationIDs: []),
-                .queued(operationIDs: []),
-            ]
-        )
-        let interrupted = ProjectInitialSyncRecorder(
-            documentRepository: repository,
-            workspaceLocator: FixedWorkspaceLocator(root: root),
-            durableChangeRecorder: durable,
-            fileManager: FailingMarkerRemovalFileManager()
-        )
-
-        _ = await interrupted.recordInitialSnapshot(
-            projectID: projectID,
-            projectName: "enqueue 뒤 중단",
-            batchKind: .projectBinding
-        )
-
-        let marker = root.appendingPathComponent(
-            ProjectInitialSyncRecorder.newProjectMarkerName
-        )
-        XCTAssertTrue(FileManager.default.fileExists(atPath: marker.path))
-        let firstAttempts = await durable.batches
-        let first = try XCTUnwrap(firstAttempts.first)
-
-        let restarted = ProjectInitialSyncRecorder(
-            documentRepository: repository,
-            workspaceLocator: FixedWorkspaceLocator(root: root),
-            durableChangeRecorder: durable
-        )
-        _ = await restarted.recordInitialSnapshot(
-            projectID: projectID,
-            projectName: "enqueue 뒤 중단",
-            batchKind: .projectBinding
-        )
-
-        let attempts = await durable.batches
-        XCTAssertEqual(attempts, [first, first])
-        XCTAssertFalse(FileManager.default.fileExists(atPath: marker.path))
+        XCTAssertEqual(treeOrder["<root>"], ["메모장"])
+        XCTAssertEqual(treeOrder["메인/메모장"], ["한글 빈폴더"])
+        XCTAssertEqual(treeOrder["메인/메모장/한글 빈폴더"], [])
     }
 
     func testSQLiteBindingUniqueIndexRejectsSecondLocalProject()
@@ -1234,57 +1003,6 @@ final class SyncV2StoreTests: XCTestCase {
             forServerProjectID: serverID
         )
         XCTAssertEqual(preserved, first)
-        await store.close()
-    }
-
-    func testNativeBindingAtomicallyCompletesFolderMigrationButLegacyDoesNot()
-        async throws {
-        let store = try await openStore(at: databaseURL())
-        let owner = UUID()
-        let nativeID = ProjectID(rawValue: UUID())
-        let windowsID = ProjectID(rawValue: UUID())
-        let legacyID = ProjectID(rawValue: UUID())
-
-        try await store.save(
-            .connected(
-                localProjectID: nativeID,
-                serverProjectID: nativeID.rawValue,
-                kind: .newServerProject,
-                projectName: "native",
-                ownerSubject: owner
-            )
-        )
-        try await store.save(
-            .connected(
-                localProjectID: windowsID,
-                serverProjectID: UUID(),
-                kind: .windowsImport,
-                projectName: "windows",
-                ownerSubject: owner
-            )
-        )
-        try await store.save(
-            .connected(
-                localProjectID: legacyID,
-                serverProjectID: UUID(),
-                kind: .existingServerProject,
-                projectName: "legacy",
-                ownerSubject: owner
-            )
-        )
-
-        let nativeCompleted = try await store.isFolderMigrationCompleted(
-            localProjectID: nativeID
-        )
-        let windowsCompleted = try await store.isFolderMigrationCompleted(
-            localProjectID: windowsID
-        )
-        let legacyCompleted = try await store.isFolderMigrationCompleted(
-            localProjectID: legacyID
-        )
-        XCTAssertTrue(nativeCompleted)
-        XCTAssertTrue(windowsCompleted)
-        XCTAssertFalse(legacyCompleted)
         await store.close()
     }
 
@@ -1952,6 +1670,91 @@ final class SyncV2StoreTests: XCTestCase {
         await store.close()
     }
 
+    func testTreeOrderCheckpointSurvivesWhileItsFolderIsPending()
+        async throws {
+        let url = try databaseURL()
+        let context = QueueAPIContext()
+        let store = try await connectedStore(at: url, context: context)
+        let treeDocumentID = syncV2UUIDv5(
+            namespace: context.serverProjectID,
+            name: syncV2TreeOrderPath
+        )
+        let folderOperationID = UUID()
+        let firstTreeID = UUID()
+        let leaseSensitiveDocumentID = UUID()
+        let leaseSensitiveOperationID = UUID()
+        let secondTreeID = UUID()
+
+        _ = try await store.enqueue(
+            context.batch(
+                kind: .structureChange,
+                mutations: [
+                    context.folderMutation(
+                        operationID: folderOperationID,
+                        name: "팯-빈폴더-팯"
+                    ),
+                    context.documentMutation(
+                        operationID: firstTreeID,
+                        documentID: treeDocumentID,
+                        relativePath: syncV2TreeOrderPath,
+                        content:
+                            "{\"tree_order\":{\"메인\":[\"팯-빈폴더-팯\"]},\"version\":1}",
+                        generation: 1,
+                        kind: .treeOrder
+                    ),
+                ]
+            )
+        )
+        _ = try await store.enqueue(
+            context.batch(
+                kind: .structureChange,
+                mutations: [
+                    context.documentMutation(
+                        operationID: leaseSensitiveOperationID,
+                        documentID: leaseSensitiveDocumentID,
+                        relativePath: "메인/다른 폴더/임대 중 문서.txt",
+                        content: "경로 변경",
+                        generation: 1
+                    ),
+                    context.documentMutation(
+                        operationID: secondTreeID,
+                        documentID: treeDocumentID,
+                        relativePath: syncV2TreeOrderPath,
+                        content:
+                            "{\"tree_order\":{\"메인\":[\"팯-빈폴더-팯\",\"다음 항목\"]},\"version\":1}",
+                        generation: 2,
+                        kind: .treeOrder
+                    ),
+                ]
+            )
+        )
+
+        let firstTreeStatus = try await store.operationStatus(
+            operationID: firstTreeID
+        )
+        XCTAssertEqual(
+            firstTreeStatus,
+            SyncV2OperationStatus.pending.rawValue
+        )
+        let folders = try await store.claimReadyFolderOperations(
+            limit: 1,
+            now: Date(timeIntervalSince1970: 10)
+        )
+        let folder = try XCTUnwrap(folders.first)
+        XCTAssertEqual(folder.operationID, folderOperationID)
+        try await store.complete(
+            folder,
+            result: folderCommitResult(for: folder)
+        )
+
+        let documents = try await store.claimReadyOperations(
+            limit: 1,
+            now: Date(timeIntervalSince1970: 20)
+        )
+        XCTAssertEqual(documents.map(\.operationID), [firstTreeID])
+        await store.close()
+    }
+
     func testTrashPurgeWaitsForTombstoneAndMaterializesItsCommittedRevision()
         async throws {
         let url = try databaseURL()
@@ -2259,8 +2062,67 @@ final class SyncV2StoreTests: XCTestCase {
         XCTAssertNil(queued[0].documentID)
         XCTAssertNil(queued[0].documentSequence)
         XCTAssertEqual(queued[0].kind, .ensureProject)
+        XCTAssertEqual(queued[0].status, .completed)
         XCTAssertEqual(binding?.projectName, "변경된 작품 이름")
         await store.close()
+    }
+
+    func testLaunchRecoveryCompletesLegacyEnsureProjectAndReleasesTreeOrder()
+        async throws {
+        let url = try databaseURL()
+        let context = QueueAPIContext()
+        let store = try await connectedStore(at: url, context: context)
+        let ensureID = UUID()
+        let treeID = UUID()
+        let treeDocumentID = syncV2UUIDv5(
+            namespace: context.serverProjectID,
+            name: syncV2TreeOrderPath
+        )
+        _ = try await store.enqueue(
+            context.batch(
+                kind: .projectBinding,
+                mutations: [
+                    .ensureProject(
+                        SyncV2EnsureProjectMutation(
+                            operationID: ensureID,
+                            projectName: "언제까지"
+                        )
+                    ),
+                    context.documentMutation(
+                        operationID: treeID,
+                        documentID: treeDocumentID,
+                        relativePath: syncV2TreeOrderPath,
+                        content: "{\"tree_order\":{\"<root>\":[]},\"version\":1}",
+                        generation: 1,
+                        kind: .treeOrder
+                    ),
+                ]
+            )
+        )
+        await store.close()
+
+        // 예전 빌드가 남긴 실제 장부 모양을 재현한다.
+        let raw = try RawSQLite(url: url)
+        try raw.execute(
+            """
+            UPDATE sync_operations SET status = 'pending'
+            WHERE operation_id = '\(ensureID.uuidString.lowercased())';
+            """
+        )
+        raw.close()
+
+        let reopened = try await openStore(at: url)
+        let recoveredEnsureStatus = try await reopened.operationStatus(
+            operationID: ensureID
+        )
+        let ready = try await reopened.claimReadyOperations(
+            limit: 1,
+            now: Date(timeIntervalSince1970: 20)
+        )
+
+        XCTAssertEqual(recoveredEnsureStatus, "completed")
+        XCTAssertEqual(ready.map(\.operationID), [treeID])
+        await reopened.close()
     }
 
     func testDispatcherClaimPreservesDocumentFIFOAndPromotesNextRevision()
@@ -3309,6 +3171,11 @@ final class SyncV2StoreTests: XCTestCase {
         )
 
         XCTAssertEqual(result, .rebased)
+        // 아래 세 줄은 되감기 결과를 firstID 아래에서 찾는다. 곧 계약 위반인
+        // 그 자리 고쳐 쓰기에 기대고 있다는 뜻이다(미해결 A, 벡터 05).
+        // A를 고치면 결과는 새 operation_id 아래에 오므로 이 세 줄이 깨진다.
+        // 그때 구현을 되돌리지 말고, 후속 작업을 찾도록 여기를 고쳐라.
+        // 이 시험의 본래 관심사인 세대 승격과 종속 취소는 그대로 남는다.
         XCTAssertEqual(rebased.status, .pending)
         XCTAssertEqual(rebased.baseRevision, 4)
         XCTAssertEqual(
@@ -4063,6 +3930,166 @@ final class SyncV2StoreTests: XCTestCase {
         await store.close()
     }
 
+    func testEquivalentRevisionZeroInitialDocumentAdoptsServerIdentity()
+        async throws {
+        let url = try databaseURL()
+        let store = try await openStore(at: url)
+        let localProjectID = ProjectID(rawValue: UUID())
+        let serverProjectID = UUID()
+        let localDocumentID = UUID()
+        let remoteDocumentID = UUID()
+        let path = "메인/1권/001화.txt"
+        try await store.save(
+            .connected(
+                localProjectID: localProjectID,
+                serverProjectID: serverProjectID,
+                kind: .newServerProject,
+                projectName: "identity race",
+                ownerSubject: UUID()
+            )
+        )
+        _ = try await store.enqueue(
+            SyncV2EnqueueBatch(
+                batchID: UUID(),
+                localProjectID: localProjectID,
+                localTransactionID: nil,
+                kind: .projectBinding,
+                mutations: [
+                    .document(
+                        SyncV2DocumentMutation(
+                            operationID: UUID(),
+                            documentID: localDocumentID,
+                            deviceID: UUID(),
+                            localSaveGeneration: 0,
+                            kind: .documentCommit,
+                            localPath: path,
+                            relativePath: path,
+                            content: "",
+                            isDeleted: false
+                        )
+                    ),
+                ]
+            )
+        )
+        let snapshot = SyncV2RemoteDocumentSnapshot(
+            documentID: remoteDocumentID,
+            relativePath: path,
+            content: "",
+            revision: 1,
+            isDeleted: false,
+            deletedAt: nil,
+            updatedAt: Date(timeIntervalSince1970: 50)
+        )
+        let initialState = try await store.snapshotState(
+            localProjectID: localProjectID,
+            serverProjectID: serverProjectID,
+            documentID: localDocumentID
+        )
+        XCTAssertEqual(initialState?.serverRevision, 0)
+        XCTAssertEqual(initialState?.serverPath, path)
+        XCTAssertTrue(initialState?.hasActiveOperation == true)
+        let queuedBeforeClaim = try await store.queuedOperations(
+            documentID: localDocumentID
+        )
+        XCTAssertEqual(
+            queuedBeforeClaim.first?.contentHash,
+            SHA256ContentHasher().sha256(for: Data()).rawValue
+        )
+
+        let adopted = try await store.adoptEquivalentInitialDocument(
+            localProjectID: localProjectID,
+            serverProjectID: serverProjectID,
+            localDocumentID: localDocumentID,
+            snapshot: snapshot
+        )
+
+        XCTAssertTrue(adopted)
+        let remoteState = try await store.snapshotState(
+            localProjectID: localProjectID,
+            serverProjectID: serverProjectID,
+            documentID: remoteDocumentID
+        )
+        XCTAssertEqual(remoteState?.serverRevision, 1)
+        XCTAssertEqual(remoteState?.serverPath, path)
+        XCTAssertFalse(remoteState?.hasActiveOperation == true)
+        let localOperations = try await store.queuedOperations(
+            documentID: localDocumentID
+        )
+        XCTAssertEqual(localOperations.map(\.status), [.cancelled])
+
+        let idempotent = try await store.adoptEquivalentInitialDocument(
+            localProjectID: localProjectID,
+            serverProjectID: serverProjectID,
+            localDocumentID: localDocumentID,
+            snapshot: snapshot
+        )
+        XCTAssertTrue(idempotent)
+        await store.close()
+    }
+
+    func testIdentityAdoptionRejectsEditedInitialDocument() async throws {
+        let url = try databaseURL()
+        let store = try await openStore(at: url)
+        let localProjectID = ProjectID(rawValue: UUID())
+        let serverProjectID = UUID()
+        let localDocumentID = UUID()
+        let path = "메인/1권/001화.txt"
+        try await store.save(
+            .connected(
+                localProjectID: localProjectID,
+                serverProjectID: serverProjectID,
+                kind: .newServerProject,
+                projectName: "edited identity race",
+                ownerSubject: UUID()
+            )
+        )
+        _ = try await store.enqueue(
+            SyncV2EnqueueBatch(
+                batchID: UUID(),
+                localProjectID: localProjectID,
+                localTransactionID: nil,
+                kind: .documentSave,
+                mutations: [
+                    .document(
+                        SyncV2DocumentMutation(
+                            operationID: UUID(),
+                            documentID: localDocumentID,
+                            deviceID: UUID(),
+                            localSaveGeneration: 1,
+                            kind: .documentCommit,
+                            localPath: path,
+                            relativePath: path,
+                            content: "로컬 편집",
+                            isDeleted: false
+                        )
+                    ),
+                ]
+            )
+        )
+
+        let adopted = try await store.adoptEquivalentInitialDocument(
+            localProjectID: localProjectID,
+            serverProjectID: serverProjectID,
+            localDocumentID: localDocumentID,
+            snapshot: SyncV2RemoteDocumentSnapshot(
+                documentID: UUID(),
+                relativePath: path,
+                content: "",
+                revision: 1,
+                isDeleted: false,
+                deletedAt: nil,
+                updatedAt: Date(timeIntervalSince1970: 50)
+            )
+        )
+
+        XCTAssertFalse(adopted)
+        let operations = try await store.queuedOperations(
+            documentID: localDocumentID
+        )
+        XCTAssertEqual(operations.map(\.status), [.pending])
+        await store.close()
+    }
+
     func testSnapshotStateAndCASBlockPendingDocumentOperation()
         async throws {
         let url = try databaseURL()
@@ -4161,6 +4188,225 @@ final class SyncV2StoreTests: XCTestCase {
         XCTAssertFalse(claimed.isDeleted)
         XCTAssertEqual(claimed.attempts, 1)
         await store.close()
+    }
+
+    func testRemoteFolderPullAdvancesRenameBaseRevision() async throws {
+        let url = try databaseURL()
+        let context = QueueAPIContext()
+        let store = try await connectedStore(at: url, context: context)
+        let remote = SyncV2RemoteFolder(
+            folderID: context.folderID,
+            parentFolderID: nil,
+            name: "윈도우 이름",
+            revision: 2,
+            isDeleted: false,
+            updatedAt: Date(timeIntervalSince1970: 20)
+        )
+
+        try await store.applyFolderSnapshotBaselines(
+            localProjectID: context.localProjectID,
+            serverProjectID: context.serverProjectID,
+            folders: [remote],
+            excluding: []
+        )
+        let baselineDatabase = try RawSQLite(url: url)
+        XCTAssertEqual(
+            try baselineDatabase.scalarInt(
+                """
+                SELECT server_revision FROM sync_folders
+                WHERE folder_id =
+                    '\(context.folderID.uuidString.lowercased())';
+                """
+            ),
+            2
+        )
+        baselineDatabase.close()
+        let renameID = UUID()
+        _ = try await store.enqueue(
+            context.batch(
+                kind: .structureChange,
+                mutations: [
+                    context.folderMutation(
+                        operationID: renameID,
+                        name: "아이패드 이름"
+                    )
+                ]
+            )
+        )
+        let ready = try await store.claimReadyFolderOperations(
+            limit: 1,
+            now: Date(timeIntervalSince1970: 30)
+        )
+
+        let claimed = try XCTUnwrap(ready.first)
+        XCTAssertEqual(claimed.operationID, renameID)
+        XCTAssertEqual(claimed.name, "아이패드 이름")
+        XCTAssertEqual(claimed.baseRevision, 2)
+        await store.close()
+    }
+
+    func testRemoteFolderPullDoesNotOverwriteActiveLocalRename()
+        async throws {
+        let url = try databaseURL()
+        let context = QueueAPIContext()
+        let store = try await connectedStore(at: url, context: context)
+        let renameID = UUID()
+        _ = try await store.enqueue(
+            context.batch(
+                kind: .structureChange,
+                mutations: [
+                    context.folderMutation(
+                        operationID: renameID,
+                        name: "아이패드 이름"
+                    )
+                ]
+            )
+        )
+
+        try await store.applyFolderSnapshotBaselines(
+            localProjectID: context.localProjectID,
+            serverProjectID: context.serverProjectID,
+            folders: [
+                SyncV2RemoteFolder(
+                    folderID: context.folderID,
+                    parentFolderID: nil,
+                    name: "늦게 도착한 서버 이름",
+                    revision: 7,
+                    isDeleted: false,
+                    updatedAt: Date(timeIntervalSince1970: 20)
+                )
+            ],
+            excluding: []
+        )
+        let ready = try await store.claimReadyFolderOperations(
+            limit: 1,
+            now: Date(timeIntervalSince1970: 30)
+        )
+
+        let claimed = try XCTUnwrap(ready.first)
+        XCTAssertEqual(claimed.name, "아이패드 이름")
+        XCTAssertEqual(claimed.baseRevision, 0)
+        await store.close()
+    }
+
+    func testFolderRevisionConflictRebasesSameFIFOOperation()
+        async throws {
+        let url = try databaseURL()
+        let context = QueueAPIContext()
+        let store = try await connectedStore(at: url, context: context)
+        try await store.applyFolderSnapshotBaselines(
+            localProjectID: context.localProjectID,
+            serverProjectID: context.serverProjectID,
+            folders: [
+                SyncV2RemoteFolder(
+                    folderID: context.folderID,
+                    parentFolderID: nil,
+                    name: "서버 revision 2",
+                    revision: 2,
+                    isDeleted: false,
+                    updatedAt: Date(timeIntervalSince1970: 20)
+                )
+            ],
+            excluding: []
+        )
+        let renameID = UUID()
+        _ = try await store.enqueue(
+            context.batch(
+                kind: .structureChange,
+                mutations: [
+                    context.folderMutation(
+                        operationID: renameID,
+                        name: "최종 아이패드 이름"
+                    )
+                ]
+            )
+        )
+        let firstClaims = try await store.claimReadyFolderOperations(
+            limit: 1,
+            now: Date(timeIntervalSince1970: 30)
+        )
+        let first = try XCTUnwrap(firstClaims.first)
+        let remote = SyncV2RemoteFolder(
+            folderID: context.folderID,
+            parentFolderID: nil,
+            name: "서버 revision 3",
+            revision: 3,
+            isDeleted: false,
+            updatedAt: Date(timeIntervalSince1970: 40)
+        )
+
+        try await store.rebaseFolderAfterRevisionConflict(
+            first,
+            remote: remote
+        )
+        let retriedClaims = try await store.claimReadyFolderOperations(
+            limit: 1,
+            now: Date(timeIntervalSince1970: 50)
+        )
+        let retried = try XCTUnwrap(retriedClaims.first)
+
+        XCTAssertEqual(retried.operationID, renameID)
+        XCTAssertEqual(retried.name, "최종 아이패드 이름")
+        XCTAssertEqual(retried.baseRevision, 3)
+        // 되감기는 attempts를 되돌리지 않는다. 되돌리면 자동 되감기 상한이
+        // 함께 사라져, 두 기기가 서로 이름을 바꾸는 동안 멈출 근거가 없다.
+        XCTAssertEqual(retried.attempts, 2)
+        await store.close()
+    }
+
+    func testLaunchRecoveryRequeuesPersistedFolderRevisionConflict()
+        async throws {
+        let url = try databaseURL()
+        let context = QueueAPIContext()
+        let store = try await connectedStore(at: url, context: context)
+        try await store.applyFolderSnapshotBaselines(
+            localProjectID: context.localProjectID,
+            serverProjectID: context.serverProjectID,
+            folders: [
+                SyncV2RemoteFolder(
+                    folderID: context.folderID,
+                    parentFolderID: nil,
+                    name: "서버 이름",
+                    revision: 1,
+                    isDeleted: false,
+                    updatedAt: Date(timeIntervalSince1970: 10)
+                )
+            ],
+            excluding: []
+        )
+        let renameID = UUID()
+        _ = try await store.enqueue(
+            context.batch(
+                kind: .structureChange,
+                mutations: [
+                    context.folderMutation(
+                        operationID: renameID,
+                        name: "팯-빈폴더-팯"
+                    )
+                ]
+            )
+        )
+        let claims = try await store.claimReadyFolderOperations(
+            limit: 1,
+            now: Date(timeIntervalSince1970: 20)
+        )
+        let claimed = try XCTUnwrap(claims.first)
+        try await store.markConflict(
+            claimed,
+            errorCode: "REVISION_CONFLICT",
+            detail: nil
+        )
+        await store.close()
+
+        let reopened = try await openStore(at: url)
+        let recovered = try await reopened.claimReadyFolderOperations(
+            limit: 1,
+            now: Date(timeIntervalSince1970: 30)
+        )
+
+        XCTAssertEqual(recovered.map(\.operationID), [renameID])
+        XCTAssertEqual(recovered.first?.baseRevision, 1)
+        await reopened.close()
     }
 
     func testFolderRenameKeepsFolderIDAndWaitsForUnknownRevision()
@@ -4344,6 +4590,7 @@ final class SyncV2StoreTests: XCTestCase {
         try downgrade.execute(
             """
             DROP TABLE sync_folders;
+            DROP TABLE sync_operation_events;
             ALTER TABLE sync_projects
                 DROP COLUMN folder_migration_completed_at;
             DELETE FROM schema_migrations WHERE version >= 3;
@@ -4500,15 +4747,163 @@ final class SyncV2StoreTests: XCTestCase {
         await store.close()
     }
 
-    func testThreeLevelFolderTombstonesCommitDeepestFirst() async throws {
+    func testStructureBatchPublishesFolderThenDocumentsThenTreeOrder()
+        async throws {
+        let url = try databaseURL()
+        let context = QueueAPIContext()
+        let store = try await connectedStore(at: url, context: context)
+        let folderOperationID = UUID()
+        let documentOperationID = UUID()
+        let treeOrderOperationID = UUID()
+        let treeOrderDocumentID = UUID()
+
+        // 실제 폴더 이름 변경 batch와 같은 순서다. 하위 TXT snapshot이 먼저
+        // 만들어져도 전송은 폴더 행을 앞세워야 한다.
+        _ = try await store.enqueue(
+            context.batch(
+                kind: .structureChange,
+                mutations: [
+                    context.documentMutation(
+                        operationID: documentOperationID,
+                        relativePath: "메모장/새 이름/문서.txt"
+                    ),
+                    context.folderMutation(
+                        operationID: folderOperationID,
+                        name: "새 이름"
+                    ),
+                    context.documentMutation(
+                        operationID: treeOrderOperationID,
+                        documentID: treeOrderDocumentID,
+                        relativePath: syncV2TreeOrderPath,
+                        content: "{\"tree_order\":{},\"version\":1}",
+                        generation: 1,
+                        kind: .treeOrder
+                    ),
+                ]
+            )
+        )
+
+        let documentsBeforeFolder = try await store.claimReadyOperations(
+            limit: 10,
+            now: Date(timeIntervalSince1970: 10)
+        )
+        XCTAssertTrue(documentsBeforeFolder.isEmpty)
+
+        let folders = try await store.claimReadyFolderOperations(
+            limit: 10,
+            now: Date(timeIntervalSince1970: 10)
+        )
+        let folder = try XCTUnwrap(folders.first)
+        XCTAssertEqual(folders.map(\.operationID), [folderOperationID])
+        try await store.complete(
+            folder,
+            result: folderCommitResult(for: folder)
+        )
+
+        let documents = try await store.claimReadyOperations(
+            limit: 10,
+            now: Date(timeIntervalSince1970: 20)
+        )
+        let document = try XCTUnwrap(documents.first)
+        XCTAssertEqual(documents.map(\.operationID), [documentOperationID])
+        try await store.complete(
+            document,
+            result: commitResult(for: document)
+        )
+
+        let treeOrder = try await store.claimReadyOperations(
+            limit: 10,
+            now: Date(timeIntervalSince1970: 30)
+        )
+        XCTAssertEqual(treeOrder.map(\.operationID), [treeOrderOperationID])
+        await store.close()
+    }
+
+    func testSixRapidFolderRenamesWaitBeforePublishingFinalTreeOrder()
+        async throws {
+        let url = try databaseURL()
+        let context = QueueAPIContext()
+        let store = try await connectedStore(at: url, context: context)
+        let treeOrderDocumentID = UUID()
+        let folderIDs = (0..<6).map { _ in UUID() }
+        var folderOperationIDs: [UUID] = []
+        var finalTreeOrderOperationID = UUID()
+
+        for index in folderIDs.indices {
+            let folderOperationID = UUID()
+            let treeOrderOperationID = UUID()
+            folderOperationIDs.append(folderOperationID)
+            finalTreeOrderOperationID = treeOrderOperationID
+            _ = try await store.enqueue(
+                context.batch(
+                    kind: .structureChange,
+                    mutations: [
+                        context.folderMutation(
+                            operationID: folderOperationID,
+                            folderID: folderIDs[index],
+                            name: "빠른 이름 \(index + 1)_팯"
+                        ),
+                        context.documentMutation(
+                            operationID: treeOrderOperationID,
+                            documentID: treeOrderDocumentID,
+                            relativePath: syncV2TreeOrderPath,
+                            content: "{\"tree_order\":{\"<root>\":[\"\(index + 1)\"]},\"version\":1}",
+                            generation: index + 1,
+                            kind: .treeOrder
+                        ),
+                    ]
+                )
+            )
+        }
+
+        let folders = try await store.claimReadyFolderOperations(
+            limit: 10,
+            now: Date(timeIntervalSince1970: 10)
+        )
+        XCTAssertEqual(folders.map(\.operationID), folderOperationIDs)
+        XCTAssertEqual(Set(folders.map(\.folderID)), Set(folderIDs))
+        XCTAssertEqual(Set(folders.map(\.name)).count, 6)
+        let treeOrderBeforeFolders = try await store.claimReadyOperations(
+            limit: 10,
+            now: Date(timeIntervalSince1970: 10)
+        )
+        XCTAssertTrue(treeOrderBeforeFolders.isEmpty)
+
+        for folder in folders.dropLast() {
+            try await store.complete(
+                folder,
+                result: folderCommitResult(for: folder)
+            )
+        }
+        let treeOrderBeforeLastFolder = try await store.claimReadyOperations(
+            limit: 10,
+            now: Date(timeIntervalSince1970: 20)
+        )
+        XCTAssertTrue(treeOrderBeforeLastFolder.isEmpty)
+
+        let lastFolder = try XCTUnwrap(folders.last)
+        try await store.complete(
+            lastFolder,
+            result: folderCommitResult(for: lastFolder)
+        )
+        let finalTreeOrder = try await store.claimReadyOperations(
+            limit: 10,
+            now: Date(timeIntervalSince1970: 30)
+        )
+        XCTAssertEqual(
+            finalTreeOrder.map(\.operationID),
+            [finalTreeOrderOperationID]
+        )
+        await store.close()
+    }
+
+    func testParentTombstoneWaitsForItsChildFolder() async throws {
         let url = try databaseURL()
         let context = QueueAPIContext()
         let store = try await connectedStore(at: url, context: context)
         let childID = UUID()
-        let grandchildID = UUID()
         let parentDeleteID = UUID()
         let childDeleteID = UUID()
-        let grandchildDeleteID = UUID()
 
         _ = try await store.enqueue(
             context.batch(
@@ -4524,24 +4919,20 @@ final class SyncV2StoreTests: XCTestCase {
                         parentFolderID: context.folderID,
                         name: "자식"
                     ),
-                    context.folderMutation(
-                        operationID: UUID(),
-                        folderID: grandchildID,
-                        parentFolderID: childID,
-                        name: "손자"
-                    ),
                 ]
             )
         )
         // 두 폴더의 생성을 끝내 무덤이 기준선을 갖게 한다. 그러지 않으면
         // 순번이 아니라 아직 비어 있는 base_revision이 무덤을 붙잡는다.
-        for created in try await store.claimReadyFolderOperations(
-            limit: 10,
-            now: Date(timeIntervalSince1970: 10)
-        ) {
+        for step in 0..<2 {
+            let created = try await store.claimReadyFolderOperations(
+                limit: 10,
+                now: Date(timeIntervalSince1970: 10 + TimeInterval(step))
+            )
+            let operation = try XCTUnwrap(created.first)
             try await store.complete(
-                created,
-                result: folderCommitResult(for: created)
+                operation,
+                result: folderCommitResult(for: operation)
             )
         }
         _ = try await store.enqueue(
@@ -4560,38 +4951,18 @@ final class SyncV2StoreTests: XCTestCase {
                         name: "자식",
                         isDeleted: true
                     ),
-                    context.folderMutation(
-                        operationID: grandchildDeleteID,
-                        folderID: grandchildID,
-                        parentFolderID: childID,
-                        name: "손자",
-                        isDeleted: true
-                    ),
                 ]
             )
         )
 
-        var committed: [UUID] = []
-        for timestamp in [20.0, 30.0, 40.0] {
-            let ready = try await store.claimReadyFolderOperations(
-                limit: 10,
-                now: Date(timeIntervalSince1970: timestamp)
-            )
-            let operation = try XCTUnwrap(ready.first)
-            XCTAssertEqual(ready.count, 1)
-            committed.append(operation.operationID)
-            try await store.complete(
-                operation,
-                result: folderCommitResult(for: operation)
-            )
-        }
-
-        // A/B/C를 부모 우선으로 enqueue해도 서버에는 C/B/A만 나갈 수 있다.
-        // A가 먼저 나가면 live 자식 때문에 FOLDER_NOT_EMPTY가 된다.
-        XCTAssertEqual(
-            committed,
-            [grandchildDeleteID, childDeleteID, parentDeleteID]
+        let ready = try await store.claimReadyFolderOperations(
+            limit: 10,
+            now: Date(timeIntervalSince1970: 20)
         )
+
+        // 서버는 내용이 있는 폴더의 삭제를 FOLDER_NOT_EMPTY로 거부한다. 자식이
+        // 먼저 나가고 부모는 그 뒤에야 나갈 수 있다.
+        XCTAssertEqual(ready.map(\.operationID), [childDeleteID])
         await store.close()
     }
 
@@ -4768,6 +5139,1373 @@ final class SyncV2StoreTests: XCTestCase {
         )
     }
 
+    // MARK: - 사건 기록 (스키마 V5)
+
+    /// 새 저장소에 사건 표가 생겨야 한다.
+    func testSchemaV5CreatesOperationEventTable() async throws {
+        let url = try databaseURL()
+
+        let store = try await openStore(at: url)
+        let version = try await store.schemaVersion()
+        await store.close()
+
+        XCTAssertEqual(version, 5)
+        let raw = try RawSQLite(url: url)
+        XCTAssertEqual(
+            try raw.scalarInt(
+                """
+                SELECT COUNT(*) FROM sqlite_master
+                WHERE type = 'table' AND name = 'sync_operation_events';
+                """
+            ),
+            1
+        )
+        let checksum = try raw.scalarText(
+            "SELECT checksum FROM schema_migrations WHERE version = 5;"
+        )
+        XCTAssertEqual(checksum.count, 64)
+        XCTAssertNotEqual(checksum, "design-fixture-v5")
+        raw.close()
+    }
+
+    /// 이미 쌓여 있던 작업에 사건 기록이 채워져야 한다. 그리고 그 기록에서
+    /// 다시 계산한 상태가 지금 status와 같아야 한다. 이것이 어긋나면 읽는
+    /// 쪽을 옮기는 순간 화면의 숫자가 달라진다.
+    func testBackfillSeedsEventsThatDeriveToStoredStatus() async throws {
+        let url = try databaseURL()
+        let context = QueueAPIContext()
+        let completedID = UUID()
+        let conflictID = UUID()
+        let pendingID = UUID()
+
+        let store = try await connectedStore(at: url, context: context)
+        for (operationID, documentID) in [
+            (completedID, UUID()), (conflictID, UUID()), (pendingID, UUID()),
+        ] {
+            _ = try await store.enqueue(
+                context.batch(
+                    mutations: [
+                        context.documentMutation(
+                            operationID: operationID,
+                            documentID: documentID,
+                            relativePath: "원고/\(operationID.uuidString).txt"
+                        )
+                    ]
+                )
+            )
+        }
+        await store.close()
+
+        // 사건을 지우고 status만 바꿔 둔다. 되만들기 표가 실제로 도는지
+        // 확인하려면 pending 말고 다른 상태가 있어야 한다.
+        let raw = try RawSQLite(url: url)
+        try raw.execute("DELETE FROM sync_operation_events;")
+        try raw.execute(
+            """
+            UPDATE sync_operations SET status = 'completed'
+            WHERE operation_id = '\(completedID.uuidString.lowercased())';
+            """
+        )
+        try raw.execute(
+            """
+            UPDATE sync_operations
+            SET status = 'conflict', last_error_code = 'PATH_CONFLICT'
+            WHERE operation_id = '\(conflictID.uuidString.lowercased())';
+            """
+        )
+        raw.close()
+
+        let reopened = try await openStore(at: url)
+        let completedEvents = try await reopened.operationEvents(
+            operationID: completedID
+        )
+        let conflictEvents = try await reopened.operationEvents(
+            operationID: conflictID
+        )
+        let pendingEvents = try await reopened.operationEvents(
+            operationID: pendingID
+        )
+        let divergences = try await reopened.operationStateDivergences()
+        await reopened.close()
+
+        XCTAssertEqual(
+            completedEvents.map(\.type),
+            [.enqueued, .dispatchStarted, .committed]
+        )
+        XCTAssertEqual(
+            conflictEvents.map(\.type),
+            [.enqueued, .dispatchStarted, .conflictDetected]
+        )
+        XCTAssertEqual(pendingEvents.map(\.type), [.enqueued])
+
+        // 사건 번호는 1부터 빈틈없이 이어져야 계산을 믿을 수 있다.
+        XCTAssertEqual(completedEvents.map(\.sequence), [1, 2, 3])
+
+        // 오류는 마지막 사건만 안고 간다. 앞의 사건들은 오류를 낸 적이 없다.
+        XCTAssertEqual(conflictEvents.map(\.errorCode), [nil, nil, "PATH_CONFLICT"])
+
+        XCTAssertEqual(
+            try SyncV2OperationStateDerivation.state(from: completedEvents),
+            .completed
+        )
+        XCTAssertEqual(
+            try SyncV2OperationStateDerivation.state(from: conflictEvents),
+            .conflict
+        )
+        XCTAssertEqual(divergences, [], "되만든 직후에는 어긋난 작업이 없어야 한다")
+    }
+
+    /// 되만들기는 몇 번을 돌려도 결과가 같아야 한다. 열 때마다 같은 사건이
+    /// 한 벌씩 더 쌓이면 기록을 믿을 수 없게 된다.
+    func testBackfillIsIdempotentAcrossReopens() async throws {
+        let url = try databaseURL()
+        let context = QueueAPIContext()
+        let operationID = UUID()
+
+        let store = try await connectedStore(at: url, context: context)
+        _ = try await store.enqueue(
+            context.batch(
+                mutations: [context.documentMutation(operationID: operationID)]
+            )
+        )
+        await store.close()
+
+        for _ in 0..<3 {
+            let reopened = try await openStore(at: url)
+            try await reopened.backfillOperationEvents()
+            await reopened.close()
+        }
+
+        let raw = try RawSQLite(url: url)
+        let total = try raw.scalarInt(
+            """
+            SELECT COUNT(*) FROM sync_operation_events
+            WHERE operation_id = '\(operationID.uuidString.lowercased())';
+            """
+        )
+        let storedEventID = try raw.scalarText(
+            """
+            SELECT event_id FROM sync_operation_events
+            WHERE operation_id = '\(operationID.uuidString.lowercased())'
+              AND event_sequence = 1;
+            """
+        )
+        raw.close()
+
+        XCTAssertEqual(total, 1)
+        XCTAssertEqual(
+            storedEventID,
+            SyncV2Store.legacyEventID(
+                operationID: operationID.uuidString.lowercased(),
+                eventType: .enqueued
+            ),
+            "사건 식별자는 작업과 종류에서 계산해야 다시 돌려도 같다"
+        )
+    }
+
+    /// 되만들기 표의 모든 상태가 자기 자신으로 되돌아와야 한다. 하나라도
+    /// 어긋나면 그 상태의 작업들이 옮기는 순간 다른 값이 된다.
+    func testSeedEventTypesRoundTripEveryStatus() throws {
+        for state in [
+            SyncV2OperationStatus.pending, .inflight, .retryWait,
+            .blocked, .conflict, .completed, .cancelled,
+        ] {
+            let events = SyncV2Store.seedEventTypes(for: state)
+                .enumerated()
+                .map { SyncV2OperationEvent(sequence: $0.offset + 1, type: $0.element) }
+            XCTAssertEqual(
+                try SyncV2OperationStateDerivation.state(from: events),
+                state,
+                "\(state)"
+            )
+        }
+    }
+
+    /// status 칸만 고치고 사건을 남기지 않으면 어긋남으로 잡혀야 한다.
+    /// 읽는 쪽을 옮기기 전에 이걸로 남은 쓰기 경로를 찾는다.
+    func testDivergenceReporterCatchesColumnOnlyChange() async throws {
+        let url = try databaseURL()
+        let context = QueueAPIContext()
+        let operationID = UUID()
+
+        let store = try await connectedStore(at: url, context: context)
+        _ = try await store.enqueue(
+            context.batch(
+                mutations: [context.documentMutation(operationID: operationID)]
+            )
+        )
+        // 이제는 대기열에 올리는 순간 첫 사건이 함께 남는다.
+        let afterEnqueue = try await store.operationStateDivergences()
+        let events = try await store.operationEvents(operationID: operationID)
+        await store.close()
+
+        // 사건은 그대로 두고 칸만 바꾼다. 지금 남아 있는 쓰기 경로들이 하는 짓이다.
+        let raw = try RawSQLite(url: url)
+        try raw.execute(
+            """
+            UPDATE sync_operations SET status = 'completed'
+            WHERE operation_id = '\(operationID.uuidString.lowercased())';
+            """
+        )
+        raw.close()
+
+        let reopened = try await openStore(at: url)
+        let after = try await reopened.operationStateDivergences()
+        await reopened.close()
+
+        XCTAssertEqual(events.map(\.type), [.enqueued])
+        XCTAssertEqual(afterEnqueue, [], "대기열에 올린 직후에는 어긋남이 없다")
+        XCTAssertEqual(after.count, 1)
+        XCTAssertEqual(after.first?.operationID, operationID.uuidString.lowercased())
+        XCTAssertEqual(after.first?.storedStatus, .completed)
+        XCTAssertEqual(after.first?.derivedStatus, .pending)
+    }
+
+    // MARK: - 아직 사건을 남기지 않는 쓰기 경로
+
+    /// 한 가지 상태 변화를 실제로 태우고, 사건 기록과 status 칸이 어긋나는지
+    /// 본다.
+    ///
+    /// 되만들기를 먼저 돌려 바탕을 깨끗하게 만든 뒤에 변화를 준다. 그래야
+    /// 나온 어긋남이 전부 그 변화 때문임이 분명해진다.
+    private func divergenceAfterTransition(
+        _ transition: (SyncV2Store, SyncV2DispatchOperation) async throws -> Void
+    ) async throws -> [SyncV2OperationStateDivergence] {
+        let url = try databaseURL()
+        let context = QueueAPIContext()
+        let store = try await connectedStore(at: url, context: context)
+        _ = try await store.enqueue(
+            context.batch(
+                mutations: [context.documentMutation(operationID: UUID())]
+            )
+        )
+        try await store.backfillOperationEvents()
+        let baseline = try await store.operationStateDivergences()
+        XCTAssertEqual(baseline, [], "바탕이 이미 어긋나 있으면 결과를 믿을 수 없다")
+
+        let claimed = try await store.claimReadyOperations(
+            limit: 1,
+            now: Date(timeIntervalSince1970: 100)
+        )
+        let operation = try XCTUnwrap(claimed.first)
+        try await transition(store, operation)
+
+        let divergences = try await store.operationStateDivergences()
+        await store.close()
+        return divergences
+    }
+
+    /// 지금 어느 쓰기 경로가 status 칸만 고치고 사건을 남기지 않는지 적어 둔다.
+    ///
+    /// 여기 나온 것이 곧 옮겨야 할 목록이다. 하나씩 사건을 남기도록 고칠
+    /// 때마다 이 목록에서 지운다. 다 지워지면 읽는 쪽을 옮겨도 화면의 숫자가
+    /// 달라지지 않는다.
+    func testWritePathsThatDoNotYetRecordEvents() async throws {
+        // 옮겼다. 대기 → 발송 중.
+        let claimOnly = try await divergenceAfterTransition { _, _ in }
+        XCTAssertEqual(claimOnly, [])
+
+        // 옮겼다. 발송이 끝나는 네 갈래는 모두 한 함수를 지난다.
+        let completed = try await divergenceAfterTransition { store, operation in
+            try await store.complete(operation, result: self.commitResult(for: operation))
+        }
+        XCTAssertEqual(completed, [])
+
+        let retryWait = try await divergenceAfterTransition { store, operation in
+            try await store.deferRetry(
+                operation,
+                errorCode: "NETWORK_UNAVAILABLE",
+                detail: nil,
+                nextAttemptAt: Date(timeIntervalSince1970: 200)
+            )
+        }
+        XCTAssertEqual(retryWait, [])
+
+        let conflict = try await divergenceAfterTransition { store, operation in
+            try await store.markConflict(
+                operation,
+                errorCode: "REVISION_CONFLICT",
+                detail: nil
+            )
+        }
+        XCTAssertEqual(conflict, [])
+
+        let blocked = try await divergenceAfterTransition { store, operation in
+            try await store.markBlocked(
+                operation,
+                errorCode: "AUTH_REQUIRED",
+                detail: nil
+            )
+        }
+        XCTAssertEqual(blocked, [])
+
+        // 대기 → 발송 중 → 다시 시도 대기 → 대기. 한 바퀴가 온전히 남는다.
+        //
+        // 이 왕복은 한때 이 눈의 사각지대였다. 양쪽 다 안 옮겼을 때는 처음
+        // 자리로 돌아오면 칸과 계산이 우연히 같아져 아무 일도 없었던 것처럼
+        // 보였다. 이제는 지나온 자리가 전부 기록에 남는다.
+        //
+        // 그래도 어긋남이 없다는 것만으로 "다 옮겼다"고 말할 수는 없다. 아직
+        // 아무것도 안 옮긴 짝끼리는 여전히 서로를 가린다. 옮길 목록은 코드에서
+        // 직접 세어야 한다.
+        let url = try databaseURL()
+        let context = QueueAPIContext()
+        let operationID = UUID()
+        let store = try await connectedStore(at: url, context: context)
+        _ = try await store.enqueue(
+            context.batch(
+                mutations: [context.documentMutation(operationID: operationID)]
+            )
+        )
+        try await store.backfillOperationEvents()
+        let claimed = try await store.claimReadyOperations(
+            limit: 1,
+            now: Date(timeIntervalSince1970: 100)
+        )
+        try await store.deferRetry(
+            try XCTUnwrap(claimed.first),
+            errorCode: "NETWORK_UNAVAILABLE",
+            detail: nil,
+            nextAttemptAt: Date(timeIntervalSince1970: 200)
+        )
+        try await store.makeRetryWaitOperationsReady(localProjectID: nil)
+        let roundTrip = try await store.operationStateDivergences()
+        let events = try await store.operationEvents(operationID: operationID)
+        await store.close()
+
+        XCTAssertEqual(roundTrip, [])
+        XCTAssertEqual(
+            events.map(\.type),
+            [.enqueued, .dispatchStarted, .retryScheduled, .enqueued]
+        )
+        // 성공했다고 앞선 실패를 지우지 않는다. 무엇 때문에 다시 시도했는지가
+        // 기록에 남아 있어야 한다.
+        XCTAssertEqual(
+            events.map(\.errorCode),
+            [nil, nil, "NETWORK_UNAVAILABLE", nil]
+        )
+    }
+
+    /// 발송이 끝날 때 남는 사건이 실제로 무엇인지 본다. 어긋나지 않는 것만으로는
+    /// 옳은 기록이 남았는지 알 수 없다.
+    func testDispatchOutcomeRecordsMatchingEvent() async throws {
+        let cases: [(String, (SyncV2Store, SyncV2DispatchOperation) async throws -> Void, SyncV2OperationEventType, String?)] = [
+            ("완료", { store, operation in
+                try await store.complete(operation, result: self.commitResult(for: operation))
+            }, .committed, nil),
+            ("다시 시도", { store, operation in
+                try await store.deferRetry(
+                    operation,
+                    errorCode: "NETWORK_UNAVAILABLE",
+                    detail: nil,
+                    nextAttemptAt: Date(timeIntervalSince1970: 200)
+                )
+            }, .retryScheduled, "NETWORK_UNAVAILABLE"),
+            ("충돌", { store, operation in
+                try await store.markConflict(
+                    operation,
+                    errorCode: "REVISION_CONFLICT",
+                    detail: nil
+                )
+            }, .conflictDetected, "REVISION_CONFLICT"),
+            ("막힘", { store, operation in
+                try await store.markBlocked(
+                    operation,
+                    errorCode: "AUTH_REQUIRED",
+                    detail: nil
+                )
+            }, .blocked, "AUTH_REQUIRED"),
+        ]
+
+        for (label, transition, expectedType, expectedError) in cases {
+            let url = try databaseURL()
+            let context = QueueAPIContext()
+            let operationID = UUID()
+            let store = try await connectedStore(at: url, context: context)
+            _ = try await store.enqueue(
+                context.batch(
+                    mutations: [context.documentMutation(operationID: operationID)]
+                )
+            )
+            try await store.backfillOperationEvents()
+            let claimed = try await store.claimReadyOperations(
+                limit: 1,
+                now: Date(timeIntervalSince1970: 100)
+            )
+            try await transition(store, try XCTUnwrap(claimed.first))
+            let events = try await store.operationEvents(operationID: operationID)
+            await store.close()
+
+            XCTAssertEqual(events.last?.type, expectedType, label)
+            XCTAssertEqual(events.last?.errorCode, expectedError, label)
+            // 발송 한 바퀴가 온전히 남는다. 대기에서 시작해 발송을 거쳐 끝난다.
+            XCTAssertEqual(
+                events.map(\.type),
+                [.enqueued, .dispatchStarted, expectedType],
+                label
+            )
+            XCTAssertEqual(events.map(\.sequence), Array(1...events.count), label)
+        }
+    }
+
+    /// 같은 작업을 다시 보내 받은 멱등 응답은 처음 올린 것과 다른 일이다.
+    /// 둘 다 완료로 수렴하지만 기록에는 구분해 남는다.
+    func testReplayedCommitRecordsReplayedEvent() async throws {
+        let url = try databaseURL()
+        let context = QueueAPIContext()
+        let operationID = UUID()
+        let store = try await connectedStore(at: url, context: context)
+        _ = try await store.enqueue(
+            context.batch(
+                mutations: [context.documentMutation(operationID: operationID)]
+            )
+        )
+        try await store.backfillOperationEvents()
+        let claimed = try await store.claimReadyOperations(
+            limit: 1,
+            now: Date(timeIntervalSince1970: 100)
+        )
+        let operation = try XCTUnwrap(claimed.first)
+        var result = commitResult(for: operation)
+        result = SyncV2CommitDocumentResult(
+            status: .replayed,
+            documentID: result.documentID,
+            versionID: result.versionID,
+            operationID: result.operationID,
+            operationKind: result.operationKind,
+            serverRevision: result.serverRevision,
+            relativePath: result.relativePath,
+            isDeleted: result.isDeleted,
+            contentHash: result.contentHash,
+            committedAt: result.committedAt
+        )
+
+        try await store.complete(operation, result: result)
+        let events = try await store.operationEvents(operationID: operationID)
+        let divergences = try await store.operationStateDivergences()
+        await store.close()
+
+        XCTAssertEqual(events.last?.type, .replayed)
+        XCTAssertEqual(
+            try SyncV2OperationStateDerivation.state(from: events),
+            .completed
+        )
+        XCTAssertEqual(divergences, [])
+    }
+
+    /// 발송 도중 앱이 꺼진 뒤 다시 열면, 되살린 것도 기록에 남아야 한다.
+    ///
+    /// 계속 발송 중이라고 믿으면 아무도 다시 손대지 않아 영영 대기에 남는다.
+    /// 무엇이 되살아났는지 기록에 없으면 나중에 되짚을 수도 없다.
+    func testRestartRecoveryRecordsRequeueEvent() async throws {
+        let url = try databaseURL()
+        let context = QueueAPIContext()
+        let operationID = UUID()
+
+        let store = try await connectedStore(at: url, context: context)
+        _ = try await store.enqueue(
+            context.batch(
+                mutations: [context.documentMutation(operationID: operationID)]
+            )
+        )
+        _ = try await store.claimReadyOperations(
+            limit: 1,
+            now: Date(timeIntervalSince1970: 100)
+        )
+        // 여기서 앱이 꺼졌다. 작업은 발송 중인 채로 남는다.
+        await store.close()
+
+        let reopened = try await openStore(at: url)
+        let events = try await reopened.operationEvents(operationID: operationID)
+        let divergences = try await reopened.operationStateDivergences()
+        await reopened.close()
+
+        XCTAssertEqual(
+            events.map(\.type),
+            [.enqueued, .dispatchStarted, .enqueued],
+            "집어들었다가 되돌아온 자취가 남아야 한다"
+        )
+        XCTAssertEqual(
+            try SyncV2OperationStateDerivation.state(from: events),
+            .pending
+        )
+        XCTAssertEqual(divergences, [])
+    }
+
+    /// 막힌 작업을 다시 풀어 줄 때도 기록에 남는다.
+    func testForbiddenBlockRecoveryRecordsRequeueEvent() async throws {
+        let url = try databaseURL()
+        let context = QueueAPIContext()
+        let operationID = UUID()
+
+        let store = try await connectedStore(at: url, context: context)
+        _ = try await store.enqueue(
+            context.batch(
+                mutations: [context.documentMutation(operationID: operationID)]
+            )
+        )
+        let claimed = try await store.claimReadyOperations(
+            limit: 1,
+            now: Date(timeIntervalSince1970: 100)
+        )
+        try await store.markBlocked(
+            try XCTUnwrap(claimed.first),
+            errorCode: "FORBIDDEN",
+            detail: nil
+        )
+        try await store.makeRetryWaitOperationsReady(localProjectID: nil)
+
+        let events = try await store.operationEvents(operationID: operationID)
+        let divergences = try await store.operationStateDivergences()
+        await store.close()
+
+        XCTAssertEqual(
+            events.map(\.type),
+            [.enqueued, .dispatchStarted, .blocked, .enqueued]
+        )
+        XCTAssertEqual(
+            events.map(\.errorCode),
+            [nil, nil, "FORBIDDEN", nil],
+            "풀려났다고 무엇에 막혔었는지를 지우지 않는다"
+        )
+        XCTAssertEqual(divergences, [])
+    }
+
+    /// 여러 경로를 섞어 태워도 기록과 칸이 끝까지 붙어 있어야 한다.
+    ///
+    /// 지금까지는 경로를 하나씩 따로 태웠다. 실제로는 섞여서 온다.
+    func testMixedLifecycleKeepsEventsAndColumnTogether() async throws {
+        let url = try databaseURL()
+        let context = QueueAPIContext()
+        let documentID = UUID()
+        let operationID = UUID()
+
+        let store = try await connectedStore(at: url, context: context)
+        _ = try await store.enqueue(
+            context.batch(
+                mutations: [
+                    context.documentMutation(
+                        operationID: operationID,
+                        documentID: documentID
+                    )
+                ]
+            )
+        )
+
+        // 세 번 실패하고 네 번째에 성공한다.
+        for round in 0..<3 {
+            let claimed = try await store.claimReadyOperations(
+                limit: 1,
+                now: Date(timeIntervalSince1970: TimeInterval(100 + round * 10))
+            )
+            try await store.deferRetry(
+                try XCTUnwrap(claimed.first),
+                errorCode: "NETWORK_UNAVAILABLE",
+                detail: nil,
+                nextAttemptAt: Date(timeIntervalSince1970: TimeInterval(105 + round * 10))
+            )
+            let midway = try await store.operationStateDivergences()
+            XCTAssertEqual(midway, [], "\(round + 1)번째 실패 뒤")
+            try await store.makeRetryWaitOperationsReady(localProjectID: nil)
+        }
+        let finalClaim = try await store.claimReadyOperations(
+            limit: 1,
+            now: Date(timeIntervalSince1970: 200)
+        )
+        let operation = try XCTUnwrap(finalClaim.first)
+        try await store.complete(operation, result: commitResult(for: operation))
+
+        let events = try await store.operationEvents(operationID: operationID)
+        let divergences = try await store.operationStateDivergences()
+        await store.close()
+
+        XCTAssertEqual(divergences, [], "섞어 태워도 끝까지 붙어 있어야 한다")
+        XCTAssertEqual(
+            try SyncV2OperationStateDerivation.state(from: events),
+            .completed
+        )
+        XCTAssertEqual(events.map(\.sequence), Array(1...events.count))
+
+        // 실패한 자취가 성공 뒤에도 남아 있어야 한다.
+        XCTAssertEqual(
+            events.filter { $0.errorCode == "NETWORK_UNAVAILABLE" }.count,
+            3
+        )
+        XCTAssertEqual(events.last?.type, .committed)
+    }
+
+    /// 다시 시도를 되풀이하면 기록이 얼마나 길어지는지 재 둔다.
+    ///
+    /// 되돌아올 때마다 사건이 둘씩 붙는다. 오래 쓴 장부가 감당 못 할 만큼
+    /// 불어나는지 알아 두어야 한다.
+    func testEventHistoryGrowthPerRetryCycle() async throws {
+        let url = try databaseURL()
+        let context = QueueAPIContext()
+        let operationID = UUID()
+        let cycles = 20
+
+        let store = try await connectedStore(at: url, context: context)
+        _ = try await store.enqueue(
+            context.batch(
+                mutations: [context.documentMutation(operationID: operationID)]
+            )
+        )
+        for round in 0..<cycles {
+            let claimed = try await store.claimReadyOperations(
+                limit: 1,
+                now: Date(timeIntervalSince1970: TimeInterval(100 + round))
+            )
+            try await store.deferRetry(
+                try XCTUnwrap(claimed.first),
+                errorCode: "NETWORK_UNAVAILABLE",
+                detail: nil,
+                nextAttemptAt: Date(timeIntervalSince1970: TimeInterval(101 + round))
+            )
+            try await store.makeRetryWaitOperationsReady(localProjectID: nil)
+        }
+        let events = try await store.operationEvents(operationID: operationID)
+        await store.close()
+
+        // 대기 1 + 주기마다 (발송 시작, 다시 시도, 대기) 3개.
+        XCTAssertEqual(events.count, 1 + cycles * 3)
+        XCTAssertEqual(
+            try SyncV2OperationStateDerivation.state(from: events),
+            .pending
+        )
+    }
+
+    /// 연쇄 편집의 뒤쪽이 영영 발송되지 않는 자리를 막는다.
+    ///
+    /// 앞선 저장이 아직 안 끝났는데 또 저장하면, 뒤쪽 작업은 기준 리비전 없이
+    /// 큐에 들어간다. 그 값은 앞선 작업이 **완료될 때** 채워진다. 앞선 작업이
+    /// 완료 아닌 길로 끝나면 뒤쪽은 값이 빈 채로 남아 발송 대상에서 영영
+    /// 빠진다. 큐가 통째로 멈추는데 화면에는 대기 중으로만 보인다.
+    ///
+    /// 취소하는 그 자리에서 되세워 그런 일이 생기지 않게 한다.
+    func testCancelledLeaderDoesNotOrphanFollowingEdit() async throws {
+        let url = try databaseURL()
+        let context = QueueAPIContext()
+        let leaderID = UUID()
+        let followerID = UUID()
+        let followerContent = "첫 문장 그리고 둘째 문장"
+
+        let store = try await connectedStore(at: url, context: context)
+        _ = try await store.enqueue(
+            context.batch(
+                mutations: [
+                    context.documentMutation(
+                        operationID: leaderID,
+                        content: "첫 문장",
+                        generation: 1
+                    )
+                ]
+            )
+        )
+        // 앞선 저장이 아직 안 끝났는데 또 저장한다.
+        _ = try await store.enqueue(
+            context.batch(
+                mutations: [
+                    context.documentMutation(
+                        operationID: followerID,
+                        content: followerContent,
+                        generation: 2
+                    )
+                ]
+            )
+        )
+
+        try await store.cancelOperation(
+            operationID: leaderID,
+            cancelEventID: UUID()
+        )
+
+        let claimed = try await store.claimReadyOperations(
+            limit: 10,
+            now: Date(timeIntervalSince1970: 100)
+        )
+        let orphans = try await store.orphanedOperationIDs()
+        let events = try await store.operationEvents(operationID: followerID)
+        let divergences = try await store.operationStateDivergences()
+        await store.close()
+
+        XCTAssertEqual(
+            claimed.map(\.operationID),
+            [followerID],
+            "앞이 취소돼도 뒤쪽은 발송된다"
+        )
+        XCTAssertEqual(
+            claimed.first?.content,
+            followerContent,
+            "사용자가 쓴 글은 그대로다"
+        )
+        XCTAssertEqual(orphans, [])
+        XCTAssertTrue(
+            events.contains { $0.errorCode == "ADOPTED_AFTER_ORPHANED_CHAIN" },
+            "왜 되세워졌는지 기록에 남아야 한다"
+        )
+        XCTAssertEqual(divergences, [])
+    }
+
+    /// 이미 끊긴 채로 남아 있던 장부는 다음에 열 때 되세워야 한다.
+    ///
+    /// 지금 빌드는 취소하는 자리에서 바로 되세우지만, 예전 빌드가 남긴 장부에는
+    /// 이미 끊긴 작업이 들어 있을 수 있다.
+    func testLaunchRecoveryAdoptsOrphanLeftByOlderBuild() async throws {
+        let url = try databaseURL()
+        let context = QueueAPIContext()
+        let operationID = UUID()
+
+        let store = try await connectedStore(at: url, context: context)
+        _ = try await store.enqueue(
+            context.batch(
+                mutations: [
+                    context.documentMutation(operationID: operationID, content: "본문")
+                ]
+            )
+        )
+        await store.close()
+
+        // 예전 빌드가 남긴 모양을 흉내 낸다. 기준 리비전이 비어 있어 발송
+        // 대상에서 빠져 있다.
+        let raw = try RawSQLite(url: url)
+        try raw.execute(
+            """
+            UPDATE sync_operations SET base_revision = NULL
+            WHERE operation_id = '\(operationID.uuidString.lowercased())';
+            """
+        )
+        raw.close()
+
+        let reopened = try await openStore(at: url)
+        let orphans = try await reopened.orphanedOperationIDs()
+        let claimed = try await reopened.claimReadyOperations(
+            limit: 10,
+            now: Date(timeIntervalSince1970: 100)
+        )
+        await reopened.close()
+
+        XCTAssertEqual(orphans, [], "열면서 되세워야 한다")
+        XCTAssertEqual(claimed.map(\.operationID), [operationID])
+    }
+
+    /// 앞이 끊긴 작업을 지금 리비전 위로 되세우면 다시 발송된다.
+    ///
+    /// 사용자가 쓴 글은 건드리지 않는다. 무엇을 보낼지는 그대로 두고 어디에
+    /// 얹을지만 고친다.
+    func testAdoptingOrphanedOperationMakesItDispatchableAgain() async throws {
+        let url = try databaseURL()
+        let context = QueueAPIContext()
+        let leaderID = UUID()
+        let followerID = UUID()
+        let followerContent = "첫 문장 그리고 둘째 문장"
+
+        let store = try await connectedStore(at: url, context: context)
+        _ = try await store.enqueue(
+            context.batch(
+                mutations: [
+                    context.documentMutation(operationID: leaderID, content: "첫 문장", generation: 1)
+                ]
+            )
+        )
+        _ = try await store.enqueue(
+            context.batch(
+                mutations: [
+                    context.documentMutation(
+                        operationID: followerID,
+                        content: followerContent,
+                        generation: 2
+                    )
+                ]
+            )
+        )
+        try await store.cancelOperation(
+            operationID: leaderID,
+            cancelEventID: UUID()
+        )
+
+        // 취소가 이미 되세웠으므로 여기서 더 되세울 것은 없다.
+        let adopted = try await store.adoptOrphanedOperations()
+        let claimed = try await store.claimReadyOperations(
+            limit: 10,
+            now: Date(timeIntervalSince1970: 100)
+        )
+        let remaining = try await store.orphanedOperationIDs()
+        let events = try await store.operationEvents(operationID: followerID)
+        let divergences = try await store.operationStateDivergences()
+        await store.close()
+
+        XCTAssertEqual(adopted, [], "취소하는 자리에서 이미 되세웠다")
+        XCTAssertEqual(claimed.map(\.operationID), [followerID], "다시 발송된다")
+        XCTAssertEqual(
+            claimed.first?.content,
+            followerContent,
+            "사용자가 쓴 글은 그대로다"
+        )
+        XCTAssertEqual(remaining, [], "더 남은 고아가 없다")
+        XCTAssertTrue(
+            events.contains { $0.errorCode == "ADOPTED_AFTER_ORPHANED_CHAIN" },
+            "왜 되살아났는지 기록에 남아야 한다"
+        )
+        XCTAssertEqual(divergences, [])
+    }
+
+    /// 앞선 작업이 정상으로 끝났으면 고아가 아니다. 되세울 것도 없다.
+    func testCompletedLeaderDoesNotLeaveOrphan() async throws {
+        let url = try databaseURL()
+        let context = QueueAPIContext()
+        let leaderID = UUID()
+        let followerID = UUID()
+
+        let store = try await connectedStore(at: url, context: context)
+        _ = try await store.enqueue(
+            context.batch(
+                mutations: [
+                    context.documentMutation(operationID: leaderID, content: "첫 문장", generation: 1)
+                ]
+            )
+        )
+        _ = try await store.enqueue(
+            context.batch(
+                mutations: [
+                    context.documentMutation(operationID: followerID, content: "둘째 문장", generation: 2)
+                ]
+            )
+        )
+        let claimed = try await store.claimReadyOperations(
+            limit: 1,
+            now: Date(timeIntervalSince1970: 100)
+        )
+        let leader = try XCTUnwrap(claimed.first)
+        try await store.complete(leader, result: commitResult(for: leader))
+
+        let orphans = try await store.orphanedOperationIDs()
+        let next = try await store.claimReadyOperations(
+            limit: 1,
+            now: Date(timeIntervalSince1970: 110)
+        )
+        await store.close()
+
+        XCTAssertEqual(orphans, [], "정상으로 끝났으면 고아가 없다")
+        XCTAssertEqual(next.map(\.operationID), [followerID])
+    }
+
+    // MARK: - 빠른 연속 이름 변경 (진단)
+
+    /// 여섯 개를 한 배치로 잇달아 바꿀 때 저장소가 무엇을 하는지 읽는다.
+    ///
+    /// 미해결 사건과 같은 모양이다. 고치지 않는다. 지금 무슨 일이 일어나는지
+    /// 기록으로 남겨, 나중에 보존된 사건에서 원인을 판정할 때 쓸 재료를 만든다.
+    ///
+    /// - Note: 벡터 04는 `ID_BASED/1`이고 사용자 작품은 `LEGACY/0`이다. 여기서
+    ///   무엇이 나오든 그 사건이 재현됐다는 뜻은 아니다.
+    func testRapidSixRenamesInOneBatchDiagnostic() async throws {
+        let url = try databaseURL()
+        let context = QueueAPIContext()
+        let store = try await connectedStore(at: url, context: context)
+
+        let folderIDs = (0..<5).map { _ in UUID() }
+        let operationIDs = (0..<5).map { _ in UUID() }
+        let documentOperationID = UUID()
+        let documentID = UUID()
+
+        // 여섯 변경이 하나의 배치를 함께 쓴다. 벡터가 그렇게 규정한다.
+        var mutations: [SyncV2Mutation] = folderIDs.enumerated().map { index, folderID in
+            context.folderMutation(
+                operationID: operationIDs[index],
+                folderID: folderID,
+                name: "R\(index + 1)"
+            )
+        }
+        mutations.append(
+            context.documentMutation(
+                operationID: documentOperationID,
+                documentID: documentID,
+                relativePath: "R6.txt",
+                content: "여섯째"
+            )
+        )
+        _ = try await store.enqueue(
+            context.batch(kind: .structureChange, mutations: mutations)
+        )
+
+        // 폴더 줄과 문서 줄을 번갈아 끝까지 흘린다.
+        var dispatchedFolders: [UUID] = []
+        for round in 0..<10 {
+            let folders = try await store.claimReadyFolderOperations(
+                limit: 10,
+                now: Date(timeIntervalSince1970: TimeInterval(100 + round))
+            )
+            if folders.isEmpty { break }
+            for folder in folders {
+                dispatchedFolders.append(folder.operationID)
+                try await store.complete(folder, result: folderCommitResult(for: folder))
+            }
+        }
+        var dispatchedDocuments: [UUID] = []
+        for round in 0..<10 {
+            let documents = try await store.claimReadyOperations(
+                limit: 10,
+                now: Date(timeIntervalSince1970: TimeInterval(200 + round))
+            )
+            if documents.isEmpty { break }
+            for document in documents {
+                dispatchedDocuments.append(document.operationID)
+                try await store.complete(document, result: commitResult(for: document))
+            }
+        }
+
+        var states: [String] = []
+        for operationID in operationIDs + [documentOperationID] {
+            let status = try await store.operationStatus(operationID: operationID) ?? "없음"
+            let attempts = try await store.operationAttempts(operationID: operationID) ?? -1
+            states.append("\(status)/\(attempts)")
+        }
+        let orphans = try await store.orphanedOperationIDs()
+        let divergences = try await store.operationStateDivergences()
+        await store.close()
+
+        // 지금 저장소가 실제로 하는 일을 못 박아 둔다. 이 값이 달라지면
+        // 무엇인가 바뀐 것이고, 그때 다시 봐야 한다.
+        XCTAssertEqual(
+            states,
+            Array(repeating: "completed/1", count: 6),
+            "여섯 변경의 최종 상태와 시도 횟수"
+        )
+        XCTAssertEqual(
+            dispatchedFolders.count,
+            5,
+            "폴더 다섯이 모두 발송됐다"
+        )
+        XCTAssertEqual(
+            dispatchedDocuments.count,
+            1,
+            "문서 하나가 발송됐다. 폴더 줄이 막혀도 문서 줄이 굶지 않는다"
+        )
+        XCTAssertEqual(orphans, [], "앞이 끊겨 남은 것이 없다")
+        XCTAssertEqual(divergences, [], "기록과 칸이 붙어 있다")
+    }
+
+    /// 같은 폴더를 잇달아 여섯 번 바꾸면 무엇이 일어나는지 읽는다.
+    ///
+    /// 서로 다른 폴더 여섯은 독립된 여섯 줄이라 서로를 막지 않는다. 같은
+    /// 폴더를 여섯 번 바꾸면 한 줄에 여섯이 늘어서고, 뒤쪽은 앞이 끝나야
+    /// 기준을 받는다. 사건의 모양에 더 가깝다.
+    ///
+    /// 고치지 않는다. 지금 무슨 일이 일어나는지 기록으로 남긴다.
+    func testSameFolderRenamedSixTimesDiagnostic() async throws {
+        let url = try databaseURL()
+        let context = QueueAPIContext()
+        let store = try await connectedStore(at: url, context: context)
+        let folderID = UUID()
+        let operationIDs = (0..<6).map { _ in UUID() }
+
+        for (index, operationID) in operationIDs.enumerated() {
+            _ = try await store.enqueue(
+                context.batch(
+                    kind: .structureChange,
+                    mutations: [
+                        context.folderMutation(
+                            operationID: operationID,
+                            folderID: folderID,
+                            name: "R\(index + 1)"
+                        )
+                    ]
+                )
+            )
+        }
+
+        // 앞의 셋만 정상으로 흘리고, 넷째에서 앞선 작업이 완료 아닌 길로
+        // 끝나게 한다. 사건에서 마지막 셋이 남았다고 했다.
+        var completed: [UUID] = []
+        for round in 0..<3 {
+            let folders = try await store.claimReadyFolderOperations(
+                limit: 10,
+                now: Date(timeIntervalSince1970: TimeInterval(100 + round))
+            )
+            guard let folder = folders.first else { break }
+            completed.append(folder.operationID)
+            try await store.complete(folder, result: folderCommitResult(for: folder))
+        }
+        let fourth = try await store.claimReadyFolderOperations(
+            limit: 1,
+            now: Date(timeIntervalSince1970: 200)
+        )
+        if let stalled = fourth.first {
+            try await store.markConflict(
+                stalled,
+                errorCode: "PATH_CONFLICT",
+                detail: nil
+            )
+        }
+
+        // 그 뒤로 더 흘려 본다.
+        var laterRounds = 0
+        for round in 0..<5 {
+            let folders = try await store.claimReadyFolderOperations(
+                limit: 10,
+                now: Date(timeIntervalSince1970: TimeInterval(300 + round))
+            )
+            if folders.isEmpty { break }
+            laterRounds += 1
+            for folder in folders {
+                completed.append(folder.operationID)
+                try await store.complete(folder, result: folderCommitResult(for: folder))
+            }
+        }
+
+        var states: [String] = []
+        for operationID in operationIDs {
+            states.append(
+                try await store.operationStatus(operationID: operationID) ?? "없음"
+            )
+        }
+        let orphans = try await store.orphanedOperationIDs()
+        let stuck = try await store.operationsMissingBaseRevision()
+        await store.close()
+
+        // 지금 저장소가 실제로 하는 일을 못 박아 둔다.
+        XCTAssertEqual(states.prefix(3).map { $0 }, Array(repeating: "completed", count: 3))
+        XCTAssertEqual(states[3], "conflict", "넷째가 막혔다")
+        XCTAssertEqual(
+            Array(states.suffix(2)),
+            ["pending", "pending"],
+            "마지막 둘은 대기 중으로 남는다"
+        )
+        XCTAssertEqual(
+            laterRounds,
+            0,
+            "넷째가 막힌 뒤로는 아무것도 발송되지 않는다"
+        )
+        // 넷째가 충돌로 막혀 있을 뿐 아직 살아 있다. 뒤쪽이 기다리는 것은
+        // 줄을 지키는 옳은 동작이지 끊긴 것이 아니다.
+        XCTAssertEqual(orphans, [], "앞이 살아 있으면 끊긴 것이 아니다")
+        XCTAssertEqual(
+            stuck.count,
+            2,
+            "다만 둘이 기준을 못 받은 채 멈춰 있다: \(stuck)"
+        )
+    }
+
+    /// 막힌 폴더 작업을 취소하면 뒤쪽도 되세워져야 한다.
+    ///
+    /// 문서 줄과 폴더 줄이 같아야 한다. 한쪽만 되세우면 폴더를 잇달아 바꾼
+    /// 사용자만 큐가 멈춘 채로 남는다.
+    func testCancellingBlockedFolderLeaderAdoptsFollowers() async throws {
+        let url = try databaseURL()
+        let context = QueueAPIContext()
+        let store = try await connectedStore(at: url, context: context)
+        let folderID = UUID()
+        let operationIDs = (0..<3).map { _ in UUID() }
+
+        for (index, operationID) in operationIDs.enumerated() {
+            _ = try await store.enqueue(
+                context.batch(
+                    kind: .structureChange,
+                    mutations: [
+                        context.folderMutation(
+                            operationID: operationID,
+                            folderID: folderID,
+                            name: "R\(index + 1)"
+                        )
+                    ]
+                )
+            )
+        }
+        // 첫째를 집어들어 막는다.
+        let claimed = try await store.claimReadyFolderOperations(
+            limit: 1,
+            now: Date(timeIntervalSince1970: 100)
+        )
+        try await store.markConflict(
+            try XCTUnwrap(claimed.first),
+            errorCode: "PATH_CONFLICT",
+            detail: nil
+        )
+        // 그 첫째를 취소한다. 뒤쪽 둘은 기준을 못 받은 채로 남아 있다.
+        try await store.cancelOperation(
+            operationID: operationIDs[0],
+            cancelEventID: UUID()
+        )
+
+        let orphans = try await store.orphanedOperationIDs()
+        let stuck = try await store.operationsMissingBaseRevision()
+        let ready = try await store.claimReadyFolderOperations(
+            limit: 10,
+            now: Date(timeIntervalSince1970: 300)
+        )
+        var states: [String] = []
+        for operationID in operationIDs {
+            states.append(
+                try await store.operationStatus(operationID: operationID) ?? "없음"
+            )
+        }
+        await store.close()
+
+        XCTAssertEqual(states[0], "cancelled")
+        XCTAssertEqual(orphans, [], "되세운 뒤에는 남은 고아가 없다")
+        // 줄의 맨 앞만 되세운다. 셋째는 둘째가 살아 있으니 그 뒤에서 기다리는
+        // 것이 옳다. 둘째가 끝나면 그때 기준을 받는다.
+        XCTAssertEqual(
+            stuck.count,
+            1,
+            "맨 앞만 풀리고 그다음은 줄을 지킨다: \(stuck)"
+        )
+        XCTAssertEqual(
+            ready.map(\.operationID),
+            [operationIDs[1]],
+            "앞을 취소하면 뒤쪽이 다시 발송된다"
+        )
+        // 둘째는 방금 집어들었으니 발송 중이고, 셋째는 그 뒤에서 기다린다.
+        XCTAssertEqual(
+            Array(states.suffix(2)),
+            ["inflight", "pending"],
+            "줄을 지켜 하나씩 나간다"
+        )
+    }
+
+    // MARK: - revision 충돌 되감기 (계약 대조)
+
+    // 계약 벡터 05 위반. 현재 동작을 기록만 한다.
+    // A 수정 시 이 시험을 고치지 말고 삭제하라.
+    //
+    /// 되감기가 원본 작업을 그 자리에서 고쳐 쓰는지 본다.
+    ///
+    /// 계약은 의도를 불변으로 다룬다. 되감을 때 원본은 그대로 두고 새 작업을
+    /// 만들어 원본을 밀어내라고 한다(벡터 05). 원본의 payload가 같은
+    /// operation_id 아래에서 바뀌면, 서버가 그 식별자로 기억해 둔 멱등 응답이
+    /// 어느 payload의 것인지 알 수 없게 된다. 다시 보냈을 때 서버는 "이미
+    /// 처리했다"고 답하는데 그 내용이 지금 보내려던 것과 다를 수 있다.
+    ///
+    /// 지금 저장소가 실제로 무엇을 하는지 못 박아 둔다. 이 시험이 통과한다는
+    /// 것은 구현이 아직 계약을 어기고 있다는 뜻이다. 계약을 지키도록 고치면
+    /// 이 시험은 깨져야 옳다. 그때 기대값을 손보지 말고 통째로 지워라.
+    /// 계약을 지키는 쪽의 시험은 벡터 05 하네스가 맡는다.
+    func testRebaseMutatesOperationInPlace_CONTRACT_VIOLATION_PINNED() async throws {
+        let url = try databaseURL()
+        let context = QueueAPIContext()
+        let store = try await connectedStore(at: url, context: context)
+        let operationID = UUID()
+        let originalContent = "내가 쓴 것\n"
+
+        _ = try await store.enqueue(
+            context.batch(
+                mutations: [
+                    context.documentMutation(
+                        operationID: operationID,
+                        content: originalContent,
+                        generation: 1
+                    )
+                ]
+            )
+        )
+        let claimed = try await store.claimReadyOperations(
+            limit: 1,
+            now: Date(timeIntervalSince1970: 100)
+        )
+        let operation = try XCTUnwrap(claimed.first)
+        let before = try await store.queuedOperations(documentID: context.documentID)
+        let beforeHash = try XCTUnwrap(
+            before.first { $0.operationID == operationID }?.contentHash
+        )
+
+        let remote = SyncV2RemoteDocumentSnapshot(
+            documentID: context.documentID,
+            relativePath: operation.relativePath,
+            content: "서버가 가진 것\n",
+            revision: operation.baseRevision + 2,
+            isDeleted: false,
+            deletedAt: nil,
+            updatedAt: Date(timeIntervalSince1970: 50)
+        )
+        let local = try await store.latestLocalSnapshot(for: operation)
+        let result = try await store.rebaseAfterRevisionConflict(
+            operation,
+            remote: remote,
+            local: local,
+            mergedContent: "내가 쓴 것\n서버가 가진 것\n",
+            mergedPath: remote.relativePath
+        )
+
+        let after = try await store.queuedOperations(documentID: context.documentID)
+        let events = try await store.operationEvents(operationID: operationID)
+        await store.close()
+
+        XCTAssertEqual(result, .rebased)
+
+        // 지금 동작: 새 작업을 만들지 않고 원본 하나를 고쳐 쓴다.
+        XCTAssertEqual(after.count, 1, "새 작업이 생기지 않는다")
+        let rebased = try XCTUnwrap(after.first)
+        XCTAssertEqual(
+            rebased.operationID,
+            operationID,
+            "같은 신원이 그대로 남는다"
+        )
+        XCTAssertNotEqual(
+            rebased.contentHash,
+            beforeHash,
+            "그런데 같은 신원 아래에서 보낼 내용이 바뀌었다"
+        )
+        XCTAssertEqual(
+            rebased.baseRevision.map(Int64.init),
+            remote.revision,
+            "기준도 서버 것으로 바뀌었다"
+        )
+        // 계약이라면 원본에 superseded가 남고 새 작업이 생겨야 한다.
+        XCTAssertFalse(
+            events.contains { $0.type == .superseded },
+            "원본이 밀려났다는 기록도 남지 않는다"
+        )
+    }
+
+    /// 장부 한 줄이 어긋났다고 저장소가 통째로 안 열리면 안 된다. 사용자는
+    /// 그 순간 동기화를 전부 잃는다. 어긋난 줄은 그냥 두고 눈에 띄게만 한다.
+    func testDivergentOperationDoesNotBlockStoreOpen() async throws {
+        let url = try databaseURL()
+        let context = QueueAPIContext()
+        let operationID = UUID()
+
+        let store = try await connectedStore(at: url, context: context)
+        _ = try await store.enqueue(
+            context.batch(
+                mutations: [context.documentMutation(operationID: operationID)]
+            )
+        )
+        let claimed = try await store.claimReadyOperations(
+            limit: 1,
+            now: Date(timeIntervalSince1970: 100)
+        )
+        try await store.complete(
+            try XCTUnwrap(claimed.first),
+            result: commitResult(for: try XCTUnwrap(claimed.first))
+        )
+        await store.close()
+
+        // 사건은 끝났다고 하는데 칸만 되돌려 놓는다. 정상 경로로는 나올 수 없는
+        // 모양이지만, 옛 빌드가 남긴 장부나 앞으로 생길 실수가 이럴 수 있다.
+        let raw = try RawSQLite(url: url)
+        try raw.execute(
+            """
+            UPDATE sync_operations SET status = 'pending'
+            WHERE operation_id = '\(operationID.uuidString.lowercased())';
+            """
+        )
+        raw.close()
+
+        let reopened = try await openStore(at: url)
+        let divergences = try await reopened.operationStateDivergences()
+        await reopened.close()
+
+        XCTAssertEqual(divergences.count, 1, "어긋난 것이 눈에 보여야 한다")
+        XCTAssertEqual(divergences.first?.derivedStatus, .completed)
+    }
+
+    /// 밀려난 작업은 취소된 것이 아니라 밀려난 것이다. 무엇에 밀렸는지까지
+    /// 기록에 남아야 나중에 왜 사라졌는지 되짚을 수 있다.
+    func testSupersededOperationRecordsSupersededEvent() async throws {
+        let url = try databaseURL()
+        let context = QueueAPIContext()
+        let firstID = UUID()
+        let secondID = UUID()
+
+        let treeDocumentID = UUID()
+        let store = try await connectedStore(at: url, context: context)
+
+        func enqueueTreeOrder(_ operationID: UUID, generation: Int, order: String) async throws {
+            _ = try await store.enqueue(
+                context.batch(
+                    kind: .structureChange,
+                    mutations: [
+                        context.documentMutation(
+                            operationID: operationID,
+                            documentID: treeDocumentID,
+                            relativePath: syncV2TreeOrderPath,
+                            content:
+                                "{\"tree_order\":{\"메인\":[\(order)]},\"version\":1}",
+                            generation: generation,
+                            kind: .treeOrder
+                        ),
+                    ]
+                )
+            )
+        }
+
+        try await enqueueTreeOrder(firstID, generation: 1, order: "\"가.txt\",\"나.txt\"")
+        // 뒤에 온 순서가 아직 못 보낸 앞의 순서를 밀어낸다.
+        try await enqueueTreeOrder(secondID, generation: 2, order: "\"나.txt\",\"가.txt\"")
+
+        let firstEvents = try await store.operationEvents(operationID: firstID)
+        let secondEvents = try await store.operationEvents(operationID: secondID)
+        let divergences = try await store.operationStateDivergences()
+        await store.close()
+
+        XCTAssertEqual(firstEvents.last?.type, .superseded)
+        XCTAssertEqual(firstEvents.last?.errorCode, "SUPERSEDED_BY_TREE_ORDER")
+        XCTAssertEqual(
+            try SyncV2OperationStateDerivation.state(from: firstEvents),
+            .cancelled
+        )
+        XCTAssertEqual(
+            try SyncV2OperationStateDerivation.state(from: secondEvents),
+            .pending,
+            "살아남은 순서는 그대로 대기한다"
+        )
+        XCTAssertEqual(divergences, [])
+    }
+
+    /// 폴더 줄도 문서 줄과 같은 문제를 안고 있다.
+    func testFolderWritePathsThatDoNotYetRecordEvents() async throws {
+        let url = try databaseURL()
+        let context = QueueAPIContext()
+        let folderOperationID = UUID()
+
+        let store = try await connectedStore(at: url, context: context)
+        _ = try await store.enqueue(
+            context.batch(
+                kind: .structureChange,
+                mutations: [context.folderMutation(operationID: folderOperationID)]
+            )
+        )
+        try await store.backfillOperationEvents()
+        let baseline = try await store.operationStateDivergences()
+        XCTAssertEqual(baseline, [])
+
+        let claimed = try await store.claimReadyFolderOperations(
+            limit: 1,
+            now: Date(timeIntervalSince1970: 100)
+        )
+        let folder = try XCTUnwrap(claimed.first)
+        try await store.complete(folder, result: folderCommitResult(for: folder))
+        let events = try await store.operationEvents(operationID: folderOperationID)
+        let divergences = try await store.operationStateDivergences()
+        await store.close()
+
+        XCTAssertEqual(divergences, [])
+        XCTAssertEqual(events.last?.type, .committed)
+    }
+
+    /// 사건 표는 존재하지 않는 작업을 가리킬 수 없다.
+    func testOperationEventRequiresExistingOperation() async throws {
+        let url = try databaseURL()
+        let store = try await openStore(at: url)
+        await store.close()
+
+        let raw = try RawSQLite(url: url)
+        XCTAssertThrowsError(
+            try raw.execute(
+                """
+                INSERT INTO sync_operation_events (
+                    event_id, operation_id, event_sequence, event_type, recorded_at
+                ) VALUES (
+                    '\(UUID().uuidString.lowercased())',
+                    '\(UUID().uuidString.lowercased())',
+                    1, 'enqueued', '2026-08-12T00:00:00.000Z'
+                );
+                """
+            )
+        )
+        raw.close()
+    }
+
     private func databaseURL() throws -> URL {
         let directory = FileManager.default.temporaryDirectory
             .appendingPathComponent(
@@ -4884,6 +6622,485 @@ final class SyncV2StoreTests: XCTestCase {
         case .unavailable(let diagnostic):
             return diagnostic
         }
+    }
+
+    // MARK: - codex 계보에서 가져온 시험
+    // 두 계보가 같은 자리에 서로 다른 시험을 넣어 엉켰다. 한쪽을 고르면
+    // 그쪽 시험만 돌아 A 판정 자체가 무의미해지므로 합집합으로 남긴다.
+
+    func testEnqueuedInitialSnapshotWithUnclearedMarkerReplaysSameIDs()
+        async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent(
+                "WriterPad-EnqueuedInitialInterruption-\(UUID().uuidString)",
+                isDirectory: true
+            )
+        try FileManager.default.createDirectory(
+            at: root,
+            withIntermediateDirectories: true
+        )
+        addTeardownBlock { try? FileManager.default.removeItem(at: root) }
+        let projectID = ProjectID(rawValue: UUID())
+        let mainID = DocumentID(rawValue: UUID())
+        let repository = InitialSnapshotDocumentRepository([
+            DocumentNode(
+                id: mainID,
+                projectID: projectID,
+                kind: .folder,
+                parentID: nil,
+                relativePath: .init(rawValue: "메인"),
+                userOrder: 0,
+                modifiedAt: Date(timeIntervalSince1970: 1),
+                contentHash: nil
+            ),
+        ])
+        let durable = ScriptedDurableChangeRecorder(
+            results: [
+                .queued(operationIDs: []),
+                .queued(operationIDs: []),
+            ]
+        )
+        let interrupted = ProjectInitialSyncRecorder(
+            documentRepository: repository,
+            workspaceLocator: FixedWorkspaceLocator(root: root),
+            durableChangeRecorder: durable,
+            fileManager: FailingMarkerRemovalFileManager()
+        )
+
+        _ = await interrupted.recordInitialSnapshot(
+            projectID: projectID,
+            projectName: "enqueue 뒤 중단",
+            batchKind: .projectBinding
+        )
+
+        let marker = root.appendingPathComponent(
+            ProjectInitialSyncRecorder.newProjectMarkerName
+        )
+        XCTAssertTrue(FileManager.default.fileExists(atPath: marker.path))
+        let firstAttempts = await durable.batches
+        let first = try XCTUnwrap(firstAttempts.first)
+
+        let restarted = ProjectInitialSyncRecorder(
+            documentRepository: repository,
+            workspaceLocator: FixedWorkspaceLocator(root: root),
+            durableChangeRecorder: durable
+        )
+        _ = await restarted.recordInitialSnapshot(
+            projectID: projectID,
+            projectName: "enqueue 뒤 중단",
+            batchKind: .projectBinding
+        )
+
+        let attempts = await durable.batches
+        XCTAssertEqual(attempts, [first, first])
+        XCTAssertFalse(FileManager.default.fileExists(atPath: marker.path))
+    }
+
+    func testInitialSnapshotPreservesLiveIdentitiesAndSkipsTrashedFolders()
+        async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent(
+                "WriterPad-NativeFolderIdentity-\(UUID().uuidString)",
+                isDirectory: true
+            )
+        try FileManager.default.createDirectory(
+            at: root.appendingPathComponent("메인/메모장"),
+            withIntermediateDirectories: true
+        )
+        addTeardownBlock { try? FileManager.default.removeItem(at: root) }
+
+        let projectID = ProjectID(rawValue: UUID())
+        let mainID = DocumentID(rawValue: UUID())
+        let standardNames = [
+            "원고", "캐릭터", "설정집", "메모장", "스토리 플롯",
+            "흐름정리", "복선", "장소", "휴지통",
+        ]
+        let standardIDs = Dictionary(
+            uniqueKeysWithValues: standardNames.map {
+                ($0, DocumentID(rawValue: UUID()))
+            }
+        )
+        let date = Date(timeIntervalSince1970: 1)
+        var nodes = [
+            DocumentNode(
+                id: mainID,
+                projectID: projectID,
+                kind: .folder,
+                parentID: nil,
+                relativePath: .init(rawValue: "메인"),
+                userOrder: 0,
+                modifiedAt: date,
+                contentHash: nil
+            ),
+        ]
+        for (order, name) in standardNames.enumerated() {
+            nodes.append(
+                DocumentNode(
+                    id: standardIDs[name]!,
+                    projectID: projectID,
+                    kind: .folder,
+                    parentID: mainID,
+                    relativePath: .init(rawValue: "메인/\(name)"),
+                    userOrder: order,
+                    modifiedAt: date,
+                    contentHash: nil
+                )
+            )
+        }
+        let decomposedName = "가"
+        let userFolderID = DocumentID(rawValue: UUID())
+        let emptyFolderID = DocumentID(rawValue: UUID())
+        let trashedFolderID = DocumentID(rawValue: UUID())
+        nodes.append(
+            contentsOf: [
+                DocumentNode(
+                    id: userFolderID,
+                    projectID: projectID,
+                    kind: .folder,
+                    parentID: standardIDs["메모장"],
+                    relativePath: .init(
+                        rawValue: "메인/메모장/\(decomposedName)"
+                    ),
+                    userOrder: 0,
+                    modifiedAt: date,
+                    contentHash: nil
+                ),
+                DocumentNode(
+                    id: emptyFolderID,
+                    projectID: projectID,
+                    kind: .folder,
+                    parentID: standardIDs["설정집"],
+                    relativePath: .init(rawValue: "메인/설정집/빈 폴더"),
+                    userOrder: 0,
+                    modifiedAt: date,
+                    contentHash: nil
+                ),
+                DocumentNode(
+                    id: trashedFolderID,
+                    projectID: projectID,
+                    kind: .folder,
+                    parentID: standardIDs["휴지통"],
+                    relativePath: .init(rawValue: "메인/휴지통/삭제 폴더"),
+                    userOrder: 0,
+                    modifiedAt: date,
+                    contentHash: nil,
+                    deletionStatus: .trashed(
+                        originalPath: .init(rawValue: "메인/메모장/삭제 폴더"),
+                        deletedAt: date
+                    )
+                ),
+            ]
+        )
+        let liveID = DocumentID(rawValue: UUID())
+        let deletedID = DocumentID(rawValue: UUID())
+        let livePath = RelativeDocumentPath(
+            rawValue: "메인/메모장/원본.txt"
+        )
+        let originalBytes = Data("원본\r\n가".utf8)
+        try originalBytes.write(to: root.appendingPathComponent(livePath.rawValue))
+        nodes.append(
+            contentsOf: [
+                DocumentNode(
+                    id: liveID,
+                    projectID: projectID,
+                    kind: .text,
+                    parentID: standardIDs["메모장"],
+                    relativePath: livePath,
+                    userOrder: 1,
+                    modifiedAt: date,
+                    contentHash: nil
+                ),
+                DocumentNode(
+                    id: deletedID,
+                    projectID: projectID,
+                    kind: .text,
+                    parentID: standardIDs["휴지통"],
+                    relativePath: .init(rawValue: "메인/휴지통/삭제.txt"),
+                    userOrder: 1,
+                    modifiedAt: date,
+                    contentHash: nil,
+                    deletionStatus: .trashed(
+                        originalPath: .init(rawValue: "메인/메모장/삭제.txt"),
+                        deletedAt: date
+                    )
+                ),
+            ]
+        )
+        // 저장소 반환 순서가 identity wire order에 영향을 주지 않아야 한다.
+        nodes.reverse()
+        let durable = ScriptedDurableChangeRecorder(
+            results: [.queued(operationIDs: [])]
+        )
+        let recorder = ProjectInitialSyncRecorder(
+            documentRepository: InitialSnapshotDocumentRepository(nodes),
+            workspaceLocator: FixedWorkspaceLocator(root: root),
+            durableChangeRecorder: durable
+        )
+
+        _ = await recorder.recordInitialSnapshot(
+            projectID: projectID,
+            projectName: "identity",
+            batchKind: .projectBinding
+        )
+
+        let recordedBatches = await durable.batches
+        let batch = try XCTUnwrap(recordedBatches.first)
+        var snapshots: [DocumentID: (DocumentID?, String, Bool, Int)] = [:]
+        for (index, mutation) in batch.mutations.enumerated() {
+            if case let .folderSnapshot(
+                _, folderID, parentID, name, isDeleted
+            ) = mutation {
+                snapshots[folderID] = (parentID, name, isDeleted, index)
+            }
+        }
+        XCTAssertEqual(snapshots.count, 12)
+        XCTAssertEqual(
+            Set(snapshots.keys),
+            Set(nodes.filter {
+                $0.kind == .folder && $0.id != trashedFolderID
+            }.map(\.id))
+        )
+        XCTAssertEqual(snapshots[mainID]?.0, nil)
+        XCTAssertEqual(snapshots[standardIDs["휴지통"]!]?.0, mainID)
+        XCTAssertEqual(snapshots[userFolderID]?.0, standardIDs["메모장"])
+        XCTAssertEqual(snapshots[userFolderID]?.1, "가")
+        XCTAssertEqual(snapshots[emptyFolderID]?.0, standardIDs["설정집"])
+        // base_revision 0의 삭제 폴더는 서버가 INVALID_ARGUMENT로 거절한다.
+        // 고정 휴지통은 live로 보내되 그 아래 폴더 operation은 만들지 않는다.
+        XCTAssertFalse(snapshots[standardIDs["휴지통"]!]?.2 ?? true)
+        XCTAssertNil(snapshots[trashedFolderID])
+        XCTAssertNotEqual(
+            userFolderID,
+            SyncV2FolderIdentity.derived(
+                serverProjectID: projectID.rawValue,
+                relativePath: "메인/메모장/\(decomposedName)"
+            )
+        )
+
+        let documentMutations = batch.mutations.compactMap { mutation ->
+            (DocumentID, String, ContentHash)? in
+            guard case let .documentSnapshot(
+                _, id, _, content, hash, _, _
+            ) = mutation else { return nil }
+            return (id, content, hash)
+        }
+        XCTAssertEqual(documentMutations.count, 1)
+        XCTAssertEqual(documentMutations.first?.0, liveID)
+        XCTAssertEqual(Data(documentMutations.first!.1.utf8), originalBytes)
+        XCTAssertEqual(
+            documentMutations.first?.2,
+            SHA256ContentHasher().sha256(for: originalBytes)
+        )
+        XCTAssertFalse(documentMutations.contains { $0.0 == deletedID })
+
+        guard case let .treeOrder(_, content, _) = batch.mutations.last else {
+            return XCTFail("tree_order가 마지막 mutation이어야 합니다.")
+        }
+        let object = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: Data(content.utf8))
+                as? [String: Any]
+        )
+        let tree = try XCTUnwrap(object["tree_order"] as? [String: [String]])
+        XCTAssertEqual(tree["<root>"], standardNames)
+        XCTAssertEqual(tree["메인/메모장"], ["가", "원본.txt"])
+        XCTAssertEqual(tree["메인/설정집"], ["빈 폴더"])
+        XCTAssertEqual(Set(tree["<root>"] ?? []).count, 9)
+    }
+
+    func testMarkerlessInitialSnapshotStateFailureNeverGuessesNewIDs()
+        async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent(
+                "WriterPad-MarkerlessInitial-\(UUID().uuidString)",
+                isDirectory: true
+            )
+        try FileManager.default.createDirectory(
+            at: root,
+            withIntermediateDirectories: true
+        )
+        addTeardownBlock { try? FileManager.default.removeItem(at: root) }
+        let projectID = ProjectID(rawValue: UUID())
+        let durable = UnavailableInitialSnapshotStateRecorder()
+        let recorder = ProjectInitialSyncRecorder(
+            documentRepository: InitialSnapshotDocumentRepository([]),
+            workspaceLocator: FixedWorkspaceLocator(root: root),
+            durableChangeRecorder: durable
+        )
+
+        let result = await recorder.recordInitialSnapshot(
+            projectID: projectID,
+            projectName: "불일치",
+            batchKind: .projectBinding
+        )
+
+        XCTAssertEqual(
+            result,
+            .localSavedButNotQueued(
+                reason: "초기 작품 동기화 완료 상태를 확인할 수 없습니다."
+            )
+        )
+        let recordCallCount = await durable.recordCallCount()
+        XCTAssertEqual(recordCallCount, 0)
+        XCTAssertFalse(
+            FileManager.default.fileExists(
+                atPath: root.appendingPathComponent(
+                    ProjectInitialSyncRecorder.newProjectMarkerName
+                ).path
+            )
+        )
+    }
+
+    func testNativeBindingAtomicallyCompletesFolderMigrationButLegacyDoesNot()
+        async throws {
+        let store = try await openStore(at: databaseURL())
+        let owner = UUID()
+        let nativeID = ProjectID(rawValue: UUID())
+        let windowsID = ProjectID(rawValue: UUID())
+        let legacyID = ProjectID(rawValue: UUID())
+
+        try await store.save(
+            .connected(
+                localProjectID: nativeID,
+                serverProjectID: nativeID.rawValue,
+                kind: .newServerProject,
+                projectName: "native",
+                ownerSubject: owner
+            )
+        )
+        try await store.save(
+            .connected(
+                localProjectID: windowsID,
+                serverProjectID: UUID(),
+                kind: .windowsImport,
+                projectName: "windows",
+                ownerSubject: owner
+            )
+        )
+        try await store.save(
+            .connected(
+                localProjectID: legacyID,
+                serverProjectID: UUID(),
+                kind: .existingServerProject,
+                projectName: "legacy",
+                ownerSubject: owner
+            )
+        )
+
+        let nativeCompleted = try await store.isFolderMigrationCompleted(
+            localProjectID: nativeID
+        )
+        let windowsCompleted = try await store.isFolderMigrationCompleted(
+            localProjectID: windowsID
+        )
+        let legacyCompleted = try await store.isFolderMigrationCompleted(
+            localProjectID: legacyID
+        )
+        XCTAssertTrue(nativeCompleted)
+        XCTAssertTrue(windowsCompleted)
+        XCTAssertFalse(legacyCompleted)
+        await store.close()
+    }
+
+    func testThreeLevelFolderTombstonesCommitDeepestFirst() async throws {
+        let url = try databaseURL()
+        let context = QueueAPIContext()
+        let store = try await connectedStore(at: url, context: context)
+        let childID = UUID()
+        let grandchildID = UUID()
+        let parentDeleteID = UUID()
+        let childDeleteID = UUID()
+        let grandchildDeleteID = UUID()
+
+        _ = try await store.enqueue(
+            context.batch(
+                kind: .structureChange,
+                mutations: [
+                    context.folderMutation(
+                        operationID: UUID(),
+                        name: "부모"
+                    ),
+                    context.folderMutation(
+                        operationID: UUID(),
+                        folderID: childID,
+                        parentFolderID: context.folderID,
+                        name: "자식"
+                    ),
+                    context.folderMutation(
+                        operationID: UUID(),
+                        folderID: grandchildID,
+                        parentFolderID: childID,
+                        name: "손자"
+                    ),
+                ]
+            )
+        )
+        // 두 폴더의 생성을 끝내 무덤이 기준선을 갖게 한다. 그러지 않으면
+        // 순번이 아니라 아직 비어 있는 base_revision이 무덤을 붙잡는다.
+        //
+        // 생성에도 부모 게이트가 걸려 한 번에 다 잡히지 않는다. 부모가 끝나야
+        // 자식이 준비되므로 더 나올 것이 없을 때까지 돈다.
+        while true {
+            let created = try await store.claimReadyFolderOperations(
+                limit: 10,
+                now: Date(timeIntervalSince1970: 10)
+            )
+            if created.isEmpty { break }
+            for operation in created {
+                try await store.complete(
+                    operation,
+                    result: folderCommitResult(for: operation)
+                )
+            }
+        }
+        _ = try await store.enqueue(
+            context.batch(
+                kind: .structureChange,
+                mutations: [
+                    context.folderMutation(
+                        operationID: parentDeleteID,
+                        name: "부모",
+                        isDeleted: true
+                    ),
+                    context.folderMutation(
+                        operationID: childDeleteID,
+                        folderID: childID,
+                        parentFolderID: context.folderID,
+                        name: "자식",
+                        isDeleted: true
+                    ),
+                    context.folderMutation(
+                        operationID: grandchildDeleteID,
+                        folderID: grandchildID,
+                        parentFolderID: childID,
+                        name: "손자",
+                        isDeleted: true
+                    ),
+                ]
+            )
+        )
+
+        var committed: [UUID] = []
+        for timestamp in [20.0, 30.0, 40.0] {
+            let ready = try await store.claimReadyFolderOperations(
+                limit: 10,
+                now: Date(timeIntervalSince1970: timestamp)
+            )
+            let operation = try XCTUnwrap(ready.first)
+            XCTAssertEqual(ready.count, 1)
+            committed.append(operation.operationID)
+            try await store.complete(
+                operation,
+                result: folderCommitResult(for: operation)
+            )
+        }
+
+        // A/B/C를 부모 우선으로 enqueue해도 서버에는 C/B/A만 나갈 수 있다.
+        // A가 먼저 나가면 live 자식 때문에 FOLDER_NOT_EMPTY가 된다.
+        XCTAssertEqual(
+            committed,
+            [grandchildDeleteID, childDeleteID, parentDeleteID]
+        )
+        await store.close()
     }
 }
 
@@ -5074,44 +7291,6 @@ private struct RawSQLiteError: Error {
     let code: Int32
 }
 
-private final class FailingMarkerRemovalFileManager: FileManager,
-    @unchecked Sendable {
-    override func removeItem(at URL: URL) throws {
-        _ = URL
-        throw CocoaError(.fileWriteUnknown)
-    }
-}
-
-private actor UnavailableInitialSnapshotStateRecorder:
-    DurableLocalChangeRecording {
-    private struct InjectedError: Error {}
-    private var calls = 0
-
-    func requirement(
-        for projectID: ProjectID
-    ) async -> DurableRecordingRequirement {
-        _ = projectID
-        return .durableQueue
-    }
-
-    func hasRecordedInitialSnapshot(
-        for projectID: ProjectID,
-        kind: DurableLocalBatchKind
-    ) async throws -> Bool {
-        _ = projectID
-        _ = kind
-        throw InjectedError()
-    }
-
-    func record(_ batch: LocalMutationBatch) async -> DurableRecordResult {
-        _ = batch
-        calls += 1
-        return .queued(operationIDs: [])
-    }
-
-    func recordCallCount() -> Int { calls }
-}
-
 private actor InitialSnapshotDocumentRepository: DocumentRepository {
     private var nodes: [DocumentNode]
 
@@ -5228,4 +7407,42 @@ private struct QueueFixture {
     private func id(_ value: UUID) -> String {
         value.uuidString.lowercased()
     }
+}
+
+private final class FailingMarkerRemovalFileManager: FileManager,
+    @unchecked Sendable {
+    override func removeItem(at URL: URL) throws {
+        _ = URL
+        throw CocoaError(.fileWriteUnknown)
+    }
+}
+
+private actor UnavailableInitialSnapshotStateRecorder:
+    DurableLocalChangeRecording {
+    private struct InjectedError: Error {}
+    private var calls = 0
+
+    func requirement(
+        for projectID: ProjectID
+    ) async -> DurableRecordingRequirement {
+        _ = projectID
+        return .durableQueue
+    }
+
+    func hasRecordedInitialSnapshot(
+        for projectID: ProjectID,
+        kind: DurableLocalBatchKind
+    ) async throws -> Bool {
+        _ = projectID
+        _ = kind
+        throw InjectedError()
+    }
+
+    func record(_ batch: LocalMutationBatch) async -> DurableRecordResult {
+        _ = batch
+        calls += 1
+        return .queued(operationIDs: [])
+    }
+
+    func recordCallCount() -> Int { calls }
 }

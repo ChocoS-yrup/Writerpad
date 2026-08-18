@@ -25,6 +25,10 @@ struct ValidatedAuthSession: Equatable, Sendable {
 
 enum SupabaseAuthTransportError: Error, Equatable, Sendable {
     case invalidCredentials
+    case weakPassword
+    case accountAlreadyExists
+    case signUpDisabled
+    case emailNotConfirmed
     case sessionExpired
     case refreshTokenRevoked
     case refreshTokenReused
@@ -32,7 +36,14 @@ enum SupabaseAuthTransportError: Error, Equatable, Sendable {
     case serverRejected
 }
 
+enum SupabaseSignUpResult: Equatable, Sendable {
+    case authenticated(ValidatedAuthSession)
+    case confirmationRequired(email: String?)
+}
+
 protocol SupabaseAuthTransporting: Sendable {
+    func signUp(email: String, password: String) async throws
+        -> SupabaseSignUpResult
     func signIn(email: String, password: String) async throws
         -> ValidatedAuthSession
     func restore(tokens: StoredSessionTokens) async throws
@@ -47,6 +58,24 @@ actor LiveSupabaseAuthTransport: SupabaseAuthTransporting {
 
     init(client: SupabaseClient) {
         self.client = client
+    }
+
+    func signUp(
+        email: String,
+        password: String
+    ) async throws -> SupabaseSignUpResult {
+        do {
+            let response = try await client.auth.signUp(
+                email: email,
+                password: password
+            )
+            if let session = response.session {
+                return .authenticated(validated(session))
+            }
+            return .confirmationRequired(email: response.user.email)
+        } catch {
+            throw map(error, isRestore: false)
+        }
     }
 
     func signIn(
@@ -125,6 +154,14 @@ actor LiveSupabaseAuthTransport: SupabaseAuthTransporting {
                 return .refreshTokenReused
             case .invalidCredentials:
                 return isRestore ? .refreshTokenRevoked : .invalidCredentials
+            case .weakPassword:
+                return .weakPassword
+            case .emailExists, .userAlreadyExists:
+                return .accountAlreadyExists
+            case .signupDisabled, .emailProviderDisabled:
+                return .signUpDisabled
+            case .emailNotConfirmed:
+                return .emailNotConfirmed
             default:
                 return .serverRejected
             }
@@ -157,9 +194,19 @@ enum AuthenticationSignOutReason: Equatable, Sendable {
 enum AuthenticationFailure: Equatable, Sendable {
     case configurationUnavailable
     case invalidCredentials
+    case weakPassword
+    case accountAlreadyExists
+    case signUpDisabled
+    case emailNotConfirmed
     case networkUnavailable
     case keychainAccess
     case serverRejected
+}
+
+enum AuthenticationSignUpResult: Equatable, Sendable {
+    case authenticated(AuthenticatedAccount)
+    case confirmationRequired(maskedEmail: String?)
+    case failed(AuthenticationFailure)
 }
 
 enum AuthenticationState: Equatable, Sendable {
@@ -185,6 +232,9 @@ protocol AuthenticationServicing: Sendable {
     @discardableResult
     func refreshSession(force: Bool) async -> AuthenticationState
     @discardableResult
+    func signUp(email: String, password: String) async
+        -> AuthenticationSignUpResult
+    @discardableResult
     func signIn(email: String, password: String) async -> AuthenticationState
     @discardableResult
     func signOut() async -> AuthenticationState
@@ -193,6 +243,13 @@ protocol AuthenticationServicing: Sendable {
 extension AuthenticationServicing {
     func stateUpdates() async -> AsyncStream<AuthenticationState> {
         AsyncStream { $0.finish() }
+    }
+
+    func signUp(
+        email: String,
+        password: String
+    ) async -> AuthenticationSignUpResult {
+        .failed(.serverRejected)
     }
 }
 
@@ -489,6 +546,68 @@ actor SupabaseAuthService: AuthenticationServicing {
     }
 
     @discardableResult
+    func signUp(
+        email: String,
+        password: String
+    ) async -> AuthenticationSignUpResult {
+        cancelActiveAuthenticationTasks()
+        guard let transport else {
+            state = .unavailable(.configurationUnavailable)
+            return .failed(.configurationUnavailable)
+        }
+        let normalizedEmail = email.trimmingCharacters(
+            in: .whitespacesAndNewlines
+        )
+        guard !normalizedEmail.isEmpty, !password.isEmpty else {
+            state = .unavailable(.invalidCredentials)
+            return .failed(.invalidCredentials)
+        }
+
+        let operationID = beginOperation()
+        do {
+            let result = try await transport.signUp(
+                email: normalizedEmail,
+                password: password
+            )
+            guard isCurrent(operationID) else {
+                return .failed(.serverRejected)
+            }
+            switch result {
+            case let .authenticated(session):
+                let accepted = await accept(
+                    session,
+                    operationID: operationID
+                )
+                if case let .authenticated(account) = accepted {
+                    return .authenticated(account)
+                }
+                if case let .unavailable(failure) = accepted {
+                    return .failed(failure)
+                }
+                return .failed(.serverRejected)
+            case let .confirmationRequired(email):
+                state = .signedOut(.noStoredSession)
+                return .confirmationRequired(
+                    maskedEmail: Self.masked(email ?? normalizedEmail)
+                )
+            }
+        } catch let error as SupabaseAuthTransportError {
+            guard isCurrent(operationID) else {
+                return .failed(.serverRejected)
+            }
+            let failure = failure(for: error)
+            state = .unavailable(failure)
+            return .failed(failure)
+        } catch {
+            guard isCurrent(operationID) else {
+                return .failed(.serverRejected)
+            }
+            state = .unavailable(.serverRejected)
+            return .failed(.serverRejected)
+        }
+    }
+
+    @discardableResult
     func signIn(
         email: String,
         password: String
@@ -595,7 +714,8 @@ actor SupabaseAuthService: AuthenticationServicing {
         case .networkUnavailable:
             state = .unavailable(.networkUnavailable)
             return state
-        case .invalidCredentials, .serverRejected:
+        case .invalidCredentials, .weakPassword, .accountAlreadyExists,
+             .signUpDisabled, .emailNotConfirmed, .serverRejected:
             reason = nil
         }
 
@@ -625,6 +745,14 @@ actor SupabaseAuthService: AuthenticationServicing {
         switch error {
         case .invalidCredentials:
             .invalidCredentials
+        case .weakPassword:
+            .weakPassword
+        case .accountAlreadyExists:
+            .accountAlreadyExists
+        case .signUpDisabled:
+            .signUpDisabled
+        case .emailNotConfirmed:
+            .emailNotConfirmed
         case .networkUnavailable:
             .networkUnavailable
         case .sessionExpired, .refreshTokenRevoked, .refreshTokenReused,

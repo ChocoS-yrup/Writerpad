@@ -140,6 +140,11 @@ final class AppEnvironment: ObservableObject {
             projectRepository: repository,
             pathResolver: pathResolver
         )
+        let syncMutationGate = SyncV2DocumentMutationGate()
+        let backupStore = LocalBackupStore(
+            workspaceLocator: workspaceLocator,
+            clock: clock
+        )
         let binderScanner = LocalBinderDirectoryScanner(pathResolver: pathResolver)
         let binderRepository = LocalBinderRepository(
             metadataStore: repository,
@@ -147,9 +152,9 @@ final class AppEnvironment: ObservableObject {
             workspaceLocator: workspaceLocator,
             scanner: binderScanner,
             pathPolicy: pathResolver.policy,
-            clock: clock
+            clock: clock,
+            syncMutationGate: syncMutationGate
         )
-        let syncMutationGate = SyncV2DocumentMutationGate()
         let futureChangeNotifier = NoOpFutureChangeNotifier()
         let supabaseClientProvider: any SupabaseClientProviding
         if isStoredInMemoryOnly {
@@ -195,7 +200,8 @@ final class AppEnvironment: ObservableObject {
             folderMigrationMarker = nil
             localSnapshotApplier = LocalSyncV2SnapshotApplier(
                 documentRepository: repository,
-                workspaceLocator: workspaceLocator
+                workspaceLocator: workspaceLocator,
+                backupStore: backupStore
             )
             editLeaseManager = nil
         } else {
@@ -214,6 +220,7 @@ final class AppEnvironment: ObservableObject {
             localSnapshotApplier = LocalSyncV2SnapshotApplier(
                 documentRepository: repository,
                 workspaceLocator: workspaceLocator,
+                backupStore: backupStore,
                 folderIdentityPublisher:
                     DurableSyncV2FolderIdentityPublisher(
                         changeRecorder: syncV2Store
@@ -345,10 +352,6 @@ final class AppEnvironment: ObservableObject {
             documentRepository: repository,
             documentStore: localDocumentStore,
             pathPolicy: pathResolver.policy
-        )
-        let backupStore = LocalBackupStore(
-            workspaceLocator: workspaceLocator,
-            clock: clock
         )
         let backupPolicyStore = LocalBackupPolicyStore(
             globalPolicyURL: pathResolver.projectsRootURL

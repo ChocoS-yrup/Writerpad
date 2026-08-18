@@ -118,6 +118,9 @@ struct WriterPadApp: App {
                 .task {
                     await startCloudServices()
                 }
+                .task {
+                    await observeAuthenticationChanges()
+                }
                 .onChange(of: scenePhase) { _, phase in
                     Task {
                         if phase == .active {
@@ -154,5 +157,37 @@ struct WriterPadApp: App {
         await environment.syncDispatcher?.loginSucceeded()
         await environment.backgroundSyncCoordinator?.start()
         await environment.backgroundSyncCoordinator?.appEnteredForeground()
+    }
+
+    private func observeAuthenticationChanges() async {
+        let updates = await environment.authenticationService.stateUpdates()
+        for await state in updates {
+            guard !Task.isCancelled else { return }
+            await applyAuthenticationState(state)
+        }
+    }
+
+    private func applyAuthenticationState(
+        _ state: AuthenticationState
+    ) async {
+        switch state {
+        case .authenticated:
+            guard GlobalSyncPreference.isEnabled() else { return }
+            await environment.syncDispatcher?.start()
+            await environment.syncDispatcher?.loginSucceeded()
+            await environment.backgroundSyncCoordinator?.start()
+        case .signedOut, .localOnly:
+            await environment.syncDispatcher?.stop()
+            await environment.backgroundSyncCoordinator?.stop()
+            await environment.editLeaseManager?.releaseAll()
+        case .unavailable:
+            // 인증되지 않은 동안 원격 pull/realtime/lease는 열지 않는다.
+            // Dispatcher는 보존된 로컬 queue의 복구 상태를 유지할 수 있다.
+            await environment.backgroundSyncCoordinator?.stop()
+            await environment.editLeaseManager?.releaseAll()
+        case .restoring:
+            // 시작 시 로컬 queue 복구를 막지 않고 서버 검증 결과를 기다린다.
+            break
+        }
     }
 }

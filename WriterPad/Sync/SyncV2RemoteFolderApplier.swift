@@ -4,6 +4,7 @@ struct SyncV2RemoteFolderApplyReport: Equatable, Sendable {
     var movedFolderIDs: [DocumentID] = []
     var createdFolderIDs: [DocumentID] = []
     var deletedFolderIDs: [DocumentID] = []
+    var rejectedFolderIDs: Set<DocumentID> = []
     /// 반영하지 못한 것들이다. 사용자가 무엇을 고쳐야 하는지 알 수 있게 이름을
     /// 함께 싣는다.
     var rejectedNames: [SyncV2RejectedStructureName] = []
@@ -12,6 +13,7 @@ struct SyncV2RemoteFolderApplyReport: Equatable, Sendable {
         movedFolderIDs.isEmpty
             && createdFolderIDs.isEmpty
             && deletedFolderIDs.isEmpty
+            && rejectedFolderIDs.isEmpty
             && rejectedNames.isEmpty
     }
 }
@@ -97,9 +99,10 @@ actor SyncV2RemoteFolderApplier: SyncV2RemoteFolderApplying {
                     root: root,
                     report: &report
                 )
-            case let .conflict(_, path, reason):
+            case let .conflict(folderID, path, reason):
                 // 목적지 점유·미전송 작업·부모 없음·고리. 넷 다 이름 문제가
                 // 아니다.
+                report.rejectedFolderIDs.insert(folderID)
                 report.rejectedNames.append(
                     rejection(path: path, reason: reason, kind: .notApplied)
                 )
@@ -118,8 +121,12 @@ actor SyncV2RemoteFolderApplier: SyncV2RemoteFolderApplying {
         report: inout SyncV2RemoteFolderApplyReport
     ) async -> [DocumentNode] {
         guard let source = documents.first(where: { $0.id == folderID })
-        else { return documents }
+        else {
+            report.rejectedFolderIDs.insert(folderID)
+            return documents
+        }
         guard isNameAllowed(to) else {
+            report.rejectedFolderIDs.insert(folderID)
             report.rejectedNames.append(
                 rejection(
                     path: to,
@@ -134,6 +141,7 @@ actor SyncV2RemoteFolderApplier: SyncV2RemoteFolderApplying {
         let sourceURL = url(root: root, path: from)
         let destinationURL = url(root: root, path: to)
         guard !fileManager.fileExists(atPath: destinationURL.path) else {
+            report.rejectedFolderIDs.insert(folderID)
             // 계획을 세운 뒤에 누군가 그 자리를 차지했다. 덮어쓰지 않는다.
             report.rejectedNames.append(
                 rejection(
@@ -160,6 +168,7 @@ actor SyncV2RemoteFolderApplier: SyncV2RemoteFolderApplying {
                 )
             }
         } catch {
+            report.rejectedFolderIDs.insert(folderID)
             report.rejectedNames.append(
                 rejection(
                     path: to,
@@ -215,6 +224,7 @@ actor SyncV2RemoteFolderApplier: SyncV2RemoteFolderApplying {
         report: inout SyncV2RemoteFolderApplyReport
     ) async -> [DocumentNode] {
         guard isNameAllowed(path) else {
+            report.rejectedFolderIDs.insert(folderID)
             report.rejectedNames.append(
                 rejection(
                     path: path,
@@ -232,6 +242,7 @@ actor SyncV2RemoteFolderApplier: SyncV2RemoteFolderApplying {
                 withIntermediateDirectories: true
             )
         } catch {
+            report.rejectedFolderIDs.insert(folderID)
             report.rejectedNames.append(
                 rejection(
                     path: path,
@@ -253,6 +264,7 @@ actor SyncV2RemoteFolderApplier: SyncV2RemoteFolderApplying {
             contentHash: nil
         )
         guard (try? await documentRepository.save(node)) != nil else {
+            report.rejectedFolderIDs.insert(folderID)
             return documents
         }
         report.createdFolderIDs.append(folderID)
@@ -274,6 +286,7 @@ actor SyncV2RemoteFolderApplier: SyncV2RemoteFolderApplying {
                 && canonical($0.relativePath.rawValue).hasPrefix(prefix)
         }
         guard !hasLocalContent else {
+            report.rejectedFolderIDs.insert(folderID)
             report.rejectedNames.append(
                 rejection(
                     path: path,
@@ -293,6 +306,7 @@ actor SyncV2RemoteFolderApplier: SyncV2RemoteFolderApplying {
                 ),
                 contents.isEmpty
             else {
+                report.rejectedFolderIDs.insert(folderID)
                 report.rejectedNames.append(
                     rejection(
                         path: path,
@@ -309,6 +323,7 @@ actor SyncV2RemoteFolderApplier: SyncV2RemoteFolderApplying {
             (try? await documentRepository.removeMetadata(id: folderID))
                 != nil
         else {
+            report.rejectedFolderIDs.insert(folderID)
             return documents
         }
         report.deletedFolderIDs.append(folderID)

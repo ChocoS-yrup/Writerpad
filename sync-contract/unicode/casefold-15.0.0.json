@@ -1,7 +1,7 @@
 {
- "table_id": "storage-name-casefold-v2",
+ "table_id": "storage-name-casefold-v1",
  "unicode_version": "15.0.0",
- "purpose": "Frozen full default case folding for the storage-name-v2 collision-key pipeline.",
+ "purpose": "Full default case folding for storage-name-v1 step 'Apply Unicode 15.0.0 Default Case Folding without locale'.",
  "rule": "Replace each scalar present in this table with its mapping. Leave every other scalar untouched. Apply per scalar, never per grapheme.",
  "source": "CPython 3.12.13 stdlib unicodedata (unidata_version 15.0.0), via supabase/scripts/generate_casefold_sql.py",
  "mapping_count": 1530,

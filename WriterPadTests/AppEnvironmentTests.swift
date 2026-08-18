@@ -279,6 +279,54 @@ final class AppEnvironmentTests: XCTestCase {
         await NoOpFutureChangeNotifier().record(.appLaunched)
     }
 
+    @MainActor
+    func testAddNewVolumeUsesCurrentManuscriptIdentityWhenTappedNodeIsStale()
+        async throws {
+        let environment = try AppEnvironment.testing()
+        let project = try await environment.projectManager.createProject(
+            named: "새 권 오래된 UUID"
+        )
+        let model = BinderViewModel(
+            repository: environment.binderRepository,
+            commands: environment.binderCommands
+        )
+        await model.load(projectID: project.id)
+        let currentManuscript = try XCTUnwrap(
+            model.roots.first { $0.fixedCategory == .manuscript }
+        )
+        let staleManuscript = BinderNode(
+            id: DocumentID(rawValue: UUID()),
+            projectID: currentManuscript.projectID,
+            kind: currentManuscript.kind,
+            relativePath: currentManuscript.relativePath,
+            displayName: currentManuscript.displayName,
+            fixedCategory: currentManuscript.fixedCategory,
+            userOrder: currentManuscript.userOrder,
+            contentState: currentManuscript.contentState,
+            isExpanded: currentManuscript.isExpanded
+        )
+
+        let firstChapter = await model.addNewVolume(in: staleManuscript)
+
+        XCTAssertNotNil(firstChapter)
+        XCTAssertNil(model.errorMessage)
+        XCTAssertEqual(firstChapter?.relativePath.rawValue, "메인/원고/1권/001화.txt")
+        let documents = try await environment.documentRepository.documents(
+            in: project.id
+        )
+        let volumeDocuments = documents.filter {
+            $0.relativePath.rawValue.hasPrefix("메인/원고/1권")
+        }
+        XCTAssertEqual(volumeDocuments.count, 26)
+        let refreshedRoots = try await environment.binderRepository.rootNodes(
+            in: project.id
+        )
+        XCTAssertTrue(
+            refreshedRoots.first { $0.fixedCategory == .manuscript }?
+                .isExpanded == true
+        )
+    }
+
     func testEditorExternalTrackerDistinguishesDocumentVersionAndComposition() {
         let firstID = DocumentID(rawValue: UUID())
         let secondID = DocumentID(rawValue: UUID())

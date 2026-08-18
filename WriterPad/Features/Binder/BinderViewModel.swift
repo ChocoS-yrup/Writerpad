@@ -21,6 +21,7 @@ final class BinderViewModel: ObservableObject {
     private let repository: any BinderRepository
     private let commands: any BinderCommanding
     private var loadedProjectID: ProjectID?
+    private var loadGeneration: UInt64 = 0
 
     init(repository: any BinderRepository, commands: any BinderCommanding) {
         self.repository = repository
@@ -35,13 +36,10 @@ final class BinderViewModel: ObservableObject {
 
     func load(projectID: ProjectID) async {
         let isBackgroundRefresh = loadedProjectID == projectID && !roots.isEmpty
+        loadGeneration &+= 1
+        let generation = loadGeneration
         loadedProjectID = projectID
-        if isBackgroundRefresh {
-            // 구조 변경 전에 접어 둔 폴더의 빈 자식 캐시를 남겨 두면,
-            // 휴지통 이동 후 폴더를 다시 펼쳐도 재조회하지 않는다.
-            // 펼쳐진 가지는 아래에서 즉시 다시 구성된다.
-            childrenByParent = [:]
-        } else {
+        if !isBackgroundRefresh {
             roots = []
             childrenByParent = [:]
             loadingFolderIDs = []
@@ -52,22 +50,48 @@ final class BinderViewModel: ObservableObject {
         }
         do {
             try await commands.recoverPendingTransactions(in: projectID)
+            try Task.checkCancellation()
             let loadedRoots = try await repository.rootNodes(in: projectID)
-            guard loadedProjectID == projectID else { return }
-            roots = loadedRoots
-            for root in loadedRoots where root.isExpanded {
-                try await restoreExpandedBranch(from: root, projectID: projectID)
-            }
+            try Task.checkCancellation()
+            let loadedChildren = try await expandedChildrenSnapshot(
+                from: loadedRoots,
+                projectID: projectID
+            )
             let loadedNodes = Array(
                 Dictionary(
-                    (loadedRoots + childrenByParent.values.flatMap { $0 })
+                    (loadedRoots + loadedChildren.values.flatMap { $0 })
                         .map { ($0.id, $0) },
                     uniquingKeysWith: { _, latest in latest }
                 ).values
             )
-            try await refreshCommandDescriptors(for: loadedNodes, projectID: projectID)
+            let loadedDescriptors = try await commands.commandDescriptors(
+                for: loadedNodes.map(\.id),
+                in: projectID
+            )
+            try Task.checkCancellation()
+            guard loadedProjectID == projectID,
+                  loadGeneration == generation
+            else { return }
+
+            let loadedIDs = Set(loadedNodes.map(\.id))
+            var transaction = Transaction(animation: nil)
+            transaction.disablesAnimations = true
+            withTransaction(transaction) {
+                // 백그라운드 갱신 중에는 기존 행을 유지하고, 펼친 가지까지
+                // 모두 준비된 뒤 완성된 트리를 한 번에 화면에 반영한다.
+                roots = loadedRoots
+                childrenByParent = loadedChildren
+                commandDescriptorsByDocument = loadedDescriptors
+                if let selectedNodeID, !loadedIDs.contains(selectedNodeID) {
+                    self.selectedNodeID = nil
+                }
+                errorMessage = nil
+            }
         } catch {
-            guard loadedProjectID == projectID else { return }
+            guard !Task.isCancelled,
+                  loadedProjectID == projectID,
+                  loadGeneration == generation
+            else { return }
             errorMessage = error.localizedDescription
         }
     }
@@ -181,19 +205,46 @@ final class BinderViewModel: ObservableObject {
         guard let projectID = loadedProjectID else { return nil }
         workingDocumentIDs.insert(manuscript.id)
         defer { workingDocumentIDs.remove(manuscript.id) }
+
+        let result: BinderVolumeCreationResult
         do {
-            let result = try await commands.addNewVolume(projectID: projectID)
-            if result.shouldRefreshBinder {
-                try await repository.setExpanded(true, for: manuscript.id)
-                try await repository.setExpanded(true, for: result.folderToExpandID)
-                await load(projectID: projectID)
-            }
-            selectedNodeID = result.documentToOpenID
-            return visibleRows.first { $0.node.id == result.documentToOpenID }?.node
+            result = try await commands.addNewVolume(projectID: projectID)
         } catch {
             errorMessage = error.localizedDescription
             return nil
         }
+
+        var expansionError: Error?
+        if result.shouldRefreshBinder {
+            do {
+                // 명령이 실행되는 동안 폴더 UUID 이관이 완료될 수
+                // 있다. 버튼을 누를 때의 BinderNode가 아니라 명령이
+                // 최신 메타데이터에서 반환한 ID를 사용한다.
+                try await repository.setExpanded(
+                    true,
+                    for: result.manuscriptFolderID
+                )
+                try await repository.setExpanded(
+                    true,
+                    for: result.folderToExpandID
+                )
+            } catch {
+                // 새 권과 회차는 이미 저장됐다. 성공한 생성을
+                // 실패로 보이지 않고, 재스캔이 회복할 기회를 준다.
+                expansionError = error
+            }
+            await load(projectID: projectID)
+            if let loadError = errorMessage {
+                let detail = expansionError?.localizedDescription ?? loadError
+                errorMessage =
+                    "새 권은 정상적으로 만들었지만 바인더 표시를 "
+                    + "갱신하지 못했습니다: \(detail)"
+            }
+        }
+        selectedNodeID = result.documentToOpenID
+        return visibleRows.first {
+            $0.node.id == result.documentToOpenID
+        }?.node
     }
 
     @discardableResult
@@ -369,19 +420,25 @@ final class BinderViewModel: ObservableObject {
         }
     }
 
-    private func restoreExpandedBranch(
-        from node: BinderNode,
+    private func expandedChildrenSnapshot(
+        from nodes: [BinderNode],
         projectID: ProjectID
-    ) async throws {
-        try await loadChildren(
-            of: node,
-            projectID: projectID,
-            refreshesCommandDescriptors: false
-        )
-        for child in childrenByParent[node.id] ?? []
-        where child.isFolder && child.isExpanded {
-            try await restoreExpandedBranch(from: child, projectID: projectID)
+    ) async throws -> [DocumentID: [BinderNode]] {
+        var result: [DocumentID: [BinderNode]] = [:]
+        for node in nodes where node.isFolder && node.isExpanded {
+            try Task.checkCancellation()
+            let children = try await repository.children(
+                of: node.id,
+                in: projectID
+            )
+            result[node.id] = children
+            let descendants = try await expandedChildrenSnapshot(
+                from: children,
+                projectID: projectID
+            )
+            result.merge(descendants) { _, latest in latest }
         }
+        return result
     }
 
     private func loadChildren(

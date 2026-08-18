@@ -1018,11 +1018,13 @@ private final class FolderDeviceFixture {
     let deviceID = UUID()
     let client: EndToEndFolderClient
     private(set) var store: SyncV2Store
+    private let server: FakeFolderServer
     private let directory: URL
     private let url: URL
     private let binding: ProjectSyncBinding
 
     init(server: FakeFolderServer) async throws {
+        self.server = server
         client = EndToEndFolderClient(server: server)
         directory = FileManager.default.temporaryDirectory
             .appendingPathComponent(
@@ -1079,8 +1081,21 @@ private final class FolderDeviceFixture {
         )
     }
 
+    /// 제품은 `AppEnvironment`에서 이것을 넘긴다. 넘기지 않으면 폴더
+    /// revision 충돌이 되감기 없이 그대로 굳으므로 시험도 같이 넘긴다.
+    private func makeRebaser() -> SyncV2AutomaticRebaser {
+        SyncV2AutomaticRebaser(
+            store: store,
+            snapshotClient: EndToEndFolderSnapshotClient(server: server)
+        )
+    }
+
     func drain(now seconds: TimeInterval) async {
-        let dispatcher = SyncV2Dispatcher(store: store, client: client)
+        let dispatcher = SyncV2Dispatcher(
+            store: store,
+            client: client,
+            automaticRebaser: makeRebaser()
+        )
         // 폴더마다 줄이 따로라 한 바퀴로는 사슬이 다 풀리지 않는다.
         for _ in 0 ..< 4 {
             await dispatcher.dispatchReadyOperations(
@@ -1091,7 +1106,11 @@ private final class FolderDeviceFixture {
 
     /// 화면이 실제로 쓰는 경로다. dispatcher가 들고 있는 저장소를 거친다.
     func stalledFolderChanges() async -> [SyncV2StalledFolderChange] {
-        let dispatcher = SyncV2Dispatcher(store: store, client: client)
+        let dispatcher = SyncV2Dispatcher(
+            store: store,
+            client: client,
+            automaticRebaser: makeRebaser()
+        )
         return await dispatcher.stalledFolderChanges(
             localProjectID: localProjectID
         )
@@ -1155,5 +1174,21 @@ private struct EndToEndWorkspaceLocator: ProjectWorkspaceLocating {
     func workspaceRoot(for projectID: ProjectID) throws -> URL {
         _ = projectID
         return root
+    }
+}
+
+/// 되감기가 서버의 현재 폴더를 다시 읽을 수 있게 하는 어댑터다.
+/// 이 fixture는 폴더만 다루므로 문서 목록은 비운다.
+private struct EndToEndFolderSnapshotClient: SyncV2SnapshotClienting {
+    let server: FakeFolderServer
+
+    func fetchDocuments(
+        projectID: UUID
+    ) async throws -> [SyncV2RemoteDocumentSnapshot] { [] }
+
+    func fetchFolders(
+        projectID: UUID
+    ) async throws -> [SyncV2RemoteFolder] {
+        await server.folderList()
     }
 }

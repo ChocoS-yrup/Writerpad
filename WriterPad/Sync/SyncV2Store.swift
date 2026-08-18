@@ -585,9 +585,9 @@ protocol SyncV2DispatchStoring: Sendable {
     /// 다른 기기가 먼저 바꿔 서버 revision이 앞서 나갔을 때, 이 작업의 기준선만
     /// 서버 값으로 다시 잡고 다시 보낼 수 있게 되돌린다. 폴더 대기열이 없는
     /// 구현은 기본값을 그대로 쓴다.
-    func rebaseFolder(
+    func rebaseFolderAfterRevisionConflict(
         _ operation: SyncV2FolderDispatchOperation,
-        serverRevision: Int64
+        remote: SyncV2RemoteFolder
     ) async throws
     func complete(
         _ operation: SyncV2DispatchOperation,
@@ -646,12 +646,11 @@ protocol SyncV2DispatchStoring: Sendable {
 }
 
 extension SyncV2DispatchStoring {
-    func rebaseFolder(
+    func rebaseFolderAfterRevisionConflict(
         _ operation: SyncV2FolderDispatchOperation,
-        serverRevision: Int64
+        remote: SyncV2RemoteFolder
     ) async throws {
-        _ = operation
-        _ = serverRevision
+        _ = (operation, remote)
         throw SyncV2DispatchStoreError.unavailable
     }
 
@@ -719,8 +718,8 @@ actor SyncV2Store:
     SyncV2DocumentRevisionProviding,
     SyncV2FolderMigrationMarking,
     SyncV2SnapshotStateStoring {
-    static let currentSchemaVersion = 4
-    static let migrationName = "SyncV2StoreSchemaV4"
+    static let currentSchemaVersion = 5
+    static let migrationName = "SyncV2StoreSchemaV5"
     static let maximumContentByteCount = 10 * 1_024 * 1_024
     static let contentTooLargeErrorCode = "CONTENT_TOO_LARGE"
 
@@ -1083,6 +1082,412 @@ actor SyncV2Store:
                     )
                     try stepDone(statement)
                 }
+            }
+            return true
+        }
+    }
+
+    func applyFolderSnapshotBaselines(
+        localProjectID: ProjectID,
+        serverProjectID: UUID,
+        folders: [SyncV2RemoteFolder],
+        excluding blockedFolderIDs: Set<UUID>
+    ) async throws {
+        let timestamp = Self.timestamp()
+        try transaction {
+            for folder in folders where
+                !blockedFolderIDs.contains(folder.folderID) {
+                let folderValue = folder.folderID.uuidString.lowercased()
+                let hasActiveOperation = try withStatement(
+                    """
+                    SELECT EXISTS(
+                        SELECT 1 FROM sync_operations
+                        WHERE folder_id = ?
+                          AND status NOT IN ('completed', 'cancelled')
+                    );
+                    """
+                ) { statement in
+                    try bind(folderValue, at: 1, to: statement)
+                    guard sqlite3_step(statement) == SQLITE_ROW else {
+                        throw SyncV2DispatchStoreError.integrityFailure
+                    }
+                    return sqlite3_column_int(statement, 0) == 1
+                }
+                guard !hasActiveOperation else { continue }
+
+                let existing = try withStatement(
+                    """
+                    SELECT local_project_id, project_id, server_revision
+                    FROM sync_folders
+                    WHERE folder_id = ?
+                    LIMIT 1;
+                    """
+                ) { statement -> (String, String, Int64)? in
+                    try bind(folderValue, at: 1, to: statement)
+                    let status = sqlite3_step(statement)
+                    if status == SQLITE_DONE { return nil }
+                    guard
+                        status == SQLITE_ROW,
+                        let localValue = columnText(statement, at: 0),
+                        let projectValue = columnText(statement, at: 1)
+                    else {
+                        throw SyncV2DispatchStoreError.integrityFailure
+                    }
+                    return (
+                        localValue,
+                        projectValue,
+                        sqlite3_column_int64(statement, 2)
+                    )
+                }
+                if let existing {
+                    guard
+                        existing.0 == localProjectID.rawValue.uuidString
+                            .lowercased(),
+                        existing.1 == serverProjectID.uuidString.lowercased()
+                    else {
+                        throw SyncV2DispatchStoreError.integrityFailure
+                    }
+                    guard folder.revision >= existing.2 else { continue }
+                    try withStatement(
+                        """
+                        UPDATE sync_folders
+                        SET parent_folder_id = ?,
+                            name = ?,
+                            server_revision = ?,
+                            is_deleted = ?,
+                            server_updated_at = ?,
+                            sync_state = 'synced',
+                            last_error_code = NULL,
+                            updated_at = ?
+                        WHERE folder_id = ?;
+                        """
+                    ) { statement in
+                        try bind(
+                            folder.parentFolderID?.uuidString.lowercased(),
+                            at: 1,
+                            to: statement
+                        )
+                        try bind(folder.name, at: 2, to: statement)
+                        try bind(folder.revision, at: 3, to: statement)
+                        try bind(folder.isDeleted ? 1 : 0, at: 4, to: statement)
+                        try bind(
+                            Self.timestamp(folder.updatedAt),
+                            at: 5,
+                            to: statement
+                        )
+                        try bind(timestamp, at: 6, to: statement)
+                        try bind(folderValue, at: 7, to: statement)
+                        try stepDone(statement)
+                    }
+                } else {
+                    try withStatement(
+                        """
+                        INSERT INTO sync_folders(
+                            folder_id, local_project_id, project_id,
+                            parent_folder_id, name, server_revision,
+                            is_deleted, server_updated_at, sync_state,
+                            next_folder_sequence, created_at, updated_at
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'synced', 1, ?, ?);
+                        """
+                    ) { statement in
+                        try bind(folderValue, at: 1, to: statement)
+                        try bind(
+                            localProjectID.rawValue.uuidString.lowercased(),
+                            at: 2,
+                            to: statement
+                        )
+                        try bind(
+                            serverProjectID.uuidString.lowercased(),
+                            at: 3,
+                            to: statement
+                        )
+                        try bind(
+                            folder.parentFolderID?.uuidString.lowercased(),
+                            at: 4,
+                            to: statement
+                        )
+                        try bind(folder.name, at: 5, to: statement)
+                        try bind(folder.revision, at: 6, to: statement)
+                        try bind(folder.isDeleted ? 1 : 0, at: 7, to: statement)
+                        try bind(
+                            Self.timestamp(folder.updatedAt),
+                            at: 8,
+                            to: statement
+                        )
+                        try bind(timestamp, at: 9, to: statement)
+                        try bind(timestamp, at: 10, to: statement)
+                        try stepDone(statement)
+                    }
+                }
+            }
+        }
+    }
+
+    func adoptEquivalentInitialDocument(
+        localProjectID: ProjectID,
+        serverProjectID: UUID,
+        localDocumentID: UUID,
+        snapshot: SyncV2RemoteDocumentSnapshot
+    ) async throws -> Bool {
+        guard localDocumentID != snapshot.documentID,
+              snapshot.revision == 1,
+              !snapshot.isDeleted,
+              snapshot.relativePath != syncV2TreeOrderPath,
+              snapshot.relativePath != syncV2TrashPurgePath
+        else { return false }
+
+        let localIdentifier = localDocumentID.uuidString.lowercased()
+        let remoteIdentifier = snapshot.documentID.uuidString.lowercased()
+        let supersededPath =
+            "__antigravity__/identity-superseded/\(localIdentifier).txt"
+        let hash = SHA256.hash(data: Data(snapshot.content.utf8))
+            .map { String(format: "%02x", $0) }
+            .joined()
+
+        return try transaction {
+            let remoteState = try snapshotState(
+                localProjectID: localProjectID,
+                serverProjectID: serverProjectID,
+                documentID: snapshot.documentID
+            )
+            if let remoteState,
+               remoteState.serverRevision == snapshot.revision,
+               remoteState.serverPath == snapshot.relativePath {
+                let oldPath = try withStatement(
+                    """
+                    SELECT local_path
+                    FROM sync_documents
+                    WHERE document_id = ?
+                      AND local_project_id = ?
+                      AND project_id = ?
+                    LIMIT 1;
+                    """
+                ) { statement -> String? in
+                    try bind(localIdentifier, at: 1, to: statement)
+                    try bind(
+                        localProjectID.rawValue.uuidString.lowercased(),
+                        at: 2,
+                        to: statement
+                    )
+                    try bind(
+                        serverProjectID.uuidString.lowercased(),
+                        at: 3,
+                        to: statement
+                    )
+                    guard sqlite3_step(statement) == SQLITE_ROW else {
+                        return nil
+                    }
+                    return columnText(statement, at: 0)
+                }
+                return oldPath == supersededPath
+            }
+            guard remoteState == nil else { return false }
+
+            let localRow = try withStatement(
+                """
+                SELECT server_revision, server_path
+                FROM sync_documents
+                WHERE document_id = ?
+                  AND local_project_id = ?
+                  AND project_id = ?
+                LIMIT 1;
+                """
+            ) { statement -> (Int64, String)? in
+                try bind(localIdentifier, at: 1, to: statement)
+                try bind(
+                    localProjectID.rawValue.uuidString.lowercased(),
+                    at: 2,
+                    to: statement
+                )
+                try bind(
+                    serverProjectID.uuidString.lowercased(),
+                    at: 3,
+                    to: statement
+                )
+                guard sqlite3_step(statement) == SQLITE_ROW,
+                      let serverPath = columnText(statement, at: 1)
+                else { return nil }
+                return (
+                    sqlite3_column_int64(statement, 0),
+                    serverPath
+                )
+            }
+            guard let localRow,
+                  localRow.0 == 0,
+                  localRow.1 == snapshot.relativePath
+            else { return false }
+
+            let hasHistoryOrConflict = try withStatement(
+                """
+                SELECT
+                    EXISTS(
+                        SELECT 1
+                        FROM sync_operations
+                        WHERE document_id = ?
+                          AND status = 'completed'
+                    ),
+                    EXISTS(
+                        SELECT 1
+                        FROM sync_conflicts
+                        WHERE document_id = ?
+                    );
+                """
+            ) { statement in
+                try bind(localIdentifier, at: 1, to: statement)
+                try bind(localIdentifier, at: 2, to: statement)
+                guard sqlite3_step(statement) == SQLITE_ROW else {
+                    throw sqliteError()
+                }
+                return sqlite3_column_int(statement, 0) == 1
+                    || sqlite3_column_int(statement, 1) == 1
+            }
+            guard !hasHistoryOrConflict else { return false }
+
+            let operationEligibility = try withStatement(
+                """
+                SELECT COUNT(*), COALESCE(SUM(
+                    CASE WHEN operation_kind = 'document_commit'
+                           AND base_revision = 0
+                           AND base_content = ''
+                           AND local_path = ?
+                           AND relative_path = ?
+                           AND content = ?
+                           AND content_hash = ?
+                           AND local_save_generation = 0
+                           AND is_deleted = 0
+                         THEN 1 ELSE 0 END
+                ), 0)
+                FROM sync_operations
+                WHERE document_id = ?
+                  AND status NOT IN ('completed', 'cancelled')
+                """
+            ) { statement -> (Int, Int) in
+                try bind(snapshot.relativePath, at: 1, to: statement)
+                try bind(snapshot.relativePath, at: 2, to: statement)
+                try bind(snapshot.content, at: 3, to: statement)
+                try bind(hash, at: 4, to: statement)
+                try bind(localIdentifier, at: 5, to: statement)
+                guard sqlite3_step(statement) == SQLITE_ROW else {
+                    throw sqliteError()
+                }
+                return (
+                    Int(sqlite3_column_int64(statement, 0)),
+                    Int(sqlite3_column_int64(statement, 1))
+                )
+            }
+            guard operationEligibility.0 > 0,
+                  operationEligibility.0 == operationEligibility.1
+            else { return false }
+            let affectedBatchIDs = try withStatement(
+                """
+                SELECT DISTINCT batch_id
+                FROM sync_operations
+                WHERE document_id = ?
+                  AND status NOT IN ('completed', 'cancelled');
+                """
+            ) { statement -> [UUID] in
+                try bind(localIdentifier, at: 1, to: statement)
+                var values: [UUID] = []
+                while true {
+                    let status = sqlite3_step(statement)
+                    if status == SQLITE_DONE { return values }
+                    guard status == SQLITE_ROW,
+                          let value = columnText(statement, at: 0),
+                          let identifier = UUID(uuidString: value)
+                    else { throw SyncV2StoreError.invalidStoredData }
+                    values.append(identifier)
+                }
+            }
+
+            let timestamp = Self.timestamp()
+            // 문서의 신원이 서버 것으로 넘어갔다. 옛 신원으로 보내려던 것들은
+            // 밀려난 것이지 취소된 것이 아니다. 이어받을 작업이 따로 없으므로
+            // 가리킬 상대는 없다.
+            let superseded = try prepareOperationEvents(
+                where: """
+                document_id = ?
+                  AND status NOT IN ('completed', 'cancelled')
+                """,
+                timestamp: timestamp
+            ) { statement in
+                try bind(localIdentifier, at: 1, to: statement)
+            }
+            try withStatement(
+                """
+                UPDATE sync_operations
+                SET status = 'cancelled',
+                    last_error_code = 'SUPERSEDED_BY_SERVER_IDENTITY',
+                    last_error_detail = NULL,
+                    next_attempt_at = NULL,
+                    updated_at = ?
+                WHERE document_id = ?
+                  AND status NOT IN ('completed', 'cancelled');
+                """
+            ) { statement in
+                try bind(timestamp, at: 1, to: statement)
+                try bind(localIdentifier, at: 2, to: statement)
+                try stepDone(statement)
+            }
+            try recordOperationEvents(
+                superseded,
+                type: .superseded,
+                errorCode: "SUPERSEDED_BY_SERVER_IDENTITY",
+                timestamp: timestamp
+            )
+            try withStatement(
+                """
+                UPDATE sync_documents
+                SET local_path = ?, is_deleted = 1,
+                    sync_state = 'synced', last_error_code = NULL,
+                    updated_at = ?
+                WHERE document_id = ?;
+                """
+            ) { statement in
+                try bind(supersededPath, at: 1, to: statement)
+                try bind(timestamp, at: 2, to: statement)
+                try bind(localIdentifier, at: 3, to: statement)
+                try stepDone(statement)
+                guard sqlite3_changes(connection.handle) == 1 else {
+                    throw SyncV2StoreError.invalidStoredData
+                }
+            }
+            try withStatement(
+                """
+                INSERT INTO sync_documents(
+                    document_id, local_project_id, project_id,
+                    local_path, server_path, server_revision,
+                    base_content, base_hash, is_deleted,
+                    server_updated_at, sync_state,
+                    next_document_sequence, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, ?, 'synced', 1, ?, ?);
+                """
+            ) { statement in
+                try bind(remoteIdentifier, at: 1, to: statement)
+                try bind(
+                    localProjectID.rawValue.uuidString.lowercased(),
+                    at: 2,
+                    to: statement
+                )
+                try bind(
+                    serverProjectID.uuidString.lowercased(),
+                    at: 3,
+                    to: statement
+                )
+                try bind(snapshot.relativePath, at: 4, to: statement)
+                try bind(snapshot.relativePath, at: 5, to: statement)
+                try bind(snapshot.revision, at: 6, to: statement)
+                try bind(snapshot.content, at: 7, to: statement)
+                try bind(hash, at: 8, to: statement)
+                try bind(Self.timestamp(snapshot.updatedAt), at: 9, to: statement)
+                try bind(timestamp, at: 10, to: statement)
+                try bind(timestamp, at: 11, to: statement)
+                try stepDone(statement)
+            }
+            for batchID in affectedBatchIDs {
+                try refreshBatchState(
+                    batchID: batchID,
+                    timestamp: timestamp
+                )
             }
             return true
         }
@@ -1739,7 +2144,22 @@ actor SyncV2Store:
         try scalarInt("SELECT COUNT(*) FROM sync_operations;")
     }
 
+    /// 작업의 지금 상태다.
+    ///
+    /// 저장된 칸이 아니라 사건 기록에서 계산한다. 칸은 계산 결과를 그대로
+    /// 비추어 두는 자리일 뿐이고, 둘이 갈라지면 사건 쪽이 옳다. 기록이 아직
+    /// 없는 작업만 칸을 그대로 읽는다.
     func operationStatus(
+        operationID: UUID
+    ) throws -> String? {
+        let events = try operationEvents(operationID: operationID)
+        if let derived = try? SyncV2OperationStateDerivation.state(from: events) {
+            return derived.rawValue
+        }
+        return try storedOperationStatus(operationID: operationID)
+    }
+
+    private func storedOperationStatus(
         operationID: UUID
     ) throws -> String? {
         try withStatement(
@@ -1850,6 +2270,90 @@ actor SyncV2Store:
                     localProjectID: nil,
                     timestamp: timestamp
                 )
+                // ensure_project는 서버 ensure RPC가 성공하고 binding이 저장된
+                // 뒤에 남기는 durable 감사 기록이다. 별도 dispatcher lane이
+                // 없으므로 pending으로 두면 같은 초기 batch의 tree-order를
+                // 영구히 막는다. 예전 빌드가 남긴 행도 완료로 정리한다.
+                let settledEnsures = try prepareOperationEvents(
+                    where: """
+                    operation_kind = 'ensure_project'
+                      AND status NOT IN ('completed', 'cancelled')
+                      AND EXISTS (
+                          SELECT 1 FROM sync_projects p
+                          WHERE p.local_project_id =
+                                sync_operations.local_project_id
+                            AND p.server_project_id =
+                                sync_operations.project_id
+                            AND p.owner_subject =
+                                sync_operations.owner_subject
+                            AND p.binding_kind <> 'local_only'
+                      )
+                    """,
+                    timestamp: timestamp
+                )
+                try execute(
+                    """
+                    UPDATE sync_operations
+                    SET status = 'completed',
+                        last_error_code = NULL,
+                        last_error_detail = NULL,
+                        next_attempt_at = NULL,
+                        updated_at = strftime(
+                            '%Y-%m-%dT%H:%M:%fZ', 'now'
+                        )
+                    WHERE operation_kind = 'ensure_project'
+                      AND status NOT IN ('completed', 'cancelled')
+                      AND EXISTS (
+                          SELECT 1 FROM sync_projects p
+                          WHERE p.local_project_id =
+                                sync_operations.local_project_id
+                            AND p.server_project_id =
+                                sync_operations.project_id
+                            AND p.owner_subject =
+                                sync_operations.owner_subject
+                            AND p.binding_kind <> 'local_only'
+                      );
+                    """
+                )
+                try recordOperationEvents(
+                    settledEnsures,
+                    type: .committed,
+                    errorCode: nil,
+                    timestamp: timestamp
+                )
+                // 폴더 revision 충돌은 최신 folders snapshot 위로 자동 rebase할
+                // 수 있다. 앱이 충돌을 기록한 직후 종료됐어도 다음 실행에서
+                // dispatcher가 다시 받아 영구 대기에 남지 않게 한다.
+                let rebasableFolders = try prepareOperationEvents(
+                    where: """
+                    folder_id IS NOT NULL
+                      AND status = 'conflict'
+                      AND last_error_code = 'REVISION_CONFLICT'
+                    """,
+                    timestamp: timestamp
+                )
+                try execute(
+                    """
+                    UPDATE sync_operations
+                    SET status = 'pending',
+                        attempts = 0,
+                        last_error_code = NULL,
+                        last_error_detail = NULL,
+                        next_attempt_at = NULL,
+                        updated_at = strftime(
+                            '%Y-%m-%dT%H:%M:%fZ', 'now'
+                        )
+                    WHERE folder_id IS NOT NULL
+                      AND status = 'conflict'
+                      AND last_error_code = 'REVISION_CONFLICT';
+                    """
+                )
+                try recordOperationEvents(
+                    rebasableFolders,
+                    type: .enqueued,
+                    errorCode: nil,
+                    timestamp: timestamp
+                )
                 // 서버 프로젝트가 삭제 후 같은 UUID로 다시 만들어지는 등
                 // 로컬 revision 기준선만 남은 경우, 이전 실행에서
                 // DOCUMENT_NOT_FOUND로 막힌 첫 operation을 create로 되돌린다.
@@ -1942,6 +2446,12 @@ actor SyncV2Store:
                     localProjectID: nil,
                     timestamp: timestamp
                 )
+                // 발송 도중 앱이 꺼진 작업이다. 계속 발송 중이라고 믿으면
+                // 아무도 다시 손대지 않아 영영 대기에 남는다.
+                let interrupted = try prepareOperationEvents(
+                    where: "status = 'inflight'",
+                    timestamp: timestamp
+                )
                 try execute(
                     """
                     UPDATE sync_operations
@@ -1950,6 +2460,12 @@ actor SyncV2Store:
                         updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
                     WHERE status = 'inflight';
                     """
+                )
+                try recordOperationEvents(
+                    interrupted,
+                    type: .enqueued,
+                    errorCode: nil,
+                    timestamp: timestamp
                 )
                 try execute(
                     """
@@ -1970,6 +2486,13 @@ actor SyncV2Store:
                     updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
                     """
                 )
+                // 상태 정리가 모두 끝난 뒤에 사건 기록을 채운다. 앞의 정리들이
+                // status를 바꾸므로, 먼저 채우면 기록과 칸이 어긋난 채로 남는다.
+                try backfillOperationEvents()
+                // 앞이 끊겨 발송 대상에서 빠진 작업을 지금 리비전 위로
+                // 되세운다. 이것이 없으면 사용자가 쓴 글이 대기 중이라는
+                // 표시만 단 채 영영 올라가지 않는다.
+                try adoptOrphanedOperationsLocked()
             }
         } catch {
             throw SyncV2StoreError.unavailable(
@@ -2028,6 +2551,52 @@ actor SyncV2Store:
                                 'completed', 'cancelled'
                             )
                       )
+                      AND (
+                          o.operation_kind = 'tree_order'
+                          OR NOT EXISTS (
+                              SELECT 1
+                              FROM sync_operations folderDependency
+                              WHERE folderDependency.batch_id = o.batch_id
+                                AND folderDependency.folder_id IS NOT NULL
+                                AND folderDependency.status NOT IN (
+                                    'completed', 'cancelled'
+                                )
+                          )
+                      )
+                      AND (
+                          o.operation_kind <> 'tree_order'
+                          OR NOT EXISTS (
+                              SELECT 1
+                              FROM sync_operations batchDependency
+                              WHERE batchDependency.batch_id = o.batch_id
+                                AND batchDependency.operation_id
+                                    <> o.operation_id
+                                AND batchDependency.status NOT IN (
+                                    'completed', 'cancelled'
+                                )
+                          )
+                      )
+                      AND (
+                          o.operation_kind <> 'tree_order'
+                          OR NOT EXISTS (
+                              SELECT 1
+                              FROM sync_operations structuralDependency
+                              JOIN sync_batches structuralBatch
+                                ON structuralBatch.batch_id
+                                    = structuralDependency.batch_id
+                              WHERE structuralDependency.local_project_id
+                                    = o.local_project_id
+                                AND structuralDependency.queue_id < o.queue_id
+                                AND structuralDependency.status NOT IN (
+                                    'completed', 'cancelled'
+                                )
+                                AND structuralBatch.batch_kind IN (
+                                    'structure_change', 'volume_creation',
+                                    'trash_change', 'backup_restore',
+                                    'windows_import'
+                                )
+                          )
+                      )
                   )
                   OR (
                       o.folder_id IS NOT NULL
@@ -2040,6 +2609,18 @@ actor SyncV2Store:
                             AND earlier.status NOT IN (
                                 'completed', 'cancelled'
                             )
+                      )
+                      AND (
+                          o.is_deleted = 1
+                          OR NOT EXISTS (
+                              SELECT 1
+                              FROM sync_operations parentOperation
+                              WHERE parentOperation.folder_id
+                                    = o.parent_folder_id
+                                AND parentOperation.status NOT IN (
+                                    'completed', 'cancelled'
+                                )
+                          )
                       )
                   )
               )
@@ -2096,6 +2677,11 @@ actor SyncV2Store:
                     nowValue: nowValue
                 )
                 for operation in candidates {
+                    let operationKey = operation.operationID.uuidString.lowercased()
+                    try ensureOperationEventHistory(
+                        operationID: operationKey,
+                        timestamp: nowValue
+                    )
                     try withStatement(
                         """
                         UPDATE sync_operations
@@ -2108,17 +2694,19 @@ actor SyncV2Store:
                         """
                     ) { statement in
                         try bind(nowValue, at: 1, to: statement)
-                        try bind(
-                            operation.operationID.uuidString.lowercased(),
-                            at: 2,
-                            to: statement
-                        )
+                        try bind(operationKey, at: 2, to: statement)
                         try stepDone(statement)
                         guard sqlite3_changes(connection.handle) == 1 else {
                             throw SyncV2DispatchStoreError
                                 .operationStateChanged
                         }
                     }
+                    try appendOperationEvent(
+                        operationID: operationKey,
+                        type: .dispatchStarted,
+                        errorCode: nil,
+                        timestamp: nowValue
+                    )
                     try withStatement(
                         """
                         UPDATE sync_batches
@@ -2208,6 +2796,11 @@ actor SyncV2Store:
                 nowValue: nowValue
             )
             for operation in candidates {
+                let operationKey = operation.operationID.uuidString.lowercased()
+                try ensureOperationEventHistory(
+                    operationID: operationKey,
+                    timestamp: nowValue
+                )
                 try withStatement(
                     """
                     UPDATE sync_operations
@@ -2220,16 +2813,18 @@ actor SyncV2Store:
                     """
                 ) { statement in
                     try bind(nowValue, at: 1, to: statement)
-                    try bind(
-                        operation.operationID.uuidString.lowercased(),
-                        at: 2,
-                        to: statement
-                    )
+                    try bind(operationKey, at: 2, to: statement)
                     try stepDone(statement)
                     guard sqlite3_changes(connection.handle) == 1 else {
                         throw SyncV2DispatchStoreError.operationStateChanged
                     }
                 }
+                try appendOperationEvent(
+                    operationID: operationKey,
+                    type: .dispatchStarted,
+                    errorCode: nil,
+                    timestamp: nowValue
+                )
                 try withStatement(
                     """
                     UPDATE sync_batches
@@ -2298,11 +2893,24 @@ actor SyncV2Store:
                     AND earlier.status NOT IN ('completed', 'cancelled')
               )
               AND (
-                  o.is_deleted = 0
+                  (
+                      o.is_deleted = 0
+                      -- 생성·이동·복원은 부모 폴더의 현재
+                      -- 작업을 먼저 확정해 FOLDER_NOT_FOUND를 막는다.
+                      AND NOT EXISTS (
+                          SELECT 1
+                          FROM sync_operations parentOperation
+                          WHERE parentOperation.folder_id = o.parent_folder_id
+                            AND parentOperation.status NOT IN (
+                                'completed', 'cancelled'
+                            )
+                      )
+                  )
                   OR (
+                      o.is_deleted = 1
                       -- 바로 아래 폴더만 본다. 그 폴더도 자기 자식을 기다리므로
                       -- 가장 깊은 곳부터 차례로 풀린다.
-                      NOT EXISTS (
+                      AND NOT EXISTS (
                           SELECT 1
                           FROM sync_folders child
                           JOIN sync_operations childOperation
@@ -2425,7 +3033,10 @@ actor SyncV2Store:
                     errorCode: nil,
                     detail: nil,
                     nextAttemptAt: nil,
-                    timestamp: timestamp
+                    timestamp: timestamp,
+                    // 같은 작업을 다시 보내 받은 멱등 응답이면 그대로 적는다.
+                    // 처음 올린 것과 다시 확인한 것은 다른 일이다.
+                    eventType: result.status == .replayed ? .replayed : .committed
                 )
                 try withStatement(
                     """
@@ -2540,7 +3151,8 @@ actor SyncV2Store:
                 errorCode: nil,
                 detail: nil,
                 nextAttemptAt: nil,
-                timestamp: timestamp
+                timestamp: timestamp,
+                eventType: result.status == .replayed ? .replayed : .committed
             )
             try withStatement(
                 """
@@ -2668,62 +3280,96 @@ actor SyncV2Store:
     /// 커밋하는 쪽이 이기는 것이 양쪽이 합의한 계약이다. 진 쪽은 pull로 상대
     /// 이름을 따라간다.
     ///
-    /// 기준선이 반드시 커지므로 서버가 실제로 앞서 나간 만큼만 돈다. 호출자가
-    /// 그 조건을 확인하지만 여기서도 함께 막는다.
-    func rebaseFolder(
+    /// 서버에서 이미 지워진 폴더를 이름 변경으로 되살리려는 되감기는 막는다.
+    /// 계약 적합성 벡터 TV-008이 못 박은 것이다 —
+    /// "rename does not resurrect the folder implicitly".
+    ///
+    /// `attempts`는 되돌리지 않는다. 되돌리면 되물림 사다리가 지워지고
+    /// 자동 되감기 상한도 함께 사라져, 두 기기가 서로 이름을 바꾸는 동안
+    /// 멈출 근거가 남지 않는다.
+    func rebaseFolderAfterRevisionConflict(
         _ operation: SyncV2FolderDispatchOperation,
-        serverRevision: Int64
-    ) throws {
-        guard serverRevision > operation.baseRevision else {
+        remote: SyncV2RemoteFolder
+    ) async throws {
+        guard
+            remote.folderID == operation.folderID,
+            remote.revision > operation.baseRevision,
+            !remote.isDeleted || operation.isDeleted
+        else {
             throw SyncV2DispatchStoreError.integrityFailure
         }
         let timestamp = Self.timestamp()
         try transaction {
-            try transitionInflightOperation(
-                operationID: operation.operationID,
-                attempts: operation.attempts,
-                status: .pending,
-                errorCode: nil,
-                detail: nil,
-                nextAttemptAt: nil,
-                timestamp: timestamp
-            )
             try withStatement(
                 """
                 UPDATE sync_operations
                 SET base_revision = ?,
+                    status = 'pending',
+                    last_error_code = NULL,
+                    last_error_detail = NULL,
+                    next_attempt_at = NULL,
                     updated_at = ?
-                WHERE operation_id = ?;
+                WHERE operation_id = ?
+                  AND folder_id = ?
+                  AND status = 'inflight'
+                  AND attempts = ?;
                 """
             ) { statement in
-                try bind(serverRevision, at: 1, to: statement)
+                try bind(remote.revision, at: 1, to: statement)
                 try bind(timestamp, at: 2, to: statement)
                 try bind(
                     operation.operationID.uuidString.lowercased(),
                     at: 3,
                     to: statement
                 )
+                try bind(
+                    operation.folderID.uuidString.lowercased(),
+                    at: 4,
+                    to: statement
+                )
+                try bind(operation.attempts, at: 5, to: statement)
                 try stepDone(statement)
+                guard sqlite3_changes(connection.handle) == 1 else {
+                    throw SyncV2DispatchStoreError.operationStateChanged
+                }
             }
-            // 다음에 이 폴더로 들어오는 작업이 낡은 기준선을 집지 않게 한다.
+            // name과 parent는 사용자가 막 바꾼 로컬 목표값이므로 유지한다.
+            // 여기서는 서버에서 확인한 기준 revision만 전진시킨다.
             try withStatement(
                 """
                 UPDATE sync_folders
                 SET server_revision = ?,
+                    server_updated_at = ?,
                     sync_state = 'pending',
                     last_error_code = NULL,
                     updated_at = ?
-                WHERE folder_id = ?;
+                WHERE folder_id = ?
+                  AND local_project_id = ?
+                  AND project_id = ?;
                 """
             ) { statement in
-                try bind(serverRevision, at: 1, to: statement)
-                try bind(timestamp, at: 2, to: statement)
+                try bind(remote.revision, at: 1, to: statement)
+                try bind(Self.timestamp(remote.updatedAt), at: 2, to: statement)
+                try bind(timestamp, at: 3, to: statement)
                 try bind(
                     operation.folderID.uuidString.lowercased(),
-                    at: 3,
+                    at: 4,
+                    to: statement
+                )
+                try bind(
+                    operation.localProjectID.rawValue.uuidString.lowercased(),
+                    at: 5,
+                    to: statement
+                )
+                try bind(
+                    operation.projectID.uuidString.lowercased(),
+                    at: 6,
                     to: statement
                 )
                 try stepDone(statement)
+                guard sqlite3_changes(connection.handle) == 1 else {
+                    throw SyncV2DispatchStoreError.integrityFailure
+                }
             }
             try refreshBatchState(
                 batchID: operation.batchID,
@@ -2846,6 +3492,11 @@ actor SyncV2Store:
                 let affectedBatchIDs = try activeBatchIDs(
                     documentID: operation.documentID
                 )
+                let superseded = try prepareSupersededSiblings(
+                    documentID: operation.documentID,
+                    survivingOperationID: operation.operationID,
+                    timestamp: timestamp
+                )
                 try withStatement(
                     """
                     UPDATE sync_operations
@@ -2871,6 +3522,16 @@ actor SyncV2Store:
                     )
                     try stepDone(statement)
                 }
+                // 밀려난 작업마다 누구에게 밀렸는지 함께 적는다. 나중에 왜
+                // 사라졌는지 되짚으려면 가리킬 상대가 있어야 한다.
+                try recordOperationEvents(
+                    superseded,
+                    type: .superseded,
+                    errorCode: "SUPERSEDED_BY_CONFLICT_SNAPSHOT",
+                    timestamp: timestamp,
+                    relatedOperationID:
+                        operation.operationID.uuidString.lowercased()
+                )
                 try transitionInflightOperation(
                     operation,
                     status: .conflict,
@@ -3041,6 +3702,11 @@ actor SyncV2Store:
                 let affectedBatchIDs = try activeBatchIDs(
                     documentID: request.documentID
                 )
+                let superseded = try prepareSupersededSiblings(
+                    documentID: request.documentID,
+                    survivingOperationID: request.resolutionOperationID,
+                    timestamp: timestamp
+                )
                 try withStatement(
                     """
                     UPDATE sync_operations
@@ -3073,6 +3739,14 @@ actor SyncV2Store:
                     )
                     try stepDone(statement)
                 }
+                try recordOperationEvents(
+                    superseded,
+                    type: .superseded,
+                    errorCode: "SUPERSEDED_BY_CONFLICT_RESOLUTION",
+                    timestamp: timestamp,
+                    relatedOperationID:
+                        request.resolutionOperationID.uuidString.lowercased()
+                )
                 try withStatement(
                     """
                     UPDATE sync_operations
@@ -3672,6 +4346,11 @@ actor SyncV2Store:
                 let affectedBatchIDs = try activeBatchIDs(
                     documentID: operation.documentID
                 )
+                let superseded = try prepareSupersededSiblings(
+                    documentID: operation.documentID,
+                    survivingOperationID: operation.operationID,
+                    timestamp: timestamp
+                )
                 try withStatement(
                     """
                     UPDATE sync_operations
@@ -3697,6 +4376,14 @@ actor SyncV2Store:
                     )
                     try stepDone(statement)
                 }
+                try recordOperationEvents(
+                    superseded,
+                    type: .superseded,
+                    errorCode: "SUPERSEDED_BY_AUTO_REBASE",
+                    timestamp: timestamp,
+                    relatedOperationID:
+                        operation.operationID.uuidString.lowercased()
+                )
 
                 let mergedData = Data(mergedContent.utf8)
                 let mergedHash = Self.sha256Hex(mergedData)
@@ -3802,6 +4489,11 @@ actor SyncV2Store:
         errorCode: String,
         timestamp: String
     ) throws {
+        let operationKey = operation.operationID.uuidString.lowercased()
+        try ensureOperationEventHistory(
+            operationID: operationKey,
+            timestamp: timestamp
+        )
         try withStatement(
             """
             UPDATE sync_operations
@@ -3816,17 +4508,19 @@ actor SyncV2Store:
         ) { statement in
             try bind(errorCode, at: 1, to: statement)
             try bind(timestamp, at: 2, to: statement)
-            try bind(
-                operation.operationID.uuidString.lowercased(),
-                at: 3,
-                to: statement
-            )
+            try bind(operationKey, at: 3, to: statement)
             try bind(operation.attempts, at: 4, to: statement)
             try stepDone(statement)
             guard sqlite3_changes(connection.handle) == 1 else {
                 throw SyncV2DispatchStoreError.operationStateChanged
             }
         }
+        try appendOperationEvent(
+            operationID: operationKey,
+            type: .enqueued,
+            errorCode: errorCode,
+            timestamp: timestamp
+        )
     }
 
     private func activeBatchIDs(documentID: UUID) throws -> [UUID] {
@@ -4048,6 +4742,16 @@ actor SyncV2Store:
                     localProjectID: localProjectID,
                     timestamp: timestamp
                 )
+                let projectValue =
+                    localProjectID?.rawValue.uuidString.lowercased()
+                // 바꾸기 전에 대상을 모은다. 바꾼 뒤에는 조건에 걸리지 않아
+                // 누구에게 사건을 남겨야 할지 알 수 없다.
+                let waiting = try operationIDs(
+                    where: "status = 'retry_wait' AND (? IS NULL OR local_project_id = ?)"
+                ) { statement in
+                    try bind(projectValue, at: 1, to: statement)
+                    try bind(projectValue, at: 2, to: statement)
+                }
                 try withStatement(
                     """
                     UPDATE sync_operations
@@ -4058,13 +4762,19 @@ actor SyncV2Store:
                       AND (? IS NULL OR local_project_id = ?);
                     """
                 ) { statement in
-                    let projectValue =
-                        localProjectID?.rawValue.uuidString.lowercased()
                     try bind(timestamp, at: 1, to: statement)
                     try bind(projectValue, at: 2, to: statement)
                     try bind(projectValue, at: 3, to: statement)
                     try stepDone(statement)
                 }
+                // 대기로 돌아왔다는 것을 적는다. 계약이 정한 사건 가운데
+                // 대기로 이어지는 것은 이것뿐이다.
+                try recordOperationEvents(
+                    waiting,
+                    type: .enqueued,
+                    errorCode: nil,
+                    timestamp: timestamp
+                )
             }
         } catch {
             throw SyncV2DispatchStoreError.unavailable
@@ -4140,6 +4850,19 @@ actor SyncV2Store:
             try bind(projectValue, at: 3, to: statement)
             try stepDone(statement)
         }
+        let unblocked = try prepareOperationEvents(
+            where: """
+            o.status = 'blocked'
+              AND o.last_error_code = 'FORBIDDEN'
+              AND (? IS NULL OR o.local_project_id = ?)
+              AND \(laneHeadPredicate)
+            """,
+            alias: "o",
+            timestamp: timestamp
+        ) { statement in
+            try bind(projectValue, at: 1, to: statement)
+            try bind(projectValue, at: 2, to: statement)
+        }
         try withStatement(
             """
             UPDATE sync_operations AS o
@@ -4160,6 +4883,12 @@ actor SyncV2Store:
             try bind(projectValue, at: 3, to: statement)
             try stepDone(statement)
         }
+        try recordOperationEvents(
+            unblocked,
+            type: .enqueued,
+            errorCode: nil,
+            timestamp: timestamp
+        )
         for batchID in affectedBatchIDs {
             try refreshBatchState(
                 batchID: batchID,
@@ -4272,6 +5001,23 @@ actor SyncV2Store:
             try bind(projectValue, at: 3, to: statement)
             try stepDone(statement)
         }
+        let requeued = try prepareOperationEvents(
+            where: """
+            status = 'conflict'
+              AND last_error_code IN (\(errorCodeList))
+              AND (? IS NULL OR local_project_id = ?)
+              AND NOT EXISTS (
+                  SELECT 1
+                  FROM sync_conflicts c
+                  WHERE c.document_id = sync_operations.document_id
+                    AND c.resolved_at IS NULL
+              )
+            """,
+            timestamp: timestamp
+        ) { statement in
+            try bind(projectValue, at: 1, to: statement)
+            try bind(projectValue, at: 2, to: statement)
+        }
         try withStatement(
             """
             UPDATE sync_operations
@@ -4297,6 +5043,12 @@ actor SyncV2Store:
             try bind(projectValue, at: 3, to: statement)
             try stepDone(statement)
         }
+        try recordOperationEvents(
+            requeued,
+            type: .enqueued,
+            errorCode: nil,
+            timestamp: timestamp
+        )
         for batchID in affectedBatchIDs {
             try refreshBatchState(
                 batchID: batchID,
@@ -4394,6 +5146,57 @@ actor SyncV2Store:
                   WHERE earlier.document_id = o.document_id
                     AND earlier.document_sequence < o.document_sequence
                     AND earlier.status NOT IN ('completed', 'cancelled')
+              )
+              -- 구조 변경 batch의 문서 경로는 폴더 행이
+              -- 서버에 확정된 뒤에만 공개한다.
+              AND (
+                  o.operation_kind = 'tree_order'
+                  OR NOT EXISTS (
+                      SELECT 1
+                      FROM sync_operations folderDependency
+                      WHERE folderDependency.batch_id = o.batch_id
+                        AND folderDependency.folder_id IS NOT NULL
+                        AND folderDependency.status NOT IN (
+                            'completed', 'cancelled'
+                        )
+                  )
+              )
+              -- tree_order는 같은 batch의 폴더·문서가 모두
+              -- 확정된 뒤에만 최종 바인더 순서로 발행한다.
+              AND (
+                  o.operation_kind <> 'tree_order'
+                  OR NOT EXISTS (
+                      SELECT 1
+                      FROM sync_operations batchDependency
+                      WHERE batchDependency.batch_id = o.batch_id
+                        AND batchDependency.operation_id <> o.operation_id
+                        AND batchDependency.status NOT IN (
+                            'completed', 'cancelled'
+                        )
+                  )
+              )
+              -- 빠른 연속 변경에서는 앞 tree_order가 최신 snapshot으로
+              -- 합쳐진다. 최신 줄은 앞선 모든 구조 작업까지 기다려야 한다.
+              AND (
+                  o.operation_kind <> 'tree_order'
+                  OR NOT EXISTS (
+                      SELECT 1
+                      FROM sync_operations structuralDependency
+                      JOIN sync_batches structuralBatch
+                        ON structuralBatch.batch_id
+                            = structuralDependency.batch_id
+                      WHERE structuralDependency.local_project_id
+                            = o.local_project_id
+                        AND structuralDependency.queue_id < o.queue_id
+                        AND structuralDependency.status NOT IN (
+                            'completed', 'cancelled'
+                        )
+                        AND structuralBatch.batch_kind IN (
+                            'structure_change', 'volume_creation',
+                            'trash_change', 'backup_restore',
+                            'windows_import'
+                        )
+                  )
               )
             ORDER BY o.queue_id
             """
@@ -4639,7 +5442,8 @@ actor SyncV2Store:
         errorCode: String?,
         detail: String?,
         nextAttemptAt: Date?,
-        timestamp: String
+        timestamp: String,
+        eventType: SyncV2OperationEventType? = nil
     ) throws {
         try transitionInflightOperation(
             operationID: operation.operationID,
@@ -4648,12 +5452,16 @@ actor SyncV2Store:
             errorCode: errorCode,
             detail: detail,
             nextAttemptAt: nextAttemptAt,
-            timestamp: timestamp
+            timestamp: timestamp,
+            eventType: eventType
         )
     }
 
     /// 문서와 폴더가 같은 표를 쓰므로 상태 전이도 같다. 시도 횟수를 조건에 넣어
     /// 이미 다른 흐름이 건드린 줄은 바꾸지 않는다.
+    ///
+    /// status 칸을 바꾸는 것과 사건을 남기는 것이 한 거래 안에서 함께 일어난다.
+    /// 둘 중 하나만 남으면 그때부터 기록과 칸이 갈라진다.
     private func transitionInflightOperation(
         operationID: UUID,
         attempts: Int,
@@ -4661,8 +5469,15 @@ actor SyncV2Store:
         errorCode: String?,
         detail: String?,
         nextAttemptAt: Date?,
-        timestamp: String
+        timestamp: String,
+        eventType: SyncV2OperationEventType? = nil
     ) throws {
+        // 칸을 바꾸기 전에 지난 일을 채워 둔다. 바꾼 뒤에 채우면 바뀐 상태를
+        // 지난 일로 잘못 적는다.
+        try ensureOperationEventHistory(
+            operationID: operationID.uuidString.lowercased(),
+            timestamp: timestamp
+        )
         try withStatement(
             """
             UPDATE sync_operations
@@ -4692,6 +5507,12 @@ actor SyncV2Store:
                 throw SyncV2DispatchStoreError.operationStateChanged
             }
         }
+        try appendOperationEvent(
+            operationID: operationID.uuidString.lowercased(),
+            type: eventType ?? Self.eventType(reaching: status),
+            errorCode: errorCode,
+            timestamp: timestamp
+        )
     }
 
     private func refreshBatchState(
@@ -5082,7 +5903,7 @@ actor SyncV2Store:
                 operation_id, batch_id, local_project_id, project_id,
                 owner_subject, operation_kind, project_name, status,
                 attempts, created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, 'ensure_project', ?, 'pending', 0, ?, ?);
+            ) VALUES (?, ?, ?, ?, ?, 'ensure_project', ?, 'completed', 0, ?, ?);
             """
         ) { statement in
             try bind(
@@ -5115,6 +5936,12 @@ actor SyncV2Store:
             try bind(timestamp, at: 8, to: statement)
             try stepDone(statement)
         }
+        // 만들어지는 순간의 상태를 지난 일로 적어 둔다. 이것이 없으면 뒤에
+        // 붙는 사건이 시작 없이 끝만 있는 기록이 된다.
+        try ensureOperationEventHistory(
+            operationID: operation.operationID.uuidString.lowercased(),
+            timestamp: timestamp
+        )
         try withStatement(
             """
             UPDATE sync_projects
@@ -5153,6 +5980,12 @@ actor SyncV2Store:
         if payload.kind == .treeOrder {
             try coalescePendingTreeOrderOperations(
                 documentID: payload.documentID,
+                preserveEarlierCheckpoint: batch.operations.contains {
+                    guard case let .document(document) = $0.payload else {
+                        return false
+                    }
+                    return document.kind != .treeOrder
+                },
                 timestamp: timestamp
             )
         }
@@ -5307,6 +6140,11 @@ actor SyncV2Store:
             try bind(timestamp, at: 23, to: statement)
             try stepDone(statement)
         }
+        // 대기열에 올랐다는 것이 이 작업의 첫 사건이다.
+        try ensureOperationEventHistory(
+            operationID: operation.operationID.uuidString.lowercased(),
+            timestamp: timestamp
+        )
 
         try withStatement(
             """
@@ -5336,8 +6174,13 @@ actor SyncV2Store:
 
     private func coalescePendingTreeOrderOperations(
         documentID: UUID,
+        preserveEarlierCheckpoint: Bool,
         timestamp: String
     ) throws {
+        // 이번 batch에 일반 문서 경로 변경이 있으면 편집 lease 때문에 오래
+        // 기다릴 수 있다. 그 경우 앞선 빈 폴더용 체크포인트까지 취소하면
+        // 관련 없는 문서 하나가 빈 폴더 공개를 함께 막으므로 그대로 둔다.
+        guard !preserveEarlierCheckpoint else { return }
         let affectedBatchIDs = try withStatement(
             """
             SELECT DISTINCT batch_id
@@ -5366,6 +6209,18 @@ actor SyncV2Store:
             }
         }
         guard !affectedBatchIDs.isEmpty else { return }
+        // 아직 못 보낸 옛 순서들은 새 순서에 밀려난다. 여섯 번 자리를 옮겨도
+        // 서버에 가는 것은 마지막 하나면 된다.
+        let superseded = try prepareOperationEvents(
+            where: """
+            document_id = ?
+              AND operation_kind = 'tree_order'
+              AND status IN ('pending', 'retry_wait', 'blocked')
+            """,
+            timestamp: timestamp
+        ) { statement in
+            try bind(documentID.uuidString.lowercased(), at: 1, to: statement)
+        }
         try withStatement(
             """
             UPDATE sync_operations
@@ -5387,6 +6242,12 @@ actor SyncV2Store:
             )
             try stepDone(statement)
         }
+        try recordOperationEvents(
+            superseded,
+            type: .superseded,
+            errorCode: "SUPERSEDED_BY_TREE_ORDER",
+            timestamp: timestamp
+        )
         for batchID in affectedBatchIDs {
             try refreshBatchState(batchID: batchID, timestamp: timestamp)
         }
@@ -5666,6 +6527,11 @@ actor SyncV2Store:
             try bind(timestamp, at: 14, to: statement)
             try stepDone(statement)
         }
+        // 폴더 작업도 대기열에 올랐다는 첫 사건을 남긴다.
+        try ensureOperationEventHistory(
+            operationID: operation.operationID.uuidString.lowercased(),
+            timestamp: timestamp
+        )
 
         try withStatement(
             """
@@ -6266,6 +7132,646 @@ actor SyncV2Store:
         } catch {
             throw ProjectBindingStoreError.invalidBinding
         }
+    }
+
+    // MARK: - 사건 기록
+
+    /// 사건 기록이 없는 작업에 지금 상태를 되만들어 넣는다.
+    ///
+    /// 이미 대기열에 쌓여 있던 작업들은 사건 기록 없이 status 칸만 들고 있다.
+    /// 읽는 쪽을 사건 계산으로 옮기려면 그 전에 기록이 있어야 한다.
+    ///
+    /// 되만든 기록은 **다시 계산했을 때 지금 status와 같은 값이 나오도록** 만든다.
+    /// 그래야 읽는 쪽을 옮기는 순간 아무것도 달라지지 않고, 그 뒤에 생기는
+    /// 어긋남은 전부 진짜 신호가 된다.
+    ///
+    /// 발송 도중 꺼진 작업을 어떻게 되살릴지는 여기서 정하지 않는다. 그것은
+    /// 복구의 문제이고, 이 함수는 지금 있는 것을 옮겨 적기만 한다.
+    ///
+    /// 같은 작업에 여러 번 돌아도 결과가 같다. 사건 식별자를 작업 식별자와
+    /// 사건 종류에서 계산하고, 이미 기록이 있는 작업은 건너뛴다.
+    func backfillOperationEvents() throws {
+        let pending = try withStatement(
+            """
+            SELECT operation_id, status, last_error_code
+            FROM sync_operations
+            WHERE NOT EXISTS (
+                SELECT 1 FROM sync_operation_events e
+                WHERE e.operation_id = sync_operations.operation_id
+            )
+            ORDER BY queue_id;
+            """
+        ) { statement -> [(String, String, String?)] in
+            var rows: [(String, String, String?)] = []
+            while sqlite3_step(statement) == SQLITE_ROW {
+                guard let operationID = sqlite3_column_text(statement, 0),
+                      let status = sqlite3_column_text(statement, 1)
+                else {
+                    throw SyncV2StoreError.invalidStoredData
+                }
+                let errorCode = sqlite3_column_text(statement, 2)
+                    .map { String(cString: $0) }
+                rows.append((
+                    String(cString: operationID),
+                    String(cString: status),
+                    errorCode
+                ))
+            }
+            return rows
+        }
+        guard !pending.isEmpty else { return }
+
+        let recordedAt = Self.timestamp()
+        for (operationID, status, errorCode) in pending {
+            guard let state = SyncV2OperationStatus(rawValue: status) else {
+                throw SyncV2StoreError.invalidStoredData
+            }
+            try seedOperationEvents(
+                operationID: operationID,
+                state: state,
+                errorCode: errorCode,
+                recordedAt: recordedAt,
+                skipIfPresent: false
+            )
+        }
+    }
+
+    /// 그 상태에 이르게 하는 사건이다.
+    ///
+    /// `completed`는 `committed`와 `replayed` 둘 다에서 나온다. 둘을 가릴 수
+    /// 있는 자리에서는 부르는 쪽이 직접 알려 준다. 여기서는 흔한 쪽을 고른다.
+    static func eventType(
+        reaching status: SyncV2OperationStatus
+    ) -> SyncV2OperationEventType {
+        switch status {
+        case .pending: return .enqueued
+        case .inflight: return .dispatchStarted
+        case .retryWait: return .retryScheduled
+        case .blocked: return .blocked
+        case .conflict: return .conflictDetected
+        case .completed: return .committed
+        case .cancelled: return .cancelRequested
+        }
+    }
+
+    /// 사건 기록이 아직 없는 작업에 지금 상태를 되만들어 넣는다.
+    ///
+    /// 쓰기 경로를 하나씩 옮기는 동안에는, 아직 안 옮긴 경로가 만든 작업이
+    /// 기록 없이 들어와 있을 수 있다. 그 위에 곧바로 사건을 얹으면 시작도
+    /// 없이 끝만 있는 기록이 된다. 그래서 얹기 전에 지난 일을 채운다.
+    ///
+    /// 쓰기 경로를 다 옮기고 나면 이 되만들기는 아무 일도 하지 않는다.
+    private func ensureOperationEventHistory(
+        operationID: String,
+        timestamp: String
+    ) throws {
+        let status = try withStatement(
+            """
+            SELECT status FROM sync_operations WHERE operation_id = ?;
+            """
+        ) { statement -> String? in
+            try bind(operationID, at: 1, to: statement)
+            guard sqlite3_step(statement) == SQLITE_ROW,
+                  let value = sqlite3_column_text(statement, 0)
+            else {
+                return nil
+            }
+            return String(cString: value)
+        }
+        guard let status, let state = SyncV2OperationStatus(rawValue: status) else {
+            return
+        }
+        try seedOperationEvents(
+            operationID: operationID,
+            state: state,
+            errorCode: nil,
+            recordedAt: timestamp,
+            skipIfPresent: true
+        )
+    }
+
+    /// 조건에 걸리는 작업의 식별자를 모은다.
+    ///
+    /// 여러 줄을 한꺼번에 바꾸는 자리에서 쓴다. 바꾸기 **전에** 불러야 한다.
+    /// 바꾼 뒤에는 조건에 더 이상 걸리지 않아 누구에게 사건을 남겨야 할지
+    /// 알 수 없다.
+    ///
+    /// 조건이 별칭으로 자기 표를 가리키면 `alias`를 준다. 상관 부질의가
+    /// `sync_operations`라는 이름을 그대로 쓰는 조건에는 주지 않는다. 별칭을
+    /// 붙이면 그 이름으로는 더 이상 가리킬 수 없다.
+    private func operationIDs(
+        where condition: String,
+        alias: String? = nil,
+        bind binder: (OpaquePointer) throws -> Void
+    ) throws -> [String] {
+        let target = alias.map { "sync_operations AS \($0)" } ?? "sync_operations"
+        return try withStatement(
+            "SELECT operation_id FROM \(target) WHERE \(condition);"
+        ) { statement in
+            try binder(statement)
+            var ids: [String] = []
+            while sqlite3_step(statement) == SQLITE_ROW {
+                guard let value = sqlite3_column_text(statement, 0) else {
+                    throw SyncV2StoreError.invalidStoredData
+                }
+                ids.append(String(cString: value))
+            }
+            return ids
+        }
+    }
+
+    /// 여럿을 한꺼번에 바꾸기 직전에 부른다. 대상을 모으고, 각자의 지난 일을
+    /// 채워 둔 뒤 식별자를 돌려준다.
+    ///
+    /// 바꾼 다음에 `recordOperationEvents`로 사건을 남기면 된다.
+    ///
+    /// 이미 끝난 것으로 계산되는 작업은 목록에서 뺀다. 계약이 끝난 작업에는
+    /// 사건을 못 붙이게 하는데, 여기서 그걸 오류로 올리면 장부 한 줄이
+    /// 어긋났다는 이유로 저장소가 아예 열리지 않는다. 그러면 사용자는 동기화를
+    /// 통째로 잃는다. 대신 그냥 두고 `operationStateDivergences()`에 드러나게
+    /// 한다. 고칠 것이 있으면 그걸 보고 고치면 된다.
+    private func prepareOperationEvents(
+        where condition: String,
+        alias: String? = nil,
+        timestamp: String,
+        bind binder: (OpaquePointer) throws -> Void = { _ in }
+    ) throws -> [String] {
+        let targets = try operationIDs(
+            where: condition,
+            alias: alias,
+            bind: binder
+        )
+        var appendable: [String] = []
+        for operationID in targets {
+            try ensureOperationEventHistory(
+                operationID: operationID,
+                timestamp: timestamp
+            )
+            let events = try operationEvents(operationID: operationID)
+            guard (try? SyncV2OperationStateDerivation
+                .requireAppendable(to: events)) != nil
+            else {
+                continue
+            }
+            appendable.append(operationID)
+        }
+        return appendable
+    }
+
+    /// 여러 작업에 같은 사건을 남긴다.
+    private func recordOperationEvents(
+        _ operationIDs: [String],
+        type: SyncV2OperationEventType,
+        errorCode: String?,
+        timestamp: String,
+        relatedOperationID: String? = nil
+    ) throws {
+        for operationID in operationIDs {
+            try appendOperationEvent(
+                operationID: operationID,
+                type: type,
+                errorCode: errorCode,
+                timestamp: timestamp,
+                relatedOperationID: relatedOperationID
+            )
+        }
+    }
+
+    /// 한 문서에 걸려 있던 다른 작업들을 밀어낼 준비를 한다.
+    ///
+    /// 살아남는 작업 하나만 남기고 나머지를 고른다. 밀어낸 뒤에는 조건에
+    /// 걸리지 않으므로 바꾸기 전에 불러야 한다.
+    private func prepareSupersededSiblings(
+        documentID: UUID,
+        survivingOperationID: UUID,
+        timestamp: String
+    ) throws -> [String] {
+        try prepareOperationEvents(
+            where: """
+            document_id = ?
+              AND operation_id <> ?
+              AND status NOT IN ('completed', 'cancelled')
+            """,
+            timestamp: timestamp
+        ) { statement in
+            try bind(documentID.uuidString.lowercased(), at: 1, to: statement)
+            try bind(
+                survivingOperationID.uuidString.lowercased(),
+                at: 2,
+                to: statement
+            )
+        }
+    }
+
+    /// 사건을 하나 덧붙인다.
+    ///
+    /// 이미 끝난 작업에는 붙이지 않는다. 붙이면 끝난 작업이 되살아나 다시
+    /// 발송된다. 계약이 `OPERATION_TERMINAL`로 막으라고 한 자리다.
+    private func appendOperationEvent(
+        operationID: String,
+        type: SyncV2OperationEventType,
+        errorCode: String?,
+        timestamp: String,
+        relatedOperationID: String? = nil
+    ) throws {
+        let events = try operationEvents(operationID: operationID)
+        try SyncV2OperationStateDerivation.requireAppendable(to: events)
+        try insertOperationEvent(
+            eventID: UUID().uuidString.lowercased(),
+            operationID: operationID,
+            sequence: events.count + 1,
+            type: type,
+            recordedAt: timestamp,
+            errorCode: errorCode,
+            relatedOperationID: relatedOperationID
+        )
+    }
+
+    /// 한 작업의 지난 일을 되만들어 넣는다.
+    private func seedOperationEvents(
+        operationID: String,
+        state: SyncV2OperationStatus,
+        errorCode: String?,
+        recordedAt: String,
+        skipIfPresent: Bool
+    ) throws {
+        if skipIfPresent,
+           try !operationEvents(operationID: operationID).isEmpty {
+            return
+        }
+        let types = Self.seedEventTypes(for: state)
+        for (index, type) in types.enumerated() {
+            // 마지막 사건만 오류를 안고 간다. 그 앞의 사건들은 이 작업이 어떤
+            // 길을 지나왔는지 표시할 뿐 오류를 낸 적이 없다.
+            try insertOperationEvent(
+                eventID: Self.legacyEventID(
+                    operationID: operationID,
+                    eventType: type
+                ),
+                operationID: operationID,
+                sequence: index + 1,
+                type: type,
+                recordedAt: recordedAt,
+                errorCode: index == types.count - 1 ? errorCode : nil
+            )
+        }
+    }
+
+    /// 지금 상태를 그대로 되돌려 주는 최소한의 사건 줄기다.
+    ///
+    /// 각 줄기의 마지막 사건이 그 상태로 이어져야 한다. 그렇지 않으면 되만든
+    /// 순간부터 기록과 칸이 어긋난다.
+    static func seedEventTypes(
+        for state: SyncV2OperationStatus
+    ) -> [SyncV2OperationEventType] {
+        switch state {
+        case .pending: return [.enqueued]
+        case .inflight: return [.enqueued, .dispatchStarted]
+        case .retryWait: return [.enqueued, .dispatchStarted, .retryScheduled]
+        case .blocked: return [.enqueued, .blocked]
+        case .conflict: return [.enqueued, .dispatchStarted, .conflictDetected]
+        case .completed: return [.enqueued, .dispatchStarted, .committed]
+        case .cancelled: return [.enqueued, .cancelRequested]
+        }
+    }
+
+    /// 되만든 사건의 식별자다. 무작위로 만들면 다시 돌릴 때마다 달라져
+    /// 같은 사건이 여러 벌 쌓인다. Windows도 같은 이름으로 계산한다.
+    static func legacyEventID(operationID: String, eventType: SyncV2OperationEventType) -> String {
+        let namespaceURL = UUID(uuidString: "6ba7b811-9dad-11d1-80b4-00c04fd430c8")!
+        return syncV2UUIDv5(
+            namespace: namespaceURL,
+            name: "writerpad:stage8:legacy:\(operationID):\(eventType.rawValue)"
+        ).uuidString.lowercased()
+    }
+
+    private func insertOperationEvent(
+        eventID: String,
+        operationID: String,
+        sequence: Int,
+        type: SyncV2OperationEventType,
+        recordedAt: String,
+        errorCode: String?,
+        relatedOperationID: String? = nil
+    ) throws {
+        try withStatement(
+            """
+            INSERT OR IGNORE INTO sync_operation_events (
+                event_id, operation_id, event_sequence, event_type,
+                recorded_at, error_code, related_operation_id, detail_json
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, '{}');
+            """
+        ) { statement in
+            try bind(eventID, at: 1, to: statement)
+            try bind(operationID, at: 2, to: statement)
+            try bind(sequence, at: 3, to: statement)
+            try bind(type.rawValue, at: 4, to: statement)
+            try bind(recordedAt, at: 5, to: statement)
+            try bind(errorCode, at: 6, to: statement)
+            try bind(relatedOperationID, at: 7, to: statement)
+            guard sqlite3_step(statement) == SQLITE_DONE else {
+                throw sqliteError()
+            }
+        }
+    }
+
+    /// 한 작업의 사건 기록을 차례대로 읽는다.
+    ///
+    /// 저장소는 식별자를 소문자로 적는다. 문자열을 그대로 받으면 대소문자가
+    /// 어긋난 조회가 조용히 빈 결과를 내므로 UUID로 받아 안에서 맞춘다.
+    func operationEvents(operationID: UUID) throws -> [SyncV2OperationEvent] {
+        try operationEvents(operationID: operationID.uuidString.lowercased())
+    }
+
+    private func operationEvents(operationID: String) throws -> [SyncV2OperationEvent] {
+        try withStatement(
+            """
+            SELECT event_sequence, event_type, error_code
+            FROM sync_operation_events
+            WHERE operation_id = ?
+            ORDER BY event_sequence;
+            """
+        ) { statement in
+            try bind(operationID, at: 1, to: statement)
+            var events: [SyncV2OperationEvent] = []
+            while sqlite3_step(statement) == SQLITE_ROW {
+                guard let rawType = sqlite3_column_text(statement, 1),
+                      let type = SyncV2OperationEventType(
+                          rawValue: String(cString: rawType)
+                      )
+                else {
+                    throw SyncV2StoreError.invalidStoredData
+                }
+                let errorCode = sqlite3_column_text(statement, 2)
+                    .map { String(cString: $0) }
+                events.append(
+                    SyncV2OperationEvent(
+                        sequence: Int(sqlite3_column_int64(statement, 0)),
+                        type: type,
+                        errorCode: errorCode
+                    )
+                )
+            }
+            return events
+        }
+    }
+
+    /// 앞이 끊겨 영영 발송되지 않는 작업이다.
+    ///
+    /// 연쇄 편집의 뒤쪽은 기준 리비전 없이 큐에 들어가고, 앞선 작업이 완료될
+    /// 때 그 값을 받는다. 앞선 작업이 완료 아닌 길로 끝나면 — 취소되거나
+    /// 밀려나거나 — 뒤쪽은 값이 빈 채로 남는다. 발송 조건이 그 값을 요구하므로
+    /// 영영 대상에서 빠지는데, 상태는 대기 중이라 화면에는 아무 문제 없어
+    /// 보인다. 큐가 통째로 멈춘다.
+    ///
+    /// 앞에 살아 있는 작업이 없는데도 기준 리비전이 비어 있으면 그것이다.
+    ///
+    /// 문서 줄과 폴더 줄을 모두 본다. 둘은 각자의 줄에 늘어서므로 앞선 작업을
+    /// 찾는 조건도 각자의 식별자로 본다. 문서만 보면 같은 폴더를 잇달아 바꾼
+    /// 뒤쪽이 멈춰 있어도 눈에 띄지 않는다.
+    func orphanedOperationIDs() throws -> [String] {
+        try operationIDs(
+            where: """
+            o.base_revision IS NULL
+              AND o.status IN ('pending', 'retry_wait', 'blocked')
+              AND (o.document_id IS NOT NULL OR o.folder_id IS NOT NULL)
+              AND NOT EXISTS (
+                  SELECT 1 FROM sync_operations earlier
+                  WHERE earlier.document_sequence < o.document_sequence
+                    AND earlier.status NOT IN ('completed', 'cancelled')
+                    AND (
+                        (o.document_id IS NOT NULL
+                         AND earlier.document_id = o.document_id)
+                        OR
+                        (o.folder_id IS NOT NULL
+                         AND earlier.folder_id = o.folder_id)
+                    )
+              )
+            """,
+            alias: "o"
+        ) { _ in }
+    }
+
+    /// 기준 리비전을 못 받아 발송 대상에서 빠져 있는 작업 전부다.
+    ///
+    /// `orphanedOperationIDs()`는 앞이 이미 끊긴 것만 고른다. 이것은 앞이
+    /// 아직 살아 있는 것까지 포함한다. 진단용이다. 앞이 살아 있으면 정상이지만,
+    /// 그 앞이 영영 끝나지 않으면 여기 있는 것들이 함께 멈춘다.
+    func operationsMissingBaseRevision() throws -> [String] {
+        try operationIDs(
+            where: """
+            base_revision IS NULL
+              AND status IN ('pending', 'retry_wait', 'blocked')
+            """
+        ) { _ in }
+    }
+
+    /// 앞이 끊긴 작업을 문서의 지금 리비전으로 다시 세운다.
+    ///
+    /// 앞선 작업이 사라졌으니 그것이 만들려던 상태는 오지 않는다. 남은 것은
+    /// 서버에 지금 있는 것 위에 이 편집을 얹는 길뿐이다. 기준을 지금 리비전으로
+    /// 바꿔 발송 대상에 되돌린다.
+    ///
+    /// 사용자가 쓴 글은 건드리지 않는다. 무엇을 보낼지는 그대로 두고 어디에
+    /// 얹을지만 고친다.
+    @discardableResult
+    func adoptOrphanedOperations() throws -> [String] {
+        try transaction {
+            try adoptOrphanedOperationsLocked()
+        }
+    }
+
+    /// 이미 거래 안에 있을 때 쓴다. 거래를 또 열면 안 된다.
+    @discardableResult
+    private func adoptOrphanedOperationsLocked() throws -> [String] {
+        let orphans = try orphanedOperationIDs()
+        guard !orphans.isEmpty else { return [] }
+        let timestamp = Self.timestamp()
+        for operationID in orphans {
+            // 문서는 문서의 지금 리비전을, 폴더는 폴더의 지금 리비전을 받는다.
+            // 본문은 문서에만 있다. 폴더는 이름과 부모만 나르므로 그대로 둔다.
+            try withStatement(
+                """
+                UPDATE sync_operations
+                SET base_revision = CASE
+                        WHEN document_id IS NOT NULL THEN (
+                            SELECT d.server_revision FROM sync_documents d
+                            WHERE d.document_id = sync_operations.document_id
+                        )
+                        ELSE (
+                            SELECT f.server_revision FROM sync_folders f
+                            WHERE f.folder_id = sync_operations.folder_id
+                        )
+                    END,
+                    base_content = CASE
+                        WHEN document_id IS NOT NULL THEN (
+                            SELECT d.base_content FROM sync_documents d
+                            WHERE d.document_id = sync_operations.document_id
+                        )
+                        ELSE base_content
+                    END,
+                    next_attempt_at = NULL,
+                    updated_at = ?
+                WHERE operation_id = ?
+                  AND base_revision IS NULL;
+                """
+            ) { statement in
+                try bind(timestamp, at: 1, to: statement)
+                try bind(operationID, at: 2, to: statement)
+                try stepDone(statement)
+            }
+        }
+        // 다시 대기열에 올랐다는 것을 남긴다. 왜 되살아났는지 기록에 없으면
+        // 나중에 되짚을 수 없다.
+        let appendable = try orphans.filter { operationID in
+            let events = try operationEvents(operationID: operationID)
+            return (try? SyncV2OperationStateDerivation
+                .requireAppendable(to: events)) != nil
+        }
+        try recordOperationEvents(
+            appendable,
+            type: .enqueued,
+            errorCode: "ADOPTED_AFTER_ORPHANED_CHAIN",
+            timestamp: timestamp
+        )
+        return orphans
+    }
+
+    /// 작업을 취소한다. 안쪽에서 되세우기까지 함께 한다.
+    ///
+    /// 계약이 정한 세 가지를 지킨다. 같은 사건 식별자로 다시 오면 기록을
+    /// 늘리지 않고 이미 취소됐다고 답한다. 이미 취소된 작업에 다시 요청해도
+    /// 오류가 아니다. 그러나 이미 끝난 작업은 `OPERATION_TERMINAL`로 거절한다.
+    /// 완료된 작업을 취소로 덮으면 서버에 이미 올라간 글이 안 올라간 것처럼
+    /// 보인다.
+    @discardableResult
+    func cancelOperation(
+        operationID: UUID,
+        cancelEventID: UUID
+    ) throws -> SyncV2OperationCancelOutcome {
+        let operationKey = operationID.uuidString.lowercased()
+        let eventKey = cancelEventID.uuidString.lowercased()
+        return try transaction {
+            guard try storedOperationStatus(operationID: operationID) != nil else {
+                throw SyncV2ContractError("INVALID_ARGUMENT", "모르는 작업이다")
+            }
+            if let owner = try operationEventOwner(eventID: eventKey) {
+                guard owner.operationID == operationKey,
+                      owner.type == .cancelRequested
+                else {
+                    throw SyncV2ContractError("EVENT_ID_REUSED")
+                }
+                return .alreadyCancelled(eventID: cancelEventID)
+            }
+
+            let timestamp = Self.timestamp()
+            try ensureOperationEventHistory(
+                operationID: operationKey,
+                timestamp: timestamp
+            )
+            let current = try SyncV2OperationStateDerivation.state(
+                from: try operationEvents(operationID: operationKey)
+            )
+            if current == .completed {
+                throw SyncV2ContractError.operationTerminal
+            }
+            if current == .cancelled {
+                return .alreadyCancelled(eventID: nil)
+            }
+
+            try withStatement(
+                """
+                UPDATE sync_operations
+                SET status = 'cancelled',
+                    next_attempt_at = NULL,
+                    updated_at = ?
+                WHERE operation_id = ?;
+                """
+            ) { statement in
+                try bind(timestamp, at: 1, to: statement)
+                try bind(operationKey, at: 2, to: statement)
+                try stepDone(statement)
+            }
+            try insertOperationEvent(
+                eventID: eventKey,
+                operationID: operationKey,
+                sequence: try operationEvents(operationID: operationKey).count + 1,
+                type: .cancelRequested,
+                recordedAt: timestamp,
+                errorCode: nil
+            )
+            // 취소한 작업을 기다리던 뒤쪽 편집이 있으면 여기서 끊긴다. 다음에
+            // 열 때까지 두지 않고 그 자리에서 되세운다.
+            try adoptOrphanedOperationsLocked()
+            return .cancelled(eventID: cancelEventID)
+        }
+    }
+
+    /// 사건 식별자가 어느 작업의 무슨 사건이었는지 찾는다.
+    private func operationEventOwner(
+        eventID: String
+    ) throws -> (operationID: String, type: SyncV2OperationEventType)? {
+        try withStatement(
+            """
+            SELECT operation_id, event_type
+            FROM sync_operation_events
+            WHERE event_id = ?
+            LIMIT 1;
+            """
+        ) { statement in
+            try bind(eventID, at: 1, to: statement)
+            guard sqlite3_step(statement) == SQLITE_ROW,
+                  let operationID = sqlite3_column_text(statement, 0),
+                  let rawType = sqlite3_column_text(statement, 1),
+                  let type = SyncV2OperationEventType(
+                      rawValue: String(cString: rawType)
+                  )
+            else {
+                return nil
+            }
+            return (String(cString: operationID), type)
+        }
+    }
+
+    /// 사건에서 계산한 상태와 status 칸이 어긋난 작업이다.
+    ///
+    /// 읽는 쪽을 옮기기 전에 이것이 비어 있어야 한다. 비어 있지 않다면 어느
+    /// 쓰기 경로가 칸만 고치고 사건을 남기지 않았다는 뜻이고, 그 경로를 찾기
+    /// 전에는 옮기면 안 된다.
+    func operationStateDivergences() throws -> [SyncV2OperationStateDivergence] {
+        let rows = try withStatement(
+            """
+            SELECT operation_id, status FROM sync_operations ORDER BY queue_id;
+            """
+        ) { statement -> [(String, String)] in
+            var rows: [(String, String)] = []
+            while sqlite3_step(statement) == SQLITE_ROW {
+                guard let operationID = sqlite3_column_text(statement, 0),
+                      let status = sqlite3_column_text(statement, 1)
+                else {
+                    throw SyncV2StoreError.invalidStoredData
+                }
+                rows.append((String(cString: operationID), String(cString: status)))
+            }
+            return rows
+        }
+
+        var divergences: [SyncV2OperationStateDivergence] = []
+        for (operationID, status) in rows {
+            let stored = SyncV2OperationStatus(rawValue: status)
+            let events = try operationEvents(operationID: operationID)
+            let derived = try? SyncV2OperationStateDerivation.state(from: events)
+            if derived != stored {
+                divergences.append(
+                    SyncV2OperationStateDivergence(
+                        operationID: operationID,
+                        storedStatus: stored,
+                        derivedStatus: derived
+                    )
+                )
+            }
+        }
+        return divergences
     }
 
     private func transaction<T>(_ body: () throws -> T) throws -> T {
@@ -6887,6 +8393,40 @@ actor LazySyncV2ProjectBindingStore:
         )
     }
 
+    func applyFolderSnapshotBaselines(
+        localProjectID: ProjectID,
+        serverProjectID: UUID,
+        folders: [SyncV2RemoteFolder],
+        excluding blockedFolderIDs: Set<UUID>
+    ) async throws {
+        guard let store = await resolvedStore() else {
+            throw SyncV2DispatchStoreError.unavailable
+        }
+        try await store.applyFolderSnapshotBaselines(
+            localProjectID: localProjectID,
+            serverProjectID: serverProjectID,
+            folders: folders,
+            excluding: blockedFolderIDs
+        )
+    }
+
+    func adoptEquivalentInitialDocument(
+        localProjectID: ProjectID,
+        serverProjectID: UUID,
+        localDocumentID: UUID,
+        snapshot: SyncV2RemoteDocumentSnapshot
+    ) async throws -> Bool {
+        guard let store = await resolvedStore() else {
+            throw SyncV2DispatchStoreError.unavailable
+        }
+        return try await store.adoptEquivalentInitialDocument(
+            localProjectID: localProjectID,
+            serverProjectID: serverProjectID,
+            localDocumentID: localDocumentID,
+            snapshot: snapshot
+        )
+    }
+
     func claimReadyOperations(
         localProjectID: ProjectID,
         limit: Int,
@@ -6974,16 +8514,16 @@ actor LazySyncV2ProjectBindingStore:
         )
     }
 
-    func rebaseFolder(
+    func rebaseFolderAfterRevisionConflict(
         _ operation: SyncV2FolderDispatchOperation,
-        serverRevision: Int64
+        remote: SyncV2RemoteFolder
     ) async throws {
         guard let store = await resolvedStore() else {
             throw SyncV2DispatchStoreError.unavailable
         }
-        try await store.rebaseFolder(
+        try await store.rebaseFolderAfterRevisionConflict(
             operation,
-            serverRevision: serverRevision
+            remote: remote
         )
     }
 
@@ -7572,16 +9112,17 @@ actor ProjectInitialSyncRecorder: InitialProjectSyncRecording {
                     }
                     return $0.relativePath.rawValue < $1.relativePath.rawValue
                 }
-            guard !children.isEmpty else { continue }
-            let key = parent.relativePath.rawValue == "메인"
+            let canonicalParentPath = SyncV2ServerPath.canonical(
+                parent.relativePath.rawValue
+            )
+            let key = canonicalParentPath == "메인"
                 ? "<root>"
-                : SyncV2FolderIdentity.canonicalPath(
-                    parent.relativePath.rawValue
-                )
+                : canonicalParentPath
             order[key] = children.map {
-                URL(fileURLWithPath: $0.relativePath.rawValue)
-                    .lastPathComponent
-                    .precomposedStringWithCanonicalMapping
+                SyncV2ServerPath.canonical(
+                    URL(fileURLWithPath: $0.relativePath.rawValue)
+                        .lastPathComponent
+                )
             }
         }
         let data = try JSONSerialization.data(
