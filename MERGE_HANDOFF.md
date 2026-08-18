@@ -179,7 +179,10 @@ storageNameAlgorithm = "storage-name-v1"   ← 0.3.0이 교체한 그것
 ## 6-1. 시험 상태
 
 ```
-763개 실행 · 1개 건너뜀 · 실패 0
+767개 실행 · 1개 건너뜀 · 실패 0
+
+검증06·07을 통과한 지점은 `verified/e2e-06-07` 태그로 보존돼 있다(21b416c).
+그 뒤 커밋은 백업 쪽이라 동기화 검증에 영향이 없다.
 ```
 
 병합 해소가 깨뜨린 시험은 전부 복구했다. 32건 → 17 → 14 → 1 → 0.
@@ -287,6 +290,73 @@ test_vectors/*.json       전부 0.2.0
 - **`server_updated_at` 정리.** 쓰기만 하고 판정에 한 번도 읽지 않는다.
   Windows v2에는 이 필드가 0건이고 v1 잔재로 보인다.
 - **`storage-name-v2` 구현.** 6번 참조. `계약개정안_storage-name-v2_초안.md`가 있다.
+
+---
+
+## 7-1. 실기기 검증 결과 (2026-08-18)
+
+두 회차 모두 `21b416c` 트리에서 나왔다.
+
+**검증06 — 동시 이름 변경. 통과.**
+
+```
+1  enqueued
+2  dispatch_started
+3  retry_scheduled    NETWORK_UNAVAILABLE
+4  enqueued
+5  dispatch_started
+6  conflict_detected  REVISION_CONFLICT     ← 되감기 1회
+7  enqueued
+8  dispatch_started
+9  committed
+```
+
+되감기 1회, attempts 3, 최종 completed. **상한 8은 여덟 배 여유다.**
+다만 표본이 한 회차뿐이라 8이 적정값이라고까지는 말할 수 없다.
+
+**검증07 — 삭제 대 이름변경. 통과. 이쪽이 더 중요하다.**
+
+```
+5  dispatch_started
+6  conflict_detected  REMOTE_DELETION       ← 여기서 정지. 뒤가 없다
+```
+
+`conflict_detected` 뒤에 `enqueued`가 오지 않는다. 되감지 않고 세운 것이다.
+`status = conflict`, `last_error_code = REMOTE_DELETION`, 화면이 그 폴더를 말한다.
+폴더는 부활하지 않았다.
+
+**이 회차가 A-2안을 고른 근거 자체를 실증했다.** 검증06에서는
+`!remote.isDeleted || operation.isDeleted` 조건이 한 번도 발동하지 않았다
+(삭제가 등장하지 않으므로). A-1안에는 이 조건이 없어 되감아 재전송했을 것이고,
+서버가 다시 거절하면 영구 루프가 됐을 것이다.
+
+> **다만 절반은 열려 있다.** 서버가 tombstone 위 rename 을 거절하는지는
+> 여전히 미확인이다. 클라이언트가 먼저 막아 요청이 서버에 가지 않았다.
+> 실질적으로는 더 안전한 결과지만, TV-008 규정 대 배포된 서버의 실제 동작은
+> 아직 확인되지 않았다.
+
+**되감기를 세는 법 — 로그가 아니라 DB다.**
+
+되감기가 성공하면 sync-v2 로거는 조용하다. `event=stalledFolderOperation`은
+굳었을 때만 뜬다. 기기에서 저장소를 받아 사건 열을 읽는다.
+
+```bash
+xcrun devicectl device copy from --device <UDID> \
+  --domain-type appDataContainer \
+  --domain-identifier com.chocos.writerpad.debug \
+  --source "Library/Application Support/WriterPad/SyncV2/sync-v2.sqlite3" \
+  --destination /tmp/db/sync-v2.sqlite3
+```
+
+WAL 파일(`-wal`, `-shm`)도 함께 받아야 최근 사건이 보인다.
+사건 이름은 **snake_case**다 — `conflictDetected`로 찾으면 0이 나온다.
+
+절차서는 저장소 최상위에 있다(git 에 없는 작업 문서).
+
+```
+실서버_종단간검증_절차서_1회차.md          검증01~06
+실서버_종단간검증_절차서_2회차_검증07.md   검증07
+```
 
 ---
 
