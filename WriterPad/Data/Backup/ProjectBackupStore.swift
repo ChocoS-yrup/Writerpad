@@ -212,7 +212,17 @@ actor ProjectBackupStore {
             throw ProjectBackupError.destinationInsideSource
         }
 
-        let workspace = package.appendingPathComponent(
+        // 사용자가 고른 이름에 직접 짓지 않는다. 짓는 중에 앱이 죽으면
+        // manifest 없는 반쪽 디렉터리가 그 이름 그대로 남고, 같은 이름으로
+        // 다시 시도하면 destinationAlreadyExists 로 막힌다. 옆에 임시로 짓고
+        // 다 된 것만 옮긴다.
+        let staging = package
+            .deletingLastPathComponent()
+            .appendingPathComponent(
+                ".\(package.lastPathComponent).partial-\(UUID().uuidString)",
+                isDirectory: true
+            )
+        let workspace = staging.appendingPathComponent(
             Self.workspaceDirectoryName,
             isDirectory: true
         )
@@ -240,15 +250,21 @@ actor ProjectBackupStore {
                 ),
                 nodes: entries
             )
+            // 복원이 거부할 manifest 를 만들어 놓고 "백업 성공"이라고 말하지
+            // 않는다. 중복 UUID·없는 부모·순환처럼 읽기 시점에만 걸리던 것을
+            // 여기서 먼저 막는다. 그러지 않으면 사용자는 복원하려는 날에야
+            // 그 백업이 쓸 수 없다는 것을 안다.
+            try validateManifest(manifest)
             let encoder = JSONEncoder()
             encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
             try encoder.encode(manifest).write(
-                to: package.appendingPathComponent(Self.manifestFileName),
+                to: staging.appendingPathComponent(Self.manifestFileName),
                 options: [.atomic]
             )
+            try fileManager.moveItem(at: staging, to: package)
             return ProjectBackupReceipt(packageURL: package, manifest: manifest)
         } catch {
-            try? fileManager.removeItem(at: package)
+            try? fileManager.removeItem(at: staging)
             throw error
         }
     }

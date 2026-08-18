@@ -409,6 +409,93 @@ final class ProjectBackupStoreTests: XCTestCase {
         }
     }
 
+    /// 복원이 거부할 백업을 만들어 놓고 "성공"이라고 말하면 안 된다.
+    ///
+    /// 중복 UUID·없는 부모·순환은 지금까지 읽기 시점에만 걸렸다. 그러면
+    /// 사용자는 복원하려는 날에야 그 백업이 쓸 수 없다는 것을 안다.
+    func testBackupRefusesManifestThatRestoreWouldReject() async throws {
+        let fileManager = FileManager.default
+        let root = fileManager.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString)
+        defer { try? fileManager.removeItem(at: root) }
+        let source = root.appendingPathComponent("원본", isDirectory: true)
+        try fileManager.createDirectory(at: source, withIntermediateDirectories: true)
+
+        let projectID = projectID("3f2a0000-0000-4000-8000-000000000009")
+        let mainID = documentID("8c1d0000-0000-4000-8000-000000000009")
+        let orphanID = documentID("a36c0000-0000-4000-8000-000000000009")
+        let missingParentID = documentID("ffff0000-0000-4000-8000-000000000009")
+        let date = Date(timeIntervalSince1970: 1_700_000_000)
+        let project = Project(
+            id: projectID, name: "부모 없는 백업",
+            createdAt: date, modifiedAt: date
+        )
+        // 부모가 문서 집합에 없다. 복원은 "없는 폴더 parent_uuid" 로 거부한다.
+        let documents = [
+            node(mainID, projectID, .folder, nil, "메인", 0, date),
+            node(orphanID, projectID, .folder, missingParentID, "메인/외톨이", 0, date),
+        ]
+        let package = root.appendingPathComponent("백업", isDirectory: true)
+
+        do {
+            _ = try await ProjectBackupStore().createBackup(
+                project: project,
+                documents: documents,
+                workspaceURL: source,
+                packageURL: package
+            )
+            XCTFail("복원 불가능한 백업이 성공으로 끝났다")
+        } catch let error as ProjectBackupError {
+            guard case .invalidManifest = error else {
+                return XCTFail("예상과 다른 오류: \(error)")
+            }
+        }
+    }
+
+    /// 실패한 백업은 사용자가 고른 이름에 반쪽 디렉터리를 남기지 않는다.
+    ///
+    /// 남기면 같은 이름으로 다시 시도할 때 destinationAlreadyExists 로 막힌다.
+    /// 그래서 최종 경로가 아니라 옆에 임시로 짓고 다 된 것만 옮긴다.
+    func testFailedBackupLeavesNothingBehind() async throws {
+        let fileManager = FileManager.default
+        let root = fileManager.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString)
+        defer { try? fileManager.removeItem(at: root) }
+        let source = root.appendingPathComponent("원본", isDirectory: true)
+        try fileManager.createDirectory(at: source, withIntermediateDirectories: true)
+
+        let projectID = projectID("3f2a0000-0000-4000-8000-00000000000a")
+        let mainID = documentID("8c1d0000-0000-4000-8000-00000000000a")
+        let orphanID = documentID("a36c0000-0000-4000-8000-00000000000a")
+        let missingParentID = documentID("ffff0000-0000-4000-8000-00000000000a")
+        let date = Date(timeIntervalSince1970: 1_700_000_000)
+        let project = Project(
+            id: projectID, name: "흔적 없는 실패",
+            createdAt: date, modifiedAt: date
+        )
+        let documents = [
+            node(mainID, projectID, .folder, nil, "메인", 0, date),
+            node(orphanID, projectID, .folder, missingParentID, "메인/외톨이", 0, date),
+        ]
+        let package = root.appendingPathComponent("백업", isDirectory: true)
+
+        _ = try? await ProjectBackupStore().createBackup(
+            project: project,
+            documents: documents,
+            workspaceURL: source,
+            packageURL: package
+        )
+
+        XCTAssertFalse(
+            fileManager.fileExists(atPath: package.path),
+            "사용자가 고른 이름에 반쪽 디렉터리가 남았다"
+        )
+        let leftovers = try fileManager.contentsOfDirectory(
+            at: root, includingPropertiesForKeys: nil, options: []
+        ).filter { $0.lastPathComponent.contains(".partial-") }
+        XCTAssertEqual(leftovers, [], "임시 디렉터리가 치워지지 않았다")
+    }
+
     private func projectID(_ value: String) -> ProjectID {
         ProjectID(rawValue: UUID(uuidString: value)!)
     }
