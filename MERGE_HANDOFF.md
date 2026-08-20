@@ -10,6 +10,27 @@ worktree   /private/tmp/WriterPad-Merge
 보존 사본  /private/tmp/WriterPad-Merge.bak-20260818
 ```
 
+### 2026-08-20 진행 갱신 — divergence 완료, 핸드셰이크 동결
+
+- 문서와 폴더 revision 충돌은 원본 행을 고쳐 쓰지 않는다. 새 `operation_id`와
+  새 `batch_id`를 만들고 `supersedes_operation_id`로 원본을 잇는다.
+- 스키마 V7이 `automatic_rebase_count`를 영속한다. successor의 `attempts`는
+  0부터 다시 시작하되 자동 되감기 상한 8은 승계 사슬 전체에서 유지된다.
+- `operationLineageDivergences()`가 프로젝트·개체·작업 종류·배치·횟수·양쪽
+  사건 끝을 대조한다. 원본은 `conflict_detected → superseded`, successor는
+  `enqueued`에서 시작한다.
+- `REMOTE_DELETION` 사전 차단은 그대로다. 서버 TV-008 직접 거절은 여전히
+  별도 RPC/통합시험 항목이다.
+- 관련 저장소·폴더 종단간 시험은 통과했다. 전체 769개 중 767 passed,
+  1 skipped, 기존 IME 타이밍 시험 1건이 전체 부하에서만 실패했고 단독 10회는
+  모두 통과했다.
+- 순서를 앞질러 작성했던 핸드셰이크/V8/RPC 작업은
+  `codex/preserve-ipad-early-handshake-20260820`의 중단 시점 스냅샷으로만
+  보존하고 이 브랜치에서는 제거했다. Windows의 되감기·사건 열·divergence가
+  끝나고 양쪽을 합친 뒤, 새 HEAD로 검증06·07을 모두 다시 통과할 때까지 동결한다.
+- `verified/e2e-06-07`의 기존 결과는 새 합류 HEAD의 증거로 재사용하지 않는다.
+- `sync-contract/`, `SyncV2Contract.clientCapabilities`, 계약 pin은 변경하지 않았다.
+
 ---
 
 ## 1. 무슨 일이었나
@@ -85,6 +106,11 @@ codex안에 옮겨 붙일 수 없다 — 가져오는 순간 A-2안이 된다.
 `local_project_id`/`project_id` 범위 조건, `sqlite3_changes == 1` 확인.
 codex안은 `WHERE operation_id = ?` 하나뿐이라 경합 시 조용히 덮어썼다.
 
+**2026-08-20 후속:** A-2의 원격 삭제 방어는 유지하되 제자리 UPDATE는 제거했다.
+현재는 최신 로컬 이름·부모·삭제 의도를 새 successor에 싣고 원본을
+`superseded`로 종결한다. 같은 구조 batch의 문서와 `tree_order`는 successor가
+끝날 때까지 계속 기다린다.
+
 ---
 
 ## 3. 원안 두 쪽에 다 없던 것 — 되감기 상한
@@ -104,7 +130,7 @@ codex안은 `WHERE operation_id = ?` 하나뿐이라 경합 시 조용히 덮어
 고리 2  이름변경 vs 이름변경         → 어느 안도 닫지 못한다. 상한만이 닫는다
 ```
 
-그래서 넣은 것:
+처음 병합에서 넣은 것:
 
 - `SyncV2RetryPolicy.maximumAutomaticRebases` (기본 8)
 - `dispatchFolder`가 되감기 전에 `operation.attempts`를 보고, 상한에 닿으면
@@ -112,9 +138,9 @@ codex안은 `WHERE operation_id = ?` 하나뿐이라 경합 시 조용히 덮어
 - **`rebaseFolderAfterRevisionConflict`에서 `attempts = 0` 되돌림을 뺐다.**
   되돌리면 상한 검사가 영원히 걸리지 않는다.
 
-> **알려진 단순화:** 상한이 `attempts`를 쓰므로 되감기 횟수와 일반 재시도
-> 횟수가 섞인다. 되감기 전용 계수기가 옳지만 스키마 변경이라 이번엔 뺐다.
-> 되물림 지연이 되감기마다 커지는데, 핑퐁 상황에서는 오히려 감쇠 효과라 둔다.
+**2026-08-20 해소:** 스키마 V7의 `automatic_rebase_count`로 분리했다. 일반
+네트워크 재시도는 이 값을 올리지 않고, 새 successor를 만들 때만 1씩 올린다.
+문서와 폴더 모두 같은 상한 8을 쓴다.
 
 ---
 
@@ -139,9 +165,10 @@ codex안은 `WHERE operation_id = ?` 하나뿐이라 경합 시 조용히 덮어
   `UnavailableInitialSnapshotStateRecorder`)도 함께 옮겼다.
 - 총 114개.
 
-**고친 기대값이 하나 있다.** `testFolderRevisionConflictRebasesSameFIFOOperation`의
-`XCTAssertEqual(retried.attempts, 1)` → `2`. `attempts = 0` 되돌림을 뺀 결과이고,
-의도한 변경이다. 주석으로 이유를 적어 두었다.
+**2026-08-20 후속:** 시험을
+`testFolderRevisionConflictCreatesImmutableSuccessor`로 뒤집었다. 새 작업은
+`attempts == 1`, `automaticRebaseCount == 1`로 처음 claim되고 원본은
+`cancelled/superseded`로 남는다.
 
 ---
 
@@ -179,7 +206,11 @@ storageNameAlgorithm = "storage-name-v1"   ← 0.3.0이 교체한 그것
 ## 6-1. 시험 상태
 
 ```
-767개 실행 · 1개 건너뜀 · 실패 0
+기준 태그: 767개 실행 · 1개 건너뜀 · 실패 0
+
+현재 작업 트리: 769개 수집. 동기화 관련 시험 전부 통과. 전체 실행에서는
+767 passed · 1 skipped · 기존 IME 타이밍 시험 1 failed였고, 실패 시험만
+10회 반복하면 10회 모두 통과했다.
 
 검증06·07을 통과한 지점은 `verified/e2e-06-07` 태그로 보존돼 있다(21b416c).
 그 뒤 커밋은 백업 쪽이라 동기화 검증에 영향이 없다.
@@ -235,13 +266,15 @@ test_vectors/*.json       전부 0.2.0
 
 ### 바로 할 수 있는 것
 
-1. **검증06 재실행.** `실서버_종단간검증_절차서_1회차.md`의 6단계
-   "동시 이름 변경". 기기 둘, 비행기 모드, 이름 하나.
-   A-1안은 이걸 통과했지만 A-2안은 실기기 증거가 없다. **반드시 돌려야 한다.**
-2. **스키마 5 마이그레이션 주석 수정.** "덧붙이기만 하는 기록에서 계산하면
-   그런 어긋남이 생길 자리가 없다"는 **사실이 아니다.** Windows는 사고 당시
-   이미 사건 기록을 갖고 있었고, 집계 질의 한 줄이 그것을 우회해서 났다.
-   (윈도우측 답변 5-2)
+1. **Windows 작업 완료를 기다린다.** 되감기 불변성·사건 열·divergence가 모두
+   닫히기 전에는 핸드셰이크/V8/RPC/계약 변경을 진행하지 않는다.
+2. **양쪽 작업을 합류한다.** 새 합류 커밋이 검증 기준 HEAD다.
+3. **새 HEAD로 검증06·07을 처음부터 재실행한다.** 원본/successor의 서로 다른
+   operation·batch ID, supersedes 링크, 사건 열과 반복 횟수를 DB에서 확인한다.
+4. **두 검증이 모두 통과한 뒤에만** 보존 브랜치의 조기 핸드셰이크 작업을
+   현재 HEAD와 다시 대조하고 필요한 변경만 선택적으로 재적용한다.
+
+완료: iPad 되감기 불변성·사건 열·lineage divergence, 스키마 5 주석 수정.
 
 ### 서버에 물어야 풀리는 것
 
@@ -274,18 +307,15 @@ test_vectors/*.json       전부 0.2.0
 
 ### 별도 작업으로 뺀 것 (양쪽 합의)
 
-- **계약 불변 intent 전환** (새 `operation_id` + `supersedes_operation_id`).
-  두 iPad 구현 다 제자리 UPDATE라 계약 위반이다. 다만 계약 배치 경로가
-  양쪽 다 꺼져 있어 지금 고쳐도 동작 차이가 0이다.
-  **Windows는 이미 전환을 끝냈다** — `sync_v2_store.py:2526` `rebase_clean_merge`가
-  참조 구현이다.
-  backup 시험에 `testRebaseMutatesOperationInPlace_CONTRACT_VIOLATION_PINNED`가
-  있다. 위반을 일부러 못 박아 둔 것이니, 전환할 때 이 시험부터 뒤집으면 된다.
+- **계약 불변 intent 전환 — 완료(2026-08-20).** 문서·폴더 모두 새
+  `operation_id`/`batch_id`와 `supersedes_operation_id`를 쓴다. 스키마 V7,
+  승계 divergence 검사, 원래 batch 의존성 시험까지 포함한다.
 - **`project_sync_mode` / `migration_epoch` 배선.** 계약은
   "이름 기반 트리 추측은 LEGACY epoch 0에서만 허용"이라고 적고 있는데,
   이 값들이 **로컬 저장소에 아예 없다.** 지금은 `.known` 여부로 대신하고 있어
   **네트워크가 끊긴 ID_BASED 작품이 legacy로 강등될 구멍이 남아 있다.**
-  서버에서 받아 칸을 만들고 마이그레이션해야 한다.
+  서버에서 받아 칸을 만들고 마이그레이션해야 한다. 단, 합류 뒤 검증06·07이
+  통과하기 전에는 보존된 조기 구현을 적용하지 않는다.
 - **폴더 발행 큐 → 조정 루프.** Windows 구조가 구조적으로 옳을 수 있으나 재설계다.
 - **`server_updated_at` 정리.** 쓰기만 하고 판정에 한 번도 읽지 않는다.
   Windows v2에는 이 필드가 0건이고 v1 잔재로 보인다.

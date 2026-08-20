@@ -1066,6 +1066,16 @@ actor SyncV2Dispatcher {
             // Windows 클라이언트도 이 코드를 REVISION_CONFLICT와 같이 취급한다.
             if Self.isAutomaticRebaseCandidate(error),
                let automaticRebaser {
+                guard operation.automaticRebaseCount
+                        < retryPolicy.maximumAutomaticRebases
+                else {
+                    try? await store.markConflict(
+                        operation,
+                        errorCode: "AUTO_REBASE_LIMIT",
+                        detail: "자동 되감기 상한에 닿았습니다. 다른 기기의 변경을 확인해 주세요."
+                    )
+                    return
+                }
                 do {
                     switch try await automaticRebaser.rebase(operation) {
                     case .rebased:
@@ -1187,9 +1197,10 @@ actor SyncV2Dispatcher {
             // 시도를 그 안에서 막는다. 계약 적합성 벡터 TV-008이
             // "rename does not resurrect the folder implicitly"로 못 박은 것이다.
             if isAutomaticRebaseCandidate(error), let automaticRebaser {
-                // 상한에 닿으면 더 되감지 않고 세운다. 이 검사가 뜻을 가지려면
-                // 되감기가 attempts를 0으로 되돌리지 않아야 한다.
-                guard operation.attempts < retryPolicy.maximumAutomaticRebases
+                // 각 successor가 attempts를 0에서 다시 시작하므로, 영속적으로
+                // 이어지는 자동 되감기 횟수로 상한을 판정한다.
+                guard operation.automaticRebaseCount
+                        < retryPolicy.maximumAutomaticRebases
                 else {
                     let code = "AUTO_REBASE_LIMIT"
                     try? await store.markConflict(

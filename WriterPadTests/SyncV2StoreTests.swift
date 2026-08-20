@@ -3007,7 +3007,7 @@ final class SyncV2StoreTests: XCTestCase {
         await store.close()
     }
 
-    func testAutomaticRebaseAtomicallyPromotesLatestGenerationAndCancelsDependents()
+    func testAutomaticRebaseCreatesImmutableSuccessorAndCancelsDependents()
         async throws {
         let url = try databaseURL()
         let store = try await openStore(at: url)
@@ -3136,6 +3136,7 @@ final class SyncV2StoreTests: XCTestCase {
             now: Date(timeIntervalSince1970: 41)
         )
         let reclaimed = try XCTUnwrap(reclaimedOperations.first)
+        let sourceBatchID = reclaimed.batchID
         let latest = try await store.latestLocalSnapshot(for: reclaimed)
 
         let result: SyncV2AutomaticRebaseStoreResult
@@ -3155,7 +3156,7 @@ final class SyncV2StoreTests: XCTestCase {
         let operations = try await store.queuedOperations(
             documentID: documentID
         )
-        let rebased = try XCTUnwrap(
+        let original = try XCTUnwrap(
             operations.first { $0.operationID == firstID }
         )
         let cancelled = try XCTUnwrap(
@@ -3164,6 +3165,11 @@ final class SyncV2StoreTests: XCTestCase {
         let advanced = try XCTUnwrap(
             operations.first { $0.operationID == advancedID }
         )
+        let successor = try XCTUnwrap(
+            operations.first {
+                $0.supersedesOperationID == firstID
+            }
+        )
         let state = try await store.snapshotState(
             localProjectID: localProjectID,
             serverProjectID: serverProjectID,
@@ -3171,22 +3177,39 @@ final class SyncV2StoreTests: XCTestCase {
         )
 
         XCTAssertEqual(result, .rebased)
-        // 아래 세 줄은 되감기 결과를 firstID 아래에서 찾는다. 곧 계약 위반인
-        // 그 자리 고쳐 쓰기에 기대고 있다는 뜻이다(미해결 A, 벡터 05).
-        // A를 고치면 결과는 새 operation_id 아래에 오므로 이 세 줄이 깨진다.
-        // 그때 구현을 되돌리지 말고, 후속 작업을 찾도록 여기를 고쳐라.
-        // 이 시험의 본래 관심사인 세대 승격과 종속 취소는 그대로 남는다.
-        XCTAssertEqual(rebased.status, .pending)
-        XCTAssertEqual(rebased.baseRevision, 4)
+        XCTAssertNotEqual(successor.operationID, firstID)
+        XCTAssertNotEqual(successor.batchID, sourceBatchID)
+        XCTAssertEqual(successor.supersedesOperationID, firstID)
+        XCTAssertEqual(successor.status, .pending)
+        XCTAssertEqual(successor.baseRevision, 4)
         XCTAssertEqual(
-            rebased.content,
+            successor.content,
             "병합 중 최신 입력\n둘째\n서버 셋째\n"
         )
-        XCTAssertEqual(rebased.relativePath, remote.relativePath)
+        XCTAssertEqual(successor.relativePath, remote.relativePath)
+
+        // 원래 의도의 식별값과 payload는 고치지 않는다. 상태와 사건만
+        // superseded로 끝나고, 서버 기준선과 병합 결과는 새 의도에만 있다.
+        XCTAssertEqual(original.status, .cancelled)
+        XCTAssertEqual(original.baseRevision, 3)
+        XCTAssertEqual(original.relativePath, baseline.relativePath)
+        XCTAssertEqual(original.content, "로컬 1\n둘째\n셋째\n")
+        let originalAttempts = try await store.operationAttempts(
+            operationID: firstID
+        )
+        XCTAssertEqual(originalAttempts, 2)
         XCTAssertEqual(cancelled.status, .cancelled)
         XCTAssertEqual(advanced.status, .cancelled)
         XCTAssertEqual(state?.serverRevision, 4)
         XCTAssertEqual(state?.serverPath, remote.relativePath)
+
+        let successorClaim = try await store.claimReadyOperations(
+            limit: 1,
+            now: Date(timeIntervalSince1970: 42)
+        )
+        XCTAssertEqual(successorClaim.map(\.operationID), [successor.operationID])
+        XCTAssertEqual(successorClaim.first?.batchID, successor.batchID)
+        XCTAssertEqual(successorClaim.first?.supersedesOperationID, firstID)
         await store.close()
     }
 
@@ -4347,18 +4370,26 @@ final class SyncV2StoreTests: XCTestCase {
 
         let divergences = try await store.operationStateDivergences()
         let events = try await store.operationEvents(operationID: renameID)
+        let operations = try await store.queuedOperations()
+        let successor = try XCTUnwrap(
+            operations.first { $0.supersedesOperationID == renameID }
+        )
+        let successorEvents = try await store.operationEvents(
+            operationID: successor.operationID
+        )
         await store.close()
 
         XCTAssertEqual(divergences, [], "되감기 뒤 상태가 사건과 갈라지면 안 된다")
         // 서버가 왜 거절했는지가 이력에 남아야 사후에 셀 수 있다.
-        XCTAssertEqual(events.last?.type, .enqueued)
+        XCTAssertEqual(events.last?.type, .superseded)
+        XCTAssertEqual(successorEvents.map(\.type), [.enqueued])
         XCTAssertTrue(
             events.contains { $0.type == .conflictDetected },
             "REVISION_CONFLICT 가 이력에 남아야 한다"
         )
     }
 
-    func testFolderRevisionConflictRebasesSameFIFOOperation()
+    func testFolderRevisionConflictCreatesImmutableSuccessor()
         async throws {
         let url = try databaseURL()
         let context = QueueAPIContext()
@@ -4414,12 +4445,24 @@ final class SyncV2StoreTests: XCTestCase {
         )
         let retried = try XCTUnwrap(retriedClaims.first)
 
-        XCTAssertEqual(retried.operationID, renameID)
+        XCTAssertNotEqual(retried.operationID, renameID)
+        XCTAssertNotEqual(retried.batchID, first.batchID)
+        XCTAssertEqual(retried.supersedesOperationID, renameID)
         XCTAssertEqual(retried.name, "최종 아이패드 이름")
         XCTAssertEqual(retried.baseRevision, 3)
-        // 되감기는 attempts를 되돌리지 않는다. 되돌리면 자동 되감기 상한이
-        // 함께 사라져, 두 기기가 서로 이름을 바꾸는 동안 멈출 근거가 없다.
-        XCTAssertEqual(retried.attempts, 2)
+        XCTAssertEqual(retried.attempts, 1)
+        XCTAssertEqual(retried.automaticRebaseCount, 1)
+        let originalStatus = try await store.operationStatus(
+            operationID: renameID
+        )
+        let originalEvents = try await store.operationEvents(
+            operationID: renameID
+        )
+        let lineageDivergences = try await store
+            .operationLineageDivergences()
+        XCTAssertEqual(originalStatus, "cancelled")
+        XCTAssertEqual(originalEvents.last?.type, .superseded)
+        XCTAssertEqual(lineageDivergences, [])
         await store.close()
     }
 
@@ -4660,6 +4703,11 @@ final class SyncV2StoreTests: XCTestCase {
             """
             DROP TABLE sync_folders;
             DROP TABLE sync_operation_events;
+            DROP INDEX sync_operations_supersedes_idx;
+            ALTER TABLE sync_operations
+                DROP COLUMN automatic_rebase_count;
+            ALTER TABLE sync_operations
+                DROP COLUMN supersedes_operation_id;
             ALTER TABLE sync_projects
                 DROP COLUMN folder_migration_completed_at;
             DELETE FROM schema_migrations WHERE version >= 3;
@@ -4885,6 +4933,104 @@ final class SyncV2StoreTests: XCTestCase {
             now: Date(timeIntervalSince1970: 30)
         )
         XCTAssertEqual(treeOrder.map(\.operationID), [treeOrderOperationID])
+        await store.close()
+    }
+
+    func testFolderRebaseSuccessorKeepsOriginalBatchDependenciesBlocked()
+        async throws {
+        let url = try databaseURL()
+        let context = QueueAPIContext()
+        let store = try await connectedStore(at: url, context: context)
+        try await store.applyFolderSnapshotBaselines(
+            localProjectID: context.localProjectID,
+            serverProjectID: context.serverProjectID,
+            folders: [
+                SyncV2RemoteFolder(
+                    folderID: context.folderID,
+                    parentFolderID: nil,
+                    name: "서버 이름",
+                    revision: 2,
+                    isDeleted: false,
+                    updatedAt: Date(timeIntervalSince1970: 10)
+                ),
+            ],
+            excluding: []
+        )
+        let folderOperationID = UUID()
+        let documentOperationID = UUID()
+        let treeOrderOperationID = UUID()
+        _ = try await store.enqueue(
+            context.batch(
+                kind: .structureChange,
+                mutations: [
+                    context.folderMutation(
+                        operationID: folderOperationID,
+                        name: "아이패드 이름"
+                    ),
+                    context.documentMutation(
+                        operationID: documentOperationID,
+                        relativePath: "메모장/아이패드 이름/문서.txt"
+                    ),
+                    context.documentMutation(
+                        operationID: treeOrderOperationID,
+                        documentID: UUID(),
+                        relativePath: syncV2TreeOrderPath,
+                        content: "{\"tree_order\":{},\"version\":1}",
+                        generation: 1,
+                        kind: .treeOrder
+                    ),
+                ]
+            )
+        )
+        let originalClaims = try await store.claimReadyFolderOperations(
+            limit: 1,
+            now: Date(timeIntervalSince1970: 20)
+        )
+        let original = try XCTUnwrap(originalClaims.first)
+        try await store.rebaseFolderAfterRevisionConflict(
+            original,
+            remote: SyncV2RemoteFolder(
+                folderID: context.folderID,
+                parentFolderID: nil,
+                name: "윈도우 이름",
+                revision: 3,
+                isDeleted: false,
+                updatedAt: Date(timeIntervalSince1970: 30)
+            )
+        )
+
+        let blocked = try await store.claimReadyOperations(
+            limit: 10,
+            now: Date(timeIntervalSince1970: 40)
+        )
+        XCTAssertTrue(blocked.isEmpty)
+
+        let successorClaims = try await store.claimReadyFolderOperations(
+            limit: 1,
+            now: Date(timeIntervalSince1970: 40)
+        )
+        let successor = try XCTUnwrap(successorClaims.first)
+        XCTAssertEqual(successor.supersedesOperationID, folderOperationID)
+        try await store.complete(
+            successor,
+            result: folderCommitResult(for: successor)
+        )
+
+        let documentClaims = try await store.claimReadyOperations(
+            limit: 10,
+            now: Date(timeIntervalSince1970: 50)
+        )
+        let document = try XCTUnwrap(documentClaims.first)
+        XCTAssertEqual(document.operationID, documentOperationID)
+        try await store.complete(document, result: commitResult(for: document))
+        let treeOrder = try await store.claimReadyOperations(
+            limit: 10,
+            now: Date(timeIntervalSince1970: 60)
+        )
+        XCTAssertEqual(treeOrder.map(\.operationID), [treeOrderOperationID])
+        let lineageDivergences = try await store
+            .operationLineageDivergences()
+        XCTAssertEqual(lineageDivergences, [])
         await store.close()
     }
 
@@ -5208,17 +5354,18 @@ final class SyncV2StoreTests: XCTestCase {
         )
     }
 
-    // MARK: - 사건 기록 (스키마 V5)
+    // MARK: - 사건 기록과 불변 되감기 (스키마 V5/V6/V7)
 
     /// 새 저장소에 사건 표가 생겨야 한다.
-    func testSchemaV5CreatesOperationEventTable() async throws {
+    func testSchemaV7PreservesLineageAndAddsPersistentRebaseCount()
+        async throws {
         let url = try databaseURL()
 
         let store = try await openStore(at: url)
         let version = try await store.schemaVersion()
         await store.close()
 
-        XCTAssertEqual(version, 5)
+        XCTAssertEqual(version, SyncV2Store.currentSchemaVersion)
         let raw = try RawSQLite(url: url)
         XCTAssertEqual(
             try raw.scalarInt(
@@ -5229,11 +5376,39 @@ final class SyncV2StoreTests: XCTestCase {
             ),
             1
         )
+        let v7Checksum = try raw.scalarText(
+            "SELECT checksum FROM schema_migrations WHERE version = 7;"
+        )
+        XCTAssertEqual(v7Checksum.count, 64)
+        XCTAssertNotEqual(v7Checksum, "design-fixture-v7")
+        XCTAssertEqual(
+            try raw.scalarInt(
+                """
+                SELECT COUNT(*) FROM pragma_table_info('sync_operations')
+                WHERE name = 'automatic_rebase_count';
+                """
+            ),
+            1
+        )
         let checksum = try raw.scalarText(
             "SELECT checksum FROM schema_migrations WHERE version = 5;"
         )
         XCTAssertEqual(checksum.count, 64)
         XCTAssertNotEqual(checksum, "design-fixture-v5")
+        let v6Checksum = try raw.scalarText(
+            "SELECT checksum FROM schema_migrations WHERE version = 6;"
+        )
+        XCTAssertEqual(v6Checksum.count, 64)
+        XCTAssertNotEqual(v6Checksum, "design-fixture-v6")
+        XCTAssertEqual(
+            try raw.scalarInt(
+                """
+                SELECT COUNT(*) FROM pragma_table_info('sync_operations')
+                WHERE name = 'supersedes_operation_id';
+                """
+            ),
+            1
+        )
         raw.close()
     }
 
@@ -6334,10 +6509,7 @@ final class SyncV2StoreTests: XCTestCase {
 
     // MARK: - revision 충돌 되감기 (계약 대조)
 
-    // 계약 벡터 05 위반. 현재 동작을 기록만 한다.
-    // A 수정 시 이 시험을 고치지 말고 삭제하라.
-    //
-    /// 되감기가 원본 작업을 그 자리에서 고쳐 쓰는지 본다.
+    /// 되감기가 원본 작업을 보존하고 새 작업으로 이어지는지 본다.
     ///
     /// 계약은 의도를 불변으로 다룬다. 되감을 때 원본은 그대로 두고 새 작업을
     /// 만들어 원본을 밀어내라고 한다(벡터 05). 원본의 payload가 같은
@@ -6345,11 +6517,10 @@ final class SyncV2StoreTests: XCTestCase {
     /// 어느 payload의 것인지 알 수 없게 된다. 다시 보냈을 때 서버는 "이미
     /// 처리했다"고 답하는데 그 내용이 지금 보내려던 것과 다를 수 있다.
     ///
-    /// 지금 저장소가 실제로 무엇을 하는지 못 박아 둔다. 이 시험이 통과한다는
-    /// 것은 구현이 아직 계약을 어기고 있다는 뜻이다. 계약을 지키도록 고치면
-    /// 이 시험은 깨져야 옳다. 그때 기대값을 손보지 말고 통째로 지워라.
-    /// 계약을 지키는 쪽의 시험은 벡터 05 하네스가 맡는다.
-    func testRebaseMutatesOperationInPlace_CONTRACT_VIOLATION_PINNED() async throws {
+    /// 새 operation과 batch는 원본을 `supersedes_operation_id`로 가리키고,
+    /// 원본에는 superseded 사건만 덧붙는다. 벡터 05의 로컬 저장소 고정점이다.
+    func testRebaseCreatesNewOperationAndSupersedesImmutableOriginal()
+        async throws {
         let url = try databaseURL()
         let context = QueueAPIContext()
         let store = try await connectedStore(at: url, context: context)
@@ -6397,32 +6568,91 @@ final class SyncV2StoreTests: XCTestCase {
 
         let after = try await store.queuedOperations(documentID: context.documentID)
         let events = try await store.operationEvents(operationID: operationID)
+        let lineageDivergences = try await store
+            .operationLineageDivergences()
         await store.close()
+        let reopened = try await openStore(at: url)
+        let persisted = try await reopened.queuedOperations(
+            documentID: context.documentID
+        )
+        await reopened.close()
 
         XCTAssertEqual(result, .rebased)
+        XCTAssertEqual(lineageDivergences, [])
 
-        // 지금 동작: 새 작업을 만들지 않고 원본 하나를 고쳐 쓴다.
-        XCTAssertEqual(after.count, 1, "새 작업이 생기지 않는다")
-        let rebased = try XCTUnwrap(after.first)
-        XCTAssertEqual(
-            rebased.operationID,
-            operationID,
-            "같은 신원이 그대로 남는다"
+        XCTAssertEqual(after.count, 2)
+        let original = try XCTUnwrap(
+            after.first { $0.operationID == operationID }
         )
-        XCTAssertNotEqual(
-            rebased.contentHash,
-            beforeHash,
-            "그런데 같은 신원 아래에서 보낼 내용이 바뀌었다"
+        let rebased = try XCTUnwrap(
+            after.first { $0.supersedesOperationID == operationID }
         )
+        XCTAssertEqual(original.status, .cancelled)
+        XCTAssertEqual(original.content, originalContent)
+        XCTAssertEqual(original.contentHash, beforeHash)
+        XCTAssertEqual(original.baseRevision.map(Int64.init), operation.baseRevision)
+
+        XCTAssertNotEqual(rebased.operationID, operationID)
+        XCTAssertNotEqual(rebased.batchID, operation.batchID)
+        XCTAssertEqual(rebased.supersedesOperationID, operationID)
+        XCTAssertEqual(rebased.automaticRebaseCount, 1)
+        XCTAssertEqual(rebased.status, .pending)
+        XCTAssertNotEqual(rebased.contentHash, beforeHash)
         XCTAssertEqual(
             rebased.baseRevision.map(Int64.init),
             remote.revision,
-            "기준도 서버 것으로 바뀌었다"
+            "새 의도만 서버 기준선에서 시작한다"
         )
-        // 계약이라면 원본에 superseded가 남고 새 작업이 생겨야 한다.
-        XCTAssertFalse(
+        XCTAssertTrue(
             events.contains { $0.type == .superseded },
-            "원본이 밀려났다는 기록도 남지 않는다"
+            "원본은 superseded 사건으로 종결한다"
+        )
+        XCTAssertEqual(
+            persisted.first {
+                $0.supersedesOperationID == operationID
+            }?.operationID,
+            rebased.operationID,
+            "재시작 뒤에도 supersedes 연결이 남는다"
+        )
+    }
+
+    func testLineageDivergenceDetectsRebaseCountWithoutPredecessor()
+        async throws {
+        let url = try databaseURL()
+        let context = QueueAPIContext()
+        let operationID = UUID()
+        let store = try await connectedStore(at: url, context: context)
+        _ = try await store.enqueue(
+            context.batch(
+                mutations: [
+                    context.documentMutation(operationID: operationID),
+                ]
+            )
+        )
+        await store.close()
+
+        let raw = try RawSQLite(url: url)
+        try raw.execute(
+            """
+            UPDATE sync_operations
+            SET automatic_rebase_count = 1
+            WHERE operation_id = '\(operationID.uuidString.lowercased())';
+            """
+        )
+        raw.close()
+
+        let reopened = try await openStore(at: url)
+        let divergences = try await reopened.operationLineageDivergences()
+        await reopened.close()
+
+        XCTAssertEqual(
+            divergences,
+            [
+                SyncV2OperationLineageDivergence(
+                    operationID: operationID.uuidString.lowercased(),
+                    reason: .rootHasRebaseCount
+                ),
+            ]
         )
     }
 

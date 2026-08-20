@@ -520,11 +520,14 @@ final class SyncV2FolderEndToEndTests: XCTestCase {
         )
 
         var status: String?
+        var finalRebaseCount = 0
         for round in 1 ... 8 {
             await sender.drain(now: TimeInterval(20 + round * 10))
-            status = try await sender.store.operationStatus(
-                operationID: renameID
-            )
+            let lineage = try await sender.store.queuedOperations()
+                .filter { $0.automaticRebaseCount > 0 }
+                .max { $0.automaticRebaseCount < $1.automaticRebaseCount }
+            status = lineage?.status.rawValue
+            finalRebaseCount = lineage?.automaticRebaseCount ?? 0
             if status == "conflict" { break }
         }
 
@@ -533,6 +536,7 @@ final class SyncV2FolderEndToEndTests: XCTestCase {
 
         // 영원히 되감지 않고 세운다.
         XCTAssertEqual(status, "conflict")
+        XCTAssertEqual(finalRebaseCount, 8)
         // 세웠으면 화면이 말할 수 있어야 한다. 조용히 굳으면 사용자는 모른다.
         XCTAssertTrue(
             stalled.contains {
@@ -569,12 +573,18 @@ final class SyncV2FolderEndToEndTests: XCTestCase {
         )
         await sender.drain(now: 20)
 
-        let status = try await sender.store.operationStatus(
+        let originalStatus = try await sender.store.operationStatus(
             operationID: renameID
+        )
+        let operations = try await sender.store.queuedOperations()
+        let successor = try XCTUnwrap(
+            operations.first { $0.supersedesOperationID == renameID }
         )
         let storedName = await server.name(of: folderID)
         let revision = await server.revision(of: folderID)
-        XCTAssertEqual(status, "completed")
+        XCTAssertEqual(originalStatus, "cancelled")
+        XCTAssertEqual(successor.status, .completed)
+        XCTAssertEqual(successor.automaticRebaseCount, 1)
         XCTAssertEqual(storedName, "이 기기 이름")
         XCTAssertEqual(revision, 3)
         await sender.close()
