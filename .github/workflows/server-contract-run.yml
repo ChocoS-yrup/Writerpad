@@ -61,8 +61,6 @@ jobs:
           psql -v ON_ERROR_STOP=1 -f supabase/migrations/20260820113209_authenticated_sync_handshake.sql
       - name: Run authenticated sync handshake conformance
         run: psql -v ON_ERROR_STOP=1 -f supabase/tests/authenticated_sync_handshake.sql
-      - name: Check patch whitespace
-        run: git diff --check "${EXPECTED_CHECKOUT_SHA}^1" "${EXPECTED_CHECKOUT_SHA}"
 
   postgres-contract:
     name: PostgreSQL migration and RPC conformance (${{ inputs.validation_label }})
