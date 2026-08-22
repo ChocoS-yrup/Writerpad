@@ -5771,6 +5771,12 @@ actor SyncV2Store:
                                 WHERE succession.operation_id
                                     = structuralDependency.operation_id
                                   AND succession.event_type = 'superseded'
+                                  -- 현재 후보가 바로 그 successor면 이 의존은
+                                  -- 이미 후보 자신으로 이어진 것이다. 자신이
+                                  -- 끝나기를 기다리게 만들면 tree_order rebase가
+                                  -- 영원히 pending에 머문다.
+                                  AND successor.operation_id
+                                    <> o.operation_id
                                   AND successor.status NOT IN (
                                       'completed', 'cancelled'
                                   )

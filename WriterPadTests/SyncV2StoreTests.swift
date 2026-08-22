@@ -5034,6 +5034,138 @@ final class SyncV2StoreTests: XCTestCase {
         await store.close()
     }
 
+    /// 검증06에서 folder successor가 끝난 뒤 tree_order도 revision 충돌로
+    /// successor를 만들었다. 앞선 원본의 successor가 현재 후보 자신인데도
+    /// "앞 구조 작업이 끝나야 한다"는 조건에 다시 걸리면, 새 tree_order는
+    /// 자기 자신의 완료를 기다리며 영원히 pending에 머문다.
+    func testTreeOrderRebaseSuccessorDoesNotWaitForItself()
+        async throws {
+        let url = try databaseURL()
+        let context = QueueAPIContext()
+        let store = try await connectedStore(at: url, context: context)
+        try await store.applyFolderSnapshotBaselines(
+            localProjectID: context.localProjectID,
+            serverProjectID: context.serverProjectID,
+            folders: [
+                SyncV2RemoteFolder(
+                    folderID: context.folderID,
+                    parentFolderID: nil,
+                    name: "서버 이름",
+                    revision: 2,
+                    isDeleted: false,
+                    updatedAt: Date(timeIntervalSince1970: 10)
+                ),
+            ],
+            excluding: []
+        )
+        let folderOperationID = UUID()
+        let treeOrderOperationID = UUID()
+        let treeOrderDocumentID = UUID()
+        _ = try await store.enqueue(
+            context.batch(
+                kind: .structureChange,
+                mutations: [
+                    context.folderMutation(
+                        operationID: folderOperationID,
+                        name: "아이패드 이름"
+                    ),
+                    context.documentMutation(
+                        operationID: treeOrderOperationID,
+                        documentID: treeOrderDocumentID,
+                        relativePath: syncV2TreeOrderPath,
+                        content: "{\"tree_order\":{},\"version\":1}",
+                        generation: 1,
+                        kind: .treeOrder
+                    ),
+                ]
+            )
+        )
+
+        let originalFolderClaims = try await store
+            .claimReadyFolderOperations(
+                limit: 1,
+                now: Date(timeIntervalSince1970: 20)
+            )
+        let originalFolder = try XCTUnwrap(originalFolderClaims.first)
+        try await store.rebaseFolderAfterRevisionConflict(
+            originalFolder,
+            remote: SyncV2RemoteFolder(
+                folderID: context.folderID,
+                parentFolderID: nil,
+                name: "윈도우 이름",
+                revision: 3,
+                isDeleted: false,
+                updatedAt: Date(timeIntervalSince1970: 30)
+            )
+        )
+        let folderSuccessorClaims = try await store
+            .claimReadyFolderOperations(
+                limit: 1,
+                now: Date(timeIntervalSince1970: 40)
+            )
+        let folderSuccessor = try XCTUnwrap(folderSuccessorClaims.first)
+        try await store.complete(
+            folderSuccessor,
+            result: folderCommitResult(for: folderSuccessor)
+        )
+
+        let originalTreeOrderClaims = try await store.claimReadyOperations(
+            limit: 1,
+            now: Date(timeIntervalSince1970: 50)
+        )
+        let originalTreeOrder = try XCTUnwrap(
+            originalTreeOrderClaims.first
+        )
+        let local = try await store.latestLocalSnapshot(
+            for: originalTreeOrder
+        )
+        let remote = SyncV2RemoteDocumentSnapshot(
+            documentID: treeOrderDocumentID,
+            relativePath: syncV2TreeOrderPath,
+            content: "{\"tree_order\":{\"<root>\":[\"윈도우 이름\"]},\"version\":1}",
+            revision: originalTreeOrder.baseRevision + 1,
+            isDeleted: false,
+            deletedAt: nil,
+            updatedAt: Date(timeIntervalSince1970: 55)
+        )
+        let result = try await store.rebaseAfterRevisionConflict(
+            originalTreeOrder,
+            remote: remote,
+            local: local,
+            mergedContent: local.content,
+            mergedPath: syncV2TreeOrderPath
+        )
+        XCTAssertEqual(result, .rebased)
+
+        let treeOrderOperations = try await store.queuedOperations(
+            documentID: treeOrderDocumentID
+        )
+        let successor = try XCTUnwrap(
+            treeOrderOperations.first {
+                $0.supersedesOperationID == treeOrderOperationID
+            }
+        )
+        XCTAssertNotEqual(successor.operationID, treeOrderOperationID)
+        XCTAssertNotEqual(successor.batchID, originalTreeOrder.batchID)
+        XCTAssertEqual(successor.status, .pending)
+
+        let ready = try await store.claimReadyOperations(
+            limit: 1,
+            now: Date(timeIntervalSince1970: 60)
+        )
+        XCTAssertEqual(
+            ready.map(\.operationID),
+            [successor.operationID],
+            "tree_order successor는 자기 자신의 완료를 기다리면 안 된다"
+        )
+        let stateDivergences = try await store.operationStateDivergences()
+        let lineageDivergences = try await store
+            .operationLineageDivergences()
+        XCTAssertEqual(stateDivergences, [])
+        XCTAssertEqual(lineageDivergences, [])
+        await store.close()
+    }
+
     func testSixRapidFolderRenamesWaitBeforePublishingFinalTreeOrder()
         async throws {
         let url = try databaseURL()

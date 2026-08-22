@@ -10,6 +10,27 @@ worktree   /private/tmp/WriterPad-Merge
 보존 사본  /private/tmp/WriterPad-Merge.bak-20260818
 ```
 
+### 2026-08-22 검증06 후속 — tree_order 자기 의존 교착 수정
+
+- `aa5a215` 실기기 검증06에서 폴더 successor는 `committed`됐지만,
+  tree_order successor가 `pending/attempts 0`에서 멈췄다. 화면의 일반적인
+  "편집 또는 조합 중" 대기 문구와 달리 실제 원인은 dispatch 의존성이었다.
+- 앞선 tree_order 원본의 `superseded.related_operation_id`가 현재 후보 자신을
+  가리키는데, 구조 선행 조건이 그 successor의 완료를 다시 요구해
+  `self_dependency = 1`이 됐다.
+- 구조 선행 조건에서 `successor.operation_id == 현재 후보 operation_id`인
+  승계 간선만 제외했다. 다른 미완료 구조 작업과 successor는 계속 차단한다.
+- 실DB 모양을 재현하는
+  `testTreeOrderRebaseSuccessorDoesNotWaitForItself`를 추가했다. 새 tree_order가
+  다른 operation/batch ID와 supersedes를 갖고 즉시 claim되며 state·lineage
+  divergence가 모두 0인지 확인한다.
+- 저장소·폴더 E2E·snapshot pull 233개 통과. 전체 WriterPadTests는
+  770개 중 769 passed, 1 skipped, 실패 0.
+- 실패 회차 자료는
+  `/Users/chocos/Documents/WriterPad-iPad-Verify06-aa5a215-failure-20260821-105407`
+  에 보존했다. 수정 HEAD를 설치한 뒤 **새 프로젝트로 검증06부터 다시** 한다.
+- 검증06·07이 새 HEAD에서 모두 통과할 때까지 핸드셰이크 동결은 유지한다.
+
 ### 2026-08-20 진행 갱신 — divergence 완료, 핸드셰이크 동결
 
 - 문서와 폴더 revision 충돌은 원본 행을 고쳐 쓰지 않는다. 새 `operation_id`와
