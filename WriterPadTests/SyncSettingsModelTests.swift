@@ -4,6 +4,42 @@ import XCTest
 
 @MainActor
 final class SyncSettingsModelTests: XCTestCase {
+    func testSignUpConfirmationKeepsProtectedCloudRoutesLocked() async {
+        let project = makeManagedProject(
+            id: "00000000-0000-0000-0000-000000000900",
+            name: "확인 대기"
+        )
+        let auth = SyncSettingsAuthenticationStub(
+            state: .signedOut(.noStoredSession),
+            signUpResult: .confirmationRequired(
+                maskedEmail: "n***@example.com"
+            )
+        )
+        let model = SyncSettingsModel(
+            projectLister: SyncSettingsProjectListerStub(
+                projects: [project]
+            ),
+            authenticationService: auth,
+            projectBindingService: SyncSettingsBindingStub(
+                projects: [project],
+                ownerSubject: UUID()
+            ),
+            defaults: makeDefaults()
+        )
+
+        await model.load()
+        await model.signUp(
+            email: "new@example.com",
+            password: "safe-password"
+        )
+
+        XCTAssertFalse(model.isAuthenticated)
+        XCTAssertEqual(
+            model.informationMessage,
+            "확인 이메일을 보냈습니다 (n***@example.com). 이메일을 확인한 뒤 로그인하세요."
+        )
+    }
+
     func testEnablingGlobalSyncConnectsOnlyUnboundProjects() async {
         let first = makeManagedProject(
             id: "00000000-0000-0000-0000-000000000901",
@@ -226,9 +262,14 @@ private actor SyncSettingsProjectListerStub: SyncProjectListing {
 
 private actor SyncSettingsAuthenticationStub: AuthenticationServicing {
     private var state: AuthenticationState
+    private let signUpResult: AuthenticationSignUpResult
 
-    init(state: AuthenticationState) {
+    init(
+        state: AuthenticationState,
+        signUpResult: AuthenticationSignUpResult = .failed(.serverRejected)
+    ) {
         self.state = state
+        self.signUpResult = signUpResult
     }
 
     func currentState() -> AuthenticationState {
@@ -243,6 +284,18 @@ private actor SyncSettingsAuthenticationStub: AuthenticationServicing {
     func refreshSession(force: Bool) -> AuthenticationState {
         _ = force
         return state
+    }
+
+    func signUp(
+        email: String,
+        password: String
+    ) -> AuthenticationSignUpResult {
+        _ = email
+        _ = password
+        if case let .authenticated(account) = signUpResult {
+            state = .authenticated(account)
+        }
+        return signUpResult
     }
 
     func signIn(

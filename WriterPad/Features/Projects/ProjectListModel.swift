@@ -55,6 +55,15 @@ final class ProjectListModel: ObservableObject {
         }
     }
 
+    func restoreBackup(at packageURL: URL) async {
+        await perform {
+            let restored = try await projectManager.restoreProjectBackup(at: packageURL)
+            projects = try await projectManager.projects()
+            selectedProjectID = restored.id
+            importSuccessMessage = "‘\(restored.name)’ WriterPad 백업을 복원했습니다."
+        }
+    }
+
     func confirmImport() async {
         guard let report = importReport else { return }
         await perform {

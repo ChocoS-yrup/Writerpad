@@ -100,7 +100,8 @@ enum WorkspaceSyncStatusReducer {
             workspaceState.lastResult
         ) {
         case (_, .conflictRequired), (_, .structuralConflict),
-             (_, .waiting), (_, .automaticallyMerged):
+             (_, .notApplied), (_, .notPublished), (_, .waiting),
+             (_, .automaticallyMerged):
             // 결과 축은 연결 수명주기와 독립적이다. 사용자 조치가 필요하거나
             // 아직 확인해야 할 pull 결과는 Realtime 전이로 가리지 않는다.
             break
@@ -165,6 +166,25 @@ enum WorkspaceSyncStatusReducer {
                 detail,
                 severity: .failure,
                 retry: true
+            )
+        case let .notPublished(detail):
+            // 이 기기가 한 조작이 서버에 없다. 실패로 부르되 재시도 버튼은
+            // 달지 않는다 — 세워 둔 작업은 다시 claim되지 않아 눌러도 바뀌지
+            // 않는다.
+            return value(
+                "서버에 못 올린 변경 있음",
+                "exclamationmark.icloud",
+                detail,
+                severity: .warning
+            )
+        case let .notApplied(detail):
+            // 실패가 아니라 덮어쓰지 않으려고 미룬 것이므로 정보성으로 둔다.
+            // 재시도 버튼을 달지 않는다. 눌러도 바뀌지 않고, 아무 일도 하지
+            // 않는 버튼은 사실을 감추는 또 하나의 거짓이 된다.
+            return value(
+                "적용하지 않은 항목 있음",
+                "info.circle",
+                detail
             )
         default:
             break

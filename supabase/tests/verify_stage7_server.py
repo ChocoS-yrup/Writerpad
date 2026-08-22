@@ -24,6 +24,7 @@ FOUNDATION_NAME = "20260811010000_sync_contract_0_1_0_foundation.sql"
 RPC_NAME = "20260811020000_sync_contract_0_1_0_rpcs.sql"
 STORAGE_V2_NAME = "20260813063251_sync_contract_0_3_0_storage_name_v2.sql"
 CORRECTIVE_NAME = "20260814182850_rpc_auth_error_envelope_corrective.sql"
+HANDSHAKE_NAME = "20260820113209_authenticated_sync_handshake.sql"
 SOURCE_CATALOG_DIGEST = (
     "6c71ff36a90993dc327557b4a1a64c0dfb27b347134ed89e7f126dae76c6ff9a"
 )
@@ -59,8 +60,9 @@ def main() -> None:
     sql_paths = sorted(MIGRATIONS.glob("*.sql"))
     require(
         [path.name for path in sql_paths]
-        == [BASELINE_NAME, FOUNDATION_NAME, RPC_NAME, STORAGE_V2_NAME, CORRECTIVE_NAME],
-        "the server chain must end with the additive auth-envelope corrective migration",
+        == [BASELINE_NAME, FOUNDATION_NAME, RPC_NAME, STORAGE_V2_NAME,
+            CORRECTIVE_NAME, HANDSHAKE_NAME],
+        "the server chain must end with the additive authenticated handshake migration",
     )
     for name, expected in IMMUTABLE_MIGRATION_DIGESTS.items():
         require(sha256(MIGRATIONS / name) == expected, f"historical migration changed: {name}")
@@ -69,6 +71,7 @@ def main() -> None:
     baseline = (MIGRATIONS / BASELINE_NAME).read_text(encoding="utf-8")
     storage_v2 = (MIGRATIONS / STORAGE_V2_NAME).read_text(encoding="utf-8")
     corrective = (MIGRATIONS / CORRECTIVE_NAME).read_text(encoding="utf-8")
+    handshake = (MIGRATIONS / HANDSHAKE_NAME).read_text(encoding="utf-8")
 
     for marker in (
         "purpose: bootstrap blank staging/new environment",
@@ -125,6 +128,26 @@ def main() -> None:
     require(
         "from public, anon, authenticated" in corrective,
         "legacy RPC entry points must not remain callable by client roles",
+    )
+
+    for marker in (
+        "public.get_sync_handshake",
+        "language plpgsql\nstable\nsecurity definer",
+        "private.has_project_role(p_project_id, v_user_id, 'viewer')",
+        "allowlist.enabled",
+        "allowlist.revoked_at is null",
+        "project_sync_mode",
+        "migration_epoch",
+        "server_protocol_version",
+        "server_contract_sha256",
+        "supported_protocol_versions",
+        "server_capabilities",
+        "grant execute on function public.get_sync_handshake(uuid, text)\n  to authenticated",
+    ):
+        require(marker in handshake, f"authenticated handshake guard missing: {marker}")
+    require(
+        "to anon, authenticated" not in handshake.split("grant execute", 1)[1],
+        "anonymous callers must not receive private allowlist metadata",
     )
 
     for guard in (

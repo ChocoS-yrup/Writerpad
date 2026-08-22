@@ -16,6 +16,52 @@ permissions:
   contents: read
 
 jobs:
+  authenticated-handshake:
+    name: Authenticated sync handshake (${{ inputs.validation_label }})
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:17.6
+        env:
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: writerpad_handshake
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d writerpad_handshake"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+    env:
+      EXPECTED_CHECKOUT_SHA: ${{ inputs.checkout_sha }}
+      PGHOST: localhost
+      PGPORT: 5432
+      PGDATABASE: writerpad_handshake
+      PGUSER: postgres
+      PGPASSWORD: postgres
+    steps:
+      - name: Check out requested commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ env.EXPECTED_CHECKOUT_SHA }}
+          persist-credentials: false
+          fetch-depth: 2
+      - name: Confirm exact checkout SHA
+        run: test "$(git rev-parse HEAD)" = "$EXPECTED_CHECKOUT_SHA"
+      - name: Apply handshake server chain and safe re-run
+        shell: bash
+        run: |
+          psql -v ON_ERROR_STOP=1 -f supabase/tests/bootstrap_postgres.sql
+          psql -v ON_ERROR_STOP=1 -f supabase/migrations/20260811000000_operational_v2_schema_baseline_snapshot.sql
+          psql -v ON_ERROR_STOP=1 -f supabase/migrations/20260811010000_sync_contract_0_1_0_foundation.sql
+          psql -v ON_ERROR_STOP=1 -f supabase/migrations/20260811020000_sync_contract_0_1_0_rpcs.sql
+          psql -v ON_ERROR_STOP=1 -f supabase/migrations/20260813063251_sync_contract_0_3_0_storage_name_v2.sql
+          psql -v ON_ERROR_STOP=1 -f supabase/migrations/20260814182850_rpc_auth_error_envelope_corrective.sql
+          psql -v ON_ERROR_STOP=1 -f supabase/migrations/20260820113209_authenticated_sync_handshake.sql
+          psql -v ON_ERROR_STOP=1 -f supabase/migrations/20260820113209_authenticated_sync_handshake.sql
+      - name: Run authenticated sync handshake conformance
+        run: psql -v ON_ERROR_STOP=1 -f supabase/tests/authenticated_sync_handshake.sql
+
   postgres-contract:
     name: PostgreSQL migration and RPC conformance (${{ inputs.validation_label }})
     runs-on: ubuntu-latest
@@ -104,16 +150,20 @@ jobs:
           psql -v ON_ERROR_STOP=1 -f supabase/migrations/20260811020000_sync_contract_0_1_0_rpcs.sql
           psql -v ON_ERROR_STOP=1 -f supabase/migrations/20260813063251_sync_contract_0_3_0_storage_name_v2.sql
           psql -v ON_ERROR_STOP=1 -f supabase/migrations/20260814182850_rpc_auth_error_envelope_corrective.sql
+          psql -v ON_ERROR_STOP=1 -f supabase/migrations/20260820113209_authenticated_sync_handshake.sql
           psql -v ON_ERROR_STOP=1 -f supabase/migrations/20260811010000_sync_contract_0_1_0_foundation.sql
           psql -v ON_ERROR_STOP=1 -f supabase/migrations/20260811020000_sync_contract_0_1_0_rpcs.sql
           psql -v ON_ERROR_STOP=1 -f supabase/migrations/20260813063251_sync_contract_0_3_0_storage_name_v2.sql
           psql -v ON_ERROR_STOP=1 -f supabase/migrations/20260814182850_rpc_auth_error_envelope_corrective.sql
+          psql -v ON_ERROR_STOP=1 -f supabase/migrations/20260820113209_authenticated_sync_handshake.sql
       - name: Run atomic, replay, cancellation, and migration checks
         run: psql -v ON_ERROR_STOP=1 -f supabase/tests/stage7_server_contract.sql
       - name: Run storage-name-v2 server conformance
         run: psql -v ON_ERROR_STOP=1 -f supabase/tests/storage_name_v2_server_contract.sql
       - name: Run RPC auth error-envelope conformance
         run: psql -v ON_ERROR_STOP=1 -f supabase/tests/rpc_auth_error_envelope.sql
+      - name: Run authenticated sync handshake conformance
+        run: psql -v ON_ERROR_STOP=1 -f supabase/tests/authenticated_sync_handshake.sql
       - name: Prepare local-only Stage 7 revalidation identities and allowlist
         shell: bash
         run: |

@@ -94,6 +94,17 @@ private func withSyncV2GateHoldLimit<
 /// 교체하지 않도록 하는 실행 중 전용 경계다.
 /// 이 Gate 안의 operation이 반환하지 않으면 공유 인스턴스를 사용하는
 /// 프로세스 전역 동기화가 멈추므로 보유 시간 상한을 제거하면 안 된다.
+///
+/// 폴더는 빈 경우 잠글 문서 UUID가 하나도 없다. 그래서 작품별
+/// 구조 변경은 아래의 전용 키를 같이 잠그고, 문서 UUID와 충돌하지
+/// 않도록 작품 UUID에서 다른 namespace로 파생한다.
+func syncV2ProjectStructureMutationID(_ projectID: ProjectID) -> UUID {
+    syncV2UUIDv5(
+        namespace: projectID.rawValue,
+        name: "writerpad-project-structure-mutation"
+    )
+}
+
 actor SyncV2DocumentMutationGate {
     private var lockedDocumentIDs: Set<UUID> = []
     private var waiters: [
@@ -774,6 +785,19 @@ struct SyncV2WorkspaceState: Equatable, Sendable {
         case automaticallyMerged
         case conflictRequired(detail: String)
         case structuralConflict(detail: String)
+        /// 서버가 알린 구조 변경 중 일부를 일부러 적용하지 않았다.
+        ///
+        /// 실패가 아니라 의도한 안전 동작이다. 이름을 고쳐서 풀리는 상태도
+        /// 아니고, 다시 시도해서 풀리는 상태도 아니다. 그래서
+        /// `structuralConflict`와 같은 자리에 둘 수 없다. 저쪽 제목과 재시도
+        /// 버튼이 이 상태에서는 전부 거짓이 된다.
+        case notApplied(detail: String)
+        /// 이 기기가 한 폴더 변경이 서버에 올라가지 못한 채 서 있다.
+        ///
+        /// 들어오는 변경을 적용하지 않은 `notApplied`와 방향이 반대다. 저쪽은
+        /// 서버 것을 안 받은 것이고 이쪽은 내 것을 못 보낸 것이라, 같은 문장으로
+        /// 말하면 둘 다 틀린다. 재시도로는 풀리지 않으므로 버튼을 달지 않는다.
+        case notPublished(detail: String)
         case failed(detail: String)
     }
 
@@ -786,6 +810,10 @@ typealias SyncV2WorkspaceSleep =
     @Sendable (Duration) async throws -> Void
 typealias SyncV2WorkspaceDispatchRetry =
     @Sendable () async -> Void
+/// 서버가 거절해 세워 둔 폴더 변경을 읽는다. 화면이 pull 결과만 보고 상태를
+/// 정하므로, 이것이 없으면 나가는 쪽 굳음은 드러나지 않는다.
+typealias SyncV2WorkspaceStalledFolderReader =
+    @Sendable (ProjectID) async -> [SyncV2StalledFolderChange]
 
 private actor SyncV2WorkspaceAuthenticationOutcome {
     private var state: AuthenticationState?
@@ -845,6 +873,8 @@ final class SyncV2WorkspaceSyncModel: ObservableObject {
     private let authenticationService: any AuthenticationServicing
     private let projectBindingService: any ProjectBindingServicing
     private let requestDispatchRetry: SyncV2WorkspaceDispatchRetry?
+    private let readStalledFolderChanges:
+        SyncV2WorkspaceStalledFolderReader?
     private let sleep: SyncV2WorkspaceSleep
     private let debounceDelay: Duration
     private let periodicDelay: Duration
@@ -856,12 +886,13 @@ final class SyncV2WorkspaceSyncModel: ObservableObject {
     private let pullTimeout: Duration
     private let pullTimeoutSleep: SyncV2WorkspaceSleep
     private let retryDelays: [Duration]
+    private let realtimeHardResetAttemptThreshold: Int
     private let recoverySleep: SyncV2WorkspaceSleep
     private let networkMonitor: SyncV2NetworkRecoveryMonitor
     private var editingGuards:
         (@MainActor @Sendable () -> [UUID: SyncV2EditingGuard])?
-    private var applyOpenSnapshot:
-        (@MainActor @Sendable (SyncV2RemoteDocumentSnapshot) -> Void)?
+    private var applyOpenSnapshots:
+        (@MainActor @Sendable ([SyncV2RemoteDocumentSnapshot]) -> Void)?
     private var debounceTask = SingleFlightTask()
     private var periodicTask = SingleFlightTask()
     private var pullTask = SingleFlightTask()
@@ -908,6 +939,8 @@ final class SyncV2WorkspaceSyncModel: ObservableObject {
         authenticationService: any AuthenticationServicing,
         projectBindingService: any ProjectBindingServicing,
         requestDispatchRetry: SyncV2WorkspaceDispatchRetry? = nil,
+        readStalledFolderChanges:
+            SyncV2WorkspaceStalledFolderReader? = nil,
         debounceDelay: Duration = SyncV2Timing.standard.debounceDelay,
         // Realtime 누락에 대비한 저빈도 안전망이다. 실제 재연결 복구는
         // reachability 이벤트가 즉시 시작하므로 이 주기를 기다리지 않는다.
@@ -920,6 +953,7 @@ final class SyncV2WorkspaceSyncModel: ObservableObject {
             SyncV2Timing.standard.realtimeSubscriptionTimeout,
         pullTimeout: Duration = SyncV2Timing.standard.pullTimeout,
         retryDelays: [Duration] = SyncV2Timing.standard.backoff,
+        realtimeHardResetAttemptThreshold: Int = 3,
         authenticationSleep:
             @escaping SyncV2WorkspaceSleep = { duration in
                 try await ContinuousClock().sleep(for: duration)
@@ -948,6 +982,7 @@ final class SyncV2WorkspaceSyncModel: ObservableObject {
         self.authenticationService = authenticationService
         self.projectBindingService = projectBindingService
         self.requestDispatchRetry = requestDispatchRetry
+        self.readStalledFolderChanges = readStalledFolderChanges
         self.debounceDelay = debounceDelay
         self.periodicDelay = periodicDelay
         self.authenticationTimeout = authenticationTimeout
@@ -958,6 +993,10 @@ final class SyncV2WorkspaceSyncModel: ObservableObject {
         self.pullTimeout = pullTimeout
         self.pullTimeoutSleep = pullTimeoutSleep
         self.retryDelays = retryDelays
+        self.realtimeHardResetAttemptThreshold = max(
+            1,
+            realtimeHardResetAttemptThreshold
+        )
         self.recoverySleep = recoverySleep
         self.networkMonitor = networkMonitor
         self.sleep = sleep
@@ -968,12 +1007,12 @@ final class SyncV2WorkspaceSyncModel: ObservableObject {
         editingGuards:
             @escaping @MainActor @Sendable
             () -> [UUID: SyncV2EditingGuard],
-        applyOpenSnapshot:
+        applyOpenSnapshots:
             @escaping @MainActor @Sendable
-            (SyncV2RemoteDocumentSnapshot) -> Void
+            ([SyncV2RemoteDocumentSnapshot]) -> Void
     ) async {
         self.editingGuards = editingGuards
-        self.applyOpenSnapshot = applyOpenSnapshot
+        self.applyOpenSnapshots = applyOpenSnapshots
         await updateSceneActivity(sceneIsActive)
     }
 
@@ -1660,6 +1699,22 @@ final class SyncV2WorkspaceSyncModel: ObservableObject {
                 await self?.pullNow(forceVisibleProgress: true)
             }
         case .closed, .channelError, .timedOut:
+            let terminalReason: String
+            switch status {
+            case .closed:
+                terminalReason = "closed"
+            case .channelError:
+                terminalReason = "channel-error"
+            case .timedOut:
+                terminalReason = "timed-out"
+            case .subscribing, .subscribed:
+                terminalReason = "non-terminal"
+            }
+            logTask(
+                "realtimeConnection",
+                action: "terminal",
+                reason: terminalReason
+            )
             let now = ContinuousClock().now
             if let lastSubscribedAt,
                lastSubscribedAt.duration(to: now)
@@ -1725,6 +1780,16 @@ final class SyncV2WorkspaceSyncModel: ObservableObject {
             guard didSleep, self.isActive else { return }
             _ = await self.authenticationService.refreshSession(force: false)
             await self.realtime?.stop()
+            if self.reconnectAttempt
+                >= self.realtimeHardResetAttemptThreshold {
+                self.logTask(
+                    "realtimeConnection",
+                    action: "reset",
+                    reason: "rapid-terminal-statuses"
+                )
+                await self.realtime?.resetConnection()
+                self.reconnectAttempt = 0
+            }
             self.startRealtime(reconnecting: true)
         }
     }
@@ -1959,10 +2024,13 @@ final class SyncV2WorkspaceSyncModel: ObservableObject {
             state.progress = .idle
             return
         }
+        // 나가는 쪽이 굳었는지는 pull 보고서에 없다. 화면을 정하기 직전에
+        // 대기열에서 읽어 와야 "동기화됨"이 거짓이 되지 않는다.
+        let stalled = await readStalledFolderChanges?(localProjectID) ?? []
         switch outcome {
         case .success(let report):
             pullRetryAttempt = 0
-            complete(report)
+            complete(report, stalled: stalled)
         case .clientError(let error):
             complete(error)
             schedulePullRetry()
@@ -2019,9 +2087,32 @@ final class SyncV2WorkspaceSyncModel: ObservableObject {
         }
     }
 
-    private func complete(_ report: SyncV2SnapshotPullReport) {
-        report.appliedSnapshots.forEach {
-            applyOpenSnapshot?($0)
+    /// 이름을 고치면 풀리는 항목만 고른다.
+    private static func unusableName(
+        in report: SyncV2SnapshotPullReport
+    ) -> SyncV2RejectedStructureName? {
+        report.rejectedStructureNames.first { $0.kind == .unusableName }
+    }
+
+    /// 이름 문제가 아니어서 적용하지 않은 항목만 고른다.
+    private static func notAppliedItem(
+        in report: SyncV2SnapshotPullReport
+    ) -> SyncV2RejectedStructureName? {
+        report.rejectedStructureNames.first { $0.kind == .notApplied }
+    }
+
+    private static func notAppliedCount(
+        in report: SyncV2SnapshotPullReport
+    ) -> Int {
+        report.rejectedStructureNames.filter { $0.kind == .notApplied }.count
+    }
+
+    private func complete(
+        _ report: SyncV2SnapshotPullReport,
+        stalled: [SyncV2StalledFolderChange] = []
+    ) {
+        if !report.appliedSnapshots.isEmpty {
+            applyOpenSnapshots?(report.appliedSnapshots)
         }
         let mergeOutcomes = report.outcomes.compactMap {
             if case let .mergeRequired(_, _, reason) = $0 {
@@ -2049,8 +2140,12 @@ final class SyncV2WorkspaceSyncModel: ObservableObject {
             // 빠져나올 수 없다. 실기기에서 폴더 이름 끝의 공백 하나로 구조
             // 동기화가 멈췄고, 화면에는 원인이 드러나지 않았다. 이름을 알아낸
             // 경우에는 그 이름을 그대로 보여준다.
+            //
+            // 이름 문제인 항목만 고른다. 목록에는 이름과 무관한 거부도 함께
+            // 들어 있고, 그것을 이 문장에 끼우면 사용자가 손댈 필요 없는
+            // 이름을 고치러 간다.
             lastResult = .structuralConflict(
-                detail: report.rejectedStructureNames.first.map { rejected in
+                detail: Self.unusableName(in: report).map { rejected in
                     """
                     \(rejected.parent) 안의 '\(rejected.name)' \
                     이름을 iPad에 적용할 수 없습니다. \
@@ -2059,6 +2154,31 @@ final class SyncV2WorkspaceSyncModel: ObservableObject {
                     로컬 TXT는 덮어쓰지 않았습니다.
                     """
                 } ?? "서버의 폴더나 문서 제목 중 iPad에서 쓸 수 없는 이름이 있어 구조를 적용하지 못했습니다. 이름 끝의 공백과 마침표를 지우고 < > : \" / \\ | ? * 문자를 뺀 뒤 다시 동기화해 주세요. 로컬 TXT는 덮어쓰지 않았습니다."
+            )
+        } else if let stalledChange = stalled.first {
+            // 사용자가 한 조작이 서버에 없는데 화면이 조용하면 그것도 거짓이다.
+            // 이름을 고치라고 단정하지 않는다 — 코드마다 할 일이 다르다.
+            let others = stalled.count - 1
+            let tail = others > 0 ? " 외 \(others)건." : ""
+            lastResult = .notPublished(
+                detail: """
+                '\(stalledChange.name)' 폴더 변경이 서버에 올라가지 \
+                못했습니다. (\(stalledChange.errorCode))\(tail) \
+                로컬 TXT는 그대로입니다.
+                """
+            )
+        } else if let skipped = Self.notAppliedItem(in: report) {
+            // 덮어쓰지 않으려고 적용하지 않은 항목이다. 아무 일도 없었던 것처럼
+            // 끝나면 사용자는 서버와 화면이 다른 이유를 알 수 없다. 이름을
+            // 고치라고도, 다시 시도하라고도 하지 않는다.
+            let others = Self.notAppliedCount(in: report) - 1
+            let tail = others > 0 ? " 외 \(others)건." : ""
+            lastResult = .notApplied(
+                detail: """
+                \(skipped.parent) 안의 '\(skipped.name)'을(를) \
+                적용하지 않았습니다. \(skipped.reason).\(tail) \
+                로컬 TXT는 그대로입니다.
+                """
             )
         } else if !mergeOutcomes.isEmpty {
             lastResult = .waiting

@@ -3,6 +3,67 @@ import XCTest
 @testable import WriterPad
 
 final class SupabaseAuthServiceTests: XCTestCase {
+    func testSignUpWithImmediateSessionStoresTokensAndAuthenticates() async {
+        let serverSession = session(email: "new@example.com")
+        let transport = AuthTransportStub(
+            signUpResult: .success(.authenticated(serverSession))
+        )
+        let store = SessionStoreStub()
+        let service = SupabaseAuthService(
+            transport: transport,
+            sessionStore: store
+        )
+
+        let result = await service.signUp(
+            email: "new@example.com",
+            password: "safe-password"
+        )
+
+        XCTAssertEqual(
+            result,
+            .authenticated(
+                AuthenticatedAccount(
+                    userID: serverSession.userID,
+                    maskedEmail: "n***@example.com"
+                )
+            )
+        )
+        let storedTokens = await store.storedTokens()
+        XCTAssertEqual(
+            storedTokens,
+            StoredSessionTokens(
+                accessToken: serverSession.accessToken,
+                refreshToken: serverSession.refreshToken
+            )
+        )
+    }
+
+    func testSignUpRequiringEmailConfirmationDoesNotAuthenticate() async {
+        let store = SessionStoreStub()
+        let service = SupabaseAuthService(
+            transport: AuthTransportStub(
+                signUpResult: .success(
+                    .confirmationRequired(email: "new@example.com")
+                )
+            ),
+            sessionStore: store
+        )
+
+        let result = await service.signUp(
+            email: "new@example.com",
+            password: "safe-password"
+        )
+
+        XCTAssertEqual(
+            result,
+            .confirmationRequired(maskedEmail: "n***@example.com")
+        )
+        let state = await service.currentState()
+        let storedTokens = await store.storedTokens()
+        XCTAssertEqual(state, .signedOut(.noStoredSession))
+        XCTAssertNil(storedTokens)
+    }
+
     func testSuccessfulLoginStoresOnlyReturnedTokensAndMasksEmail() async {
         let serverSession = session(email: "writer@example.com")
         let transport = AuthTransportStub(signInResult: .success(serverSession))
@@ -611,6 +672,10 @@ private actor SessionStoreStub: SessionTokenStoring {
 }
 
 private actor AuthTransportStub: SupabaseAuthTransporting {
+    private let signUpResult: Result<
+        SupabaseSignUpResult,
+        SupabaseAuthTransportError
+    >
     private let signInResult: Result<
         ValidatedAuthSession,
         SupabaseAuthTransportError
@@ -634,6 +699,10 @@ private actor AuthTransportStub: SupabaseAuthTransporting {
     private var restoreTokens: StoredSessionTokens?
 
     init(
+        signUpResult: Result<
+            SupabaseSignUpResult,
+            SupabaseAuthTransportError
+        > = .failure(.serverRejected),
         signInResult: Result<
             ValidatedAuthSession,
             SupabaseAuthTransportError
@@ -651,6 +720,7 @@ private actor AuthTransportStub: SupabaseAuthTransporting {
         restoreGate: AuthRestoreGate? = nil,
         refreshGate: AuthRestoreGate? = nil
     ) {
+        self.signUpResult = signUpResult
         self.signInResult = signInResult
         self.restoreResult = restoreResult
         self.refreshResult = refreshResult ?? restoreResult
@@ -658,6 +728,15 @@ private actor AuthTransportStub: SupabaseAuthTransporting {
         self.restoreDelay = restoreDelay
         self.restoreGate = restoreGate
         self.refreshGate = refreshGate
+    }
+
+    func signUp(
+        email: String,
+        password: String
+    ) throws -> SupabaseSignUpResult {
+        _ = email
+        _ = password
+        return try signUpResult.get()
     }
 
     func signIn(

@@ -1,5 +1,6 @@
 import Foundation
 import SwiftUI
+import UIKit
 
 enum GlobalSyncPreference {
     static let storageKey = "writerpad.sync-all-projects-enabled"
@@ -126,6 +127,44 @@ final class SyncSettingsModel: ObservableObject {
     func load() async {
         authenticationState = await authenticationService.currentState()
         await reloadProjects()
+    }
+
+    func observeAuthenticationChanges() async {
+        let updates = await authenticationService.stateUpdates()
+        for await updatedState in updates {
+            guard !Task.isCancelled else { return }
+            authenticationState = updatedState
+        }
+    }
+
+    func signUp(email: String, password: String) async {
+        guard !isWorking else { return }
+        isWorking = true
+        errorMessage = nil
+        informationMessage = nil
+
+        let result = await authenticationService.signUp(
+            email: email,
+            password: password
+        )
+        authenticationState = await authenticationService.currentState()
+        switch result {
+        case .authenticated:
+            if isSyncAllEnabled {
+                await syncDispatcher?.start()
+                await backgroundSyncCoordinator?.start()
+            }
+            await syncDispatcher?.loginSucceeded()
+            informationMessage = "계정을 만들고 로그인했습니다."
+        case let .confirmationRequired(maskedEmail):
+            let recipient = maskedEmail.map { " (\($0))" } ?? ""
+            informationMessage = "확인 이메일을 보냈습니다\(recipient). 이메일을 확인한 뒤 로그인하세요."
+        case let .failed(failure):
+            errorMessage = Self.authenticationMessage(
+                .unavailable(failure)
+            )
+        }
+        isWorking = false
     }
 
     func signIn(email: String, password: String) async {
@@ -355,6 +394,14 @@ final class SyncSettingsModel: ObservableObject {
                 return "서버 주소와 공개 키가 이 빌드에 설정되지 않았습니다."
             case .invalidCredentials:
                 return "아이디 또는 비밀번호가 올바르지 않습니다."
+            case .weakPassword:
+                return "더 안전한 비밀번호를 사용하세요."
+            case .accountAlreadyExists:
+                return "이미 등록된 이메일입니다. 로그인해 주세요."
+            case .signUpDisabled:
+                return "현재 새 계정을 만들 수 없습니다."
+            case .emailNotConfirmed:
+                return "이메일 확인을 완료한 뒤 로그인하세요."
             case .networkUnavailable:
                 return "서버에 연결할 수 없습니다. 네트워크를 확인하세요."
             case .keychainAccess:
@@ -399,10 +446,32 @@ final class SyncSettingsModel: ObservableObject {
             return "서버가 예상과 다른 작품 정보를 반환했습니다."
         case .serverRejected:
             return "서버가 작품 연결을 처리하지 못했습니다."
+        case .initialSnapshotNotQueued:
+            return "최초 작품 snapshot을 안전하게 기록하지 못했습니다. 앱을 다시 열면 자동으로 재시도합니다."
         case .notBound:
             return "아직 서버에 연결되지 않은 작품입니다."
         }
     }
+}
+
+private enum AuthenticationFormMode: String, CaseIterable, Identifiable {
+    case signIn
+    case signUp
+
+    var id: String { rawValue }
+
+    var title: String {
+        switch self {
+        case .signIn: "로그인"
+        case .signUp: "회원 가입"
+        }
+    }
+}
+
+private enum AuthenticationField: Hashable {
+    case email
+    case password
+    case passwordConfirmation
 }
 
 private enum ExistingConnectionKind: String, Identifiable {
@@ -430,10 +499,166 @@ private struct ExistingConnectionRequest: Identifiable {
     }
 }
 
+private struct AuthenticationTextField: UIViewRepresentable {
+    let field: AuthenticationField
+    let placeholder: String
+    @Binding var text: String
+    @Binding var focusedField: AuthenticationField?
+    let isSecure: Bool
+    let keyboardType: UIKeyboardType
+    let textContentType: UITextContentType?
+    let accessibilityIdentifier: String
+    let isPreviousEnabled: Bool
+    let isNextEnabled: Bool
+    let onMove: (Int) -> Void
+
+    func makeCoordinator() -> Coordinator {
+        Coordinator(parent: self)
+    }
+
+    func makeUIView(context: Context) -> UITextField {
+        let textField = UITextField(frame: .zero)
+        textField.delegate = context.coordinator
+        textField.addTarget(
+            context.coordinator,
+            action: #selector(Coordinator.textDidChange(_:)),
+            for: .editingChanged
+        )
+        configure(textField, coordinator: context.coordinator)
+        return textField
+    }
+
+    func updateUIView(_ textField: UITextField, context: Context) {
+        context.coordinator.parent = self
+        configure(textField, coordinator: context.coordinator)
+
+        if textField.text != text {
+            textField.text = text
+        }
+
+        if focusedField == field {
+            if !textField.isFirstResponder {
+                textField.becomeFirstResponder()
+            }
+        } else if textField.isFirstResponder {
+            textField.resignFirstResponder()
+        }
+    }
+
+    private func configure(
+        _ textField: UITextField,
+        coordinator: Coordinator
+    ) {
+        textField.placeholder = placeholder
+        textField.font = UIFont.preferredFont(forTextStyle: .body)
+        textField.textColor = .label
+        textField.tintColor = .tintColor
+        textField.keyboardType = keyboardType
+        textField.textContentType = textContentType
+        if textField.isSecureTextEntry != isSecure {
+            textField.isSecureTextEntry = isSecure
+        }
+        textField.autocapitalizationType = .none
+        textField.autocorrectionType = .no
+        textField.spellCheckingType = .no
+        textField.returnKeyType = isNextEnabled ? .next : .done
+        textField.accessibilityIdentifier = accessibilityIdentifier
+        textField.accessibilityLabel = placeholder
+
+        guard coordinator.previousEnabled != isPreviousEnabled
+                || coordinator.nextEnabled != isNextEnabled
+                || coordinator.previousButton == nil
+                || coordinator.nextButton == nil else {
+            return
+        }
+
+        coordinator.previousEnabled = isPreviousEnabled
+        coordinator.nextEnabled = isNextEnabled
+        let previousButton = UIBarButtonItem(
+            image: UIImage(systemName: "chevron.up"),
+            style: .plain,
+            target: coordinator,
+            action: #selector(Coordinator.moveToPreviousField)
+        )
+        previousButton.accessibilityLabel = "이전 입력란"
+        previousButton.accessibilityIdentifier =
+            "writerpad.auth-previous-field"
+        previousButton.isEnabled = isPreviousEnabled
+
+        let nextButton = UIBarButtonItem(
+            image: UIImage(systemName: "chevron.down"),
+            style: .plain,
+            target: coordinator,
+            action: #selector(Coordinator.moveToNextField)
+        )
+        nextButton.accessibilityLabel = "다음 입력란"
+        nextButton.accessibilityIdentifier = "writerpad.auth-next-field"
+        nextButton.isEnabled = isNextEnabled
+
+        coordinator.previousButton = previousButton
+        coordinator.nextButton = nextButton
+        textField.inputAssistantItem.trailingBarButtonGroups = [
+            UIBarButtonItemGroup(
+                barButtonItems: [previousButton, nextButton],
+                representativeItem: nil
+            )
+        ]
+        if textField.isFirstResponder {
+            textField.reloadInputViews()
+        }
+    }
+
+    final class Coordinator: NSObject, UITextFieldDelegate {
+        var parent: AuthenticationTextField
+        var previousEnabled: Bool?
+        var nextEnabled: Bool?
+        var previousButton: UIBarButtonItem?
+        var nextButton: UIBarButtonItem?
+
+        init(parent: AuthenticationTextField) {
+            self.parent = parent
+        }
+
+        @objc func textDidChange(_ textField: UITextField) {
+            parent.text = textField.text ?? ""
+        }
+
+        func textFieldDidBeginEditing(_ textField: UITextField) {
+            parent.focusedField = parent.field
+        }
+
+        func textFieldDidEndEditing(_ textField: UITextField) {
+            if parent.focusedField == parent.field {
+                parent.focusedField = nil
+            }
+        }
+
+        func textFieldShouldReturn(_ textField: UITextField) -> Bool {
+            if parent.isNextEnabled {
+                parent.onMove(1)
+            } else {
+                textField.resignFirstResponder()
+            }
+            return false
+        }
+
+        @objc func moveToPreviousField() {
+            parent.onMove(-1)
+        }
+
+        @objc func moveToNextField() {
+            parent.onMove(1)
+        }
+    }
+}
+
 struct SyncSettingsView: View {
     @StateObject private var model: SyncSettingsModel
+    @State private var authenticationMode: AuthenticationFormMode = .signIn
     @State private var email = ""
     @State private var password = ""
+    @State private var passwordConfirmation = ""
+    @State private var focusedAuthenticationField: AuthenticationField?
     @State private var isConfirmingEnableAll = false
     @State private var connectionRequest: ExistingConnectionRequest?
     @State private var disconnectTarget: SyncProjectRow?
@@ -462,11 +687,21 @@ struct SyncSettingsView: View {
     var body: some View {
         Form {
             accountSection
-            globalSyncSection
-            projectConnectionsSection
+            if model.isAuthenticated {
+                globalSyncSection
+                projectConnectionsSection
+            } else {
+                protectedCloudSection
+            }
         }
         .navigationTitle("서버 동기화")
         .navigationBarTitleDisplayMode(.inline)
+        .onChange(of: authenticationMode) { _, mode in
+            if mode == .signIn,
+               focusedAuthenticationField == .passwordConfirmation {
+                focusedAuthenticationField = .password
+            }
+        }
         .disabled(model.isWorking)
         .overlay {
             if model.isWorking {
@@ -475,7 +710,10 @@ struct SyncSettingsView: View {
                     .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 14))
             }
         }
-        .task { await model.load() }
+        .task {
+            await model.load()
+            await model.observeAuthenticationChanges()
+        }
         .confirmationDialog(
             "연결되지 않은 작품 \(model.unconnectedProjectCount)개를 새 서버 작품으로 연결할까요?",
             isPresented: $isConfirmingEnableAll,
@@ -565,31 +803,88 @@ struct SyncSettingsView: View {
                     Text("저장된 로그인을 확인하는 중…")
                 }
             case .localOnly, .signedOut, .unavailable:
-                TextField("이메일", text: $email)
-                    .textInputAutocapitalization(.never)
-                    .keyboardType(.emailAddress)
-                    .textContentType(.username)
-                    .autocorrectionDisabled()
-                    .accessibilityIdentifier("writerpad.sync-email")
-                SecureField("비밀번호", text: $password)
-                    .textContentType(.password)
-                    .accessibilityIdentifier("writerpad.sync-password")
-                Button("로그인") {
+                Picker("인증 방식", selection: $authenticationMode) {
+                    ForEach(AuthenticationFormMode.allCases) { mode in
+                        Text(mode.title).tag(mode)
+                    }
+                }
+                .pickerStyle(.segmented)
+                .accessibilityIdentifier("writerpad.auth-mode")
+                AuthenticationTextField(
+                    field: .email,
+                    placeholder: "이메일",
+                    text: $email,
+                    focusedField: $focusedAuthenticationField,
+                    isSecure: false,
+                    keyboardType: .emailAddress,
+                    textContentType: .username,
+                    accessibilityIdentifier: "writerpad.sync-email",
+                    isPreviousEnabled: previousAuthenticationField != nil,
+                    isNextEnabled: nextAuthenticationField != nil,
+                    onMove: { moveAuthenticationFocus(by: $0) }
+                )
+                .frame(maxWidth: .infinity, minHeight: 36)
+                AuthenticationTextField(
+                    field: .password,
+                    placeholder: "비밀번호",
+                    text: $password,
+                    focusedField: $focusedAuthenticationField,
+                    isSecure: true,
+                    keyboardType: .default,
+                    textContentType: authenticationMode == .signUp
+                        ? .newPassword
+                        : .password,
+                    accessibilityIdentifier: "writerpad.sync-password",
+                    isPreviousEnabled: previousAuthenticationField != nil,
+                    isNextEnabled: nextAuthenticationField != nil,
+                    onMove: { moveAuthenticationFocus(by: $0) }
+                )
+                .frame(maxWidth: .infinity, minHeight: 36)
+                if authenticationMode == .signUp {
+                    AuthenticationTextField(
+                        field: .passwordConfirmation,
+                        placeholder: "비밀번호 확인",
+                        text: $passwordConfirmation,
+                        focusedField: $focusedAuthenticationField,
+                        isSecure: true,
+                        keyboardType: .default,
+                        textContentType: .newPassword,
+                        accessibilityIdentifier:
+                            "writerpad.sync-password-confirmation",
+                        isPreviousEnabled: previousAuthenticationField != nil,
+                        isNextEnabled: nextAuthenticationField != nil,
+                        onMove: { moveAuthenticationFocus(by: $0) }
+                    )
+                    .frame(maxWidth: .infinity, minHeight: 36)
+                    Text("비밀번호는 6자 이상이어야 합니다. 서버의 보안 정책에 따라 더 강한 비밀번호가 필요할 수 있습니다.")
+                        .font(.footnote)
+                        .foregroundStyle(.secondary)
+                }
+                Button(authenticationMode.title) {
                     let submittedEmail = email
                     let submittedPassword = password
                     password = ""
+                    passwordConfirmation = ""
                     Task {
-                        await model.signIn(
-                            email: submittedEmail,
-                            password: submittedPassword
-                        )
+                        if authenticationMode == .signUp {
+                            await model.signUp(
+                                email: submittedEmail,
+                                password: submittedPassword
+                            )
+                        } else {
+                            await model.signIn(
+                                email: submittedEmail,
+                                password: submittedPassword
+                            )
+                        }
                     }
                 }
-                .disabled(
-                    email.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-                        || password.isEmpty
+                .disabled(!canSubmitAuthentication)
+                .accessibilityIdentifier(
+                    authenticationMode == .signUp
+                        ? "writerpad.sync-sign-up"
+                        : "writerpad.sync-sign-in"
                 )
-                .accessibilityIdentifier("writerpad.sync-sign-in")
 
                 if case let .unavailable(failure) = model.authenticationState {
                     Text(unavailableHint(failure))
@@ -598,10 +893,69 @@ struct SyncSettingsView: View {
                 }
             }
 
-            Text("비밀번호는 로그인 요청에만 사용하며 앱 설정에 저장하지 않습니다. 로그인 토큰은 iPad 키체인에 저장합니다.")
+            Text("비밀번호는 로그인·회원 가입 요청에만 사용하며 앱 설정에 저장하지 않습니다. 로그인 토큰은 iPad 키체인에 저장합니다.")
                 .font(.footnote)
                 .foregroundStyle(.secondary)
         }
+    }
+
+    private var protectedCloudSection: some View {
+        Section("보호된 클라우드 기능") {
+            Label("로그인 필요", systemImage: "lock.fill")
+                .font(.headline)
+            Text("모든 작품 동기화와 작품별 서버 연결은 인증된 계정에서만 열립니다. 로컬 작품 작성과 저장은 계속 사용할 수 있습니다.")
+                .font(.footnote)
+                .foregroundStyle(.secondary)
+        }
+        .accessibilityIdentifier("writerpad.protected-cloud-route")
+    }
+
+    private var canSubmitAuthentication: Bool {
+        let hasEmail = !email.trimmingCharacters(
+            in: .whitespacesAndNewlines
+        ).isEmpty
+        guard hasEmail, !password.isEmpty else { return false }
+        if authenticationMode == .signUp {
+            return password.count >= 6 && password == passwordConfirmation
+        }
+        return true
+    }
+
+    private var authenticationFields: [AuthenticationField] {
+        if authenticationMode == .signUp {
+            return [.email, .password, .passwordConfirmation]
+        }
+        return [.email, .password]
+    }
+
+    private var previousAuthenticationField: AuthenticationField? {
+        adjacentAuthenticationField(offset: -1)
+    }
+
+    private var nextAuthenticationField: AuthenticationField? {
+        adjacentAuthenticationField(offset: 1)
+    }
+
+    private func adjacentAuthenticationField(
+        offset: Int
+    ) -> AuthenticationField? {
+        guard let focusedAuthenticationField,
+              let currentIndex = authenticationFields.firstIndex(
+                  of: focusedAuthenticationField
+              ) else {
+            return nil
+        }
+        let targetIndex = currentIndex + offset
+        guard authenticationFields.indices.contains(targetIndex) else {
+            return nil
+        }
+        return authenticationFields[targetIndex]
+    }
+
+    private func moveAuthenticationFocus(by offset: Int) {
+        focusedAuthenticationField = adjacentAuthenticationField(
+            offset: offset
+        )
     }
 
     private var globalSyncSection: some View {
@@ -733,6 +1087,14 @@ struct SyncSettingsView: View {
             return "이 빌드에는 서버 주소와 공개 키가 설정되지 않았습니다."
         case .invalidCredentials:
             return "아이디 또는 비밀번호를 다시 확인하세요."
+        case .weakPassword:
+            return "더 안전한 비밀번호를 사용하세요."
+        case .accountAlreadyExists:
+            return "이미 등록된 이메일입니다. 로그인해 주세요."
+        case .signUpDisabled:
+            return "현재 새 계정을 만들 수 없습니다."
+        case .emailNotConfirmed:
+            return "이메일 확인을 완료한 뒤 로그인하세요."
         case .networkUnavailable:
             return "네트워크에 연결되면 다시 시도하세요."
         case .keychainAccess:
@@ -780,11 +1142,13 @@ private struct ExistingProjectConnectionView: View {
             .toolbar {
                 ToolbarItem(placement: .cancellationAction) {
                     Button("취소", action: onCancel)
+                        .keyboardShortcut(.cancelAction)
                 }
                 ToolbarItem(placement: .confirmationAction) {
                     Button("연결") {
                         onConnect(serverID, confirmation)
                     }
+                    .keyboardShortcut(.defaultAction)
                     .disabled(serverID.isEmpty || confirmation.isEmpty)
                 }
             }

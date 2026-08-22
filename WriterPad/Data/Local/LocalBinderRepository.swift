@@ -10,6 +10,8 @@ actor LocalBinderRepository: BinderRepository {
     private let hierarchyPolicy = BinderHierarchyPolicy()
     private let clock: any AppClock
     private let uuidGenerator: any UUIDGenerating
+    private let syncMutationGate: SyncV2DocumentMutationGate
+    private let fileManager: FileManager
 
     init(
         metadataStore: any BinderMetadataStoring,
@@ -18,7 +20,10 @@ actor LocalBinderRepository: BinderRepository {
         scanner: any BinderDirectoryScanning,
         pathPolicy: PathPolicy = PathPolicy(),
         clock: any AppClock,
-        uuidGenerator: any UUIDGenerating = SystemUUIDGenerator()
+        uuidGenerator: any UUIDGenerating = SystemUUIDGenerator(),
+        syncMutationGate: SyncV2DocumentMutationGate =
+            SyncV2DocumentMutationGate(),
+        fileManager: FileManager = .default
     ) {
         self.metadataStore = metadataStore
         self.workspaceStateRepository = workspaceStateRepository
@@ -28,20 +33,55 @@ actor LocalBinderRepository: BinderRepository {
         self.ruleService = BinderRuleService(pathPolicy: pathPolicy)
         self.clock = clock
         self.uuidGenerator = uuidGenerator
+        self.syncMutationGate = syncMutationGate
+        self.fileManager = fileManager
     }
 
     func rootContainerID(in projectID: ProjectID) async throws -> DocumentID {
+        try await syncMutationGate.withCriticalSection(
+            documentID: syncV2ProjectStructureMutationID(projectID)
+        ) { [self] in
+            try await rootContainerIDInsideMutationGate(in: projectID)
+        }
+    }
+
+    private func rootContainerIDInsideMutationGate(
+        in projectID: ProjectID
+    ) async throws -> DocumentID {
         let mainPath = RelativeDocumentPath(rawValue: "메인")
         return try await ensureMainDocument(in: projectID, path: mainPath).id
     }
 
     func rootNodes(in projectID: ProjectID) async throws -> [BinderNode] {
+        try await syncMutationGate.withCriticalSection(
+            documentID: syncV2ProjectStructureMutationID(projectID)
+        ) { [self] in
+            try await rootNodesInsideMutationGate(in: projectID)
+        }
+    }
+
+    private func rootNodesInsideMutationGate(
+        in projectID: ProjectID
+    ) async throws -> [BinderNode] {
         let workspaceRoot = try await workspaceLocator.workspaceRoot(for: projectID)
         let mainPath = RelativeDocumentPath(rawValue: "메인")
-        let entries = try await scanner.children(
+        var entries = try await scanner.children(
             in: workspaceRoot,
             parentPath: mainPath
         )
+        // 고정 폴더는 사용자가 이름을 바꾸거나 삭제할 수 없는
+        // 앱 구조다. 예전 테스트 빌드나 낡은 원격 tombstone으로
+        // 빈 고정 폴더 하나가 사라졌다면, 다른 경로는 전혀 건드리지
+        // 않고 그 빈 디렉터리만 다시 추가한다.
+        if try ensureFixedCategoryDirectories(
+            in: workspaceRoot,
+            scannedEntries: entries
+        ) {
+            entries = try await scanner.children(
+                in: workspaceRoot,
+                parentPath: mainPath
+            )
+        }
         let main = try await ensureMainDocument(in: projectID, path: mainPath)
         if let invalidEntry = entries.first(where: { $0.kind == .text }) {
             throw BinderRepositoryError.documentAtTopLevel(
@@ -76,7 +116,58 @@ actor LocalBinderRepository: BinderRepository {
         return nodes.sorted(by: rootOrdering)
     }
 
+    /// 반환값은 디렉터리를 하나라도 새로 만들었는지다.
+    /// 같은 이름의 파일이나 심볼릭크가 있으면 덮어쓰지 않고,
+    /// 뒤의 기존 검증이 원래 오류를 보여 주게 둔다.
+    private func ensureFixedCategoryDirectories(
+        in workspaceRoot: URL,
+        scannedEntries: [BinderDiskEntry]
+    ) throws -> Bool {
+        let existing = Set(scannedEntries.map {
+            normalizedPathKey($0.relativePath)
+        })
+        let standardizedRoot = workspaceRoot.standardizedFileURL
+        let rootPrefix = standardizedRoot.path + "/"
+        var didCreate = false
+
+        for category in BinderFixedCategory.allCases where
+            !existing.contains(normalizedPathKey(category.relativePath)) {
+            let target = standardizedRoot
+                .appendingPathComponent(category.relativePath.rawValue)
+                .standardizedFileURL
+            guard target.path.hasPrefix(rootPrefix) else { continue }
+
+            var isDirectory: ObjCBool = false
+            if fileManager.fileExists(
+                atPath: target.path,
+                isDirectory: &isDirectory
+            ) {
+                continue
+            }
+            try fileManager.createDirectory(
+                at: target,
+                withIntermediateDirectories: false
+            )
+            didCreate = true
+        }
+        return didCreate
+    }
+
     func children(
+        of folderID: DocumentID,
+        in projectID: ProjectID
+    ) async throws -> [BinderNode] {
+        try await syncMutationGate.withCriticalSection(
+            documentID: syncV2ProjectStructureMutationID(projectID)
+        ) { [self] in
+            try await childrenInsideMutationGate(
+                of: folderID,
+                in: projectID
+            )
+        }
+    }
+
+    private func childrenInsideMutationGate(
         of folderID: DocumentID,
         in projectID: ProjectID
     ) async throws -> [BinderNode] {

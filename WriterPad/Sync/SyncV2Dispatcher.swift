@@ -21,6 +21,7 @@ enum SyncV2AutomaticRebaseOutcome: Equatable, Sendable {
     case rebased
     case generationAdvanced
     case conflictPreserved
+    case sourceResolved
     case conflict(code: String, detail: String?)
 }
 
@@ -30,18 +31,21 @@ actor SyncV2AutomaticRebaser {
     private let localApplier: (any SyncV2LocalSnapshotApplying)?
     private let openLocalProvider:
         (any SyncV2OpenLocalSnapshotProviding)?
+    private let conflictRecoveryStore: ConflictRecoveryStore?
 
     init(
         store: any SyncV2DispatchStoring,
         snapshotClient: any SyncV2SnapshotClienting,
         localApplier: (any SyncV2LocalSnapshotApplying)? = nil,
         openLocalProvider:
-            (any SyncV2OpenLocalSnapshotProviding)? = nil
+            (any SyncV2OpenLocalSnapshotProviding)? = nil,
+        conflictRecoveryStore: ConflictRecoveryStore? = nil
     ) {
         self.store = store
         self.snapshotClient = snapshotClient
         self.localApplier = localApplier
         self.openLocalProvider = openLocalProvider
+        self.conflictRecoveryStore = conflictRecoveryStore
     }
 
     func rebase(
@@ -81,11 +85,28 @@ actor SyncV2AutomaticRebaser {
                 )
             }
             let local = try await store.latestLocalSnapshot(for: operation)
+            let mergedContent: String
+            if operation.baseRevision == 0 {
+                guard let merged = Self.mergeInitialTreeOrder(
+                    localContent: local.content,
+                    remoteContent: remote.content
+                ) else {
+                    return .conflict(
+                        code: "INVALID_TREE_ORDER",
+                        detail: "초기 tree-order와 서버 tree-order를 안전하게 병합할 수 없습니다."
+                    )
+                }
+                mergedContent = merged
+            } else {
+                // 이미 공유가 시작된 뒤의 순서 변경은 마지막 로컬 조작을
+                // 유지한다. 초기 연결 경쟁만 서버 항목과 합집합으로 병합한다.
+                mergedContent = local.content
+            }
             let result = try await store.rebaseAfterRevisionConflict(
                 operation,
                 remote: remote,
                 local: local,
-                mergedContent: local.content,
+                mergedContent: mergedContent,
                 mergedPath: syncV2TreeOrderPath
             )
             switch result {
@@ -328,6 +349,117 @@ actor SyncV2AutomaticRebaser {
         }
     }
 
+    private static func mergeInitialTreeOrder(
+        localContent: String,
+        remoteContent: String
+    ) -> String? {
+        guard
+            let local = treeOrderPayload(localContent),
+            let remote = treeOrderPayload(remoteContent)
+        else { return nil }
+
+        var mergedOrder: [String: [String]] = [:]
+        for key in Set(remote.order.keys).union(local.order.keys).sorted() {
+            var names: [String] = []
+            for name in (remote.order[key] ?? []) + (local.order[key] ?? []) {
+                let canonical = name.precomposedStringWithCanonicalMapping
+                if !names.contains(canonical) {
+                    names.append(canonical)
+                }
+            }
+            mergedOrder[key.precomposedStringWithCanonicalMapping] = names
+        }
+
+        var folderPaths: [String] = []
+        let derivedPaths = mergedOrder.keys.filter { $0 != "<root>" }
+        for path in remote.folderPaths + local.folderPaths + derivedPaths {
+            let canonical = path.precomposedStringWithCanonicalMapping
+            if !folderPaths.contains(canonical) {
+                folderPaths.append(canonical)
+            }
+        }
+        let object: [String: Any] = [
+            "folder_paths": folderPaths,
+            "tree_order": mergedOrder,
+            "version": 1,
+        ]
+        guard JSONSerialization.isValidJSONObject(object),
+              let data = try? JSONSerialization.data(
+                  withJSONObject: object,
+                  options: [.sortedKeys]
+              )
+        else { return nil }
+        return String(data: data, encoding: .utf8)
+    }
+
+    private static func treeOrderPayload(
+        _ content: String
+    ) -> (order: [String: [String]], folderPaths: [String])? {
+        guard
+            let data = content.data(using: .utf8),
+            let object = try? JSONSerialization.jsonObject(with: data),
+            let dictionary = object as? [String: Any],
+            let version = dictionary["version"] as? NSNumber,
+            CFGetTypeID(version) != CFBooleanGetTypeID(),
+            version.intValue == 1,
+            let rawOrder = dictionary["tree_order"] as? [String: Any]
+        else { return nil }
+
+        var order: [String: [String]] = [:]
+        for (key, value) in rawOrder {
+            guard let names = value as? [String] else { return nil }
+            order[key.precomposedStringWithCanonicalMapping] = names.map {
+                $0.precomposedStringWithCanonicalMapping
+            }
+        }
+        let folderPaths: [String]
+        if let value = dictionary["folder_paths"] {
+            guard let paths = value as? [String] else { return nil }
+            folderPaths = paths.map {
+                $0.precomposedStringWithCanonicalMapping
+            }
+        } else {
+            folderPaths = []
+        }
+        return (order, folderPaths)
+    }
+
+    func rebase(
+        _ operation: SyncV2FolderDispatchOperation
+    ) async throws -> SyncV2AutomaticRebaseOutcome {
+        guard
+            let remote = try await snapshotClient.fetchFolders(
+                projectID: operation.projectID
+            ).first(where: { $0.folderID == operation.folderID })
+        else {
+            return .conflict(
+                code: "FOLDER_NOT_FOUND",
+                detail: "revision conflict 뒤 최신 서버 폴더를 찾지 못했습니다."
+            )
+        }
+        guard remote.revision > operation.baseRevision else {
+            throw SyncV2ClientError.invalidResponse
+        }
+        guard !remote.isDeleted || operation.isDeleted else {
+            guard let conflictRecoveryStore else {
+                return .conflict(
+                    code: "REMOTE_DELETION",
+                    detail: "서버에서 삭제된 폴더는 이름변경으로 자동 복원하지 않습니다."
+                )
+            }
+            _ = try await conflictRecoveryStore.preserveRemoteDeletion(
+                operation: operation,
+                tombstoneRevision: remote.revision
+            )
+            return .sourceResolved
+        }
+        try await store.rebaseFolderAfterRevisionConflict(
+            operation,
+            remote: remote
+        )
+        return .rebased
+    }
+
     private static func newest(
         queued: SyncV2RebaseLocalSnapshot,
         open: SyncV2RebaseLocalSnapshot?
@@ -368,17 +500,26 @@ struct SyncV2RetryPolicy: Equatable, Sendable {
     let maximumDelay: TimeInterval
     let jitterFraction: Double
     let leaseConflictDelay: TimeInterval
+    /// 자동 되감기를 몇 번까지 허용할지다.
+    ///
+    /// 폴더는 늦게 커밋하는 쪽이 이기므로, 두 기기가 모두 이름 변경을 들고
+    /// 있으면 서로 되감기를 주고받을 수 있다. 지연만 있고 횟수 상한이 없으면
+    /// 멈출 근거가 사용자가 이름을 그만 바꾸는 것뿐인데 그것은 장치가 아니다.
+    /// 상한에 닿으면 세워서 화면이 말하게 한다.
+    let maximumAutomaticRebases: Int
 
     init(
         initialDelay: TimeInterval,
         maximumDelay: TimeInterval,
         jitterFraction: Double,
-        leaseConflictDelay: TimeInterval = 3
+        leaseConflictDelay: TimeInterval = 3,
+        maximumAutomaticRebases: Int = 8
     ) {
         self.initialDelay = initialDelay
         self.maximumDelay = maximumDelay
         self.jitterFraction = jitterFraction
         self.leaseConflictDelay = leaseConflictDelay
+        self.maximumAutomaticRebases = maximumAutomaticRebases
     }
 
     static let `default` = SyncV2RetryPolicy(
@@ -588,6 +729,18 @@ actor SyncV2Dispatcher {
         await immediateRetryOpportunity()
     }
 
+    /// 서버가 거절해 세워 둔 폴더 변경을 화면 쪽에서 읽어 간다.
+    ///
+    /// 읽지 못하면 빈 목록으로 답한다. 진단을 읽다 실패한 것 때문에 동기화
+    /// 상태 표시가 무너지면 안 된다.
+    func stalledFolderChanges(
+        localProjectID: ProjectID
+    ) async -> [SyncV2StalledFolderChange] {
+        (try? await store.stalledFolderChanges(
+            localProjectID: localProjectID
+        )) ?? []
+    }
+
     /// 사용자가 동기화 상세 화면에서 명시적으로 재시도를 선택할 때 호출한다.
     func userRequestedRetry() async {
         await immediateRetryOpportunity()
@@ -780,14 +933,20 @@ actor SyncV2Dispatcher {
                         )
                     }
                 }
-                for operation in folderOperations {
-                    group.addTask {
+                // 한 batch의 폴더 작업은 생성·복원은 부모부터, 삭제는 자식부터
+                // queue에 들어온다. 여러 요청을 동시에 보내면 서버 도착 순서가
+                // 뒤집혀 PARENT_FOLDER_NOT_FOUND 또는 FOLDER_NOT_EMPTY가 될 수
+                // 있으므로 폴더 줄은 claim 순서대로 하나씩 비운다. 문서 줄은
+                // 별도 task로 계속 나란히 흐른다.
+                group.addTask {
+                    for operation in folderOperations {
                         await Self.dispatchFolder(
                             operation,
                             store: store,
                             client: client,
                             retryPolicy: retryPolicy,
                             randomUnit: randomUnit,
+                            automaticRebaser: automaticRebaser,
                             now: now()
                         )
                     }
@@ -918,9 +1077,19 @@ actor SyncV2Dispatcher {
             // Windows 클라이언트도 이 코드를 REVISION_CONFLICT와 같이 취급한다.
             if Self.isAutomaticRebaseCandidate(error),
                let automaticRebaser {
+                guard operation.automaticRebaseCount
+                        < retryPolicy.maximumAutomaticRebases
+                else {
+                    try? await store.markConflict(
+                        operation,
+                        errorCode: "AUTO_REBASE_LIMIT",
+                        detail: "자동 되감기 상한에 닿았습니다. 다른 기기의 변경을 확인해 주세요."
+                    )
+                    return
+                }
                 do {
                     switch try await automaticRebaser.rebase(operation) {
-                    case .rebased:
+                    case .rebased, .sourceResolved:
                         return
                     case .conflictPreserved:
                         return
@@ -1009,6 +1178,7 @@ actor SyncV2Dispatcher {
         client: any SyncV2CommitClienting,
         retryPolicy: SyncV2RetryPolicy,
         randomUnit: @Sendable () -> Double,
+        automaticRebaser: SyncV2AutomaticRebaser?,
         now: Date
     ) async {
         do {
@@ -1028,6 +1198,60 @@ actor SyncV2Dispatcher {
             )
             try await store.complete(operation, result: result)
         } catch let error as SyncV2ClientError {
+            // 다른 기기가 먼저 이 폴더를 바꿔 서버 revision이 앞서 나갔다.
+            // 폴더에는 합칠 본문이 없으므로 문서처럼 3-way로 합칠 것이 없고,
+            // 기준선만 서버 값으로 옮겨 이 기기의 이름을 그대로 다시 보내면
+            // 된다. 늦게 커밋하는 쪽이 이기고 진 쪽은 pull로 따라간다.
+            //
+            // 되감기는 `SyncV2AutomaticRebaser`를 지난다. 문서 쪽 되감기와 같은
+            // 길을 쓰고, 서버에서 이미 지워진 폴더를 이름 변경으로 되살리려는
+            // 시도를 그 안에서 막는다. 계약 적합성 벡터 TV-008이
+            // "rename does not resurrect the folder implicitly"로 못 박은 것이다.
+            if isAutomaticRebaseCandidate(error), let automaticRebaser {
+                // 각 successor가 attempts를 0에서 다시 시작하므로, 영속적으로
+                // 이어지는 자동 되감기 횟수로 상한을 판정한다.
+                guard operation.automaticRebaseCount
+                        < retryPolicy.maximumAutomaticRebases
+                else {
+                    let code = "AUTO_REBASE_LIMIT"
+                    try? await store.markConflict(
+                        operation,
+                        errorCode: code,
+                        detail: "자동 되감기 상한에 닿았다. 다른 기기가 같은 폴더를 계속 바꾸고 있다."
+                    )
+                    Self.reportStalledFolder(operation, code: code)
+                    return
+                }
+                do {
+                    let outcome = try await automaticRebaser.rebase(operation)
+                    switch outcome {
+                    case .rebased, .generationAdvanced, .sourceResolved:
+                        return
+                    case .conflictPreserved:
+                        return
+                    case let .conflict(code, detail):
+                        try await store.markConflict(
+                            operation,
+                            errorCode: code,
+                            detail: detail
+                        )
+                        Self.reportStalledFolder(operation, code: code)
+                        return
+                    }
+                } catch {
+                    let delay = retryPolicy.delay(
+                        attempt: operation.attempts,
+                        randomUnit: randomUnit()
+                    )
+                    try? await store.deferRetry(
+                        operation,
+                        errorCode: "AUTO_REBASE_FAILED",
+                        detail: error.localizedDescription,
+                        nextAttemptAt: now.addingTimeInterval(delay)
+                    )
+                    return
+                }
+            }
             do {
                 switch handling(for: error) {
                 case let .retry(code, detail):
@@ -1048,12 +1272,14 @@ actor SyncV2Dispatcher {
                         errorCode: code,
                         detail: detail
                     )
+                    Self.reportStalledFolder(operation, code: code)
                 case let .blocked(code, detail):
                     try await store.markBlocked(
                         operation,
                         errorCode: code,
                         detail: detail
                     )
+                    Self.reportStalledFolder(operation, code: code)
                 }
             } catch {
                 // 서버 응답과 SQLite 반영 사이에서 끊기면 inflight 복구가 같은
@@ -1073,6 +1299,44 @@ actor SyncV2Dispatcher {
         }
     }
 
+    /// 서버가 REVISION_CONFLICT와 함께 알려준 현재 revision을 읽는다.
+    ///
+    /// 배포된 `commit_folder`는 거절할 때 detail에 현재 revision과 서버가 들고
+    /// 있는 이름·부모를 함께 싣는다. 그 값을 쓰면 기준선을 맞추려고 서버에 다시
+    /// 물을 필요가 없다. 형식이 다르거나 값이 없으면 nil을 돌려주고 호출자가
+    /// 지금까지 하던 대로 세운다.
+    private static func serverRevision(
+        fromRevisionConflict detail: String?
+    ) -> Int64? {
+        guard let detail,
+              let data = detail.data(using: .utf8),
+              let object = try? JSONSerialization.jsonObject(
+                  with: data
+              ) as? [String: Any],
+              let revision = object["current_revision"] as? NSNumber
+        else {
+            return nil
+        }
+        return revision.int64Value
+    }
+
+    /// 서 있는 폴더 하나당 한 줄만 남긴다.
+    ///
+    /// operation_id를 싣지 않는다. 같은 폴더가 같은 이유로 서 있는 것은 한
+    /// 상태이지 매번 새로 발견한 사건이 아니다. operation_id를 넣으면 사용자가
+    /// 같은 조작을 다시 시도할 때마다 새 발견처럼 보인다.
+    private static func reportStalledFolder(
+        _ operation: SyncV2FolderDispatchOperation,
+        code: String
+    ) {
+        SyncV2Diagnostics.stalledFolderOperation(
+            folderID: operation.folderID,
+            parentFolderID: operation.parentFolderID,
+            name: operation.name,
+            code: code
+        )
+    }
+
     private static func isAutomaticRebaseCandidate(
         _ error: SyncV2ClientError
     ) -> Bool {
@@ -1083,7 +1347,8 @@ actor SyncV2Dispatcher {
         case .documentNotFound, .operationIDReused, .pathConflict,
              .authRequired, .leaseRequired, .leaseConflict,
              .leaseExpired, .forbidden, .invalidArgument,
-             .folderNotFound, .folderAlreadyExists, .folderNotEmpty:
+             .folderNotFound, .folderAlreadyExists, .folderNotEmpty,
+             .parentFolderNotFound, .folderNameConflict, .folderCycle:
             // 자동 rebase는 본문을 3-way로 합치는 일이다. 폴더는 합칠 본문이
             // 없으므로 여기로 오지 않는다.
             return false
@@ -1117,9 +1382,15 @@ actor SyncV2Dispatcher {
             case .documentNotFound, .documentAlreadyExists,
                  .revisionConflict, .operationIDReused,
                  .pathConflict, .folderNotFound, .folderAlreadyExists,
-                 .folderNotEmpty:
-                // FOLDER_NOT_EMPTY는 순서를 잘못 잡았다는 뜻이라 그대로 다시
-                // 보내면 계속 거절당한다. 자동 재시도로 돌리지 않고 세워 둔다.
+                 .folderNotEmpty, .parentFolderNotFound,
+                 .folderNameConflict, .folderCycle:
+                // 시간이 지나서 저절로 풀리는 상태가 아니라 사람이 트리나
+                // 이름을 고쳐야 바뀌는 상태다. FOLDER_NOT_EMPTY는 순서를
+                // 잘못 잡았다는 뜻이고, PARENT_FOLDER_NOT_FOUND는 직렬
+                // 전송에서도 나왔다면 트리 불일치라는 뜻이며,
+                // FOLDER_NAME_CONFLICT는 사용자가 이름을 바꾸기 전에는 같은
+                // 답이 온다. 그대로 다시 보내면 계속 거절당하므로 자동
+                // 재시도로 돌리지 않고 세워 둔다.
                 return .conflict(code: code.rawValue, detail: detail)
             }
         }

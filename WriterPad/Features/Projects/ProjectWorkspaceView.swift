@@ -17,6 +17,7 @@ struct ProjectWorkspaceView: View {
     @State private var deleteTarget: ManagedProject?
     @State private var deletedListTarget: ManagedProject?
     @State private var isSelectingImportFolder = false
+    @State private var isSelectingBackupPackage = false
     @State private var isShowingSettings = false
     @State private var isShowingDeletedProjects = false
     private let binderRepository: any BinderRepository
@@ -36,6 +37,7 @@ struct ProjectWorkspaceView: View {
     private let syncDispatcher: SyncV2Dispatcher?
     private let conflictResolutionService:
         (any SyncV2ConflictResolving)?
+    private let conflictRecoveryStore: ConflictRecoveryStore?
     private let snapshotPullService: SyncV2SnapshotPullService?
     private let realtimeTrigger: (any SyncV2RealtimeTriggering)?
     private let backgroundSyncCoordinator:
@@ -63,6 +65,7 @@ struct ProjectWorkspaceView: View {
         syncDispatcher: SyncV2Dispatcher?,
         conflictResolutionService:
             (any SyncV2ConflictResolving)? = nil,
+        conflictRecoveryStore: ConflictRecoveryStore? = nil,
         snapshotPullService: SyncV2SnapshotPullService? = nil,
         realtimeTrigger: (any SyncV2RealtimeTriggering)? = nil,
         backgroundSyncCoordinator:
@@ -87,6 +90,7 @@ struct ProjectWorkspaceView: View {
         self.projectBindingService = projectBindingService
         self.syncDispatcher = syncDispatcher
         self.conflictResolutionService = conflictResolutionService
+        self.conflictRecoveryStore = conflictRecoveryStore
         self.snapshotPullService = snapshotPullService
         self.realtimeTrigger = realtimeTrigger
         self.backgroundSyncCoordinator = backgroundSyncCoordinator
@@ -125,6 +129,7 @@ struct ProjectWorkspaceView: View {
                         syncDispatcher: syncDispatcher,
                         conflictResolutionService:
                             conflictResolutionService,
+                        conflictRecoveryStore: conflictRecoveryStore,
                         snapshotPullService: snapshotPullService,
                         realtimeTrigger: realtimeTrigger,
                         editLeaseManager: editLeaseManager,
@@ -193,6 +198,19 @@ struct ProjectWorkspaceView: View {
                 model.present(error: error)
             }
         }
+        .fileImporter(
+            isPresented: $isSelectingBackupPackage,
+            allowedContentTypes: [.folder],
+            allowsMultipleSelection: false
+        ) { result in
+            switch result {
+            case let .success(urls):
+                guard let packageURL = urls.first else { return }
+                Task { await model.restoreBackup(at: packageURL) }
+            case let .failure(error):
+                model.present(error: error)
+            }
+        }
         .sheet(
             item: $model.importReport,
             onDismiss: { model.dismissImportReport() }
@@ -220,7 +238,10 @@ struct ProjectWorkspaceView: View {
             )
         ) {
             TextField("새 이름", text: $renameText)
+                .submitLabel(.done)
+                .onSubmit(submitProjectRename)
             Button("취소", role: .cancel) { renameTarget = nil }
+                .keyboardShortcut(.cancelAction)
             Button("변경") {
                 submitProjectRename()
             }
@@ -354,6 +375,12 @@ struct ProjectWorkspaceView: View {
                         isSelectingImportFolder = true
                     }
                     .disabled(model.isWorking)
+
+                    Button("WriterPad 백업 복원", systemImage: "arrow.counterclockwise.icloud") {
+                        isSelectingBackupPackage = true
+                    }
+                    .disabled(model.isWorking)
+                    .accessibilityIdentifier("writerpad.restore-project-backup")
 
                     Button("설정", systemImage: "gearshape") {
                         isShowingSettings = true

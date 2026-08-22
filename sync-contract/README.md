@@ -1,4 +1,4 @@
-# WriterPad Sync Contract 0.3.0
+# WriterPad Sync Contract 0.2.0
 
 This directory is the released, implementation-independent WriterPad sync
 contract. It defines wire behavior and conformance requirements; it does not
@@ -6,12 +6,12 @@ implement Windows, iPad, macOS, server, database, or migration code.
 
 ## Release identity
 
-- Contract version: `0.3.0`
+- Contract version: `0.2.0`
 - Status: released; deployment and server allowlisting are separate stage-7 actions
 - Canonicalization: RFC 8785
-- Canonical `protocol.json` byte length: `24777`
+- Canonical `protocol.json` byte length: `23256`
 - Canonical SHA-256:
-  `abbd234c7b65d422c2e43d468f4f724e069ede26a3d24be22eb8b35cce8ebf2c`
+  `416c1b99edb9bda694731dee4b25688d9d82d1f32610aa23ddfda571ec3c7670`
 
 The digest is SHA-256 over the exact UTF-8 bytes returned by RFC 8785
 canonicalization of `protocol.json`. It is not a source-file, pretty-print,
@@ -42,7 +42,6 @@ because a Git commit cannot contain its own SHA without changing that SHA.
 | `transition-vector.schema.json` | State transition and fault-injection vector format |
 | `test_vectors/*.json` | Twelve required cross-client transition vectors |
 | `conformance_vectors/*.json` | Atomic wire and storage-name conformance cases |
-| `unicode/*.json` | Frozen assignment, exclusion, and full default casefold tables with canonical digests |
 | `TRACEABILITY.md` | C-01 through C-07 normative text → schema → vector → verifier mapping |
 | `contract-lock.json` | Expected release identity, counts, canonical length, and digest |
 | `scripts/verify_contract.py` | Schema, vector, digest, and cross-file semantic verifier |
@@ -54,7 +53,7 @@ because a Git commit cannot contain its own SHA without changing that SHA.
 |---|---|---|---|---|
 | 1 | `LEGACY` only | `LEGACY_EPOCH_0` | forbidden | Name-based legacy projection through the server legacy adapter |
 | 2 | `LEGACY` only | `LEGACY_EPOCH_0` | forbidden | Stable folders and tombstones without claiming released-contract provenance |
-| 3 | `LEGACY`, `MIGRATING`, `ID_BASED` | `CONTRACT_BATCH` | required | Full capability set, append-only attempts/events, storage-name-v2, atomic structure, and atomic document writes |
+| 3 | `LEGACY`, `MIGRATING`, `ID_BASED` | `CONTRACT_BATCH` | required | Full capability set, append-only attempts/events, storage-name-v1, atomic structure, and atomic document writes |
 
 `MIGRATING` and `ID_BASED` require protocol 3 for both content and structure.
 Protocol 1/2 clients are rejected with `PROTOCOL_TOO_OLD` after enforcement
@@ -101,25 +100,20 @@ Identical retries replay the complete stored result after response loss or a
 server restart. Any mismatch or partial result is rejected and never applied by
 a client.
 
-## Storage-name-v2
+## Storage-name-v1
 
-Sibling collision keys use frozen contract assets rather than a runtime
-Unicode-version promise. The normative order is:
+Sibling collision keys use Unicode 15.0.0 and this fixed sequence:
 
-1. Reject input outside the Unicode 14.0.0 assigned baseline.
-2. Reject Private Use, tags, and the Variation Selectors Supplement.
-3. Before NFKC, reject a supplementary scalar immediately followed by a
-   nonzero canonical combining-class scalar, U+FF9E, or U+FF9F.
-4. Apply NFKC, the frozen full default casefold table, and NFKC again.
-5. Reject controls, DEL, `/`, and `\` after normalization, then defensively
-   recheck the assigned baseline.
-6. Remove trailing ASCII space and full stop; reject empty, dot, dot-dot, and
-   Windows device basenames.
-7. Compare the exact UTF-8 bytes of the remaining string.
+1. Reject controls, DEL, `/`, and `\` in a single name segment.
+2. Apply Unicode NFKC, Default Case Folding without locale, then NFKC again.
+3. Remove trailing ASCII space and full stop.
+4. Reject empty, dot, dot-dot, and Windows device basenames.
+5. Compare the exact UTF-8 bytes of the remaining string.
 
-BMP variation selectors U+FE00 through U+FE0F remain allowed. Leading ASCII
-space remains significant. SN-001 through SN-029 are the normative
-cross-language cases for Windows, Swift, and PostgreSQL implementations.
+Leading ASCII space remains significant. Internal whitespace is preserved
+except where Unicode NFKC changes its code point. SN-001 through SN-015 are the
+normative cross-language cases for Windows, Swift, and PostgreSQL
+implementations.
 
 ## Legacy migration boundary
 
@@ -154,13 +148,12 @@ python3.12 -m venv .venv-contract
 The verifier checks:
 
 - all seven Draft 2020-12 schemas;
-- released protocol `0.3.0` and twelve transition vectors;
+- released protocol `0.2.0` and twelve transition vectors;
 - capability `since_protocol` and required capability declarations;
 - operation creation paths and immutable rebase identities;
 - protocol-specific batch/provenance obligations;
 - event-to-state derivation and cancellation cases;
-- twenty-nine storage-name-v2 vectors, exact UTF-8 keys, and four frozen-table
-  canonical digests;
+- fifteen Unicode 15.0.0 storage-name vectors and exact UTF-8 keys;
 - four atomic wire cases, including digest binding, replay, and full rollback;
 - seven document wire cases covering empty content, update, delete, restore,
   replay, changed replay, and full rollback;
@@ -176,6 +169,4 @@ The verifier checks:
   operational migration ledger remains unverified until stage 7 performs a
   read-only preflight.
 - This release does not modify client/server source, run a migration, change a
-  database, retry synchronization, or allowlist/deploy the contract. The new
-  pin must not be consumed until the server stage deploys its matching rules and
-  allowlist entry.
+  database, retry synchronization, or allowlist/deploy the contract.

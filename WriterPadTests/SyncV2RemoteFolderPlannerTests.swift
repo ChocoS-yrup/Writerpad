@@ -84,6 +84,40 @@ final class SyncV2RemoteFolderPlannerTests: XCTestCase {
         )
     }
 
+    func testFixedTrashTombstoneAndRenameAreIgnored() {
+        let trashID = DocumentID(rawValue: UUID())
+        let local = [
+            folder(id: rootID, path: "메인", parent: nil),
+            folder(id: trashID, path: "메인/휴지통", parent: rootID),
+        ]
+        let tombstone = SyncV2RemoteFolderPlanner.plan(
+            remote: [
+                remoteFolder(id: rootID, parent: nil, name: "메인"),
+                remoteFolder(
+                    id: trashID,
+                    parent: rootID,
+                    name: "휴지통",
+                    isDeleted: true
+                ),
+            ],
+            documents: local
+        )
+        let rename = SyncV2RemoteFolderPlanner.plan(
+            remote: [
+                remoteFolder(id: rootID, parent: nil, name: "메인"),
+                remoteFolder(
+                    id: trashID,
+                    parent: rootID,
+                    name: "서버가 보낸 다른 이름"
+                ),
+            ],
+            documents: local
+        )
+
+        XCTAssertTrue(tombstone.isEmpty)
+        XCTAssertTrue(rename.isEmpty)
+    }
+
     func testOccupiedDestinationIsPreservedAsAConflict() {
         let movingID = DocumentID(rawValue: UUID())
         let sittingID = DocumentID(rawValue: UUID())

@@ -17,6 +17,8 @@ final class AppEnvironment: ObservableObject {
     let exporter: any Exporting
     let backupStore: any BackupStoring
     let backupPolicyStore: any BackupPolicyStoring
+    let projectBackupCoordinator: ProjectBackupCoordinator
+    let conflictRecoveryStore: ConflictRecoveryStore?
     let restoreCoordinator: DocumentRestoreCoordinator
     let clock: any AppClock
     let futureChangeNotifier: any FutureChangeNotifying
@@ -46,6 +48,8 @@ final class AppEnvironment: ObservableObject {
         searchService: any Searching,
         backupStore: any BackupStoring,
         backupPolicyStore: any BackupPolicyStoring,
+        projectBackupCoordinator: ProjectBackupCoordinator,
+        conflictRecoveryStore: ConflictRecoveryStore? = nil,
         restoreCoordinator: DocumentRestoreCoordinator,
         clock: any AppClock,
         futureChangeNotifier: any FutureChangeNotifying,
@@ -79,6 +83,8 @@ final class AppEnvironment: ObservableObject {
         )
         self.backupStore = backupStore
         self.backupPolicyStore = backupPolicyStore
+        self.projectBackupCoordinator = projectBackupCoordinator
+        self.conflictRecoveryStore = conflictRecoveryStore
         self.restoreCoordinator = restoreCoordinator
         self.clock = clock
         self.futureChangeNotifier = futureChangeNotifier
@@ -119,6 +125,7 @@ final class AppEnvironment: ObservableObject {
         let clock = SystemClock()
         let projectManager = LocalProjectManager(
             projectRepository: repository,
+            creationMetadataStore: repository,
             workspaceStateRepository: repository,
             pathResolver: pathResolver,
             clock: clock
@@ -136,6 +143,11 @@ final class AppEnvironment: ObservableObject {
             projectRepository: repository,
             pathResolver: pathResolver
         )
+        let syncMutationGate = SyncV2DocumentMutationGate()
+        let backupStore = LocalBackupStore(
+            workspaceLocator: workspaceLocator,
+            clock: clock
+        )
         let binderScanner = LocalBinderDirectoryScanner(pathResolver: pathResolver)
         let binderRepository = LocalBinderRepository(
             metadataStore: repository,
@@ -143,9 +155,9 @@ final class AppEnvironment: ObservableObject {
             workspaceLocator: workspaceLocator,
             scanner: binderScanner,
             pathPolicy: pathResolver.policy,
-            clock: clock
+            clock: clock,
+            syncMutationGate: syncMutationGate
         )
-        let syncMutationGate = SyncV2DocumentMutationGate()
         let futureChangeNotifier = NoOpFutureChangeNotifier()
         let supabaseClientProvider: any SupabaseClientProviding
         if isStoredInMemoryOnly {
@@ -177,6 +189,7 @@ final class AppEnvironment: ObservableObject {
         let conflictResolutionService: (any SyncV2ConflictResolving)?
         let snapshotStateStore: (any SyncV2SnapshotStateStoring)?
         let folderMigrationMarker: (any SyncV2FolderMigrationMarking)?
+        let conflictRecoveryStore: ConflictRecoveryStore?
         // 이관을 마친 폴더는 서버와 공유하는 UUID를 갖는다. tree_order로만 온
         // 이름 변경을 폴더 기록에도 올려야 그 기록이 낡지 않는다.
         let localSnapshotApplier: LocalSyncV2SnapshotApplier
@@ -189,9 +202,11 @@ final class AppEnvironment: ObservableObject {
             conflictResolutionService = nil
             snapshotStateStore = nil
             folderMigrationMarker = nil
+            conflictRecoveryStore = nil
             localSnapshotApplier = LocalSyncV2SnapshotApplier(
                 documentRepository: repository,
-                workspaceLocator: workspaceLocator
+                workspaceLocator: workspaceLocator,
+                backupStore: backupStore
             )
             editLeaseManager = nil
         } else {
@@ -207,9 +222,21 @@ final class AppEnvironment: ObservableObject {
             conflictResolutionService = syncV2Store
             snapshotStateStore = syncV2Store
             folderMigrationMarker = syncV2Store
+            conflictRecoveryStore = ConflictRecoveryStore
+                .defaultPackagesRootURL()
+                .map {
+                    ConflictRecoveryStore(
+                        ledger: syncV2Store,
+                        documentRepository: repository,
+                        workspaceLocator: workspaceLocator,
+                        packagesRootURL: $0,
+                        durableChangeRecorder: syncV2Store
+                    )
+                }
             localSnapshotApplier = LocalSyncV2SnapshotApplier(
                 documentRepository: repository,
                 workspaceLocator: workspaceLocator,
+                backupStore: backupStore,
                 folderIdentityPublisher:
                     DurableSyncV2FolderIdentityPublisher(
                         changeRecorder: syncV2Store
@@ -239,7 +266,8 @@ final class AppEnvironment: ObservableObject {
                         snapshotClient: $0,
                         localApplier: localSnapshotApplier,
                         openLocalProvider:
-                            SyncV2EditorSessionRegistry.shared
+                            SyncV2EditorSessionRegistry.shared,
+                        conflictRecoveryStore: conflictRecoveryStore
                     )
                 }
                 return SyncV2Dispatcher(
@@ -342,14 +370,15 @@ final class AppEnvironment: ObservableObject {
             documentStore: localDocumentStore,
             pathPolicy: pathResolver.policy
         )
-        let backupStore = LocalBackupStore(
-            workspaceLocator: workspaceLocator,
-            clock: clock
-        )
         let backupPolicyStore = LocalBackupPolicyStore(
             globalPolicyURL: pathResolver.projectsRootURL
                 .appendingPathComponent(".writerpad-backup-policy.json"),
             legacyWorkspaceLocator: workspaceLocator
+        )
+        let projectBackupCoordinator = ProjectBackupCoordinator(
+            projectRepository: repository,
+            documentRepository: repository,
+            workspaceLocator: workspaceLocator
         )
         let binderCommands = LocalBinderCommandService(
             metadataStore: repository,
@@ -385,6 +414,8 @@ final class AppEnvironment: ObservableObject {
             searchService: searchService,
             backupStore: backupStore,
             backupPolicyStore: backupPolicyStore,
+            projectBackupCoordinator: projectBackupCoordinator,
+            conflictRecoveryStore: conflictRecoveryStore,
             restoreCoordinator: restoreCoordinator,
             clock: clock,
             futureChangeNotifier: futureChangeNotifier,

@@ -277,10 +277,33 @@ struct SyncV2SnapshotPullReport: Equatable, Sendable {
     var rejectedStructureNames: [SyncV2RejectedStructureName] = []
 }
 
+/// 거부를 사용자에게 어떻게 말해야 하는지 가른다.
+///
+/// 두 종류가 한 목록에 섞여 있었고, 화면은 목록의 첫 항목을 "이름을 고치라"는
+/// 문장에 그대로 끼워 넣었다. 이름 문제가 아닌 거부가 앞에 있으면 사용자는
+/// 손댈 필요가 없는 이름을 고치러 간다. 그래서 종류를 값으로 들고 다닌다.
+enum SyncV2RejectedStructureKind: Equatable, Sendable {
+    /// 이 이름 자체를 iPad에 쓸 수 없다. 보낸 기기에서 이름을 고치면 풀린다.
+    case unusableName
+    /// 이름 문제가 아니다. 덮어쓰지 않으려고 적용하지 않은 것이라, 이름을
+    /// 고쳐도 바뀌지 않는다.
+    case notApplied
+}
+
+/// 서버가 거절해 세워 둔 폴더 변경이다.
+///
+/// 이 기기가 한 조작이 서버에 올라가지 못한 상태다. 들어오는 변경을 적용하지
+/// 않은 것과 방향이 반대라 같은 목록에 담지 않는다.
+struct SyncV2StalledFolderChange: Equatable, Sendable {
+    let name: String
+    let errorCode: String
+}
+
 struct SyncV2RejectedStructureName: Equatable, Sendable {
     let name: String
     let parent: String
     let reason: String
+    let kind: SyncV2RejectedStructureKind
 }
 
 /// Watchdog와 실제 작업 중 먼저 끝난 값을 한 번만 채택하는 one-shot Race다.

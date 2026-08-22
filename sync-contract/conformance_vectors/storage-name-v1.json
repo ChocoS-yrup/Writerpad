@@ -1,0 +1,108 @@
+{
+  "$schema": "../storage-name-vectors.schema.json",
+  "contract_version": "0.2.0",
+  "algorithm_id": "storage-name-v1",
+  "unicode_version": "15.0.0",
+  "vectors": [
+    {
+      "vector_id": "SN-001",
+      "input": "Résumé",
+      "valid": true,
+      "normalized": "résumé",
+      "utf8_hex": "72c3a973756dc3a9"
+    },
+    {
+      "vector_id": "SN-002",
+      "input": "Résumé",
+      "valid": true,
+      "normalized": "résumé",
+      "utf8_hex": "72c3a973756dc3a9"
+    },
+    {
+      "vector_id": "SN-003",
+      "input": "FILE.TXT",
+      "valid": true,
+      "normalized": "file.txt",
+      "utf8_hex": "66696c652e747874"
+    },
+    {
+      "vector_id": "SN-004",
+      "input": "File. ",
+      "valid": true,
+      "normalized": "file",
+      "utf8_hex": "66696c65"
+    },
+    {
+      "vector_id": "SN-005",
+      "input": "폴더",
+      "valid": true,
+      "normalized": "폴더",
+      "utf8_hex": "ed8fb4eb8d94"
+    },
+    {
+      "vector_id": "SN-006",
+      "input": "İ",
+      "valid": true,
+      "normalized": "i̇",
+      "utf8_hex": "69cc87"
+    },
+    {
+      "vector_id": "SN-007",
+      "input": "Straße",
+      "valid": true,
+      "normalized": "strasse",
+      "utf8_hex": "73747261737365"
+    },
+    {
+      "vector_id": "SN-008",
+      "input": " leading",
+      "valid": true,
+      "normalized": " leading",
+      "utf8_hex": "206c656164696e67"
+    },
+    {
+      "vector_id": "SN-009",
+      "input": "A B",
+      "valid": true,
+      "normalized": "a b",
+      "utf8_hex": "612062"
+    },
+    {
+      "vector_id": "SN-010",
+      "input": "ＡＢＣ",
+      "valid": true,
+      "normalized": "abc",
+      "utf8_hex": "616263"
+    },
+    {
+      "vector_id": "SN-011",
+      "input": "CON.txt",
+      "valid": false,
+      "error_code": "STORAGE_NAME_RESERVED"
+    },
+    {
+      "vector_id": "SN-012",
+      "input": "folder/name",
+      "valid": false,
+      "error_code": "STORAGE_NAME_INVALID"
+    },
+    {
+      "vector_id": "SN-013",
+      "input": "folder\\name",
+      "valid": false,
+      "error_code": "STORAGE_NAME_INVALID"
+    },
+    {
+      "vector_id": "SN-014",
+      "input": ". ",
+      "valid": false,
+      "error_code": "STORAGE_NAME_INVALID"
+    },
+    {
+      "vector_id": "SN-015",
+      "input": "",
+      "valid": false,
+      "error_code": "STORAGE_NAME_INVALID"
+    }
+  ]
+}

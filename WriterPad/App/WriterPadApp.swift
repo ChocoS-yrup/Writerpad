@@ -20,6 +20,31 @@ struct WriterPadCommandActions {
     let canToggleEditorPane: Bool
 }
 
+enum WriterPadCloudStartup {
+    static func start(
+        syncEnabled: Bool,
+        authenticationService: any AuthenticationServicing,
+        deviceIdentityService: any DeviceIdentityProviding,
+        syncDispatcher: SyncV2Dispatcher?,
+        backgroundSyncCoordinator: SyncV2BackgroundSyncCoordinator?
+    ) async {
+        async let identity: Void = deviceIdentityService.prepareIdentity()
+        guard syncEnabled else {
+            await identity
+            return
+        }
+
+        // 인증 네트워크 요청이 지연돼도 기존 queue 복구와 새 operation
+        // 감시는 즉시 시작한다.
+        await syncDispatcher?.start()
+        async let authentication = authenticationService.restoreSession()
+        let (state, _) = await (authentication, identity)
+        guard state.isAuthenticated else { return }
+        await syncDispatcher?.loginSucceeded()
+        await backgroundSyncCoordinator?.start()
+    }
+}
+
 private struct WriterPadCommandActionsKey: FocusedValueKey {
     typealias Value = WriterPadCommandActions
 }
@@ -93,6 +118,9 @@ struct WriterPadApp: App {
                 .task {
                     await startCloudServices()
                 }
+                .task {
+                    await observeAuthenticationChanges()
+                }
                 .onChange(of: scenePhase) { _, phase in
                     Task {
                         if phase == .active {
@@ -109,20 +137,14 @@ struct WriterPadApp: App {
     }
 
     private func startCloudServices() async {
-        let isSyncEnabled = GlobalSyncPreference.isEnabled()
-        async let authentication =
-            environment.authenticationService.restoreSession()
-        async let identity: Void =
-            environment.deviceIdentityService.prepareIdentity()
-        if isSyncEnabled {
-            // 인증 네트워크 요청이 지연돼도 기존 queue 복구와 새 operation
-            // 감시는 즉시 시작한다.
-            await environment.syncDispatcher?.start()
-        }
-        let (state, _) = await (authentication, identity)
-        guard isSyncEnabled, state.isAuthenticated else { return }
-        await environment.syncDispatcher?.loginSucceeded()
-        await environment.backgroundSyncCoordinator?.start()
+        await WriterPadCloudStartup.start(
+            syncEnabled: GlobalSyncPreference.isEnabled(),
+            authenticationService: environment.authenticationService,
+            deviceIdentityService: environment.deviceIdentityService,
+            syncDispatcher: environment.syncDispatcher,
+            backgroundSyncCoordinator:
+                environment.backgroundSyncCoordinator
+        )
     }
 
     private func resumeCloudServices() async {
@@ -135,5 +157,37 @@ struct WriterPadApp: App {
         await environment.syncDispatcher?.loginSucceeded()
         await environment.backgroundSyncCoordinator?.start()
         await environment.backgroundSyncCoordinator?.appEnteredForeground()
+    }
+
+    private func observeAuthenticationChanges() async {
+        let updates = await environment.authenticationService.stateUpdates()
+        for await state in updates {
+            guard !Task.isCancelled else { return }
+            await applyAuthenticationState(state)
+        }
+    }
+
+    private func applyAuthenticationState(
+        _ state: AuthenticationState
+    ) async {
+        switch state {
+        case .authenticated:
+            guard GlobalSyncPreference.isEnabled() else { return }
+            await environment.syncDispatcher?.start()
+            await environment.syncDispatcher?.loginSucceeded()
+            await environment.backgroundSyncCoordinator?.start()
+        case .signedOut, .localOnly:
+            await environment.syncDispatcher?.stop()
+            await environment.backgroundSyncCoordinator?.stop()
+            await environment.editLeaseManager?.releaseAll()
+        case .unavailable:
+            // 인증되지 않은 동안 원격 pull/realtime/lease는 열지 않는다.
+            // Dispatcher는 보존된 로컬 queue의 복구 상태를 유지할 수 있다.
+            await environment.backgroundSyncCoordinator?.stop()
+            await environment.editLeaseManager?.releaseAll()
+        case .restoring:
+            // 시작 시 로컬 queue 복구를 막지 않고 서버 검증 결과를 기다린다.
+            break
+        }
     }
 }

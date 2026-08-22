@@ -1,5 +1,5 @@
 {
-  "contract_version": "0.3.0",
+  "contract_version": "0.2.0",
   "wire_schema": "../document-commit.schema.json",
   "cases": [
     {
@@ -13,10 +13,10 @@
         "batch": {
           "batch_id": "10000000-0000-4000-8000-000000000301",
           "writer_device_id": "60000000-0000-4000-8000-000000000301",
-          "client_build_id": "conformance-0.3.0",
+          "client_build_id": "conformance-0.2.0",
           "sync_protocol_version": 3,
-          "contract_version": "0.3.0",
-          "canonical_contract_sha256": "abbd234c7b65d422c2e43d468f4f724e069ede26a3d24be22eb8b35cce8ebf2c",
+          "contract_version": "0.2.0",
+          "canonical_contract_sha256": "416c1b99edb9bda694731dee4b25688d9d82d1f32610aa23ddfda571ec3c7670",
           "client_capabilities": [
             "folders_authoritative",
             "tree_order_ids",
@@ -24,7 +24,7 @@
             "immutable_batch_contract_metadata",
             "operation_attempt_history",
             "operation_state_events",
-            "storage_name_v2",
+            "storage_name_v1",
             "document_commit_v1"
           ],
           "batch_payload_sha256": "e2571bcb8611ea13c058753470871eb61fb6117d8dd8adbd36688eac0cd5d34d"
@@ -112,14 +112,14 @@
         "batch": {
           "batch_id": "10000000-0000-4000-8000-000000000302",
           "writer_device_id": "60000000-0000-4000-8000-000000000301",
-          "client_build_id": "conformance-0.3.0",
+          "client_build_id": "conformance-0.2.0",
           "sync_protocol_version": 3,
-          "contract_version": "0.3.0",
-          "canonical_contract_sha256": "abbd234c7b65d422c2e43d468f4f724e069ede26a3d24be22eb8b35cce8ebf2c",
+          "contract_version": "0.2.0",
+          "canonical_contract_sha256": "416c1b99edb9bda694731dee4b25688d9d82d1f32610aa23ddfda571ec3c7670",
           "client_capabilities": [
             "folders_authoritative", "tree_order_ids", "tombstones",
             "immutable_batch_contract_metadata", "operation_attempt_history",
-            "operation_state_events", "storage_name_v2", "document_commit_v1"
+            "operation_state_events", "storage_name_v1", "document_commit_v1"
           ],
           "batch_payload_sha256": "1a504f19755c396597622bbf4d86213e3fc12d720e648b217a44dcee1aed6b10"
         },
@@ -179,14 +179,14 @@
         "batch": {
           "batch_id": "10000000-0000-4000-8000-000000000303",
           "writer_device_id": "60000000-0000-4000-8000-000000000301",
-          "client_build_id": "conformance-0.3.0",
+          "client_build_id": "conformance-0.2.0",
           "sync_protocol_version": 3,
-          "contract_version": "0.3.0",
-          "canonical_contract_sha256": "abbd234c7b65d422c2e43d468f4f724e069ede26a3d24be22eb8b35cce8ebf2c",
+          "contract_version": "0.2.0",
+          "canonical_contract_sha256": "416c1b99edb9bda694731dee4b25688d9d82d1f32610aa23ddfda571ec3c7670",
           "client_capabilities": [
             "folders_authoritative", "tree_order_ids", "tombstones",
             "immutable_batch_contract_metadata", "operation_attempt_history",
-            "operation_state_events", "storage_name_v2", "document_commit_v1"
+            "operation_state_events", "storage_name_v1", "document_commit_v1"
           ],
           "batch_payload_sha256": "62d126e8bf19ccae4b126f8c7347e9d4c429064a018b5c5562e899236dc9ef6c"
         },
@@ -265,14 +265,14 @@
         "batch": {
           "batch_id": "10000000-0000-4000-8000-000000000302",
           "writer_device_id": "60000000-0000-4000-8000-000000000301",
-          "client_build_id": "conformance-0.3.0",
+          "client_build_id": "conformance-0.2.0",
           "sync_protocol_version": 3,
-          "contract_version": "0.3.0",
-          "canonical_contract_sha256": "abbd234c7b65d422c2e43d468f4f724e069ede26a3d24be22eb8b35cce8ebf2c",
+          "contract_version": "0.2.0",
+          "canonical_contract_sha256": "416c1b99edb9bda694731dee4b25688d9d82d1f32610aa23ddfda571ec3c7670",
           "client_capabilities": [
             "folders_authoritative", "tree_order_ids", "tombstones",
             "immutable_batch_contract_metadata", "operation_attempt_history",
-            "operation_state_events", "storage_name_v2", "document_commit_v1"
+            "operation_state_events", "storage_name_v1", "document_commit_v1"
           ],
           "batch_payload_sha256": "866d276e18c2b0bdc1a202650a213034e00e235bb33a683ac365f6a696615b78"
         },
@@ -324,14 +324,14 @@
         "batch": {
           "batch_id": "10000000-0000-4000-8000-000000000304",
           "writer_device_id": "60000000-0000-4000-8000-000000000301",
-          "client_build_id": "conformance-0.3.0",
+          "client_build_id": "conformance-0.2.0",
           "sync_protocol_version": 3,
-          "contract_version": "0.3.0",
-          "canonical_contract_sha256": "abbd234c7b65d422c2e43d468f4f724e069ede26a3d24be22eb8b35cce8ebf2c",
+          "contract_version": "0.2.0",
+          "canonical_contract_sha256": "416c1b99edb9bda694731dee4b25688d9d82d1f32610aa23ddfda571ec3c7670",
           "client_capabilities": [
             "folders_authoritative", "tree_order_ids", "tombstones",
             "immutable_batch_contract_metadata", "operation_attempt_history",
-            "operation_state_events", "storage_name_v2", "document_commit_v1"
+            "operation_state_events", "storage_name_v1", "document_commit_v1"
           ],
           "batch_payload_sha256": "630432041aa0e0d2d40762b3cd7ec1741b694e166b6e742cba1a9b99fde5c695"
         },

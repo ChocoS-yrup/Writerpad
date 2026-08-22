@@ -1,14 +1,14 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "urn:writerpad:sync-contract:storage-name-vectors:0.3.0",
-  "title": "WriterPad storage-name-v2 conformance vectors",
+  "$id": "urn:writerpad:sync-contract:storage-name-vectors:0.2.0",
+  "title": "WriterPad storage-name-v1 conformance vectors",
   "type": "object",
   "additionalProperties": false,
   "required": [
     "$schema",
     "contract_version",
     "algorithm_id",
-    "baseline_unicode_version",
+    "unicode_version",
     "vectors"
   ],
   "properties": {
@@ -16,17 +16,17 @@
       "const": "../storage-name-vectors.schema.json"
     },
     "contract_version": {
-      "const": "0.3.0"
+      "const": "0.2.0"
     },
     "algorithm_id": {
-      "const": "storage-name-v2"
+      "const": "storage-name-v1"
     },
-    "baseline_unicode_version": {
-      "const": "14.0.0"
+    "unicode_version": {
+      "const": "15.0.0"
     },
     "vectors": {
       "type": "array",
-      "minItems": 29,
+      "minItems": 12,
       "items": {
         "type": "object",
         "additionalProperties": false,
@@ -56,9 +56,7 @@
           "error_code": {
             "enum": [
               "STORAGE_NAME_INVALID",
-              "STORAGE_NAME_RESERVED",
-              "STORAGE_NAME_UNASSIGNED",
-              "STORAGE_NAME_UNSUPPORTED_SCALAR"
+              "STORAGE_NAME_RESERVED"
             ]
           }
         },

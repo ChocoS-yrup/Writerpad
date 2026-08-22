@@ -23,6 +23,7 @@ protocol SyncV2RealtimeTriggering: Sendable {
             (SyncV2RealtimeConnectionStatus) -> Void
     ) async throws
     func stop() async
+    func resetConnection() async
 }
 
 enum SyncV2RealtimeConnectionStatus: Equatable, Sendable {
@@ -39,6 +40,10 @@ enum SyncV2RealtimeTriggerError: Error, Sendable {
 }
 
 extension SyncV2RealtimeTriggering {
+    func resetConnection() async {
+        await stop()
+    }
+
     func startAll(
         onChange: @escaping @Sendable () -> Void,
         onSubscribed: @escaping @Sendable () -> Void
@@ -266,6 +271,24 @@ actor LiveSyncV2RealtimeTrigger: SyncV2RealtimeTriggering {
         channelGeneration = nil
         hasObservedSubscribing = false
         hasSubscribed = false
+    }
+
+    /// 채널 재구독만으로 빠져나오지 못하는 socket 상태를 비운다. 같은
+    /// SupabaseClient를 쓰는 background/workspace trigger가 공유 gate를
+    /// 사용하므로 reset 도중 다른 phx_join이 끼어들지 않는다.
+    func resetConnection() async {
+        do {
+            try await subscriptionGate.withSubscription {
+                await self.stop()
+                await self.client.realtimeV2.removeAllChannels()
+                // SDK disconnect가 ConnectionManager actor에 전달된 뒤 다음
+                // subscribe가 새 WebSocket을 만들도록 짧게 실행권을 넘긴다.
+                try await ContinuousClock().sleep(for: .milliseconds(100))
+            }
+        } catch {
+            // 상위 lifecycle의 다음 start/watchdog가 실패를 판정하고 기존
+            // backoff를 계속한다. reset 실패가 동기화 Task를 끝내면 안 된다.
+        }
     }
 
     private func receivedChange(

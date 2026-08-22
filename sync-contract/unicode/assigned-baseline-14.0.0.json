@@ -1,5 +1,5 @@
 {
- "table_id": "storage-name-baseline-assigned-v2",
+ "table_id": "storage-name-baseline-assigned-v1",
  "baseline_unicode_version": "14.0.0",
  "purpose": "The frozen set of scalars a storage name may contain. Replaces the runtime Unicode version requirement.",
  "rule": "A storage name MUST be rejected (STORAGE_NAME_UNASSIGNED) if it contains any scalar not covered by these ranges.",

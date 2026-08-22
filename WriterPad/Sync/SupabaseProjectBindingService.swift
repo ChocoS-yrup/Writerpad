@@ -280,6 +280,7 @@ enum ProjectBindingFailure: Equatable, Sendable {
     case networkUnavailable
     case invalidServerResponse
     case serverRejected
+    case initialSnapshotNotQueued
     case notBound
 }
 
@@ -304,7 +305,7 @@ struct NoOpInitialProjectSyncRecorder: InitialProjectSyncRecording {
         batchKind: DurableLocalBatchKind
     ) async -> DurableRecordResult {
         _ = batchKind
-        return .localOnly
+        return .notNeeded
     }
 }
 
@@ -386,7 +387,14 @@ actor SupabaseProjectBindingService: ProjectBindingServicing {
         guard await bindingStore.availability() == .available else {
             return nil
         }
-        return try? await bindingStore.binding(for: localProjectID)
+        guard let binding = try? await bindingStore.binding(
+            for: localProjectID
+        ) else {
+            return nil
+        }
+        return await prepareInitialSnapshotIfNeeded(for: binding)
+            ? binding
+            : nil
     }
 
     func bindingUpdates(
@@ -412,8 +420,15 @@ actor SupabaseProjectBindingService: ProjectBindingServicing {
         guard await bindingStore.availability() == .available else {
             return []
         }
-        return (try? await bindingStore.allBindings())?
+        let bindings = (try? await bindingStore.allBindings())?
             .filter { $0.serverProjectID != nil } ?? []
+        var prepared: [ProjectSyncBinding] = []
+        for binding in bindings {
+            if await prepareInitialSnapshotIfNeeded(for: binding) {
+                prepared.append(binding)
+            }
+        }
+        return prepared
     }
 
     func createServerProject(
@@ -637,19 +652,42 @@ actor SupabaseProjectBindingService: ProjectBindingServicing {
         )
         do {
             try await bindingStore.save(binding)
-            if kind == .newServerProject || kind == .windowsImport {
-                _ = await initialSyncRecorder.recordInitialSnapshot(
-                    projectID: localProjectID,
-                    projectName: name,
-                    batchKind: kind == .windowsImport
-                        ? .windowsImport
-                        : .projectBinding
-                )
+            guard await prepareInitialSnapshotIfNeeded(for: binding) else {
+                return .failed(.initialSnapshotNotQueued)
             }
             publish(binding, localProjectID: localProjectID)
             return .connected(binding)
         } catch {
             return .failed(storeFailure(error))
+        }
+    }
+
+    /// Native identity 연결은 초기 batch가 durable queue에 들어가기 전까지 다른
+    /// coordinator에 노출하지 않는다. 앱 재시작 때 current/allBindings 조회가
+    /// marker 또는 binding 직후 중단을 자동으로 재개한다.
+    private func prepareInitialSnapshotIfNeeded(
+        for binding: ProjectSyncBinding
+    ) async -> Bool {
+        let batchKind: DurableLocalBatchKind
+        switch binding.kind {
+        case .newServerProject:
+            batchKind = .projectBinding
+        case .windowsImport:
+            batchKind = .windowsImport
+        case .localOnly, .existingServerProject:
+            return true
+        }
+        let result = await initialSyncRecorder.recordInitialSnapshot(
+            projectID: binding.localProjectID,
+            projectName: binding.projectName,
+            batchKind: batchKind
+        )
+        switch result {
+        case .queued, .notNeeded:
+            return true
+        case .serverSizeLimitExceeded, .localOnly,
+             .localSavedButNotQueued:
+            return false
         }
     }
 

@@ -91,6 +91,50 @@ extension SwiftDataMetadataRepository: DocumentRepository {
     }
 }
 
+extension SwiftDataMetadataRepository: DocumentIdentityReplacing {
+    func replaceDocumentIdentity(
+        from oldID: DocumentID,
+        to newID: DocumentID,
+        in projectID: ProjectID
+    ) async throws {
+        guard oldID != newID else { return }
+        guard try uniqueDocumentRecord(id: newID) == nil else {
+            throw MetadataRepositoryError.corruptedRecord(
+                entity: "DocumentRecord",
+                identifier: newID.rawValue.uuidString,
+                reason: "replacement document identity already exists"
+            )
+        }
+        let record = try requireDocumentRecord(id: oldID)
+        guard record.projectID == projectID.rawValue else {
+            throw MetadataRepositoryError.documentProjectCannotChange(oldID)
+        }
+
+        let children = try documentRecords(
+            in: projectID,
+            parentID: oldID
+        )
+        if let workspace = try uniqueWorkspaceRecord(projectID: projectID) {
+            if workspace.leftDocumentID == oldID.rawValue {
+                workspace.leftDocumentID = newID.rawValue
+            }
+            if workspace.rightDocumentID == oldID.rawValue {
+                workspace.rightDocumentID = newID.rawValue
+            }
+        }
+        record.id = newID.rawValue
+        for child in children {
+            child.parentID = newID.rawValue
+        }
+        do {
+            try modelContext.save()
+        } catch {
+            modelContext.rollback()
+            throw error
+        }
+    }
+}
+
 extension SwiftDataMetadataRepository: DocumentFileMetadataUpdating {
     func validateBeforeFileSave(
         _ request: DocumentSaveRequest
