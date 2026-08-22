@@ -38,6 +38,7 @@ struct WritingWorkspaceShell: View {
     let futureChangeNotifier: any FutureChangeNotifying
     let conflictResolutionService:
         (any SyncV2ConflictResolving)?
+    let conflictRecoveryStore: ConflictRecoveryStore?
     private let storageCoordinator: WorkspaceStorageCoordinator
     @Binding var isShowingSettings: Bool
     @Binding var smartPairsEnabled: Bool
@@ -67,6 +68,8 @@ struct WritingWorkspaceShell: View {
     @State private var conflictResolutionRoute:
         ConflictResolutionRoute?
     @State private var conflictResolutionErrorMessage: String?
+    @State private var isShowingConflictRecovery = false
+    @State private var conflictRecoveryCount = 0
     @State private var isLoadingConflictResolution = false
     @State private var binderErrorMessage: String?
     @State private var isBinderOrdering = false
@@ -105,6 +108,7 @@ struct WritingWorkspaceShell: View {
         syncDispatcher: SyncV2Dispatcher? = nil,
         conflictResolutionService:
             (any SyncV2ConflictResolving)? = nil,
+        conflictRecoveryStore: ConflictRecoveryStore? = nil,
         snapshotPullService: SyncV2SnapshotPullService? = nil,
         realtimeTrigger: (any SyncV2RealtimeTriggering)? = nil,
         editLeaseManager: (any EditLeaseManaging)? = nil,
@@ -125,6 +129,7 @@ struct WritingWorkspaceShell: View {
         self.restoreCoordinator = restoreCoordinator
         self.futureChangeNotifier = futureChangeNotifier
         self.conflictResolutionService = conflictResolutionService
+        self.conflictRecoveryStore = conflictRecoveryStore
         self.storageCoordinator = WorkspaceStorageCoordinator(
             projectID: project.id,
             binderRepository: repository,
@@ -387,6 +392,23 @@ struct WritingWorkspaceShell: View {
                     )
                 }
             )
+        }
+        .sheet(isPresented: $isShowingConflictRecovery) {
+            if let conflictRecoveryStore {
+                ConflictRecoveryView(
+                    projectID: project.id,
+                    store: conflictRecoveryStore,
+                    documentRepository: documentRepository,
+                    onChanged: {
+                        binderSnapshotRefreshGeneration &+= 1
+                        Task { await refreshConflictRecoveryCount() }
+                    }
+                )
+            }
+        }
+        .task { await refreshConflictRecoveryCount() }
+        .onChange(of: workspaceSyncModel.state) { _, _ in
+            Task { await refreshConflictRecoveryCount() }
         }
         .alert(item: $notice) { notice in
             Alert(
@@ -749,6 +771,21 @@ struct WritingWorkspaceShell: View {
                 .accessibilityIdentifier("writerpad.manuscript-export")
                 Button("백업") { Task { await presentBackupHistory() } }
                     .accessibilityIdentifier("writerpad.backup-history")
+                if conflictRecoveryStore != nil {
+                    Button {
+                        isShowingConflictRecovery = true
+                    } label: {
+                        if conflictRecoveryCount > 0 {
+                            Label(
+                                "충돌 복구 백업 (\(conflictRecoveryCount))",
+                                systemImage: "archivebox.badge.exclamationmark"
+                            )
+                        } else {
+                            Label("충돌 복구 백업", systemImage: "archivebox")
+                        }
+                    }
+                    .accessibilityIdentifier("writerpad.conflict-recovery")
+                }
                 Button("작품 전체 검색", systemImage: "doc.text.magnifyingglass") {
                     presentProjectSearch()
                 }
@@ -1042,6 +1079,20 @@ struct WritingWorkspaceShell: View {
         } catch {
             notice = .contentReadFailure
         }
+    }
+
+    @MainActor
+    private func refreshConflictRecoveryCount() async {
+        guard let conflictRecoveryStore else {
+            conflictRecoveryCount = 0
+            return
+        }
+        let packages = try? await conflictRecoveryStore.packages(
+            localProjectID: project.id
+        )
+        conflictRecoveryCount = packages?.filter {
+            $0.state != .discarded && $0.payloadDeletedAt == nil
+        }.count ?? 0
     }
 
     private func shouldUseCompactLayout(

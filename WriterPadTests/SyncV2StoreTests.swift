@@ -4701,6 +4701,8 @@ final class SyncV2StoreTests: XCTestCase {
         let downgrade = try RawSQLite(url: url)
         try downgrade.execute(
             """
+            DROP TABLE conflict_recovery_entities;
+            DROP TABLE conflict_recovery_packages;
             DROP TABLE sync_folders;
             DROP TABLE sync_operation_events;
             DROP INDEX sync_operations_supersedes_idx;
@@ -7531,6 +7533,155 @@ final class SyncV2StoreTests: XCTestCase {
             committed,
             [grandchildDeleteID, childDeleteID, parentDeleteID]
         )
+        await store.close()
+    }
+
+    func testRemoteDeletionRecoveryIsIdempotentAndCancelsOnlyItsBatch()
+        async throws {
+        let url = try databaseURL()
+        let context = QueueAPIContext()
+        let store = try await connectedStore(at: url, context: context)
+        let batchID = UUID()
+        let renameOperationID = UUID()
+        let treeOrderOperationID = UUID()
+        let unrelatedDocumentID = UUID()
+        let unrelatedOperationID = UUID()
+        _ = try await store.enqueue(
+            context.batch(
+                batchID: batchID,
+                kind: .structureChange,
+                mutations: [
+                    context.folderMutation(
+                        operationID: renameOperationID,
+                        name: "삭제시험-아이패드"
+                    ),
+                    context.documentMutation(
+                        operationID: treeOrderOperationID,
+                        documentID: syncV2UUIDv5(
+                            namespace: context.serverProjectID,
+                            name: syncV2TreeOrderPath
+                        ),
+                        relativePath: syncV2TreeOrderPath,
+                        content: #"{"tree_order":{},"version":1}"#,
+                        generation: 1,
+                        kind: .treeOrder
+                    ),
+                ]
+            )
+        )
+        _ = try await store.enqueue(
+            context.batch(
+                mutations: [
+                    context.documentMutation(
+                        operationID: unrelatedOperationID,
+                        documentID: unrelatedDocumentID,
+                        relativePath: "메모장/다른 폴더/정상.txt",
+                        content: "계속 동기화할 본문"
+                    ),
+                ]
+            )
+        )
+        let readyFolders = try await store.claimReadyFolderOperations(
+            limit: 1,
+            now: Date(timeIntervalSince1970: 10)
+        )
+        let operation = try XCTUnwrap(readyFolders.first)
+        let payloadPath = "fixture.writerpad-recovery"
+        let first = try await store.beginRemoteDeletionRecovery(
+            operation: operation,
+            tombstoneRevision: 2,
+            displayName: operation.name,
+            payloadRelativePath: payloadPath
+        )
+        let replay = try await store.beginRemoteDeletionRecovery(
+            operation: operation,
+            tombstoneRevision: 2,
+            displayName: operation.name,
+            payloadRelativePath: payloadPath
+        )
+        XCTAssertEqual(replay.id, first.id)
+        XCTAssertEqual(replay.state, .preparing)
+
+        let root = ConflictRecoveryEntity(
+            kind: .folder,
+            sourceEntityID: operation.folderID,
+            restoredEntityID: nil,
+            parentSourceEntityID: nil,
+            relativePath: operation.name,
+            title: operation.name,
+            userOrder: 0,
+            byteCount: nil,
+            sha256: nil,
+            restoreStatus: .pending
+        )
+        try await store.markConflictRecoveryReady(
+            packageID: first.id,
+            manifestSHA256: String(repeating: "a", count: 64),
+            fileCount: 0,
+            totalBytes: 0,
+            entities: [root]
+        )
+        try await store.resolveRemoteDeletionSource(packageID: first.id)
+        try await store.resolveRemoteDeletionSource(packageID: first.id)
+
+        let packages = try await store.conflictRecoveryPackages(
+            localProjectID: context.localProjectID
+        )
+        XCTAssertEqual(packages.count, 1)
+        XCTAssertEqual(packages.first?.state, .sourceResolved)
+        let entities = try await store.conflictRecoveryEntities(packageID: first.id)
+        let renameEvents = try await store.operationEvents(
+            operationID: renameOperationID
+        )
+        let treeOrderEvents = try await store.operationEvents(
+            operationID: treeOrderOperationID
+        )
+        let stateDivergences = try await store.operationStateDivergences()
+        let lineageDivergences = try await store.operationLineageDivergences()
+        let orphanedIDs = try await store.orphanedOperationIDs()
+        let unrelated = try await store.queuedOperations(
+            documentID: unrelatedDocumentID
+        )
+        XCTAssertEqual(entities, [root])
+        XCTAssertEqual(renameEvents.last?.type, .cancelRequested)
+        XCTAssertEqual(treeOrderEvents.last?.type, .cancelRequested)
+        XCTAssertEqual(stateDivergences, [])
+        XCTAssertEqual(lineageDivergences, [])
+        XCTAssertEqual(orphanedIDs, [])
+        XCTAssertEqual(unrelated.map(\.operationID), [unrelatedOperationID])
+
+        let restoredFolderID = UUID()
+        let restoreBatchID = UUID()
+        try await store.markConflictRecoveryRestoreEnqueued(
+            packageID: first.id,
+            restoreBatchID: restoreBatchID,
+            restoredEntityIDs: [operation.folderID: restoredFolderID]
+        )
+        try await store.markConflictRecoveryRestoreEnqueued(
+            packageID: first.id,
+            restoreBatchID: restoreBatchID,
+            restoredEntityIDs: [operation.folderID: restoredFolderID]
+        )
+        var restoredPackages = try await store.conflictRecoveryPackages(
+            localProjectID: context.localProjectID
+        )
+        var restoredEntities = try await store.conflictRecoveryEntities(
+            packageID: first.id
+        )
+        XCTAssertEqual(restoredPackages.first?.state, .restoreEnqueued)
+        XCTAssertEqual(restoredPackages.first?.restoreBatchID, restoreBatchID)
+        XCTAssertEqual(restoredEntities.first?.restoredEntityID, restoredFolderID)
+        XCTAssertEqual(restoredEntities.first?.restoreStatus, .enqueued)
+
+        try await store.markConflictRecoveryRestored(packageID: first.id)
+        restoredPackages = try await store.conflictRecoveryPackages(
+            localProjectID: context.localProjectID
+        )
+        restoredEntities = try await store.conflictRecoveryEntities(
+            packageID: first.id
+        )
+        XCTAssertEqual(restoredPackages.first?.state, .restored)
+        XCTAssertEqual(restoredEntities.first?.restoreStatus, .committed)
         await store.close()
     }
 }

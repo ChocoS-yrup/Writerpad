@@ -21,6 +21,7 @@ enum SyncV2AutomaticRebaseOutcome: Equatable, Sendable {
     case rebased
     case generationAdvanced
     case conflictPreserved
+    case sourceResolved
     case conflict(code: String, detail: String?)
 }
 
@@ -30,18 +31,21 @@ actor SyncV2AutomaticRebaser {
     private let localApplier: (any SyncV2LocalSnapshotApplying)?
     private let openLocalProvider:
         (any SyncV2OpenLocalSnapshotProviding)?
+    private let conflictRecoveryStore: ConflictRecoveryStore?
 
     init(
         store: any SyncV2DispatchStoring,
         snapshotClient: any SyncV2SnapshotClienting,
         localApplier: (any SyncV2LocalSnapshotApplying)? = nil,
         openLocalProvider:
-            (any SyncV2OpenLocalSnapshotProviding)? = nil
+            (any SyncV2OpenLocalSnapshotProviding)? = nil,
+        conflictRecoveryStore: ConflictRecoveryStore? = nil
     ) {
         self.store = store
         self.snapshotClient = snapshotClient
         self.localApplier = localApplier
         self.openLocalProvider = openLocalProvider
+        self.conflictRecoveryStore = conflictRecoveryStore
     }
 
     func rebase(
@@ -433,14 +437,21 @@ actor SyncV2AutomaticRebaser {
                 detail: "revision conflict 뒤 최신 서버 폴더를 찾지 못했습니다."
             )
         }
-        guard !remote.isDeleted || operation.isDeleted else {
-            return .conflict(
-                code: "REMOTE_DELETION",
-                detail: "서버에서 삭제된 폴더는 이름변경으로 자동 복원하지 않습니다."
-            )
-        }
         guard remote.revision > operation.baseRevision else {
             throw SyncV2ClientError.invalidResponse
+        }
+        guard !remote.isDeleted || operation.isDeleted else {
+            guard let conflictRecoveryStore else {
+                return .conflict(
+                    code: "REMOTE_DELETION",
+                    detail: "서버에서 삭제된 폴더는 이름변경으로 자동 복원하지 않습니다."
+                )
+            }
+            _ = try await conflictRecoveryStore.preserveRemoteDeletion(
+                operation: operation,
+                tombstoneRevision: remote.revision
+            )
+            return .sourceResolved
         }
         try await store.rebaseFolderAfterRevisionConflict(
             operation,
@@ -1078,7 +1089,7 @@ actor SyncV2Dispatcher {
                 }
                 do {
                     switch try await automaticRebaser.rebase(operation) {
-                    case .rebased:
+                    case .rebased, .sourceResolved:
                         return
                     case .conflictPreserved:
                         return
@@ -1214,7 +1225,7 @@ actor SyncV2Dispatcher {
                 do {
                     let outcome = try await automaticRebaser.rebase(operation)
                     switch outcome {
-                    case .rebased, .generationAdvanced:
+                    case .rebased, .generationAdvanced, .sourceResolved:
                         return
                     case .conflictPreserved:
                         return

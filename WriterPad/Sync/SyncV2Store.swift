@@ -571,6 +571,100 @@ struct SyncV2OperationLineageDivergence: Equatable, Sendable {
     let reason: SyncV2OperationLineageDivergenceReason
 }
 
+enum ConflictRecoveryPackageState: String, Codable, Equatable, Sendable {
+    case preparing
+    case ready
+    case sourceResolved = "source_resolved"
+    case restoreEnqueued = "restore_enqueued"
+    case restored
+    case discarded
+}
+
+enum ConflictRecoveryEntityKind: String, Codable, Equatable, Sendable {
+    case folder
+    case document
+}
+
+enum ConflictRecoveryEntityRestoreStatus: String, Codable, Equatable, Sendable {
+    case pending
+    case enqueued
+    case committed
+}
+
+struct ConflictRecoveryEntity: Codable, Equatable, Sendable {
+    let kind: ConflictRecoveryEntityKind
+    let sourceEntityID: UUID
+    let restoredEntityID: UUID?
+    let parentSourceEntityID: UUID?
+    let relativePath: String
+    let title: String
+    let userOrder: Int
+    let byteCount: Int?
+    let sha256: String?
+    let restoreStatus: ConflictRecoveryEntityRestoreStatus
+}
+
+struct ConflictRecoveryPackage: Codable, Equatable, Identifiable, Sendable {
+    let id: UUID
+    let localProjectID: ProjectID
+    let serverProjectID: UUID
+    let sourceOperationID: UUID
+    let sourceFolderID: UUID
+    let sourceBaseRevision: Int64
+    let tombstoneRevision: Int64
+    let displayName: String
+    let state: ConflictRecoveryPackageState
+    let payloadRelativePath: String
+    let manifestSHA256: String?
+    let fileCount: Int
+    let totalBytes: Int
+    let restoreBatchID: UUID?
+    let createdAt: Date
+    let updatedAt: Date
+    let restoredAt: Date?
+    let payloadDeletedAt: Date?
+}
+
+enum ConflictRecoveryLedgerError: Error, Equatable, Sendable {
+    case invalidRemoteDeletion
+    case packageNotFound
+    case invalidState
+    case manifestMismatch
+    case operationChanged
+    case unavailable
+}
+
+protocol ConflictRecoveryLedger: Sendable {
+    func beginRemoteDeletionRecovery(
+        operation: SyncV2FolderDispatchOperation,
+        tombstoneRevision: Int64,
+        displayName: String,
+        payloadRelativePath: String
+    ) async throws -> ConflictRecoveryPackage
+    func markConflictRecoveryReady(
+        packageID: UUID,
+        manifestSHA256: String,
+        fileCount: Int,
+        totalBytes: Int,
+        entities: [ConflictRecoveryEntity]
+    ) async throws
+    func resolveRemoteDeletionSource(packageID: UUID) async throws
+    func markConflictRecoveryRestoreEnqueued(
+        packageID: UUID,
+        restoreBatchID: UUID,
+        restoredEntityIDs: [UUID: UUID]
+    ) async throws
+    func markConflictRecoveryRestored(packageID: UUID) async throws
+    func discardConflictRecoveryPackage(packageID: UUID) async throws
+    func markConflictRecoveryPayloadDeleted(packageID: UUID) async throws
+    func conflictRecoveryPackages(
+        localProjectID: ProjectID?
+    ) async throws -> [ConflictRecoveryPackage]
+    func conflictRecoveryEntities(
+        packageID: UUID
+    ) async throws -> [ConflictRecoveryEntity]
+}
+
 protocol SyncV2DispatchStoring: Sendable {
     func recoverInterruptedWork() async throws
     func readyLocalProjectIDs(
@@ -745,12 +839,13 @@ private final class SyncV2StoreBundleToken {}
 actor SyncV2Store:
     ProjectBindingStoring,
     SyncV2DispatchStoring,
+    ConflictRecoveryLedger,
     SyncV2ConflictResolving,
     SyncV2DocumentRevisionProviding,
     SyncV2FolderMigrationMarking,
     SyncV2SnapshotStateStoring {
-    static let currentSchemaVersion = 7
-    static let migrationName = "SyncV2StoreSchemaV7"
+    static let currentSchemaVersion = 8
+    static let migrationName = "SyncV2StoreSchemaV8"
     static let maximumContentByteCount = 10 * 1_024 * 1_024
     static let contentTooLargeErrorCode = "CONTENT_TOO_LARGE"
 
@@ -7563,6 +7658,8 @@ actor SyncV2Store:
             "sync_batches",
             "sync_operations",
             "sync_conflicts",
+            "conflict_recovery_packages",
+            "conflict_recovery_entities",
         ]
         for table in expectedTables {
             let count = try withStatement(
@@ -7976,7 +8073,8 @@ actor SyncV2Store:
         type: SyncV2OperationEventType,
         errorCode: String?,
         timestamp: String,
-        relatedOperationID: String? = nil
+        relatedOperationID: String? = nil,
+        detailJSON: String = "{}"
     ) throws {
         let events = try operationEvents(operationID: operationID)
         try SyncV2OperationStateDerivation.requireAppendable(to: events)
@@ -7987,7 +8085,8 @@ actor SyncV2Store:
             type: type,
             recordedAt: timestamp,
             errorCode: errorCode,
-            relatedOperationID: relatedOperationID
+            relatedOperationID: relatedOperationID,
+            detailJSON: detailJSON
         )
     }
 
@@ -8056,14 +8155,15 @@ actor SyncV2Store:
         type: SyncV2OperationEventType,
         recordedAt: String,
         errorCode: String?,
-        relatedOperationID: String? = nil
+        relatedOperationID: String? = nil,
+        detailJSON: String = "{}"
     ) throws {
         try withStatement(
             """
             INSERT OR IGNORE INTO sync_operation_events (
                 event_id, operation_id, event_sequence, event_type,
                 recorded_at, error_code, related_operation_id, detail_json
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, '{}');
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?);
             """
         ) { statement in
             try bind(eventID, at: 1, to: statement)
@@ -8073,6 +8173,7 @@ actor SyncV2Store:
             try bind(recordedAt, at: 5, to: statement)
             try bind(errorCode, at: 6, to: statement)
             try bind(relatedOperationID, at: 7, to: statement)
+            try bind(detailJSON, at: 8, to: statement)
             guard sqlite3_step(statement) == SQLITE_DONE else {
                 throw sqliteError()
             }
@@ -8239,6 +8340,670 @@ actor SyncV2Store:
             timestamp: timestamp
         )
         return orphans
+    }
+
+    func beginRemoteDeletionRecovery(
+        operation: SyncV2FolderDispatchOperation,
+        tombstoneRevision: Int64,
+        displayName: String,
+        payloadRelativePath: String
+    ) throws -> ConflictRecoveryPackage {
+        guard !operation.isDeleted,
+              tombstoneRevision > operation.baseRevision,
+              !displayName.isEmpty,
+              !payloadRelativePath.isEmpty
+        else {
+            throw ConflictRecoveryLedgerError.invalidRemoteDeletion
+        }
+        if let existing = try conflictRecoveryPackage(
+            sourceOperationID: operation.operationID,
+            tombstoneRevision: tombstoneRevision
+        ) {
+            return existing
+        }
+        let packageID = UUID()
+        let timestamp = Self.timestamp()
+        do {
+            try withStatement(
+                """
+                INSERT INTO conflict_recovery_packages(
+                    package_id, local_project_id, server_project_id,
+                    source_operation_id, source_folder_id,
+                    source_base_revision, tombstone_revision, display_name,
+                    state, payload_relative_path, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'preparing', ?, ?, ?);
+                """
+            ) { statement in
+                try bind(packageID.uuidString.lowercased(), at: 1, to: statement)
+                try bind(operation.localProjectID.rawValue.uuidString.lowercased(), at: 2, to: statement)
+                try bind(operation.projectID.uuidString.lowercased(), at: 3, to: statement)
+                try bind(operation.operationID.uuidString.lowercased(), at: 4, to: statement)
+                try bind(operation.folderID.uuidString.lowercased(), at: 5, to: statement)
+                try bind(operation.baseRevision, at: 6, to: statement)
+                try bind(tombstoneRevision, at: 7, to: statement)
+                try bind(displayName, at: 8, to: statement)
+                try bind(payloadRelativePath, at: 9, to: statement)
+                try bind(timestamp, at: 10, to: statement)
+                try bind(timestamp, at: 11, to: statement)
+                try stepDone(statement)
+            }
+        } catch let error as SyncV2StoreError {
+            if case let .sqlite(code) = error,
+               code == sqliteConstraintUniqueCode,
+               let existing = try conflictRecoveryPackage(
+                   sourceOperationID: operation.operationID,
+                   tombstoneRevision: tombstoneRevision
+               ) {
+                return existing
+            }
+            throw error
+        }
+        guard let package = try conflictRecoveryPackage(packageID: packageID) else {
+            throw ConflictRecoveryLedgerError.packageNotFound
+        }
+        return package
+    }
+
+    func markConflictRecoveryReady(
+        packageID: UUID,
+        manifestSHA256: String,
+        fileCount: Int,
+        totalBytes: Int,
+        entities: [ConflictRecoveryEntity]
+    ) throws {
+        guard ContentHash(rawValue: manifestSHA256) != nil,
+              fileCount >= 0,
+              totalBytes >= 0,
+              entities.filter({ $0.kind == .document }).count == fileCount,
+              entities.allSatisfy({
+                  $0.restoredEntityID == nil && $0.restoreStatus == .pending
+              })
+        else {
+            throw ConflictRecoveryLedgerError.manifestMismatch
+        }
+        try transaction {
+            guard let package = try conflictRecoveryPackage(packageID: packageID) else {
+                throw ConflictRecoveryLedgerError.packageNotFound
+            }
+            if package.state != .preparing {
+                guard package.manifestSHA256 == manifestSHA256,
+                      package.fileCount == fileCount,
+                      package.totalBytes == totalBytes,
+                      try conflictRecoveryEntities(packageID: packageID) == entities
+                else {
+                    throw ConflictRecoveryLedgerError.manifestMismatch
+                }
+                return
+            }
+            try withStatement(
+                """
+                INSERT INTO conflict_recovery_entities(
+                    package_id, entity_kind, source_entity_id,
+                    restored_entity_id, parent_source_entity_id,
+                    relative_path, title, user_order, byte_count, sha256,
+                    restore_status
+                ) VALUES (?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, 'pending');
+                """
+            ) { statement in
+                for entity in entities {
+                    sqlite3_reset(statement)
+                    sqlite3_clear_bindings(statement)
+                    try bind(packageID.uuidString.lowercased(), at: 1, to: statement)
+                    try bind(entity.kind.rawValue, at: 2, to: statement)
+                    try bind(entity.sourceEntityID.uuidString.lowercased(), at: 3, to: statement)
+                    try bind(entity.parentSourceEntityID?.uuidString.lowercased(), at: 4, to: statement)
+                    try bind(entity.relativePath, at: 5, to: statement)
+                    try bind(entity.title, at: 6, to: statement)
+                    try bind(entity.userOrder, at: 7, to: statement)
+                    try bind(entity.byteCount, at: 8, to: statement)
+                    try bind(entity.sha256, at: 9, to: statement)
+                    try stepDone(statement)
+                }
+            }
+            let timestamp = Self.timestamp()
+            try withStatement(
+                """
+                UPDATE conflict_recovery_packages
+                SET state = 'ready', manifest_sha256 = ?, file_count = ?,
+                    total_bytes = ?, updated_at = ?
+                WHERE package_id = ? AND state = 'preparing';
+                """
+            ) { statement in
+                try bind(manifestSHA256, at: 1, to: statement)
+                try bind(fileCount, at: 2, to: statement)
+                try bind(totalBytes, at: 3, to: statement)
+                try bind(timestamp, at: 4, to: statement)
+                try bind(packageID.uuidString.lowercased(), at: 5, to: statement)
+                try stepDone(statement)
+            }
+        }
+    }
+
+    func resolveRemoteDeletionSource(packageID: UUID) throws {
+        try transaction {
+            guard let package = try conflictRecoveryPackage(packageID: packageID) else {
+                throw ConflictRecoveryLedgerError.packageNotFound
+            }
+            if package.state == .sourceResolved
+                || package.state == .restoreEnqueued
+                || package.state == .restored
+                || package.state == .discarded {
+                return
+            }
+            guard package.state == .ready,
+                  package.manifestSHA256 != nil
+            else {
+                throw ConflictRecoveryLedgerError.invalidState
+            }
+            let sourceKey = package.sourceOperationID.uuidString.lowercased()
+            guard let source = try recoverySourceOperation(operationID: sourceKey),
+                  source.folderID == package.sourceFolderID,
+                  source.baseRevision == package.sourceBaseRevision,
+                  source.projectID == package.serverProjectID,
+                  source.status != .completed,
+                  source.status != .cancelled
+            else {
+                throw ConflictRecoveryLedgerError.operationChanged
+            }
+            let timestamp = Self.timestamp()
+            let detail = try Self.recoveryDetailJSON(
+                reason: "REMOTE_DELETION_BACKED_UP",
+                packageID: packageID,
+                remoteRevision: package.tombstoneRevision,
+                folderID: package.sourceFolderID
+            )
+            try cancelOperationLocked(
+                operationID: sourceKey,
+                errorCode: "REMOTE_DELETION",
+                detailJSON: detail,
+                timestamp: timestamp
+            )
+
+            let companions = try operationIDs(
+                where: """
+                batch_id = ?
+                  AND operation_kind = 'tree_order'
+                  AND status NOT IN ('completed', 'cancelled')
+                """
+            ) { statement in
+                try bind(source.batchID.uuidString.lowercased(), at: 1, to: statement)
+            }
+            let companionDetail = try Self.recoveryDetailJSON(
+                reason: "REMOTE_DELETION_DEPENDENT_TREE_ORDER",
+                packageID: packageID,
+                remoteRevision: package.tombstoneRevision,
+                folderID: package.sourceFolderID
+            )
+            for operationID in companions where operationID != sourceKey {
+                try cancelOperationLocked(
+                    operationID: operationID,
+                    errorCode: "REMOTE_DELETION",
+                    detailJSON: companionDetail,
+                    timestamp: timestamp
+                )
+            }
+            try withStatement(
+                """
+                UPDATE conflict_recovery_packages
+                SET state = 'source_resolved', updated_at = ?
+                WHERE package_id = ? AND state = 'ready';
+                """
+            ) { statement in
+                try bind(timestamp, at: 1, to: statement)
+                try bind(packageID.uuidString.lowercased(), at: 2, to: statement)
+                try stepDone(statement)
+            }
+            try adoptOrphanedOperationsLocked()
+        }
+    }
+
+    func markConflictRecoveryRestoreEnqueued(
+        packageID: UUID,
+        restoreBatchID: UUID,
+        restoredEntityIDs: [UUID: UUID]
+    ) throws {
+        try transaction {
+            guard let package = try conflictRecoveryPackage(packageID: packageID) else {
+                throw ConflictRecoveryLedgerError.packageNotFound
+            }
+            let entities = try conflictRecoveryEntities(packageID: packageID)
+            guard Set(restoredEntityIDs.keys) == Set(entities.map(\.sourceEntityID)),
+                  Set(restoredEntityIDs.values).count == restoredEntityIDs.count,
+                  restoredEntityIDs.allSatisfy({ $0.key != $0.value })
+            else { throw ConflictRecoveryLedgerError.manifestMismatch }
+            if package.state == .restoreEnqueued || package.state == .restored {
+                guard package.restoreBatchID == restoreBatchID,
+                      entities.allSatisfy({
+                          $0.restoredEntityID == restoredEntityIDs[$0.sourceEntityID]
+                      })
+                else { throw ConflictRecoveryLedgerError.manifestMismatch }
+                return
+            }
+            guard package.state == .sourceResolved else {
+                throw ConflictRecoveryLedgerError.invalidState
+            }
+            try withStatement(
+                """
+                UPDATE conflict_recovery_entities
+                SET restored_entity_id = ?, restore_status = 'enqueued'
+                WHERE package_id = ? AND source_entity_id = ?;
+                """
+            ) { statement in
+                for entity in entities {
+                    guard let restoredID = restoredEntityIDs[entity.sourceEntityID] else {
+                        throw ConflictRecoveryLedgerError.manifestMismatch
+                    }
+                    sqlite3_reset(statement)
+                    sqlite3_clear_bindings(statement)
+                    try bind(restoredID.uuidString.lowercased(), at: 1, to: statement)
+                    try bind(packageID.uuidString.lowercased(), at: 2, to: statement)
+                    try bind(entity.sourceEntityID.uuidString.lowercased(), at: 3, to: statement)
+                    try stepDone(statement)
+                }
+            }
+            try withStatement(
+                """
+                UPDATE conflict_recovery_packages
+                SET state = 'restore_enqueued', restore_batch_id = ?, updated_at = ?
+                WHERE package_id = ? AND state = 'source_resolved';
+                """
+            ) { statement in
+                try bind(restoreBatchID.uuidString.lowercased(), at: 1, to: statement)
+                try bind(Self.timestamp(), at: 2, to: statement)
+                try bind(packageID.uuidString.lowercased(), at: 3, to: statement)
+                try stepDone(statement)
+            }
+        }
+    }
+
+    func markConflictRecoveryRestored(packageID: UUID) throws {
+        try transaction {
+            guard let package = try conflictRecoveryPackage(packageID: packageID) else {
+                throw ConflictRecoveryLedgerError.packageNotFound
+            }
+            if package.state == .restored { return }
+            guard package.state == .restoreEnqueued else {
+                throw ConflictRecoveryLedgerError.invalidState
+            }
+            let timestamp = Self.timestamp()
+            try withStatement(
+                """
+                UPDATE conflict_recovery_entities
+                SET restore_status = 'committed'
+                WHERE package_id = ?;
+                """
+            ) { statement in
+                try bind(packageID.uuidString.lowercased(), at: 1, to: statement)
+                try stepDone(statement)
+            }
+            try withStatement(
+                """
+                UPDATE conflict_recovery_packages
+                SET state = 'restored', restored_at = ?, updated_at = ?
+                WHERE package_id = ? AND state = 'restore_enqueued';
+                """
+            ) { statement in
+                try bind(timestamp, at: 1, to: statement)
+                try bind(timestamp, at: 2, to: statement)
+                try bind(packageID.uuidString.lowercased(), at: 3, to: statement)
+                try stepDone(statement)
+            }
+        }
+    }
+
+    func discardConflictRecoveryPackage(packageID: UUID) throws {
+        guard let package = try conflictRecoveryPackage(packageID: packageID) else {
+            throw ConflictRecoveryLedgerError.packageNotFound
+        }
+        if package.state == .discarded { return }
+        guard package.state == .sourceResolved else {
+            throw ConflictRecoveryLedgerError.invalidState
+        }
+        try withStatement(
+            """
+            UPDATE conflict_recovery_packages
+            SET state = 'discarded', payload_deleted_at = ?, updated_at = ?
+            WHERE package_id = ? AND state = 'source_resolved';
+            """
+        ) { statement in
+            let timestamp = Self.timestamp()
+            try bind(timestamp, at: 1, to: statement)
+            try bind(timestamp, at: 2, to: statement)
+            try bind(packageID.uuidString.lowercased(), at: 3, to: statement)
+            try stepDone(statement)
+        }
+    }
+
+    func markConflictRecoveryPayloadDeleted(packageID: UUID) throws {
+        guard let package = try conflictRecoveryPackage(packageID: packageID) else {
+            throw ConflictRecoveryLedgerError.packageNotFound
+        }
+        if package.payloadDeletedAt != nil { return }
+        guard package.state == .restored else {
+            throw ConflictRecoveryLedgerError.invalidState
+        }
+        try withStatement(
+            """
+            UPDATE conflict_recovery_packages
+            SET payload_deleted_at = ?, updated_at = ?
+            WHERE package_id = ? AND state = 'restored';
+            """
+        ) { statement in
+            let timestamp = Self.timestamp()
+            try bind(timestamp, at: 1, to: statement)
+            try bind(timestamp, at: 2, to: statement)
+            try bind(packageID.uuidString.lowercased(), at: 3, to: statement)
+            try stepDone(statement)
+        }
+    }
+
+    func conflictRecoveryPackages(
+        localProjectID: ProjectID? = nil
+    ) throws -> [ConflictRecoveryPackage] {
+        try refreshCompletedConflictRecoveries()
+        return try withStatement(
+            """
+            SELECT package_id, local_project_id, server_project_id,
+                   source_operation_id, source_folder_id,
+                   source_base_revision, tombstone_revision, display_name,
+                   state, payload_relative_path, manifest_sha256,
+                   file_count, total_bytes, restore_batch_id,
+                   created_at, updated_at, restored_at, payload_deleted_at
+            FROM conflict_recovery_packages
+            WHERE (? IS NULL OR local_project_id = ?)
+            ORDER BY created_at DESC, package_id;
+            """
+        ) { statement in
+            let key = localProjectID?.rawValue.uuidString.lowercased()
+            try bind(key, at: 1, to: statement)
+            try bind(key, at: 2, to: statement)
+            var packages: [ConflictRecoveryPackage] = []
+            while sqlite3_step(statement) == SQLITE_ROW {
+                packages.append(try decodeConflictRecoveryPackage(statement))
+            }
+            return packages
+        }
+    }
+
+    private func refreshCompletedConflictRecoveries() throws {
+        let packageIDs = try withStatement(
+            """
+            SELECT p.package_id
+            FROM conflict_recovery_packages p
+            JOIN sync_batches b ON b.batch_id = p.restore_batch_id
+            WHERE p.state = 'restore_enqueued'
+              AND b.status = 'completed';
+            """
+        ) { statement in
+            var values: [String] = []
+            while sqlite3_step(statement) == SQLITE_ROW {
+                guard let value = columnText(statement, at: 0) else {
+                    throw SyncV2StoreError.invalidStoredData
+                }
+                values.append(value)
+            }
+            return values
+        }
+        guard !packageIDs.isEmpty else { return }
+        try transaction {
+            let timestamp = Self.timestamp()
+            for packageID in packageIDs {
+                try withStatement(
+                    """
+                    UPDATE conflict_recovery_entities
+                    SET restore_status = 'committed'
+                    WHERE package_id = ?;
+                    """
+                ) { statement in
+                    try bind(packageID, at: 1, to: statement)
+                    try stepDone(statement)
+                }
+                try withStatement(
+                    """
+                    UPDATE conflict_recovery_packages
+                    SET state = 'restored', restored_at = ?, updated_at = ?
+                    WHERE package_id = ? AND state = 'restore_enqueued';
+                    """
+                ) { statement in
+                    try bind(timestamp, at: 1, to: statement)
+                    try bind(timestamp, at: 2, to: statement)
+                    try bind(packageID, at: 3, to: statement)
+                    try stepDone(statement)
+                }
+            }
+        }
+    }
+
+    func conflictRecoveryEntities(
+        packageID: UUID
+    ) throws -> [ConflictRecoveryEntity] {
+        try withStatement(
+            """
+            SELECT entity_kind, source_entity_id, restored_entity_id,
+                   parent_source_entity_id, relative_path, title, user_order,
+                   byte_count, sha256, restore_status
+            FROM conflict_recovery_entities
+            WHERE package_id = ?
+            ORDER BY relative_path, source_entity_id;
+            """
+        ) { statement in
+            try bind(packageID.uuidString.lowercased(), at: 1, to: statement)
+            var entities: [ConflictRecoveryEntity] = []
+            while sqlite3_step(statement) == SQLITE_ROW {
+                guard let kindRaw = columnText(statement, at: 0),
+                      let kind = ConflictRecoveryEntityKind(rawValue: kindRaw),
+                      let sourceRaw = columnText(statement, at: 1),
+                      let sourceID = UUID(uuidString: sourceRaw),
+                      let path = columnText(statement, at: 4),
+                      let title = columnText(statement, at: 5),
+                      let statusRaw = columnText(statement, at: 9),
+                      let status = ConflictRecoveryEntityRestoreStatus(rawValue: statusRaw)
+                else { throw SyncV2StoreError.invalidStoredData }
+                let restoredID = columnText(statement, at: 2).flatMap(UUID.init(uuidString:))
+                let parentID = columnText(statement, at: 3).flatMap(UUID.init(uuidString:))
+                let byteCount = sqlite3_column_type(statement, 7) == SQLITE_NULL
+                    ? nil : Int(sqlite3_column_int64(statement, 7))
+                entities.append(
+                    ConflictRecoveryEntity(
+                        kind: kind,
+                        sourceEntityID: sourceID,
+                        restoredEntityID: restoredID,
+                        parentSourceEntityID: parentID,
+                        relativePath: path,
+                        title: title,
+                        userOrder: Int(sqlite3_column_int64(statement, 6)),
+                        byteCount: byteCount,
+                        sha256: columnText(statement, at: 8),
+                        restoreStatus: status
+                    )
+                )
+            }
+            return entities
+        }
+    }
+
+    private func conflictRecoveryPackage(
+        packageID: UUID
+    ) throws -> ConflictRecoveryPackage? {
+        try conflictRecoveryPackage(where: "package_id = ?") { statement in
+            try bind(packageID.uuidString.lowercased(), at: 1, to: statement)
+        }
+    }
+
+    private func conflictRecoveryPackage(
+        sourceOperationID: UUID,
+        tombstoneRevision: Int64
+    ) throws -> ConflictRecoveryPackage? {
+        try conflictRecoveryPackage(
+            where: "source_operation_id = ? AND tombstone_revision = ?"
+        ) { statement in
+            try bind(sourceOperationID.uuidString.lowercased(), at: 1, to: statement)
+            try bind(tombstoneRevision, at: 2, to: statement)
+        }
+    }
+
+    private func conflictRecoveryPackage(
+        where condition: String,
+        bind binder: (OpaquePointer) throws -> Void
+    ) throws -> ConflictRecoveryPackage? {
+        try withStatement(
+            """
+            SELECT package_id, local_project_id, server_project_id,
+                   source_operation_id, source_folder_id,
+                   source_base_revision, tombstone_revision, display_name,
+                   state, payload_relative_path, manifest_sha256,
+                   file_count, total_bytes, restore_batch_id,
+                   created_at, updated_at, restored_at, payload_deleted_at
+            FROM conflict_recovery_packages
+            WHERE \(condition)
+            LIMIT 1;
+            """
+        ) { statement in
+            try binder(statement)
+            guard sqlite3_step(statement) == SQLITE_ROW else { return nil }
+            return try decodeConflictRecoveryPackage(statement)
+        }
+    }
+
+    private func decodeConflictRecoveryPackage(
+        _ statement: OpaquePointer
+    ) throws -> ConflictRecoveryPackage {
+        guard let packageRaw = columnText(statement, at: 0),
+              let packageID = UUID(uuidString: packageRaw),
+              let localRaw = columnText(statement, at: 1),
+              let localUUID = UUID(uuidString: localRaw),
+              let serverRaw = columnText(statement, at: 2),
+              let serverID = UUID(uuidString: serverRaw),
+              let operationRaw = columnText(statement, at: 3),
+              let operationID = UUID(uuidString: operationRaw),
+              let folderRaw = columnText(statement, at: 4),
+              let folderID = UUID(uuidString: folderRaw),
+              let displayName = columnText(statement, at: 7),
+              let stateRaw = columnText(statement, at: 8),
+              let state = ConflictRecoveryPackageState(rawValue: stateRaw),
+              let payloadPath = columnText(statement, at: 9),
+              let createdRaw = columnText(statement, at: 14),
+              let createdAt = Self.date(createdRaw),
+              let updatedRaw = columnText(statement, at: 15),
+              let updatedAt = Self.date(updatedRaw)
+        else { throw SyncV2StoreError.invalidStoredData }
+        return ConflictRecoveryPackage(
+            id: packageID,
+            localProjectID: ProjectID(rawValue: localUUID),
+            serverProjectID: serverID,
+            sourceOperationID: operationID,
+            sourceFolderID: folderID,
+            sourceBaseRevision: sqlite3_column_int64(statement, 5),
+            tombstoneRevision: sqlite3_column_int64(statement, 6),
+            displayName: displayName,
+            state: state,
+            payloadRelativePath: payloadPath,
+            manifestSHA256: columnText(statement, at: 10),
+            fileCount: Int(sqlite3_column_int64(statement, 11)),
+            totalBytes: Int(sqlite3_column_int64(statement, 12)),
+            restoreBatchID: columnText(statement, at: 13).flatMap(UUID.init(uuidString:)),
+            createdAt: createdAt,
+            updatedAt: updatedAt,
+            restoredAt: columnText(statement, at: 16).flatMap(Self.date),
+            payloadDeletedAt: columnText(statement, at: 17).flatMap(Self.date)
+        )
+    }
+
+    private func recoverySourceOperation(
+        operationID: String
+    ) throws -> (
+        batchID: UUID,
+        projectID: UUID,
+        folderID: UUID,
+        baseRevision: Int64,
+        status: SyncV2OperationStatus
+    )? {
+        try withStatement(
+            """
+            SELECT batch_id, project_id, folder_id, base_revision, status
+            FROM sync_operations WHERE operation_id = ? LIMIT 1;
+            """
+        ) { statement in
+            try bind(operationID, at: 1, to: statement)
+            guard sqlite3_step(statement) == SQLITE_ROW else { return nil }
+            guard let batchRaw = columnText(statement, at: 0),
+                  let batchID = UUID(uuidString: batchRaw),
+                  let projectRaw = columnText(statement, at: 1),
+                  let projectID = UUID(uuidString: projectRaw),
+                  let folderRaw = columnText(statement, at: 2),
+                  let folderID = UUID(uuidString: folderRaw),
+                  sqlite3_column_type(statement, 3) != SQLITE_NULL,
+                  let statusRaw = columnText(statement, at: 4),
+                  let status = SyncV2OperationStatus(rawValue: statusRaw)
+            else { throw SyncV2StoreError.invalidStoredData }
+            return (
+                batchID,
+                projectID,
+                folderID,
+                sqlite3_column_int64(statement, 3),
+                status
+            )
+        }
+    }
+
+    private func cancelOperationLocked(
+        operationID: String,
+        errorCode: String,
+        detailJSON: String,
+        timestamp: String
+    ) throws {
+        try ensureOperationEventHistory(
+            operationID: operationID,
+            timestamp: timestamp
+        )
+        let state = try SyncV2OperationStateDerivation.state(
+            from: try operationEvents(operationID: operationID)
+        )
+        if state == .cancelled { return }
+        guard state != .completed else {
+            throw ConflictRecoveryLedgerError.operationChanged
+        }
+        try withStatement(
+            """
+            UPDATE sync_operations
+            SET status = 'cancelled', next_attempt_at = NULL,
+                last_error_code = ?, last_error_detail = NULL, updated_at = ?
+            WHERE operation_id = ?;
+            """
+        ) { statement in
+            try bind(errorCode, at: 1, to: statement)
+            try bind(timestamp, at: 2, to: statement)
+            try bind(operationID, at: 3, to: statement)
+            try stepDone(statement)
+        }
+        try appendOperationEvent(
+            operationID: operationID,
+            type: .cancelRequested,
+            errorCode: errorCode,
+            timestamp: timestamp,
+            detailJSON: detailJSON
+        )
+    }
+
+    private static func recoveryDetailJSON(
+        reason: String,
+        packageID: UUID,
+        remoteRevision: Int64,
+        folderID: UUID
+    ) throws -> String {
+        let data = try JSONSerialization.data(
+            withJSONObject: [
+                "reason": reason,
+                "recovery_package_id": packageID.uuidString.lowercased(),
+                "remote_revision": remoteRevision,
+                "folder_id": folderID.uuidString.lowercased(),
+            ],
+            options: [.sortedKeys]
+        )
+        guard let value = String(data: data, encoding: .utf8) else {
+            throw ConflictRecoveryLedgerError.manifestMismatch
+        }
+        return value
     }
 
     /// 작업을 취소한다. 안쪽에서 되세우기까지 함께 한다.
@@ -8841,6 +9606,7 @@ actor LazySyncV2ProjectBindingStore:
     ProjectBindingStoring,
     DurableLocalChangeRecording,
     SyncV2DispatchStoring,
+    ConflictRecoveryLedger,
     SyncV2ConflictResolving,
     SyncV2DocumentRevisionProviding,
     SyncV2FolderMigrationMarking,
@@ -9144,6 +9910,107 @@ actor LazySyncV2ProjectBindingStore:
             throw SyncV2DispatchStoreError.unavailable
         }
         try await store.recoverInterruptedWork()
+    }
+
+    func beginRemoteDeletionRecovery(
+        operation: SyncV2FolderDispatchOperation,
+        tombstoneRevision: Int64,
+        displayName: String,
+        payloadRelativePath: String
+    ) async throws -> ConflictRecoveryPackage {
+        guard let store = await resolvedStore() else {
+            throw ConflictRecoveryLedgerError.unavailable
+        }
+        return try await store.beginRemoteDeletionRecovery(
+            operation: operation,
+            tombstoneRevision: tombstoneRevision,
+            displayName: displayName,
+            payloadRelativePath: payloadRelativePath
+        )
+    }
+
+    func markConflictRecoveryReady(
+        packageID: UUID,
+        manifestSHA256: String,
+        fileCount: Int,
+        totalBytes: Int,
+        entities: [ConflictRecoveryEntity]
+    ) async throws {
+        guard let store = await resolvedStore() else {
+            throw ConflictRecoveryLedgerError.unavailable
+        }
+        try await store.markConflictRecoveryReady(
+            packageID: packageID,
+            manifestSHA256: manifestSHA256,
+            fileCount: fileCount,
+            totalBytes: totalBytes,
+            entities: entities
+        )
+    }
+
+    func resolveRemoteDeletionSource(packageID: UUID) async throws {
+        guard let store = await resolvedStore() else {
+            throw ConflictRecoveryLedgerError.unavailable
+        }
+        try await store.resolveRemoteDeletionSource(packageID: packageID)
+        await dispatchWakeup?.signal()
+    }
+
+    func markConflictRecoveryRestoreEnqueued(
+        packageID: UUID,
+        restoreBatchID: UUID,
+        restoredEntityIDs: [UUID: UUID]
+    ) async throws {
+        guard let store = await resolvedStore() else {
+            throw ConflictRecoveryLedgerError.unavailable
+        }
+        try await store.markConflictRecoveryRestoreEnqueued(
+            packageID: packageID,
+            restoreBatchID: restoreBatchID,
+            restoredEntityIDs: restoredEntityIDs
+        )
+        await dispatchWakeup?.signal()
+    }
+
+    func markConflictRecoveryRestored(packageID: UUID) async throws {
+        guard let store = await resolvedStore() else {
+            throw ConflictRecoveryLedgerError.unavailable
+        }
+        try await store.markConflictRecoveryRestored(packageID: packageID)
+    }
+
+    func discardConflictRecoveryPackage(packageID: UUID) async throws {
+        guard let store = await resolvedStore() else {
+            throw ConflictRecoveryLedgerError.unavailable
+        }
+        try await store.discardConflictRecoveryPackage(packageID: packageID)
+    }
+
+    func markConflictRecoveryPayloadDeleted(packageID: UUID) async throws {
+        guard let store = await resolvedStore() else {
+            throw ConflictRecoveryLedgerError.unavailable
+        }
+        try await store.markConflictRecoveryPayloadDeleted(packageID: packageID)
+    }
+
+    func conflictRecoveryPackages(
+        localProjectID: ProjectID?
+    ) async throws -> [ConflictRecoveryPackage] {
+        guard let store = await resolvedStore() else {
+            throw ConflictRecoveryLedgerError.unavailable
+        }
+        return try await store.conflictRecoveryPackages(
+            localProjectID: localProjectID
+        )
+    }
+
+    func conflictRecoveryEntities(
+        packageID: UUID
+    ) async throws -> [ConflictRecoveryEntity] {
+        guard let store = await resolvedStore() else {
+            throw ConflictRecoveryLedgerError.unavailable
+        }
+        return try await store.conflictRecoveryEntities(packageID: packageID)
     }
 
     func serverRevision(for documentID: UUID) async throws -> Int64? {

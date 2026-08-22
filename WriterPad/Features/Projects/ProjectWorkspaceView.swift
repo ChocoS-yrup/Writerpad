@@ -37,6 +37,7 @@ struct ProjectWorkspaceView: View {
     private let syncDispatcher: SyncV2Dispatcher?
     private let conflictResolutionService:
         (any SyncV2ConflictResolving)?
+    private let conflictRecoveryStore: ConflictRecoveryStore?
     private let snapshotPullService: SyncV2SnapshotPullService?
     private let realtimeTrigger: (any SyncV2RealtimeTriggering)?
     private let backgroundSyncCoordinator:
@@ -64,6 +65,7 @@ struct ProjectWorkspaceView: View {
         syncDispatcher: SyncV2Dispatcher?,
         conflictResolutionService:
             (any SyncV2ConflictResolving)? = nil,
+        conflictRecoveryStore: ConflictRecoveryStore? = nil,
         snapshotPullService: SyncV2SnapshotPullService? = nil,
         realtimeTrigger: (any SyncV2RealtimeTriggering)? = nil,
         backgroundSyncCoordinator:
@@ -88,6 +90,7 @@ struct ProjectWorkspaceView: View {
         self.projectBindingService = projectBindingService
         self.syncDispatcher = syncDispatcher
         self.conflictResolutionService = conflictResolutionService
+        self.conflictRecoveryStore = conflictRecoveryStore
         self.snapshotPullService = snapshotPullService
         self.realtimeTrigger = realtimeTrigger
         self.backgroundSyncCoordinator = backgroundSyncCoordinator
@@ -126,6 +129,7 @@ struct ProjectWorkspaceView: View {
                         syncDispatcher: syncDispatcher,
                         conflictResolutionService:
                             conflictResolutionService,
+                        conflictRecoveryStore: conflictRecoveryStore,
                         snapshotPullService: snapshotPullService,
                         realtimeTrigger: realtimeTrigger,
                         editLeaseManager: editLeaseManager,

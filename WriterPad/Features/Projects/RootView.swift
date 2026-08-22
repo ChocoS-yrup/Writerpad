@@ -25,6 +25,7 @@ struct RootView: View {
             syncDispatcher: environment.syncDispatcher,
             conflictResolutionService:
                 environment.conflictResolutionService,
+            conflictRecoveryStore: environment.conflictRecoveryStore,
             snapshotPullService: environment.snapshotPullService,
             realtimeTrigger: environment.realtimeTrigger,
             backgroundSyncCoordinator:

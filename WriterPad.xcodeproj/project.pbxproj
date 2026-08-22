@@ -78,7 +78,10 @@
 		A10000000000000000000045 /* LocalBackupStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = B1000000000000000000004D /* LocalBackupStore.swift */; };
 		A10000000000000000000046 /* LocalBackupStoreTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = B1000000000000000000004E /* LocalBackupStoreTests.swift */; };
 		D20000000000000000000001 /* ProjectBackupStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = D21000000000000000000001 /* ProjectBackupStore.swift */; };
+		D20000000000000000000003 /* ConflictRecoveryStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = D21000000000000000000003 /* ConflictRecoveryStore.swift */; };
+		D20000000000000000000005 /* ConflictRecoveryView.swift in Sources */ = {isa = PBXBuildFile; fileRef = D21000000000000000000005 /* ConflictRecoveryView.swift */; };
 		D20000000000000000000002 /* ProjectBackupStoreTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = D21000000000000000000002 /* ProjectBackupStoreTests.swift */; };
+		D20000000000000000000004 /* ConflictRecoveryStoreTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = D21000000000000000000004 /* ConflictRecoveryStoreTests.swift */; };
 		A10000000000000000000047 /* BackupHistoryView.swift in Sources */ = {isa = PBXBuildFile; fileRef = B1000000000000000000004F /* BackupHistoryView.swift */; };
 		A10000000000000000000048 /* TrashManagementView.swift in Sources */ = {isa = PBXBuildFile; fileRef = B10000000000000000000050 /* TrashManagementView.swift */; };
 		A1000000000000000000004D /* BinderHierarchyPolicy.swift in Sources */ = {isa = PBXBuildFile; fileRef = B10000000000000000000051 /* BinderHierarchyPolicy.swift */; };
@@ -134,6 +137,7 @@
 		A96000000000000000000006 /* SyncV2StoreSchemaV5.sql in Resources */ = {isa = PBXBuildFile; fileRef = B96000000000000000000006 /* SyncV2StoreSchemaV5.sql */; };
 		A97000000000000000000007 /* SyncV2StoreSchemaV6.sql in Resources */ = {isa = PBXBuildFile; fileRef = B97000000000000000000007 /* SyncV2StoreSchemaV6.sql */; };
 		A97000000000000000000008 /* SyncV2StoreSchemaV7.sql in Resources */ = {isa = PBXBuildFile; fileRef = B97000000000000000000008 /* SyncV2StoreSchemaV7.sql */; };
+		A98000000000000000000008 /* SyncV2StoreSchemaV8.sql in Resources */ = {isa = PBXBuildFile; fileRef = B98000000000000000000008 /* SyncV2StoreSchemaV8.sql */; };
 		A9000000000000000000000F /* SyncV2Client.swift in Sources */ = {isa = PBXBuildFile; fileRef = B90000000000000000000013 /* SyncV2Client.swift */; };
 		A90000000000000000000010 /* SyncV2ClientTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = B90000000000000000000014 /* SyncV2ClientTests.swift */; };
 		A90000000000000000000011 /* SyncV2Dispatcher.swift in Sources */ = {isa = PBXBuildFile; fileRef = B90000000000000000000015 /* SyncV2Dispatcher.swift */; };
@@ -256,7 +260,10 @@
 		B1000000000000000000004D /* LocalBackupStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LocalBackupStore.swift; sourceTree = "<group>"; };
 		B1000000000000000000004E /* LocalBackupStoreTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LocalBackupStoreTests.swift; sourceTree = "<group>"; };
 		D21000000000000000000001 /* ProjectBackupStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ProjectBackupStore.swift; sourceTree = "<group>"; };
+		D21000000000000000000003 /* ConflictRecoveryStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ConflictRecoveryStore.swift; sourceTree = "<group>"; };
+		D21000000000000000000005 /* ConflictRecoveryView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ../../Features/Backup/ConflictRecoveryView.swift; sourceTree = "<group>"; };
 		D21000000000000000000002 /* ProjectBackupStoreTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ProjectBackupStoreTests.swift; sourceTree = "<group>"; };
+		D21000000000000000000004 /* ConflictRecoveryStoreTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ConflictRecoveryStoreTests.swift; sourceTree = "<group>"; };
 		B1000000000000000000004F /* BackupHistoryView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ../../Features/Backup/BackupHistoryView.swift; sourceTree = "<group>"; };
 		B10000000000000000000050 /* TrashManagementView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ../../Features/Binder/TrashManagementView.swift; sourceTree = "<group>"; };
 		B10000000000000000000051 /* BinderHierarchyPolicy.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BinderHierarchyPolicy.swift; sourceTree = "<group>"; };
@@ -313,6 +320,7 @@
 		B96000000000000000000006 /* SyncV2StoreSchemaV5.sql */ = {isa = PBXFileReference; lastKnownFileType = text; path = Scripts/fixtures/SyncV2StoreSchemaV5.sql; sourceTree = SOURCE_ROOT; };
 		B97000000000000000000007 /* SyncV2StoreSchemaV6.sql */ = {isa = PBXFileReference; lastKnownFileType = text; path = Scripts/fixtures/SyncV2StoreSchemaV6.sql; sourceTree = SOURCE_ROOT; };
 		B97000000000000000000008 /* SyncV2StoreSchemaV7.sql */ = {isa = PBXFileReference; lastKnownFileType = text; path = Scripts/fixtures/SyncV2StoreSchemaV7.sql; sourceTree = SOURCE_ROOT; };
+		B98000000000000000000008 /* SyncV2StoreSchemaV8.sql */ = {isa = PBXFileReference; lastKnownFileType = text; path = Scripts/fixtures/SyncV2StoreSchemaV8.sql; sourceTree = SOURCE_ROOT; };
 		B90000000000000000000013 /* SyncV2Client.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SyncV2Client.swift; sourceTree = "<group>"; };
 		B90000000000000000000014 /* SyncV2ClientTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SyncV2ClientTests.swift; sourceTree = "<group>"; };
 		B90000000000000000000015 /* SyncV2Dispatcher.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SyncV2Dispatcher.swift; sourceTree = "<group>"; };
@@ -378,6 +386,7 @@
 				B96000000000000000000006 /* SyncV2StoreSchemaV5.sql */,
 				B97000000000000000000007 /* SyncV2StoreSchemaV6.sql */,
 				B97000000000000000000008 /* SyncV2StoreSchemaV7.sql */,
+				B98000000000000000000008 /* SyncV2StoreSchemaV8.sql */,
 				G10000000000000000000013 /* Products */,
 			);
 			sourceTree = "<group>";
@@ -561,6 +570,7 @@
 				B1000000000000000000002D /* LocalDocumentStoreRecoveryTests.swift */,
 				B1000000000000000000004E /* LocalBackupStoreTests.swift */,
 				D21000000000000000000002 /* ProjectBackupStoreTests.swift */,
+				D21000000000000000000004 /* ConflictRecoveryStoreTests.swift */,
 				B10000000000000000000053 /* ProjectSearchServiceTests.swift */,
 				B10000000000000000000055 /* LocalManuscriptExporterTests.swift */,
 				B10000000000000000000062 /* LocalPerformanceBaselineTests.swift */,
@@ -658,6 +668,8 @@
 			children = (
 				B1000000000000000000004D /* LocalBackupStore.swift */,
 				D21000000000000000000001 /* ProjectBackupStore.swift */,
+				D21000000000000000000003 /* ConflictRecoveryStore.swift */,
+				D21000000000000000000005 /* ConflictRecoveryView.swift */,
 				B1000000000000000000004F /* BackupHistoryView.swift */,
 			);
 			path = Backup;
@@ -863,6 +875,7 @@
 				A96000000000000000000006 /* SyncV2StoreSchemaV5.sql in Resources */,
 				A97000000000000000000007 /* SyncV2StoreSchemaV6.sql in Resources */,
 				A97000000000000000000008 /* SyncV2StoreSchemaV7.sql in Resources */,
+				A98000000000000000000008 /* SyncV2StoreSchemaV8.sql in Resources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -934,6 +947,8 @@
 				A10000000000000000000044 /* AppearanceSettingsView.swift in Sources */,
 				A10000000000000000000045 /* LocalBackupStore.swift in Sources */,
 				D20000000000000000000001 /* ProjectBackupStore.swift in Sources */,
+				D20000000000000000000003 /* ConflictRecoveryStore.swift in Sources */,
+				D20000000000000000000005 /* ConflictRecoveryView.swift in Sources */,
 				A10000000000000000000047 /* BackupHistoryView.swift in Sources */,
 				A10000000000000000000048 /* TrashManagementView.swift in Sources */,
 				A10000000000000000000016 /* WriterPadMetadataSchema.swift in Sources */,
@@ -1009,6 +1024,7 @@
 				A10000000000000000000029 /* LocalDocumentStoreRecoveryTests.swift in Sources */,
 				A10000000000000000000046 /* LocalBackupStoreTests.swift in Sources */,
 				D20000000000000000000002 /* ProjectBackupStoreTests.swift in Sources */,
+				D20000000000000000000004 /* ConflictRecoveryStoreTests.swift in Sources */,
 				A1000000000000000000004F /* ProjectSearchServiceTests.swift in Sources */,
 				A10000000000000000000051 /* LocalManuscriptExporterTests.swift in Sources */,
 				A1000000000000000000005E /* LocalPerformanceBaselineTests.swift in Sources */,
