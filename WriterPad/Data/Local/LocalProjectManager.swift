@@ -7,6 +7,7 @@ enum ProjectManagerError: Error, Equatable, LocalizedError, Sendable {
     case deletionAlreadyRequested(ProjectID)
     case deletionNotRequested(ProjectID)
     case projectAlreadyInDeletedList(ProjectID)
+    case projectNameInDeletedList(String)
     case projectNotInDeletedList(ProjectID)
     case projectAlreadyExists(ProjectID)
     case staleDeletionConfirmation
@@ -27,6 +28,8 @@ enum ProjectManagerError: Error, Equatable, LocalizedError, Sendable {
             "삭제 대기 중인 작품만 삭제 목록으로 옮길 수 있습니다: \(id.rawValue.uuidString)"
         case let .projectAlreadyInDeletedList(id):
             "이미 삭제 목록에 있는 작품입니다: \(id.rawValue.uuidString)"
+        case .projectNameInDeletedList:
+            "삭제 목록에 같은 이름의 작품이 존재합니다."
         case let .projectNotInDeletedList(id):
             "삭제 목록에 있는 작품만 영구 삭제할 수 있습니다: \(id.rawValue.uuidString)"
         case let .projectAlreadyExists(id):
@@ -199,7 +202,11 @@ actor LocalProjectManager: ProjectManaging {
             named: name,
             existingProjects: existingProjects
         ) {
-            return try await requireManagedProject(id: existing.id)
+            let managed = try await requireManagedProject(id: existing.id)
+            if managed.isInDeletedList {
+                throw ProjectManagerError.projectNameInDeletedList(name)
+            }
+            return managed
         }
         try validateFilesystemNameIsAvailable(name, excluding: nil)
 
