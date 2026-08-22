@@ -886,6 +886,7 @@ final class SyncV2WorkspaceSyncModel: ObservableObject {
     private let pullTimeout: Duration
     private let pullTimeoutSleep: SyncV2WorkspaceSleep
     private let retryDelays: [Duration]
+    private let realtimeHardResetAttemptThreshold: Int
     private let recoverySleep: SyncV2WorkspaceSleep
     private let networkMonitor: SyncV2NetworkRecoveryMonitor
     private var editingGuards:
@@ -952,6 +953,7 @@ final class SyncV2WorkspaceSyncModel: ObservableObject {
             SyncV2Timing.standard.realtimeSubscriptionTimeout,
         pullTimeout: Duration = SyncV2Timing.standard.pullTimeout,
         retryDelays: [Duration] = SyncV2Timing.standard.backoff,
+        realtimeHardResetAttemptThreshold: Int = 3,
         authenticationSleep:
             @escaping SyncV2WorkspaceSleep = { duration in
                 try await ContinuousClock().sleep(for: duration)
@@ -991,6 +993,10 @@ final class SyncV2WorkspaceSyncModel: ObservableObject {
         self.pullTimeout = pullTimeout
         self.pullTimeoutSleep = pullTimeoutSleep
         self.retryDelays = retryDelays
+        self.realtimeHardResetAttemptThreshold = max(
+            1,
+            realtimeHardResetAttemptThreshold
+        )
         self.recoverySleep = recoverySleep
         self.networkMonitor = networkMonitor
         self.sleep = sleep
@@ -1693,6 +1699,22 @@ final class SyncV2WorkspaceSyncModel: ObservableObject {
                 await self?.pullNow(forceVisibleProgress: true)
             }
         case .closed, .channelError, .timedOut:
+            let terminalReason: String
+            switch status {
+            case .closed:
+                terminalReason = "closed"
+            case .channelError:
+                terminalReason = "channel-error"
+            case .timedOut:
+                terminalReason = "timed-out"
+            case .subscribing, .subscribed:
+                terminalReason = "non-terminal"
+            }
+            logTask(
+                "realtimeConnection",
+                action: "terminal",
+                reason: terminalReason
+            )
             let now = ContinuousClock().now
             if let lastSubscribedAt,
                lastSubscribedAt.duration(to: now)
@@ -1758,6 +1780,16 @@ final class SyncV2WorkspaceSyncModel: ObservableObject {
             guard didSleep, self.isActive else { return }
             _ = await self.authenticationService.refreshSession(force: false)
             await self.realtime?.stop()
+            if self.reconnectAttempt
+                >= self.realtimeHardResetAttemptThreshold {
+                self.logTask(
+                    "realtimeConnection",
+                    action: "reset",
+                    reason: "rapid-terminal-statuses"
+                )
+                await self.realtime?.resetConnection()
+                self.reconnectAttempt = 0
+            }
             self.startRealtime(reconnecting: true)
         }
     }

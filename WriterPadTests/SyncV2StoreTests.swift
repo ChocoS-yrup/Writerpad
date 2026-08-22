@@ -7642,9 +7642,25 @@ final class SyncV2StoreTests: XCTestCase {
         let unrelated = try await store.queuedOperations(
             documentID: unrelatedDocumentID
         )
+        let raw = try RawSQLite(url: url)
+        let sourceBatchStatus = try raw.scalarText(
+            """
+            SELECT status FROM sync_batches
+            WHERE batch_id = '\(batchID.uuidString.lowercased())';
+            """
+        )
+        let sourceBatchError = try raw.scalarText(
+            """
+            SELECT last_error_code FROM sync_batches
+            WHERE batch_id = '\(batchID.uuidString.lowercased())';
+            """
+        )
+        raw.close()
         XCTAssertEqual(entities, [root])
         XCTAssertEqual(renameEvents.last?.type, .cancelRequested)
         XCTAssertEqual(treeOrderEvents.last?.type, .cancelRequested)
+        XCTAssertEqual(sourceBatchStatus, "completed")
+        XCTAssertEqual(sourceBatchError, "REMOTE_DELETION")
         XCTAssertEqual(stateDivergences, [])
         XCTAssertEqual(lineageDivergences, [])
         XCTAssertEqual(orphanedIDs, [])
@@ -7683,6 +7699,42 @@ final class SyncV2StoreTests: XCTestCase {
         XCTAssertEqual(restoredPackages.first?.state, .restored)
         XCTAssertEqual(restoredEntities.first?.restoreStatus, .committed)
         await store.close()
+
+        // 수정 전 실기기 DB 모양을 재현한다. 앱이 transaction 직후 꺼졌거나
+        // 구버전이 남긴 stale batch라도 다음 실행에서 같은 투영으로 치유한다.
+        let stale = try RawSQLite(url: url)
+        try stale.execute(
+            """
+            UPDATE sync_batches
+            SET status = 'processing',
+                last_error_code = 'NETWORK_UNAVAILABLE'
+            WHERE batch_id = '\(batchID.uuidString.lowercased())';
+            """
+        )
+        stale.close()
+
+        let reopened = try await openStore(at: url)
+        await reopened.close()
+        let healed = try RawSQLite(url: url)
+        XCTAssertEqual(
+            try healed.scalarText(
+                """
+                SELECT status FROM sync_batches
+                WHERE batch_id = '\(batchID.uuidString.lowercased())';
+                """
+            ),
+            "completed"
+        )
+        XCTAssertEqual(
+            try healed.scalarText(
+                """
+                SELECT last_error_code FROM sync_batches
+                WHERE batch_id = '\(batchID.uuidString.lowercased())';
+                """
+            ),
+            "REMOTE_DELETION"
+        )
+        healed.close()
     }
 }
 

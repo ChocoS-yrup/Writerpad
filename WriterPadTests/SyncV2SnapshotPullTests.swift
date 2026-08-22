@@ -5230,6 +5230,45 @@ final class SyncV2SnapshotPullTests: XCTestCase {
     }
 
     @MainActor
+    func testRapidSubscribedThenClosedResetsConnectionAndRecovers()
+        async throws {
+        let previous = GlobalSyncPreference.isEnabled()
+        GlobalSyncPreference.setEnabled(true)
+        defer { GlobalSyncPreference.setEnabled(previous) }
+        let puller = WorkspacePullerStub()
+        let realtime = WorkspaceRealtimeStub()
+        let model = makeLifecycleModel(
+            puller: puller,
+            realtime: realtime,
+            retryDelays: [.zero],
+            recoverySleep: { _ in }
+        )
+
+        await model.start(editingGuards: { [:] }) { _ in }
+        for _ in 0..<100 where await realtime.startCount() < 1 {
+            await Task.yield()
+        }
+
+        for expectedStartCount in 2...4 {
+            await realtime.emitStatus(.subscribed)
+            await realtime.emitStatus(.closed)
+            for _ in 0..<100
+                where await realtime.startCount() < expectedStartCount {
+                await Task.yield()
+            }
+        }
+
+        let resetCount = await realtime.resetCount()
+        XCTAssertEqual(resetCount, 1)
+        await realtime.emitStatus(.subscribed)
+        for _ in 0..<100 where model.state.connection != .healthy {
+            await Task.yield()
+        }
+        XCTAssertEqual(model.state.connection, .healthy)
+        await model.stop()
+    }
+
+    @MainActor
     func testPullWatchdogReleasesHungRequestAndRetrySucceeds()
         async throws {
         let previous = GlobalSyncPreference.isEnabled()
@@ -5941,6 +5980,7 @@ final class SyncV2SnapshotPullTests: XCTestCase {
         realtimeSubscriptionTimeout: Duration = .seconds(12),
         pullTimeout: Duration = .seconds(15),
         retryDelays: [Duration] = [.seconds(1), .seconds(2)],
+        realtimeHardResetAttemptThreshold: Int = 3,
         realtimeTimeoutSleep:
             @escaping SyncV2WorkspaceSleep = { duration in
                 try await ContinuousClock().sleep(for: duration)
@@ -5973,6 +6013,8 @@ final class SyncV2SnapshotPullTests: XCTestCase {
             realtimeSubscriptionTimeout: realtimeSubscriptionTimeout,
             pullTimeout: pullTimeout,
             retryDelays: retryDelays,
+            realtimeHardResetAttemptThreshold:
+                realtimeHardResetAttemptThreshold,
             realtimeTimeoutSleep: realtimeTimeoutSleep,
             pullTimeoutSleep: pullTimeoutSleep,
             recoverySleep: recoverySleep
@@ -6674,6 +6716,7 @@ private actor WorkspaceRealtimeStub: SyncV2RealtimeTriggering {
         @Sendable (SyncV2RealtimeConnectionStatus) -> Void
     ] = []
     private var stops = 0
+    private var resets = 0
 
     func start(
         projectID: UUID,
@@ -6718,6 +6761,11 @@ private actor WorkspaceRealtimeStub: SyncV2RealtimeTriggering {
         subscribed = nil
     }
 
+    func resetConnection() async {
+        resets += 1
+        await stop()
+    }
+
     func emitChange() {
         change?()
     }
@@ -6741,6 +6789,7 @@ private actor WorkspaceRealtimeStub: SyncV2RealtimeTriggering {
     }
 
     func stopCount() -> Int { stops }
+    func resetCount() -> Int { resets }
     func startCount() -> Int { statuses.count }
 }
 

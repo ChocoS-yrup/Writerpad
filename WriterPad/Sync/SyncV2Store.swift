@@ -2611,6 +2611,14 @@ actor SyncV2Store:
                         ) THEN 'ready'
                         ELSE 'completed'
                     END,
+                    last_error_code = (
+                        SELECT o.last_error_code
+                        FROM sync_operations o
+                        WHERE o.batch_id = sync_batches.batch_id
+                          AND o.last_error_code IS NOT NULL
+                        ORDER BY o.queue_id
+                        LIMIT 1
+                    ),
                     updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
                     """
                 )
@@ -8542,6 +8550,14 @@ actor SyncV2Store:
                     timestamp: timestamp
                 )
             }
+            // 원본 rename과 같은 구조 batch의 종속 tree-order를 한 transaction
+            // 안에서 모두 닫았으므로 batch 투영도 같은 경계에서 갱신한다.
+            // 이를 생략하면 활성 operation이 하나도 없어도 이전 dispatcher의
+            // processing/NETWORK_UNAVAILABLE 상태가 영구히 남는다.
+            try refreshBatchState(
+                batchID: source.batchID,
+                timestamp: timestamp
+            )
             try withStatement(
                 """
                 UPDATE conflict_recovery_packages
