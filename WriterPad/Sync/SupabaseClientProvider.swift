@@ -7,12 +7,14 @@ protocol SupabaseClientProviding: AnyObject {
     func makeAuthTransport() -> (any SupabaseAuthTransporting)?
     func makeProjectBindingTransport() -> (any EnsureProjectTransporting)?
     func makeSyncV2Client() -> SyncV2Client?
+    func makeHandshakeTransport() -> (any SyncV2HandshakeTransporting)?
     func makeSnapshotClient() -> SyncV2SnapshotClient?
     func makeRealtimeTrigger() -> (any SyncV2RealtimeTriggering)?
     func makeEditLeaseClient() -> EditLeaseClient?
 }
 
 extension SupabaseClientProviding {
+    func makeHandshakeTransport() -> (any SyncV2HandshakeTransporting)? { nil }
     func makeSnapshotClient() -> SyncV2SnapshotClient? { nil }
     func makeRealtimeTrigger() -> (any SyncV2RealtimeTriggering)? { nil }
 }
@@ -67,6 +69,13 @@ final class SupabaseClientProvider: SupabaseClientProviding {
                 transport: LiveSyncV2CommitTransport(client: $0)
             )
         }
+    }
+
+    /// 전송만 만든다. `SyncV2HandshakeService`는 답을 메모리에 들고 있어서, 부를
+    /// 때마다 새로 만들면 들고 있던 답이 매번 사라진다. 서비스를 하나 만들어 두는
+    /// 것은 이것을 쓰는 쪽의 몫이다.
+    func makeHandshakeTransport() -> (any SyncV2HandshakeTransporting)? {
+        client.map { LiveSyncV2HandshakeTransport(client: $0) }
     }
 
     func makeSnapshotClient() -> SyncV2SnapshotClient? {
