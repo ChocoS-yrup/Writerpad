@@ -30,6 +30,9 @@ final class AppEnvironment: ObservableObject {
     let realtimeTrigger: (any SyncV2RealtimeTriggering)?
     let backgroundSyncCoordinator: SyncV2BackgroundSyncCoordinator?
     let editLeaseManager: EditLeaseManager?
+    /// 계약 핸드셰이크는 답을 메모리에만 들고 있으므로 하나만 만들어 든다.
+    /// 부를 때마다 새로 만들면 들고 있던 답이 매번 사라진다.
+    let handshakeService: SyncV2HandshakeService?
 
     @Published private(set) var storageStatus: LocalStorageStatus = .ready
 
@@ -92,6 +95,8 @@ final class AppEnvironment: ObservableObject {
         self.realtimeTrigger = realtimeTrigger
         self.backgroundSyncCoordinator = backgroundSyncCoordinator
         self.editLeaseManager = editLeaseManager
+        handshakeService = supabaseClientProvider.makeHandshakeTransport()
+            .map { SyncV2HandshakeService(transport: $0) }
     }
 
     static func live() throws -> AppEnvironment {

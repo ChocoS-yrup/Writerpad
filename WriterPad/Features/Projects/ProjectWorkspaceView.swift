@@ -41,6 +41,7 @@ struct ProjectWorkspaceView: View {
     private let backgroundSyncCoordinator:
         SyncV2BackgroundSyncCoordinator?
     private let editLeaseManager: EditLeaseManager?
+    private let handshakeService: SyncV2HandshakeService?
     @Binding private var isDarkMode: Bool
     @Binding private var smartPairsEnabled: Bool
 
@@ -68,6 +69,7 @@ struct ProjectWorkspaceView: View {
         backgroundSyncCoordinator:
             SyncV2BackgroundSyncCoordinator? = nil,
         editLeaseManager: EditLeaseManager? = nil,
+        handshakeService: SyncV2HandshakeService? = nil,
         isDarkMode: Binding<Bool>,
         smartPairsEnabled: Binding<Bool>
     ) {
@@ -91,6 +93,7 @@ struct ProjectWorkspaceView: View {
         self.realtimeTrigger = realtimeTrigger
         self.backgroundSyncCoordinator = backgroundSyncCoordinator
         self.editLeaseManager = editLeaseManager
+        self.handshakeService = handshakeService
         _isDarkMode = isDarkMode
         _smartPairsEnabled = smartPairsEnabled
         _model = StateObject(
@@ -161,7 +164,8 @@ struct ProjectWorkspaceView: View {
                 syncDispatcher: syncDispatcher,
                 backgroundSyncCoordinator:
                     backgroundSyncCoordinator,
-                editLeaseManager: editLeaseManager
+                editLeaseManager: editLeaseManager,
+                handshakeService: handshakeService
             )
         }
         .sheet(isPresented: $isShowingDeletedProjects) {

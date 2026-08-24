@@ -71,6 +71,7 @@ final class SyncSettingsModel: ObservableObject {
     private let backgroundSyncCoordinator:
         SyncV2BackgroundSyncCoordinator?
     private let editLeaseManager: (any EditLeaseManaging)?
+    private let handshakeService: SyncV2HandshakeService?
     private let defaults: UserDefaults
 
     init(
@@ -81,6 +82,7 @@ final class SyncSettingsModel: ObservableObject {
         backgroundSyncCoordinator:
             SyncV2BackgroundSyncCoordinator? = nil,
         editLeaseManager: (any EditLeaseManaging)? = nil,
+        handshakeService: SyncV2HandshakeService? = nil,
         defaults: UserDefaults = .standard
     ) {
         projectLister = ProjectManagerSyncProjectLister(
@@ -91,6 +93,7 @@ final class SyncSettingsModel: ObservableObject {
         self.syncDispatcher = syncDispatcher
         self.backgroundSyncCoordinator = backgroundSyncCoordinator
         self.editLeaseManager = editLeaseManager
+        self.handshakeService = handshakeService
         self.defaults = defaults
         isSyncAllEnabled = GlobalSyncPreference.isEnabled(in: defaults)
     }
@@ -103,6 +106,7 @@ final class SyncSettingsModel: ObservableObject {
         backgroundSyncCoordinator:
             SyncV2BackgroundSyncCoordinator? = nil,
         editLeaseManager: (any EditLeaseManaging)? = nil,
+        handshakeService: SyncV2HandshakeService? = nil,
         defaults: UserDefaults
     ) {
         self.projectLister = projectLister
@@ -111,9 +115,93 @@ final class SyncSettingsModel: ObservableObject {
         self.syncDispatcher = syncDispatcher
         self.backgroundSyncCoordinator = backgroundSyncCoordinator
         self.editLeaseManager = editLeaseManager
+        self.handshakeService = handshakeService
         self.defaults = defaults
         isSyncAllEnabled = GlobalSyncPreference.isEnabled(in: defaults)
     }
+
+#if DEBUG
+    /// 서버가 이 작품에 대해 무엇을 지원하는지 한 번 묻고 그 답을 보여 준다.
+    ///
+    /// 읽기 전용이다. 답이 무엇이든 계약 경로를 열지 않으며, 관문은 이 화면에서
+    /// 건드리지 않는다. 개발 빌드에서 서버와 처음 대화해 보기 위한 자리다.
+    @Published private(set) var handshakeReport: String?
+
+    /// 연결하지 않은 서버 작품에도 물을 수 있게 한다.
+    ///
+    /// 작품을 연결하면 `ensure_project`가 서버에 쓴다. 핸드셰이크만 확인하려는
+    /// 자리에서 그 쓰기를 유발하지 않으려고 서버 작품 id를 직접 받는다. 로컬
+    /// 작품 id는 캐시 키에만 쓰이고 요청에는 실리지 않는다.
+    func runHandshake(serverProjectIDText: String) async {
+        guard let serverProjectID = UUID(uuidString: serverProjectIDText.trimmingCharacters(in: .whitespacesAndNewlines)) else {
+            handshakeReport = "서버 작품 id가 UUID 형식이 아닙니다."
+            return
+        }
+        await runHandshake(
+            localProjectID: ProjectID(rawValue: serverProjectID),
+            serverProjectID: serverProjectID
+        )
+    }
+
+    func runHandshake(for row: SyncProjectRow) async {
+        guard let handshakeService else {
+            handshakeReport = "핸드셰이크 전송이 없습니다. Supabase 설정을 확인하세요."
+            return
+        }
+        guard let serverProjectID = row.binding?.serverProjectID else {
+            handshakeReport = "이 작품은 서버에 연결되어 있지 않습니다."
+            return
+        }
+        await runHandshake(
+            localProjectID: row.project.id,
+            serverProjectID: serverProjectID
+        )
+    }
+
+    private func runHandshake(
+        localProjectID: ProjectID,
+        serverProjectID: UUID
+    ) async {
+        guard let handshakeService else {
+            handshakeReport = "핸드셰이크 전송이 없습니다. Supabase 설정을 확인하세요."
+            return
+        }
+        guard let context = SyncV2HandshakeContext.make(
+            authenticationState: authenticationState,
+            localProjectID: localProjectID,
+            serverProjectID: serverProjectID
+        ) else {
+            handshakeReport = "로그인 상태가 아니라 누구로서 묻는지 확정할 수 없습니다."
+            return
+        }
+
+        isWorking = true
+        defer { isWorking = false }
+        do {
+            let handshake = try await handshakeService.refresh(context: context)
+            let gateIsOpen = ContractPathGate.isOpen(
+                for: localProjectID,
+                in: defaults
+            )
+            let usesContractPath = await handshakeService.usesContractStructure(
+                context: context,
+                gateIsOpen: gateIsOpen
+            )
+            handshakeReport = """
+            supported: 예
+            mode: \(handshake.projectSyncMode.rawValue) / epoch \(handshake.migrationEpoch)
+            contract: \(handshake.contractVersion)
+            protocol: \(handshake.serverProtocolVersion)
+            digest: \(handshake.contractSHA256.prefix(12))…
+            capabilities: \(handshake.serverCapabilities.count)개
+            관문: \(gateIsOpen ? "열림" : "닫힘")
+            계약 경로: \(usesContractPath ? "사용" : "미사용")
+            """
+        } catch {
+            handshakeReport = "실패: \(error)"
+        }
+    }
+#endif
 
     var isAuthenticated: Bool {
         authenticationState.isAuthenticated
@@ -499,6 +587,9 @@ struct SyncSettingsView: View {
     @State private var isConfirmingEnableAll = false
     @State private var connectionRequest: ExistingConnectionRequest?
     @State private var disconnectTarget: SyncProjectRow?
+#if DEBUG
+    @State private var handshakeProjectIDText = ""
+#endif
 
     init(
         projectManager: any ProjectManaging,
@@ -507,7 +598,8 @@ struct SyncSettingsView: View {
         syncDispatcher: SyncV2Dispatcher?,
         backgroundSyncCoordinator:
             SyncV2BackgroundSyncCoordinator? = nil,
-        editLeaseManager: (any EditLeaseManaging)? = nil
+        editLeaseManager: (any EditLeaseManaging)? = nil,
+        handshakeService: SyncV2HandshakeService? = nil
     ) {
         _model = StateObject(
             wrappedValue: SyncSettingsModel(
@@ -516,7 +608,8 @@ struct SyncSettingsView: View {
                 projectBindingService: projectBindingService,
                 syncDispatcher: syncDispatcher,
                 backgroundSyncCoordinator: backgroundSyncCoordinator,
-                editLeaseManager: editLeaseManager
+                editLeaseManager: editLeaseManager,
+                handshakeService: handshakeService
             )
         )
     }
@@ -527,6 +620,9 @@ struct SyncSettingsView: View {
             if model.isAuthenticated {
                 globalSyncSection
                 projectConnectionsSection
+#if DEBUG
+                handshakeDiagnosticsSection
+#endif
             } else {
                 protectedCloudSection
             }
@@ -617,6 +713,41 @@ struct SyncSettingsView: View {
             Text(model.informationMessage ?? "")
         }
     }
+
+#if DEBUG
+    /// 개발 빌드에서만 보이는 진단 자리다. 서버에 읽기만 하고 아무것도 쓰지 않는다.
+    private var handshakeDiagnosticsSection: some View {
+        Section("계약 핸드셰이크 (개발용)") {
+            TextField("서버 작품 id (UUID)", text: $handshakeProjectIDText)
+                .textInputAutocapitalization(.never)
+                .autocorrectionDisabled()
+                .keyboardType(.asciiCapable)
+                .font(.footnote.monospaced())
+            Button("이 id로 확인") {
+                Task {
+                    await model.runHandshake(
+                        serverProjectIDText: handshakeProjectIDText
+                    )
+                }
+            }
+            .disabled(model.isWorking || handshakeProjectIDText.isEmpty)
+            ForEach(model.projectRows.filter(\.isConnected)) { row in
+                Button("\(row.project.name) 확인") {
+                    Task { await model.runHandshake(for: row) }
+                }
+                .disabled(model.isWorking)
+            }
+            if let report = model.handshakeReport {
+                Text(report)
+                    .font(.footnote.monospaced())
+                    .textSelection(.enabled)
+            }
+            Text("서버에 읽기만 합니다. 관문은 닫힌 채이고 원고도 구조도 보내지 않습니다.")
+                .font(.footnote)
+                .foregroundStyle(.secondary)
+        }
+    }
+#endif
 
     @ViewBuilder
     private var accountSection: some View {
