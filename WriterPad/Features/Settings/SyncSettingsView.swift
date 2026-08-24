@@ -192,6 +192,7 @@ final class SyncSettingsModel: ObservableObject {
             mode: \(handshake.projectSyncMode.rawValue) / epoch \(handshake.migrationEpoch)
             contract: \(handshake.contractVersion)
             protocol: \(handshake.serverProtocolVersion)
+            supported_protocol_versions: \(handshake.supportedProtocolVersions)
             digest: \(handshake.contractSHA256.prefix(12))…
             capabilities: \(handshake.serverCapabilities.count)개
             관문: \(gateIsOpen ? "열림" : "닫힘")

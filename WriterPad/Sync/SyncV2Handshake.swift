@@ -233,6 +233,7 @@ extension SyncV2Contract {
             contractVersion: contractVersion,
             contractSHA256: serverDigest,
             serverProtocolVersion: serverProtocolVersion,
+            supportedProtocolVersions: response.supportedProtocolVersions,
             serverCapabilities: response.serverCapabilities.sorted()
         )
     }
@@ -254,6 +255,9 @@ struct SyncV2ValidatedHandshake: Equatable, Sendable {
     let contractVersion: String
     let contractSHA256: String
     let serverProtocolVersion: Int
+    /// 서버가 지금 받아 주는 protocol 번호 전부다. `serverProtocolVersion`은
+    /// 천장일 뿐이라, 우리가 쓰는 번호가 이 안에 남아 있는지가 실제 판정이다.
+    let supportedProtocolVersions: [Int]
     let serverCapabilities: [String]
 }
 
