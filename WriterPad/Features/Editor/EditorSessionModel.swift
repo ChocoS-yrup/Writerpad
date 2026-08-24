@@ -1341,6 +1341,15 @@ final class EditorSessionModel: ObservableObject {
         }
     }
 
+#if DEBUG
+    /// 예약된 통계 계산이 끝날 때까지 기다린다. 가상 시계로 시간을 돌리는 시험이
+    /// 실제 시계로 어림잡아 기다리지 않고 계산이 반영된 시점을 정확히 붙잡는다.
+    /// 대기 중인 계산이 없으면 곧바로 돌아온다.
+    func awaitStatisticsForTesting() async {
+        await statisticsTask?.value
+    }
+#endif
+
     private func apply(_ effects: [EditorFocusEffect]) async {
         for effect in effects {
             switch effect {
