@@ -158,6 +158,38 @@ final class AppEnvironmentTests: XCTestCase {
     }
 
     @MainActor
+    func testProjectListModelReportsNameConflictWithDeletedList() async throws {
+        let environment = try AppEnvironment.testing()
+        let deleted = try await environment.projectManager.createProject(
+            named: "삭제 목록 중복 작품"
+        )
+        let pending = try await environment.projectManager.prepareDeletion(
+            id: deleted.id
+        )
+        try await environment.projectManager.confirmDeletion(pending)
+        let deletedListConfirmation = try await environment.projectManager
+            .prepareMoveToDeletedList(id: deleted.id)
+        _ = try await environment.projectManager.moveToDeletedList(
+            deletedListConfirmation
+        )
+
+        let model = ProjectListModel(
+            projectManager: environment.projectManager,
+            projectImporter: environment.projectImporter
+        )
+        await model.load(opensLastProject: false)
+        await model.create(named: "삭제 목록 중복 작품")
+
+        XCTAssertEqual(
+            model.errorMessage,
+            "삭제 목록에 같은 이름의 작품이 존재합니다."
+        )
+        XCTAssertTrue(model.selectedProjectID == nil)
+        XCTAssertEqual(model.libraryProjects.count, 0)
+        XCTAssertEqual(model.deletedProjects.count, 1)
+    }
+
+    @MainActor
     func testProjectListRenameStaysInLibraryAndPreservesNameOnCollision()
         async throws {
         let environment = try AppEnvironment.testing()

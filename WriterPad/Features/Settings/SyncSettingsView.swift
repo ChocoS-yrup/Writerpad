@@ -1,5 +1,6 @@
 import Foundation
 import SwiftUI
+import UIKit
 
 enum GlobalSyncPreference {
     static let storageKey = "writerpad.sync-all-projects-enabled"
@@ -465,6 +466,12 @@ private enum AuthenticationFormMode: String, CaseIterable, Identifiable {
     }
 }
 
+private enum AuthenticationField: Hashable {
+    case email
+    case password
+    case passwordConfirmation
+}
+
 private enum ExistingConnectionKind: String, Identifiable {
     case existing
     case windows
@@ -490,12 +497,166 @@ private struct ExistingConnectionRequest: Identifiable {
     }
 }
 
+private struct AuthenticationTextField: UIViewRepresentable {
+    let field: AuthenticationField
+    let placeholder: String
+    @Binding var text: String
+    @Binding var focusedField: AuthenticationField?
+    let isSecure: Bool
+    let keyboardType: UIKeyboardType
+    let textContentType: UITextContentType?
+    let accessibilityIdentifier: String
+    let isPreviousEnabled: Bool
+    let isNextEnabled: Bool
+    let onMove: (Int) -> Void
+
+    func makeCoordinator() -> Coordinator {
+        Coordinator(parent: self)
+    }
+
+    func makeUIView(context: Context) -> UITextField {
+        let textField = UITextField(frame: .zero)
+        textField.delegate = context.coordinator
+        textField.addTarget(
+            context.coordinator,
+            action: #selector(Coordinator.textDidChange(_:)),
+            for: .editingChanged
+        )
+        configure(textField, coordinator: context.coordinator)
+        return textField
+    }
+
+    func updateUIView(_ textField: UITextField, context: Context) {
+        context.coordinator.parent = self
+        configure(textField, coordinator: context.coordinator)
+
+        if textField.text != text {
+            textField.text = text
+        }
+
+        if focusedField == field {
+            if !textField.isFirstResponder {
+                textField.becomeFirstResponder()
+            }
+        } else if textField.isFirstResponder {
+            textField.resignFirstResponder()
+        }
+    }
+
+    private func configure(
+        _ textField: UITextField,
+        coordinator: Coordinator
+    ) {
+        textField.placeholder = placeholder
+        textField.font = UIFont.preferredFont(forTextStyle: .body)
+        textField.textColor = .label
+        textField.tintColor = .tintColor
+        textField.keyboardType = keyboardType
+        textField.textContentType = textContentType
+        if textField.isSecureTextEntry != isSecure {
+            textField.isSecureTextEntry = isSecure
+        }
+        textField.autocapitalizationType = .none
+        textField.autocorrectionType = .no
+        textField.spellCheckingType = .no
+        textField.returnKeyType = isNextEnabled ? .next : .done
+        textField.accessibilityIdentifier = accessibilityIdentifier
+        textField.accessibilityLabel = placeholder
+
+        guard coordinator.previousEnabled != isPreviousEnabled
+                || coordinator.nextEnabled != isNextEnabled
+                || coordinator.previousButton == nil
+                || coordinator.nextButton == nil else {
+            return
+        }
+
+        coordinator.previousEnabled = isPreviousEnabled
+        coordinator.nextEnabled = isNextEnabled
+        let previousButton = UIBarButtonItem(
+            image: UIImage(systemName: "chevron.up"),
+            style: .plain,
+            target: coordinator,
+            action: #selector(Coordinator.moveToPreviousField)
+        )
+        previousButton.accessibilityLabel = "이전 입력란"
+        previousButton.accessibilityIdentifier =
+            "writerpad.auth-previous-field"
+        previousButton.isEnabled = isPreviousEnabled
+
+        let nextButton = UIBarButtonItem(
+            image: UIImage(systemName: "chevron.down"),
+            style: .plain,
+            target: coordinator,
+            action: #selector(Coordinator.moveToNextField)
+        )
+        nextButton.accessibilityLabel = "다음 입력란"
+        nextButton.accessibilityIdentifier = "writerpad.auth-next-field"
+        nextButton.isEnabled = isNextEnabled
+
+        coordinator.previousButton = previousButton
+        coordinator.nextButton = nextButton
+        textField.inputAssistantItem.trailingBarButtonGroups = [
+            UIBarButtonItemGroup(
+                barButtonItems: [previousButton, nextButton],
+                representativeItem: nil
+            )
+        ]
+        if textField.isFirstResponder {
+            textField.reloadInputViews()
+        }
+    }
+
+    final class Coordinator: NSObject, UITextFieldDelegate {
+        var parent: AuthenticationTextField
+        var previousEnabled: Bool?
+        var nextEnabled: Bool?
+        var previousButton: UIBarButtonItem?
+        var nextButton: UIBarButtonItem?
+
+        init(parent: AuthenticationTextField) {
+            self.parent = parent
+        }
+
+        @objc func textDidChange(_ textField: UITextField) {
+            parent.text = textField.text ?? ""
+        }
+
+        func textFieldDidBeginEditing(_ textField: UITextField) {
+            parent.focusedField = parent.field
+        }
+
+        func textFieldDidEndEditing(_ textField: UITextField) {
+            if parent.focusedField == parent.field {
+                parent.focusedField = nil
+            }
+        }
+
+        func textFieldShouldReturn(_ textField: UITextField) -> Bool {
+            if parent.isNextEnabled {
+                parent.onMove(1)
+            } else {
+                textField.resignFirstResponder()
+            }
+            return false
+        }
+
+        @objc func moveToPreviousField() {
+            parent.onMove(-1)
+        }
+
+        @objc func moveToNextField() {
+            parent.onMove(1)
+        }
+    }
+}
+
 struct SyncSettingsView: View {
     @StateObject private var model: SyncSettingsModel
     @State private var authenticationMode: AuthenticationFormMode = .signIn
     @State private var email = ""
     @State private var password = ""
     @State private var passwordConfirmation = ""
+    @State private var focusedAuthenticationField: AuthenticationField?
     @State private var isConfirmingEnableAll = false
     @State private var connectionRequest: ExistingConnectionRequest?
     @State private var disconnectTarget: SyncProjectRow?
@@ -533,6 +694,12 @@ struct SyncSettingsView: View {
         }
         .navigationTitle("서버 동기화")
         .navigationBarTitleDisplayMode(.inline)
+        .onChange(of: authenticationMode) { _, mode in
+            if mode == .signIn,
+               focusedAuthenticationField == .passwordConfirmation {
+                focusedAuthenticationField = .password
+            }
+        }
         .disabled(model.isWorking)
         .overlay {
             if model.isWorking {
@@ -641,25 +808,52 @@ struct SyncSettingsView: View {
                 }
                 .pickerStyle(.segmented)
                 .accessibilityIdentifier("writerpad.auth-mode")
-                TextField("이메일", text: $email)
-                    .textInputAutocapitalization(.never)
-                    .keyboardType(.emailAddress)
-                    .textContentType(.username)
-                    .autocorrectionDisabled()
-                    .accessibilityIdentifier("writerpad.sync-email")
-                SecureField("비밀번호", text: $password)
-                    .textContentType(
-                        authenticationMode == .signUp
-                            ? .newPassword
-                            : .password
-                    )
-                    .accessibilityIdentifier("writerpad.sync-password")
+                AuthenticationTextField(
+                    field: .email,
+                    placeholder: "이메일",
+                    text: $email,
+                    focusedField: $focusedAuthenticationField,
+                    isSecure: false,
+                    keyboardType: .emailAddress,
+                    textContentType: .username,
+                    accessibilityIdentifier: "writerpad.sync-email",
+                    isPreviousEnabled: previousAuthenticationField != nil,
+                    isNextEnabled: nextAuthenticationField != nil,
+                    onMove: { moveAuthenticationFocus(by: $0) }
+                )
+                .frame(maxWidth: .infinity, minHeight: 36)
+                AuthenticationTextField(
+                    field: .password,
+                    placeholder: "비밀번호",
+                    text: $password,
+                    focusedField: $focusedAuthenticationField,
+                    isSecure: true,
+                    keyboardType: .default,
+                    textContentType: authenticationMode == .signUp
+                        ? .newPassword
+                        : .password,
+                    accessibilityIdentifier: "writerpad.sync-password",
+                    isPreviousEnabled: previousAuthenticationField != nil,
+                    isNextEnabled: nextAuthenticationField != nil,
+                    onMove: { moveAuthenticationFocus(by: $0) }
+                )
+                .frame(maxWidth: .infinity, minHeight: 36)
                 if authenticationMode == .signUp {
-                    SecureField("비밀번호 확인", text: $passwordConfirmation)
-                        .textContentType(.newPassword)
-                        .accessibilityIdentifier(
-                            "writerpad.sync-password-confirmation"
-                        )
+                    AuthenticationTextField(
+                        field: .passwordConfirmation,
+                        placeholder: "비밀번호 확인",
+                        text: $passwordConfirmation,
+                        focusedField: $focusedAuthenticationField,
+                        isSecure: true,
+                        keyboardType: .default,
+                        textContentType: .newPassword,
+                        accessibilityIdentifier:
+                            "writerpad.sync-password-confirmation",
+                        isPreviousEnabled: previousAuthenticationField != nil,
+                        isNextEnabled: nextAuthenticationField != nil,
+                        onMove: { moveAuthenticationFocus(by: $0) }
+                    )
+                    .frame(maxWidth: .infinity, minHeight: 36)
                     Text("비밀번호는 6자 이상이어야 합니다. 서버의 보안 정책에 따라 더 강한 비밀번호가 필요할 수 있습니다.")
                         .font(.footnote)
                         .foregroundStyle(.secondary)
@@ -723,6 +917,43 @@ struct SyncSettingsView: View {
             return password.count >= 6 && password == passwordConfirmation
         }
         return true
+    }
+
+    private var authenticationFields: [AuthenticationField] {
+        if authenticationMode == .signUp {
+            return [.email, .password, .passwordConfirmation]
+        }
+        return [.email, .password]
+    }
+
+    private var previousAuthenticationField: AuthenticationField? {
+        adjacentAuthenticationField(offset: -1)
+    }
+
+    private var nextAuthenticationField: AuthenticationField? {
+        adjacentAuthenticationField(offset: 1)
+    }
+
+    private func adjacentAuthenticationField(
+        offset: Int
+    ) -> AuthenticationField? {
+        guard let focusedAuthenticationField,
+              let currentIndex = authenticationFields.firstIndex(
+                  of: focusedAuthenticationField
+              ) else {
+            return nil
+        }
+        let targetIndex = currentIndex + offset
+        guard authenticationFields.indices.contains(targetIndex) else {
+            return nil
+        }
+        return authenticationFields[targetIndex]
+    }
+
+    private func moveAuthenticationFocus(by offset: Int) {
+        focusedAuthenticationField = adjacentAuthenticationField(
+            offset: offset
+        )
     }
 
     private var globalSyncSection: some View {

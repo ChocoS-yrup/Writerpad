@@ -298,6 +298,31 @@ final class LocalProjectManagerTests: XCTestCase {
         )
     }
 
+    func testCreateRejectsNameStillInDeletedList() async throws {
+        let harness = try makeHarness()
+        let deleted = try await harness.manager.createProject(named: "삭제 목록 작품")
+        let pending = try await harness.manager.prepareDeletion(id: deleted.id)
+        try await harness.manager.confirmDeletion(pending)
+        let deletedListConfirmation = try await harness.manager.prepareMoveToDeletedList(
+            id: deleted.id
+        )
+        _ = try await harness.manager.moveToDeletedList(deletedListConfirmation)
+
+        do {
+            _ = try await harness.manager.createProject(named: "삭제 목록 작품")
+            XCTFail("삭제 목록에 남은 이름은 새 작품으로 만들 수 없어야 합니다.")
+        } catch let error as ProjectManagerError {
+            XCTAssertEqual(
+                error,
+                .projectNameInDeletedList("삭제 목록 작품")
+            )
+        }
+
+        let projects = try await harness.manager.projects()
+        XCTAssertEqual(projects.count, 1)
+        XCTAssertTrue(projects[0].isInDeletedList)
+    }
+
     func testRestartCompletesPermanentDeletionInterruptedAfterQuarantine() async throws {
         let harness = try makeHarness()
         let doomed = try await harness.manager.createProject(named: "중단 삭제")
