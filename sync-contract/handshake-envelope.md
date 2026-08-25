@@ -30,18 +30,35 @@ RFC 8785 정규화 바이트에만 걸린다(`contract-lock.json`의 `protocol_p
 
 ## 클라이언트가 요구하는 것
 
-양쪽 모두 아래를 **필수**로 보고, 하나라도 어긋나면 계약 경로를 열지 않는다.
+**양쪽이 같지 않다.** 두 구현의 현재 상태를 그대로 적는다.
+
+### 양쪽 공통
 
 - `supported`가 참이 아니면 사용 불가
 - `project_id`가 물은 값과 다르면 거절
-- `supported=true`면 nullable 넷이 전부 있어야 함
-- `canonical_contract_sha256 == server_contract_sha256` — 다르면 서버가 자기
-  자신과 어긋나게 말한 것이라 어느 쪽도 고르지 않고 거절
-- `supported_protocol_versions`가 `server_protocol_version`을 포함해야 함
-- `supported_protocol_versions`가 **클라이언트가 쓰는 번호를 포함**해야 함.
-  `server_protocol_version`은 천장일 뿐이라 `>=` 검사만으로는 부족하다. 3을
-  내리고 4로 답하는 서버는 그 검사를 통과하면서 우리가 할 수 있는 말은 전부
-  거절한다
+- `server_contract_sha256` 부재 → 거절
+- `server_protocol_version` 부재 → 거절
+- 값이 있는데 어긋나면 거절: `canonical_contract_sha256 == server_contract_sha256`
+  (다르면 서버가 자기 자신과 어긋나게 말한 것이라 어느 쪽도 고르지 않는다),
+  `supported_protocol_versions`가 `server_protocol_version`을 포함할 것,
+  그리고 **클라이언트가 쓰는 번호를 포함**할 것 — `server_protocol_version`은
+  천장일 뿐이라 `>=` 검사만으로는 부족하다. 3을 내리고 4로 답하는 서버는 그
+  검사를 통과하면서 우리가 할 수 있는 말은 전부 거절한다
+
+### 갈리는 곳
+
+| 키가 **없을** 때 | iPad | Windows |
+|---|---|---|
+| `contract_version` | 거절 | **통과** |
+| `canonical_contract_sha256` | 거절 | **통과** |
+| `supported_protocol_versions` | 거절 | **통과** |
+
+Windows는 셋 다 "있는데 틀리면 거절, 아예 없으면 통과"다. 판정 근거가 없을 때
+통과시키는 모양이고, **Windows의 미해결 항목**이다 — 서버 응답 모양이 바뀌기
+전에 fail-closed로 맞춘다. 지금 서버가 셋을 항상 보내므로 동작 차이는 없다.
+
+iPad는 `supported_protocol_versions`를 비옵셔널로 두어 부재 시 해독 단계에서
+닫히고, 나머지 둘은 `readHandshakeCompatibility`가 요구한다.
 
 `server_protocol_version`과 `server_contract_sha256`이 빠진 응답은 두 클라이언트
 모두 거절한다. `becbf42`의 `20260820113209_authenticated_sync_handshake.sql`이
