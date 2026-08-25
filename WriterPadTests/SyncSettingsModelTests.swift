@@ -4,6 +4,65 @@ import XCTest
 
 @MainActor
 final class SyncSettingsModelTests: XCTestCase {
+#if DEBUG
+    func testContractPathGateTogglePublishesAndRestoresStoredState()
+        async throws {
+        let project = makeManagedProject(
+            id: "00000000-0000-0000-0000-000000000899",
+            name: "관문 확인"
+        )
+        let defaults = makeDefaults()
+        let model = SyncSettingsModel(
+            projectLister: SyncSettingsProjectListerStub(projects: [project]),
+            authenticationService: SyncSettingsAuthenticationStub(
+                state: .signedOut(.noStoredSession)
+            ),
+            projectBindingService: SyncSettingsBindingStub(
+                projects: [project],
+                ownerSubject: UUID()
+            ),
+            defaults: defaults
+        )
+
+        await model.load()
+        let row = try XCTUnwrap(model.projectRows.first)
+        XCTAssertFalse(model.isGateOpen(for: row))
+
+        model.setGateOpen(true, for: row)
+
+        XCTAssertTrue(model.isGateOpen(for: row))
+        XCTAssertTrue(
+            ContractPathGate.isOpen(for: project.id, in: defaults)
+        )
+        XCTAssertEqual(model.gateReport, "관문 확인 관문: 열림")
+
+        let restoredModel = SyncSettingsModel(
+            projectLister: SyncSettingsProjectListerStub(projects: [project]),
+            authenticationService: SyncSettingsAuthenticationStub(
+                state: .signedOut(.noStoredSession)
+            ),
+            projectBindingService: SyncSettingsBindingStub(
+                projects: [project],
+                ownerSubject: UUID()
+            ),
+            defaults: defaults
+        )
+        await restoredModel.load()
+        let restoredRow = try XCTUnwrap(restoredModel.projectRows.first)
+        XCTAssertTrue(restoredModel.isGateOpen(for: restoredRow))
+
+        restoredModel.setGateOpen(false, for: restoredRow)
+
+        XCTAssertFalse(restoredModel.isGateOpen(for: restoredRow))
+        XCTAssertNil(
+            defaults.object(
+                forKey: ContractPathGate.storageKey(for: project.id)
+            )
+        )
+        XCTAssertEqual(restoredModel.gateReport, "관문 확인 관문: 닫힘")
+    }
+#endif
+
     func testSignUpConfirmationKeepsProtectedCloudRoutesLocked() async {
         let project = makeManagedProject(
             id: "00000000-0000-0000-0000-000000000900",

@@ -144,6 +144,32 @@ final class SyncSettingsModel: ObservableObject {
     /// 나가 중복이 되거나 FOLDER_NAME_CONFLICT 로 막힌다. 그래서 pull 만 부른다.
     @Published private(set) var pullReport: String?
 
+    /// 작품별 계약 경로 관문이다. 로컬 스위치이고 서버에 나가는 것이 없다.
+    ///
+    /// 켜도 그 자체로는 아무것도 쓰지 않는다. 서 있는 핸드셰이크와 함께여야
+    /// 계약 경로가 쓰이고, 그 둘 중 어느 것도 서버가 움직일 수 없다.
+    @Published private(set) var openContractPathProjectIDs: Set<ProjectID> = []
+
+    func isGateOpen(for row: SyncProjectRow) -> Bool {
+        openContractPathProjectIDs.contains(row.project.id)
+    }
+
+    func setGateOpen(_ isOpen: Bool, for row: SyncProjectRow) {
+        if isOpen {
+            ContractPathGate.setOpen(true, for: row.project.id, in: defaults)
+            openContractPathProjectIDs.insert(row.project.id)
+        } else {
+            ContractPathGate.close(for: row.project.id, in: defaults)
+            openContractPathProjectIDs.remove(row.project.id)
+            // 관문을 닫으면 들고 있던 답도 버린다. 닫힌 뒤에도 답이 서 있으면
+            // 다시 열었을 때 낡은 답으로 곧장 쓰기 시작한다.
+            Task { await handshakeService?.gateClosed() }
+        }
+        gateReport = "\(row.project.name) 관문: \(isOpen ? "열림" : "닫힘")"
+    }
+
+    @Published private(set) var gateReport: String?
+
     func runPullOnly(for row: SyncProjectRow) async {
         guard let snapshotPuller else {
             pullReport = "snapshot 전송이 없습니다. Supabase 설정을 확인하세요."
@@ -483,6 +509,20 @@ final class SyncSettingsModel: ObservableObject {
                 )
             }
             projectRows = rows
+#if DEBUG
+            // UserDefaults만 읽으면 토글 자체는 관찰할 상태가 없어 탭 직후 예전
+            // 값으로 돌아간다. 로드할 때 저장값을 화면 상태로 한 번 끌어올린다.
+            openContractPathProjectIDs = Set(
+                rows.lazy
+                    .filter {
+                        ContractPathGate.isOpen(
+                            for: $0.project.id,
+                            in: self.defaults
+                        )
+                    }
+                    .map(\.project.id)
+            )
+#endif
         } catch {
             errorMessage = "작품 목록을 불러오지 못했습니다: \(error.localizedDescription)"
         }
@@ -783,6 +823,15 @@ struct SyncSettingsView: View {
             }
             .disabled(model.isWorking || handshakeProjectIDText.isEmpty)
             ForEach(model.projectRows.filter(\.isConnected)) { row in
+                Toggle(
+                    "\(row.project.name) 관문",
+                    isOn: Binding(
+                        get: { model.isGateOpen(for: row) },
+                        set: { newValue in
+                            model.setGateOpen(newValue, for: row)
+                        }
+                    )
+                )
                 Button("\(row.project.name) — pull만 실행") {
                     Task { await model.runPullOnly(for: row) }
                 }
@@ -791,6 +840,10 @@ struct SyncSettingsView: View {
                     Task { await model.runHandshake(for: row) }
                 }
                 .disabled(model.isWorking)
+            }
+            if let report = model.gateReport {
+                Text(report)
+                    .font(.footnote.monospaced())
             }
             if let report = model.pullReport {
                 Text(report)
