@@ -8245,6 +8245,41 @@ actor LazySyncV2ProjectBindingStore:
             )
         }
 
+        // 계약 순서를 한 번이라도 받은 작품이면 구조의 진실은 계약 표에 있다.
+        // 레거시 경로로 구조를 쓰면 계약 표가 아는 자식이 빠진 트리가 서버에
+        // 남는다. 순서 문서만 막고 폴더는 내보내면 서버에 반쯤 적용된 구조가
+        // 생기므로, 구조 변경이 하나라도 섞인 배치는 통째로 거부한다.
+        //
+        // 문서 저장만 담긴 배치는 막지 않는다. 본문은 순서와 무관하고, 그것까지
+        // 막으면 계약 경로를 열기 전에는 글을 저장할 수 없게 된다.
+        let touchesStructure = batch.mutations.contains { mutation in
+            switch mutation {
+            case .treeOrder, .folderSnapshot:
+                return true
+            case .ensureProject, .documentSnapshot, .trashPurge:
+                return false
+            }
+        }
+        if touchesStructure {
+            let hasContractOrder: Bool
+            do {
+                hasContractOrder = try await store
+                    .hasContractTreeOrderHistory(
+                        localProjectID: batch.projectID
+                    )
+            } catch {
+                return .localSavedButNotQueued(
+                    reason: "계약 순서 상태를 확인할 수 없습니다."
+                )
+            }
+            guard !hasContractOrder else {
+                return .localSavedButNotQueued(
+                    reason: "이 작품은 계약 순서를 쓰고 있어 레거시 구조 변경을 "
+                        + "보내지 않습니다."
+                )
+            }
+        }
+
         var syncMutations: [SyncV2Mutation] = []
         syncMutations.reserveCapacity(batch.mutations.count)
         for mutation in batch.mutations {
@@ -8304,28 +8339,6 @@ actor LazySyncV2ProjectBindingStore:
                 guard Int(exactly: generation) != nil else {
                     return .localSavedButNotQueued(
                         reason: "바인더 순서 snapshot 검증에 실패했습니다."
-                    )
-                }
-                // 계약 순서를 한 번이라도 받은 작품이면 순서의 진실은 계약 표에
-                // 있다. 레거시 문서는 그때부터 낡기 시작하므로, 그것으로 서버에
-                // 쓰면 남이 넣은 자식이 빠진 목록이 나간다. 조용히 쓰지 않고
-                // 여기서 막는다. 로컬 저장은 이미 끝났으므로 사용자가 방금 바꾼
-                // 순서는 화면에 그대로 남는다.
-                let hasContractOrder: Bool
-                do {
-                    hasContractOrder = try await store
-                        .hasContractTreeOrderHistory(
-                            localProjectID: batch.projectID
-                        )
-                } catch {
-                    return .localSavedButNotQueued(
-                        reason: "계약 순서 상태를 확인할 수 없습니다."
-                    )
-                }
-                guard !hasContractOrder else {
-                    return .localSavedButNotQueued(
-                        reason: "이 작품은 계약 순서를 쓰고 있어 레거시 순서로 "
-                            + "보내지 않습니다."
                     )
                 }
                 let path = syncV2TreeOrderPath

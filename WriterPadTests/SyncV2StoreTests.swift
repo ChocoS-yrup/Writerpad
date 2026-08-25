@@ -6582,6 +6582,147 @@ final class SyncV2StoreTests: XCTestCase {
         )
     }
 
+    /// 순서 문서만 막고 폴더는 내보내면 서버에 반쯤 적용된 구조가 남는다.
+    ///
+    /// 폴더 생성·이름변경·삭제는 commit_folder로 따로 나가므로, 순서만 막는
+    /// 구현은 이 시험을 통과하지 못한다.
+    func testLegacyFolderWritesAreRefusedOnceContractOrderArrives()
+        async throws {
+        let url = try databaseURL()
+        let identity = DeviceIdentityService(
+            store: InMemoryDeviceIdentityStore(),
+            generateUUID: { UUID() }
+        )
+        let recorder = LazySyncV2ProjectBindingStore(
+            databaseURL: url,
+            deviceIdentityProvider: identity
+        )
+        let localProjectID = ProjectID(rawValue: UUID())
+        let serverProjectID = UUID()
+        try await recorder.save(
+            .connected(
+                localProjectID: localProjectID,
+                serverProjectID: serverProjectID,
+                kind: .existingServerProject,
+                projectName: "계약 순서 작품",
+                ownerSubject: UUID()
+            )
+        )
+
+        func recordFolder(
+            folderID: DocumentID,
+            name: String,
+            isDeleted: Bool
+        ) async -> DurableRecordResult {
+            await recorder.record(
+                LocalMutationBatch(
+                    batchID: UUID(),
+                    projectID: localProjectID,
+                    localTransactionID: UUID(),
+                    kind: .structureChange,
+                    mutations: [
+                        .folderSnapshot(
+                            operationID: UUID(),
+                            folderID: folderID,
+                            parentFolderID: nil,
+                            name: name,
+                            isDeleted: isDeleted
+                        )
+                    ]
+                )
+            )
+        }
+
+        try await recorder.applyTreeOrderSnapshotBaselines(
+            localProjectID: localProjectID,
+            serverProjectID: serverProjectID,
+            treeOrders: [
+                SyncV2RemoteTreeOrder(
+                    treeOrderID: UUID(),
+                    parentFolderID: UUID(),
+                    children: [UUID()],
+                    revision: 3,
+                    updatedAt: Date(timeIntervalSince1970: 30)
+                )
+            ]
+        )
+
+        // 생성·이름변경·삭제 셋 다 나가지 않아야 한다.
+        let folderID = DocumentID(rawValue: UUID())
+        for (name, isDeleted) in [
+            ("새 폴더", false), ("바뀐 이름", false), ("바뀐 이름", true),
+        ] {
+            guard case .localSavedButNotQueued = await recordFolder(
+                folderID: folderID,
+                name: name,
+                isDeleted: isDeleted
+            ) else {
+                return XCTFail(
+                    "계약 순서를 받은 뒤에도 레거시 폴더 변경이 나갔다: \(name)"
+                )
+            }
+        }
+
+        // 큐에 아무것도 남지 않아야 한다. 하나라도 있으면 서버에 반쯤 적용된
+        // 구조가 생긴다.
+        let inspection = try await openStore(at: url)
+        let queued = try await inspection.queuedOperations(
+            documentID: folderID.rawValue
+        )
+        XCTAssertTrue(
+            queued.isEmpty,
+            "레거시 폴더 작업이 큐에 남았다: \(queued.count)건"
+        )
+        await inspection.close()
+    }
+
+    /// 계약 이력은 한 번 생기면 되돌아가지 않는다.
+    ///
+    /// 서버가 빈 응답을 주거나 RLS가 어긋나 아무것도 못 읽는 날, 이력이 지워지면
+    /// 방어가 조용히 풀린다. 빈 적용이 이력을 지우지 않는지 못 박는다.
+    func testContractTreeOrderHistorySurvivesAnEmptySnapshot() async throws {
+        let url = try databaseURL()
+        let context = QueueAPIContext()
+        let store = try await connectedStore(at: url, context: context)
+
+        try await store.applyTreeOrderSnapshotBaselines(
+            localProjectID: context.localProjectID,
+            serverProjectID: context.serverProjectID,
+            treeOrders: [
+                SyncV2RemoteTreeOrder(
+                    treeOrderID: UUID(),
+                    parentFolderID: UUID(),
+                    children: [UUID()],
+                    revision: 2,
+                    updatedAt: Date(timeIntervalSince1970: 30)
+                )
+            ]
+        )
+        var hasHistory = try await store.hasContractTreeOrderHistory(
+            localProjectID: context.localProjectID
+        )
+        XCTAssertTrue(hasHistory)
+
+        // 빈 응답을 그대로 적용해도 이력은 남아야 한다.
+        try await store.applyTreeOrderSnapshotBaselines(
+            localProjectID: context.localProjectID,
+            serverProjectID: context.serverProjectID,
+            treeOrders: []
+        )
+        hasHistory = try await store.hasContractTreeOrderHistory(
+            localProjectID: context.localProjectID
+        )
+        XCTAssertTrue(hasHistory, "빈 snapshot 적용으로 계약 이력이 지워졌다")
+        await store.close()
+
+        let reopened = try await openStore(at: url)
+        let restoredHistory = try await reopened.hasContractTreeOrderHistory(
+            localProjectID: context.localProjectID
+        )
+        XCTAssertTrue(restoredHistory, "재시작 뒤 계약 이력이 사라졌다")
+        await reopened.close()
+    }
+
     // MARK: - 계약 tree_order
 
     /// 서버가 말한 순서와 revision을 그대로 들고 있어야 한다. revision은 우리가
