@@ -72,6 +72,7 @@ final class SyncSettingsModel: ObservableObject {
         SyncV2BackgroundSyncCoordinator?
     private let editLeaseManager: (any EditLeaseManaging)?
     private let handshakeService: SyncV2HandshakeService?
+    private let snapshotPuller: (any SyncV2SnapshotPulling)?
     private let defaults: UserDefaults
 
     init(
@@ -83,6 +84,7 @@ final class SyncSettingsModel: ObservableObject {
             SyncV2BackgroundSyncCoordinator? = nil,
         editLeaseManager: (any EditLeaseManaging)? = nil,
         handshakeService: SyncV2HandshakeService? = nil,
+        snapshotPuller: (any SyncV2SnapshotPulling)? = nil,
         defaults: UserDefaults = .standard
     ) {
         projectLister = ProjectManagerSyncProjectLister(
@@ -94,6 +96,7 @@ final class SyncSettingsModel: ObservableObject {
         self.backgroundSyncCoordinator = backgroundSyncCoordinator
         self.editLeaseManager = editLeaseManager
         self.handshakeService = handshakeService
+        self.snapshotPuller = snapshotPuller
         self.defaults = defaults
         isSyncAllEnabled = GlobalSyncPreference.isEnabled(in: defaults)
     }
@@ -107,6 +110,7 @@ final class SyncSettingsModel: ObservableObject {
             SyncV2BackgroundSyncCoordinator? = nil,
         editLeaseManager: (any EditLeaseManaging)? = nil,
         handshakeService: SyncV2HandshakeService? = nil,
+        snapshotPuller: (any SyncV2SnapshotPulling)? = nil,
         defaults: UserDefaults
     ) {
         self.projectLister = projectLister
@@ -116,6 +120,7 @@ final class SyncSettingsModel: ObservableObject {
         self.backgroundSyncCoordinator = backgroundSyncCoordinator
         self.editLeaseManager = editLeaseManager
         self.handshakeService = handshakeService
+        self.snapshotPuller = snapshotPuller
         self.defaults = defaults
         isSyncAllEnabled = GlobalSyncPreference.isEnabled(in: defaults)
     }
@@ -132,6 +137,49 @@ final class SyncSettingsModel: ObservableObject {
     /// 작품을 연결하면 `ensure_project`가 서버에 쓴다. 핸드셰이크만 확인하려는
     /// 자리에서 그 쓰기를 유발하지 않으려고 서버 작품 id를 직접 받는다. 로컬
     /// 작품 id는 캐시 키에만 쓰이고 요청에는 실리지 않는다.
+    /// 서버 구조를 내려받아 로컬에 반영만 한다. 서버로 나가는 것은 없다.
+    ///
+    /// 전체 동기화 토글은 dispatcher 를 함께 시작해서 나가는 쪽도 연다. 대조만
+    /// 하려는 자리에서 그걸 켜면, 이름은 같고 id 가 다른 로컬 폴더가 서버로
+    /// 나가 중복이 되거나 FOLDER_NAME_CONFLICT 로 막힌다. 그래서 pull 만 부른다.
+    @Published private(set) var pullReport: String?
+
+    func runPullOnly(for row: SyncProjectRow) async {
+        guard let snapshotPuller else {
+            pullReport = "snapshot 전송이 없습니다. Supabase 설정을 확인하세요."
+            return
+        }
+        guard let serverProjectID = row.binding?.serverProjectID else {
+            pullReport = "이 작품은 서버에 연결되어 있지 않습니다."
+            return
+        }
+        isWorking = true
+        defer { isWorking = false }
+        do {
+            let report = try await snapshotPuller.pull(
+                localProjectID: row.project.id,
+                serverProjectID: serverProjectID,
+                editingGuards: [:]
+            )
+            var lines = [
+                "적용된 스냅샷: \(report.appliedSnapshots.count)",
+                "결과: \(report.outcomes.count)",
+            ]
+            if report.rejectedStructureNames.isEmpty {
+                lines.append("거부된 구조 이름: 없음")
+            } else {
+                lines.append("거부된 구조 이름 \(report.rejectedStructureNames.count):")
+                for rejected in report.rejectedStructureNames.prefix(5) {
+                    lines.append("  \(rejected.parent)/\(rejected.name) — \(rejected.reason)")
+                }
+            }
+            pullReport = lines.joined(separator: "\n")
+            await reloadProjects()
+        } catch {
+            pullReport = "실패: \(error)"
+        }
+    }
+
     func runHandshake(serverProjectIDText: String) async {
         guard let serverProjectID = UUID(uuidString: serverProjectIDText.trimmingCharacters(in: .whitespacesAndNewlines)) else {
             handshakeReport = "서버 작품 id가 UUID 형식이 아닙니다."
@@ -600,7 +648,8 @@ struct SyncSettingsView: View {
         backgroundSyncCoordinator:
             SyncV2BackgroundSyncCoordinator? = nil,
         editLeaseManager: (any EditLeaseManaging)? = nil,
-        handshakeService: SyncV2HandshakeService? = nil
+        handshakeService: SyncV2HandshakeService? = nil,
+        snapshotPuller: (any SyncV2SnapshotPulling)? = nil,
     ) {
         _model = StateObject(
             wrappedValue: SyncSettingsModel(
@@ -610,7 +659,8 @@ struct SyncSettingsView: View {
                 syncDispatcher: syncDispatcher,
                 backgroundSyncCoordinator: backgroundSyncCoordinator,
                 editLeaseManager: editLeaseManager,
-                handshakeService: handshakeService
+                handshakeService: handshakeService,
+                snapshotPuller: snapshotPuller
             )
         )
     }
@@ -733,10 +783,19 @@ struct SyncSettingsView: View {
             }
             .disabled(model.isWorking || handshakeProjectIDText.isEmpty)
             ForEach(model.projectRows.filter(\.isConnected)) { row in
+                Button("\(row.project.name) — pull만 실행") {
+                    Task { await model.runPullOnly(for: row) }
+                }
+                .disabled(model.isWorking)
                 Button("\(row.project.name) 확인") {
                     Task { await model.runHandshake(for: row) }
                 }
                 .disabled(model.isWorking)
+            }
+            if let report = model.pullReport {
+                Text(report)
+                    .font(.footnote.monospaced())
+                    .textSelection(.enabled)
             }
             if let report = model.handshakeReport {
                 Text(report)

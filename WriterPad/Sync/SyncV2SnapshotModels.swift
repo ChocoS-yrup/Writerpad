@@ -100,7 +100,6 @@ struct SyncV2RemoteDocumentSnapshot: Codable, Equatable, Sendable {
         }
         return date
     }
-
     private static func encodeDate(_ date: Date) -> String {
         let formatter = ISO8601DateFormatter()
         formatter.formatOptions = [
@@ -110,6 +109,37 @@ struct SyncV2RemoteDocumentSnapshot: Codable, Equatable, Sendable {
         return formatter.string(from: date)
     }
 }
+/// 로컬에 적어 둔 계약 tree_order 한 줄이다. 쓰기 전에 `serverRevision`을 base로
+/// 싣고, `children`으로 서버가 아는 목록을 확인한다.
+struct SyncV2StoredTreeOrder: Equatable, Sendable {
+    let treeOrderID: UUID
+    let parentFolderID: UUID?
+    let children: [UUID]
+    let serverRevision: Int64
+}
+
+/// 계약이 정한 tree_order 한 줄이다.
+///
+/// 자식을 이름이 아니라 `folder_id`/`document_id`로 적는다. 이름으로 두면 이름이
+/// 바뀌는 순간 순서가 어느 것을 가리키는지 알 수 없다. 그리고 revision은 우리가
+/// 만들어낼 수 없는 값이라, 이 줄을 받아 두지 않으면 순서를 안전하게 쓸 수 없다.
+struct SyncV2RemoteTreeOrder: Codable, Equatable, Sendable {
+    let treeOrderID: UUID
+    /// `nil`이면 작품 최상위다.
+    let parentFolderID: UUID?
+    let children: [UUID]
+    let revision: Int64
+    let updatedAt: Date
+
+    enum CodingKeys: String, CodingKey {
+        case treeOrderID = "tree_order_id"
+        case parentFolderID = "parent_folder_id"
+        case children
+        case revision
+        case updatedAt = "updated_at"
+    }
+}
+
 
 /// 서버 folders 한 줄이다. 문서와 달리 본문도 경로도 없다. 위치는
 /// parentFolderID 사슬로만 나타내므로, 경로는 받는 쪽에서 이름을 이어 붙여

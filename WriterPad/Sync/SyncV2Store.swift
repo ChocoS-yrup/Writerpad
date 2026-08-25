@@ -710,8 +710,8 @@ actor SyncV2Store:
     SyncV2DocumentRevisionProviding,
     SyncV2FolderMigrationMarking,
     SyncV2SnapshotStateStoring {
-    static let currentSchemaVersion = 5
-    static let migrationName = "SyncV2StoreSchemaV5"
+    static let currentSchemaVersion = 6
+    static let migrationName = "SyncV2StoreSchemaV6"
     static let maximumContentByteCount = 10 * 1_024 * 1_024
     static let contentTooLargeErrorCode = "CONTENT_TOO_LARGE"
 
@@ -1079,6 +1079,219 @@ actor SyncV2Store:
         }
     }
 
+    /// 계약 tree_order를 서버가 말한 그대로 적어 둔다.
+    ///
+    /// 이 표가 있어야 순서를 쓸 수 있다. tree_order는 자식 목록 전체를 보내므로,
+    /// 서버가 무엇을 담고 있는지 모른 채 우리 목록을 보내면 남이 넣은 것을 지운다.
+    /// revision은 우리가 만들어낼 수 없는 유일한 값이라 더욱 그렇다.
+    ///
+    /// 아직 보내지 않은 로컬 순서 변경(`pending`)은 덮지 않는다. 덮으면 사용자가
+    /// 방금 바꾼 순서가 소리 없이 사라진다.
+    func applyTreeOrderSnapshotBaselines(
+        localProjectID: ProjectID,
+        serverProjectID: UUID,
+        treeOrders: [SyncV2RemoteTreeOrder]
+    ) async throws {
+        let timestamp = Self.timestamp()
+        let localValue = localProjectID.rawValue.uuidString.lowercased()
+        let projectValue = serverProjectID.uuidString.lowercased()
+        try transaction {
+            for treeOrder in treeOrders {
+                let idValue = treeOrder.treeOrderID.uuidString.lowercased()
+                let parentValue = treeOrder.parentFolderID?
+                    .uuidString.lowercased()
+                let childrenJSON = try Self.encodeTreeOrderChildren(
+                    treeOrder.children
+                )
+
+                let existing = try withStatement(
+                    """
+                    SELECT local_project_id, project_id, sync_state
+                    FROM sync_tree_orders
+                    WHERE tree_order_id = ?
+                    LIMIT 1;
+                    """
+                ) { statement -> (String, String, String)? in
+                    try bind(idValue, at: 1, to: statement)
+                    let status = sqlite3_step(statement)
+                    if status == SQLITE_DONE { return nil }
+                    guard
+                        status == SQLITE_ROW,
+                        let local = columnText(statement, at: 0),
+                        let project = columnText(statement, at: 1),
+                        let state = columnText(statement, at: 2)
+                    else {
+                        throw SyncV2DispatchStoreError.integrityFailure
+                    }
+                    return (local, project, state)
+                }
+
+                if let existing {
+                    // 같은 id가 다른 작품에 붙어 있으면 우리가 아는 세상과 서버가
+                    // 다른 것이다. 추측해서 잇지 않는다.
+                    guard
+                        existing.0 == localValue,
+                        existing.1 == projectValue
+                    else {
+                        throw SyncV2DispatchStoreError.integrityFailure
+                    }
+                    guard existing.2 != "pending" else { continue }
+                    try withStatement(
+                        """
+                        UPDATE sync_tree_orders
+                        SET parent_folder_id = ?, children_json = ?,
+                            server_revision = ?, server_updated_at = ?,
+                            sync_state = 'synced', last_error_code = NULL,
+                            updated_at = ?
+                        WHERE tree_order_id = ?;
+                        """
+                    ) { statement in
+                        try bind(parentValue, at: 1, to: statement)
+                        try bind(childrenJSON, at: 2, to: statement)
+                        try bind(treeOrder.revision, at: 3, to: statement)
+                        try bind(
+                            Self.timestamp(treeOrder.updatedAt),
+                            at: 4,
+                            to: statement
+                        )
+                        try bind(timestamp, at: 5, to: statement)
+                        try bind(idValue, at: 6, to: statement)
+                        guard sqlite3_step(statement) == SQLITE_DONE else {
+                            throw sqliteError()
+                        }
+                    }
+                } else {
+                    try withStatement(
+                        """
+                        INSERT INTO sync_tree_orders (
+                            tree_order_id, local_project_id, project_id,
+                            parent_folder_id, children_json, server_revision,
+                            server_updated_at, sync_state, created_at, updated_at
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, 'synced', ?, ?);
+                        """
+                    ) { statement in
+                        try bind(idValue, at: 1, to: statement)
+                        try bind(localValue, at: 2, to: statement)
+                        try bind(projectValue, at: 3, to: statement)
+                        try bind(parentValue, at: 4, to: statement)
+                        try bind(childrenJSON, at: 5, to: statement)
+                        try bind(treeOrder.revision, at: 6, to: statement)
+                        try bind(
+                            Self.timestamp(treeOrder.updatedAt),
+                            at: 7,
+                            to: statement
+                        )
+                        try bind(timestamp, at: 8, to: statement)
+                        try bind(timestamp, at: 9, to: statement)
+                        guard sqlite3_step(statement) == SQLITE_DONE else {
+                            throw sqliteError()
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// 이 작품에 계약 tree_order 이력이 있는가.
+    ///
+    /// 있다면 순서의 진실은 계약 표에 있고, 레거시 문서로 구조를 쓰면 낡은 순서가
+    /// 서버로 나간다. 그래서 이 값이 레거시 구조 쓰기를 막는 판별 근거가 된다.
+    func hasContractTreeOrderHistory(
+        localProjectID: ProjectID
+    ) async throws -> Bool {
+        try withStatement(
+            """
+            SELECT EXISTS(
+                SELECT 1 FROM sync_tree_orders WHERE local_project_id = ?
+            );
+            """
+        ) { statement in
+            try bind(
+                localProjectID.rawValue.uuidString.lowercased(),
+                at: 1,
+                to: statement
+            )
+            guard sqlite3_step(statement) == SQLITE_ROW else {
+                throw SyncV2DispatchStoreError.integrityFailure
+            }
+            return sqlite3_column_int(statement, 0) == 1
+        }
+    }
+
+    /// 한 부모의 순서와 그 revision이다. 쓰기 전에 base revision으로 쓴다.
+    func storedTreeOrder(
+        localProjectID: ProjectID,
+        parentFolderID: UUID?
+    ) async throws -> SyncV2StoredTreeOrder? {
+        let localValue = localProjectID.rawValue.uuidString.lowercased()
+        let sql = parentFolderID == nil
+            ? """
+              SELECT tree_order_id, children_json, server_revision
+              FROM sync_tree_orders
+              WHERE local_project_id = ? AND parent_folder_id IS NULL
+              LIMIT 1;
+              """
+            : """
+              SELECT tree_order_id, children_json, server_revision
+              FROM sync_tree_orders
+              WHERE local_project_id = ? AND parent_folder_id = ?
+              LIMIT 1;
+              """
+        return try withStatement(sql) { statement -> SyncV2StoredTreeOrder? in
+            try bind(localValue, at: 1, to: statement)
+            if let parentFolderID {
+                try bind(
+                    parentFolderID.uuidString.lowercased(),
+                    at: 2,
+                    to: statement
+                )
+            }
+            let status = sqlite3_step(statement)
+            if status == SQLITE_DONE { return nil }
+            guard
+                status == SQLITE_ROW,
+                let idValue = columnText(statement, at: 0),
+                let treeOrderID = UUID(uuidString: idValue),
+                let childrenJSON = columnText(statement, at: 1)
+            else {
+                throw SyncV2DispatchStoreError.integrityFailure
+            }
+            return SyncV2StoredTreeOrder(
+                treeOrderID: treeOrderID,
+                parentFolderID: parentFolderID,
+                children: try Self.decodeTreeOrderChildren(childrenJSON),
+                serverRevision: sqlite3_column_int64(statement, 2)
+            )
+        }
+    }
+
+    static func encodeTreeOrderChildren(_ children: [UUID]) throws -> String {
+        let values = children.map { $0.uuidString.lowercased() }
+        let data = try JSONSerialization.data(
+            withJSONObject: values,
+            options: [.sortedKeys]
+        )
+        guard let text = String(data: data, encoding: .utf8) else {
+            throw SyncV2DispatchStoreError.integrityFailure
+        }
+        return text
+    }
+
+    static func decodeTreeOrderChildren(_ json: String) throws -> [UUID] {
+        guard
+            let data = json.data(using: .utf8),
+            let raw = try? JSONSerialization.jsonObject(with: data),
+            let values = raw as? [String]
+        else {
+            throw SyncV2DispatchStoreError.integrityFailure
+        }
+        return try values.map { value in
+            guard let uuid = UUID(uuidString: value) else {
+                throw SyncV2DispatchStoreError.integrityFailure
+            }
+            return uuid
+        }
+    }
     func applyFolderSnapshotBaselines(
         localProjectID: ProjectID,
         serverProjectID: UUID,
@@ -6828,6 +7041,7 @@ actor SyncV2Store:
             "sync_batches",
             "sync_operations",
             "sync_conflicts",
+            "sync_tree_orders",
         ]
         for table in expectedTables {
             let count = try withStatement(
@@ -8092,6 +8306,28 @@ actor LazySyncV2ProjectBindingStore:
                         reason: "바인더 순서 snapshot 검증에 실패했습니다."
                     )
                 }
+                // 계약 순서를 한 번이라도 받은 작품이면 순서의 진실은 계약 표에
+                // 있다. 레거시 문서는 그때부터 낡기 시작하므로, 그것으로 서버에
+                // 쓰면 남이 넣은 자식이 빠진 목록이 나간다. 조용히 쓰지 않고
+                // 여기서 막는다. 로컬 저장은 이미 끝났으므로 사용자가 방금 바꾼
+                // 순서는 화면에 그대로 남는다.
+                let hasContractOrder: Bool
+                do {
+                    hasContractOrder = try await store
+                        .hasContractTreeOrderHistory(
+                            localProjectID: batch.projectID
+                        )
+                } catch {
+                    return .localSavedButNotQueued(
+                        reason: "계약 순서 상태를 확인할 수 없습니다."
+                    )
+                }
+                guard !hasContractOrder else {
+                    return .localSavedButNotQueued(
+                        reason: "이 작품은 계약 순서를 쓰고 있어 레거시 순서로 "
+                            + "보내지 않습니다."
+                    )
+                }
                 let path = syncV2TreeOrderPath
                 let serverProjectID = binding.serverProjectID!
                 syncMutations.append(
@@ -8263,6 +8499,45 @@ actor LazySyncV2ProjectBindingStore:
             serverProjectID: serverProjectID,
             folders: folders,
             excluding: blockedFolderIDs
+        )
+    }
+
+    func applyTreeOrderSnapshotBaselines(
+        localProjectID: ProjectID,
+        serverProjectID: UUID,
+        treeOrders: [SyncV2RemoteTreeOrder]
+    ) async throws {
+        guard let store = await resolvedStore() else {
+            throw SyncV2DispatchStoreError.unavailable
+        }
+        try await store.applyTreeOrderSnapshotBaselines(
+            localProjectID: localProjectID,
+            serverProjectID: serverProjectID,
+            treeOrders: treeOrders
+        )
+    }
+
+    func hasContractTreeOrderHistory(
+        localProjectID: ProjectID
+    ) async throws -> Bool {
+        guard let store = await resolvedStore() else {
+            throw SyncV2DispatchStoreError.unavailable
+        }
+        return try await store.hasContractTreeOrderHistory(
+            localProjectID: localProjectID
+        )
+    }
+
+    func storedTreeOrder(
+        localProjectID: ProjectID,
+        parentFolderID: UUID?
+    ) async throws -> SyncV2StoredTreeOrder? {
+        guard let store = await resolvedStore() else {
+            throw SyncV2DispatchStoreError.unavailable
+        }
+        return try await store.storedTreeOrder(
+            localProjectID: localProjectID,
+            parentFolderID: parentFolderID
         )
     }
 

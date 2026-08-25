@@ -17,6 +17,9 @@ protocol SyncV2SnapshotTransporting: Sendable {
         documentID: UUID
     ) async throws -> SyncV2RemoteDocumentSnapshot?
     func fetchFolders(projectID: UUID) async throws -> [SyncV2RemoteFolder]
+    func fetchTreeOrders(
+        projectID: UUID
+    ) async throws -> [SyncV2RemoteTreeOrder]
 }
 
 extension SyncV2SnapshotTransporting {
@@ -35,6 +38,7 @@ extension SyncV2SnapshotTransporting {
         _ = projectID
         return []
     }
+
 }
 
 protocol SyncV2SnapshotClienting: Sendable {
@@ -46,6 +50,9 @@ protocol SyncV2SnapshotClienting: Sendable {
         documentID: UUID
     ) async throws -> SyncV2RemoteDocumentSnapshot?
     func fetchFolders(projectID: UUID) async throws -> [SyncV2RemoteFolder]
+    func fetchTreeOrders(
+        projectID: UUID
+    ) async throws -> [SyncV2RemoteTreeOrder]
 }
 
 extension SyncV2SnapshotClienting {
@@ -62,6 +69,7 @@ extension SyncV2SnapshotClienting {
         _ = projectID
         return []
     }
+
 }
 
 actor LiveSyncV2SnapshotTransport: SyncV2SnapshotTransporting {
@@ -87,6 +95,50 @@ actor LiveSyncV2SnapshotTransport: SyncV2SnapshotTransporting {
                 )
                 .eq("project_id", value: projectID.uuidString.lowercased())
                 .execute()
+            return response.value
+        } catch let error as PostgrestError {
+            throw SyncV2SnapshotTransportError.postgrest(
+                message: error.message,
+                postgresCode: error.code,
+                detail: error.detail
+            )
+        } catch let error as URLError {
+            throw SyncV2SnapshotTransportError.url(code: error.code)
+        } catch is DecodingError {
+            throw SyncV2SnapshotTransportError.invalidResponse
+        } catch {
+            let nsError = error as NSError
+            if nsError.domain == NSURLErrorDomain {
+                throw SyncV2SnapshotTransportError.url(
+                    code: URLError.Code(rawValue: nsError.code)
+                )
+            }
+            throw SyncV2SnapshotTransportError.unknown(
+                message: error.localizedDescription
+            )
+        }
+    }
+
+    /// 계약 tree_order를 서버가 말한 그대로 받아 온다.
+    ///
+    /// 이름이 아니라 id 목록이라 이름이 바뀌어도 순서가 끊기지 않고, revision은
+    /// 쓰기 전에 반드시 있어야 하는 값이다. 없으면 base를 0으로 보내게 되고 서버가
+    /// REVISION_CONFLICT로 막는다.
+    func fetchTreeOrders(
+        projectID: UUID
+    ) async throws -> [SyncV2RemoteTreeOrder] {
+        do {
+            let response: PostgrestResponse<[SyncV2RemoteTreeOrder]> =
+                try await client
+                    .from("tree_orders")
+                    .select(
+                        "tree_order_id,parent_folder_id,children,revision,updated_at"
+                    )
+                    .eq(
+                        "project_id",
+                        value: projectID.uuidString.lowercased()
+                    )
+                    .execute()
             return response.value
         } catch let error as PostgrestError {
             throw SyncV2SnapshotTransportError.postgrest(
@@ -257,6 +309,41 @@ actor SyncV2SnapshotClient: SyncV2SnapshotClienting {
                 throw SyncV2ClientError.invalidResponse
             }
             return snapshot
+        } catch let error as SyncV2ClientError {
+            throw error
+        } catch let error as SyncV2SnapshotTransportError {
+            throw Self.classify(error)
+        } catch {
+            throw SyncV2ClientError.serverRejected(
+                SyncV2RemoteRejection(
+                    postgresCode: nil,
+                    message: error.localizedDescription,
+                    detail: nil
+                )
+            )
+        }
+    }
+
+    /// 계약 tree_order를 그대로 넘긴다. 한 부모에 줄이 둘 오면 어느 쪽이 참인지
+    /// 고를 수 없으므로 거절한다. revision이 1 미만인 줄도 계약이 허용하지 않는다.
+    func fetchTreeOrders(
+        projectID: UUID
+    ) async throws -> [SyncV2RemoteTreeOrder] {
+        do {
+            let treeOrders = try await transport.fetchTreeOrders(
+                projectID: projectID
+            )
+            var parents = Set<UUID?>()
+            for treeOrder in treeOrders {
+                guard
+                    parents.insert(treeOrder.parentFolderID).inserted,
+                    treeOrder.revision >= 1,
+                    Set(treeOrder.children).count == treeOrder.children.count
+                else {
+                    throw SyncV2ClientError.invalidResponse
+                }
+            }
+            return treeOrders
         } catch let error as SyncV2ClientError {
             throw error
         } catch let error as SyncV2SnapshotTransportError {

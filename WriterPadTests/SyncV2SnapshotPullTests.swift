@@ -5639,13 +5639,16 @@ private func makeTrashPurgeFixture(
 private actor SnapshotTransportStub: SyncV2SnapshotTransporting {
     let snapshots: [SyncV2RemoteDocumentSnapshot]
     let folders: [SyncV2RemoteFolder]
+    let treeOrders: [SyncV2RemoteTreeOrder]
 
     init(
         snapshots: [SyncV2RemoteDocumentSnapshot],
-        folders: [SyncV2RemoteFolder] = []
+        folders: [SyncV2RemoteFolder] = [],
+        treeOrders: [SyncV2RemoteTreeOrder] = []
     ) {
         self.snapshots = snapshots
         self.folders = folders
+        self.treeOrders = treeOrders
     }
 
     func fetchDocuments(
@@ -5659,18 +5662,27 @@ private actor SnapshotTransportStub: SyncV2SnapshotTransporting {
     ) async throws -> [SyncV2RemoteFolder] {
         folders
     }
+
+    func fetchTreeOrders(
+        projectID: UUID
+    ) async throws -> [SyncV2RemoteTreeOrder] {
+        treeOrders
+    }
 }
 
 private actor SnapshotClientStub: SyncV2SnapshotClienting {
     let snapshots: [SyncV2RemoteDocumentSnapshot]
     let folders: [SyncV2RemoteFolder]
+    let treeOrders: [SyncV2RemoteTreeOrder]
 
     init(
         snapshots: [SyncV2RemoteDocumentSnapshot],
-        folders: [SyncV2RemoteFolder] = []
+        folders: [SyncV2RemoteFolder] = [],
+        treeOrders: [SyncV2RemoteTreeOrder] = []
     ) {
         self.snapshots = snapshots
         self.folders = folders
+        self.treeOrders = treeOrders
     }
 
     func fetchDocuments(
@@ -5683,6 +5695,12 @@ private actor SnapshotClientStub: SyncV2SnapshotClienting {
 
     func fetchFolders(projectID: UUID) async throws -> [SyncV2RemoteFolder] {
         folders
+    }
+
+    func fetchTreeOrders(
+        projectID: UUID
+    ) async throws -> [SyncV2RemoteTreeOrder] {
+        treeOrders
     }
 }
 
@@ -5718,6 +5736,15 @@ private actor SnapshotStateStoreStub: SyncV2SnapshotStateStoring {
     }
 
     func committedIDs() -> [UUID] { commits }
+
+    /// 이 대역은 계약 순서를 적어 두지 않는다. 다루지 않음을 명시한다.
+    func applyTreeOrderSnapshotBaselines(
+        localProjectID: ProjectID,
+        serverProjectID: UUID,
+        treeOrders: [SyncV2RemoteTreeOrder]
+    ) async throws {
+        _ = (localProjectID, serverProjectID, treeOrders)
+    }
 }
 
 private actor EquivalentIdentityStateStoreStub:
@@ -5770,6 +5797,15 @@ private actor EquivalentIdentityStateStoreStub:
         else { return false }
         adopted = true
         return true
+    }
+
+    /// 이 대역은 계약 순서를 적어 두지 않는다. 다루지 않음을 명시한다.
+    func applyTreeOrderSnapshotBaselines(
+        localProjectID: ProjectID,
+        serverProjectID: UUID,
+        treeOrders: [SyncV2RemoteTreeOrder]
+    ) async throws {
+        _ = (localProjectID, serverProjectID, treeOrders)
     }
 }
 
@@ -5827,6 +5863,15 @@ private actor BlockingSnapshotStateStore:
     func resumeSnapshotRead() {
         readContinuation?.resume()
         readContinuation = nil
+    }
+
+    /// 이 대역은 계약 순서를 적어 두지 않는다. 다루지 않음을 명시한다.
+    func applyTreeOrderSnapshotBaselines(
+        localProjectID: ProjectID,
+        serverProjectID: UUID,
+        treeOrders: [SyncV2RemoteTreeOrder]
+    ) async throws {
+        _ = (localProjectID, serverProjectID, treeOrders)
     }
 }
 

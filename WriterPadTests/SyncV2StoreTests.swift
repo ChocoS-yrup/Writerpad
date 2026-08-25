@@ -4575,6 +4575,7 @@ final class SyncV2StoreTests: XCTestCase {
             """
             DROP TABLE sync_folders;
             DROP TABLE sync_operation_events;
+            DROP TABLE sync_tree_orders;
             ALTER TABLE sync_projects
                 DROP COLUMN folder_migration_completed_at;
             DELETE FROM schema_migrations WHERE version >= 3;
@@ -5133,7 +5134,7 @@ final class SyncV2StoreTests: XCTestCase {
         let version = try await store.schemaVersion()
         await store.close()
 
-        XCTAssertEqual(version, 5)
+        XCTAssertEqual(version, SyncV2Store.currentSchemaVersion)
         let raw = try RawSQLite(url: url)
         XCTAssertEqual(
             try raw.scalarInt(
@@ -6504,6 +6505,193 @@ final class SyncV2StoreTests: XCTestCase {
             try? FileManager.default.removeItem(at: directory)
         }
         return directory.appendingPathComponent("sync-v2.sqlite3")
+    }
+
+    /// 계약 순서를 받은 작품은 레거시 순서 쓰기를 서버로 보내지 않는다.
+    ///
+    /// 보내면 계약 표가 아는 자식이 빠진 목록이 나가고, 그건 남이 넣은 폴더를
+    /// 순서에서 지우는 일이다. 로컬 저장은 이미 끝났으므로 사용자가 방금 바꾼
+    /// 순서는 화면에 남는다 — 막는 것은 전송뿐이다.
+    func testLegacyTreeOrderWriteIsRefusedOnceContractOrderArrives()
+        async throws {
+        let url = try databaseURL()
+        let identity = DeviceIdentityService(
+            store: InMemoryDeviceIdentityStore(),
+            generateUUID: { UUID() }
+        )
+        let recorder = LazySyncV2ProjectBindingStore(
+            databaseURL: url,
+            deviceIdentityProvider: identity
+        )
+        let localProjectID = ProjectID(rawValue: UUID())
+        let serverProjectID = UUID()
+        try await recorder.save(
+            .connected(
+                localProjectID: localProjectID,
+                serverProjectID: serverProjectID,
+                kind: .existingServerProject,
+                projectName: "계약 순서 작품",
+                ownerSubject: UUID()
+            )
+        )
+
+        func recordTreeOrder() async -> DurableRecordResult {
+            await recorder.record(
+                LocalMutationBatch(
+                    batchID: UUID(),
+                    projectID: localProjectID,
+                    localTransactionID: UUID(),
+                    kind: .structureChange,
+                    mutations: [
+                        .treeOrder(
+                            operationID: UUID(),
+                            content: "{\"tree_order\":{},\"version\":1}",
+                            generation: 7
+                        )
+                    ]
+                )
+            )
+        }
+
+        // 계약 순서를 받기 전에는 막을 이유가 없다.
+        guard case .queued = await recordTreeOrder() else {
+            return XCTFail("계약 순서 이전에는 레거시 순서가 나가야 한다.")
+        }
+
+        try await recorder.applyTreeOrderSnapshotBaselines(
+            localProjectID: localProjectID,
+            serverProjectID: serverProjectID,
+            treeOrders: [
+                SyncV2RemoteTreeOrder(
+                    treeOrderID: UUID(),
+                    parentFolderID: UUID(),
+                    children: [UUID(), UUID()],
+                    revision: 3,
+                    updatedAt: Date(timeIntervalSince1970: 30)
+                )
+            ]
+        )
+
+        guard case let .localSavedButNotQueued(reason) = await recordTreeOrder()
+        else {
+            return XCTFail("계약 순서를 받은 뒤에도 레거시 순서가 나갔다.")
+        }
+        XCTAssertTrue(
+            reason.contains("계약 순서"),
+            "막힌 이유가 사용자에게 설명되지 않는다: \(reason)"
+        )
+    }
+
+    // MARK: - 계약 tree_order
+
+    /// 서버가 말한 순서와 revision을 그대로 들고 있어야 한다. revision은 우리가
+    /// 만들어낼 수 없는 값이고, 그게 없으면 base 0으로 보내 거절당한다.
+    func testContractTreeOrderKeepsServerChildrenAndRevision() async throws {
+        let url = try databaseURL()
+        let context = QueueAPIContext()
+        let store = try await connectedStore(at: url, context: context)
+        let parent = UUID()
+        let children = [UUID(), UUID(), UUID()]
+
+        try await store.applyTreeOrderSnapshotBaselines(
+            localProjectID: context.localProjectID,
+            serverProjectID: context.serverProjectID,
+            treeOrders: [
+                SyncV2RemoteTreeOrder(
+                    treeOrderID: UUID(),
+                    parentFolderID: parent,
+                    children: children,
+                    revision: 3,
+                    updatedAt: Date(timeIntervalSince1970: 30)
+                )
+            ]
+        )
+
+        let stored = try await store.storedTreeOrder(
+            localProjectID: context.localProjectID,
+            parentFolderID: parent
+        )
+        XCTAssertEqual(stored?.children, children)
+        XCTAssertEqual(stored?.serverRevision, 3)
+        await store.close()
+
+        // 재시작해도 남아 있어야 한다. 순서는 쓰기 직전에 필요한 값이라
+        // 세션 안에서만 살아 있으면 다음 실행의 첫 쓰기가 막힌다.
+        let reopened = try await openStore(at: url)
+        let restored = try await reopened.storedTreeOrder(
+            localProjectID: context.localProjectID,
+            parentFolderID: parent
+        )
+        XCTAssertEqual(restored?.children, children)
+        XCTAssertEqual(restored?.serverRevision, 3)
+        await reopened.close()
+    }
+
+    /// 최상위는 parent가 NULL이다. SQLite는 UNIQUE에서 NULL을 서로 다르게 보므로
+    /// 두 번 받아도 한 줄이어야 한다.
+    func testContractTreeOrderRootStaysASingleRow() async throws {
+        let url = try databaseURL()
+        let context = QueueAPIContext()
+        let store = try await connectedStore(at: url, context: context)
+        let first = [UUID()]
+        let second = [UUID(), UUID()]
+        let treeOrderID = UUID()
+
+        for (children, revision) in [(first, Int64(1)), (second, Int64(2))] {
+            try await store.applyTreeOrderSnapshotBaselines(
+                localProjectID: context.localProjectID,
+                serverProjectID: context.serverProjectID,
+                treeOrders: [
+                    SyncV2RemoteTreeOrder(
+                        treeOrderID: treeOrderID,
+                        parentFolderID: nil,
+                        children: children,
+                        revision: revision,
+                        updatedAt: Date(timeIntervalSince1970: 30)
+                    )
+                ]
+            )
+        }
+
+        let stored = try await store.storedTreeOrder(
+            localProjectID: context.localProjectID,
+            parentFolderID: nil
+        )
+        XCTAssertEqual(stored?.children, second)
+        XCTAssertEqual(stored?.serverRevision, 2)
+        await store.close()
+    }
+
+    /// 계약 순서를 받은 적이 없으면 레거시 순서 쓰기를 막을 이유가 없다.
+    func testContractTreeOrderHistoryIsFalseUntilServerSpeaks() async throws {
+        let url = try databaseURL()
+        let context = QueueAPIContext()
+        let store = try await connectedStore(at: url, context: context)
+
+        var hasHistory = try await store.hasContractTreeOrderHistory(
+            localProjectID: context.localProjectID
+        )
+        XCTAssertFalse(hasHistory)
+
+        try await store.applyTreeOrderSnapshotBaselines(
+            localProjectID: context.localProjectID,
+            serverProjectID: context.serverProjectID,
+            treeOrders: [
+                SyncV2RemoteTreeOrder(
+                    treeOrderID: UUID(),
+                    parentFolderID: UUID(),
+                    children: [UUID()],
+                    revision: 1,
+                    updatedAt: Date(timeIntervalSince1970: 30)
+                )
+            ]
+        )
+
+        hasHistory = try await store.hasContractTreeOrderHistory(
+            localProjectID: context.localProjectID
+        )
+        XCTAssertTrue(hasHistory)
+        await store.close()
     }
 
     private func openStore(at url: URL) async throws -> SyncV2Store {

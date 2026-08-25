@@ -35,6 +35,7 @@ struct AppearanceSettingsView: View {
     let backgroundSyncCoordinator: SyncV2BackgroundSyncCoordinator?
     let editLeaseManager: (any EditLeaseManaging)?
     var handshakeService: SyncV2HandshakeService?
+    var snapshotPuller: (any SyncV2SnapshotPulling)?
     @Environment(\.dismiss) private var dismiss
 
     @AppStorage("writerpad.editor-font-family")
@@ -77,7 +78,8 @@ struct AppearanceSettingsView: View {
                             backgroundSyncCoordinator:
                                 backgroundSyncCoordinator,
                             editLeaseManager: editLeaseManager,
-                            handshakeService: handshakeService
+                            handshakeService: handshakeService,
+                            snapshotPuller: snapshotPuller
                         )
                     } label: {
                         Label(
