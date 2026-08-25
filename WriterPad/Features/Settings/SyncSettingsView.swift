@@ -72,6 +72,7 @@ final class SyncSettingsModel: ObservableObject {
         SyncV2BackgroundSyncCoordinator?
     private let editLeaseManager: (any EditLeaseManaging)?
     private let handshakeService: SyncV2HandshakeService?
+    private let contractStructureSender: SyncV2ContractStructureSender?
     private let snapshotPuller: (any SyncV2SnapshotPulling)?
     private let defaults: UserDefaults
 
@@ -84,6 +85,7 @@ final class SyncSettingsModel: ObservableObject {
             SyncV2BackgroundSyncCoordinator? = nil,
         editLeaseManager: (any EditLeaseManaging)? = nil,
         handshakeService: SyncV2HandshakeService? = nil,
+        contractStructureSender: SyncV2ContractStructureSender? = nil,
         snapshotPuller: (any SyncV2SnapshotPulling)? = nil,
         defaults: UserDefaults = .standard
     ) {
@@ -96,6 +98,7 @@ final class SyncSettingsModel: ObservableObject {
         self.backgroundSyncCoordinator = backgroundSyncCoordinator
         self.editLeaseManager = editLeaseManager
         self.handshakeService = handshakeService
+        self.contractStructureSender = contractStructureSender
         self.snapshotPuller = snapshotPuller
         self.defaults = defaults
         isSyncAllEnabled = GlobalSyncPreference.isEnabled(in: defaults)
@@ -110,6 +113,7 @@ final class SyncSettingsModel: ObservableObject {
             SyncV2BackgroundSyncCoordinator? = nil,
         editLeaseManager: (any EditLeaseManaging)? = nil,
         handshakeService: SyncV2HandshakeService? = nil,
+        contractStructureSender: SyncV2ContractStructureSender? = nil,
         snapshotPuller: (any SyncV2SnapshotPulling)? = nil,
         defaults: UserDefaults
     ) {
@@ -120,6 +124,7 @@ final class SyncSettingsModel: ObservableObject {
         self.backgroundSyncCoordinator = backgroundSyncCoordinator
         self.editLeaseManager = editLeaseManager
         self.handshakeService = handshakeService
+        self.contractStructureSender = contractStructureSender
         self.snapshotPuller = snapshotPuller
         self.defaults = defaults
         isSyncAllEnabled = GlobalSyncPreference.isEnabled(in: defaults)
@@ -169,6 +174,28 @@ final class SyncSettingsModel: ObservableObject {
     }
 
     @Published private(set) var gateReport: String?
+    @Published private(set) var contractSendReport: String?
+
+    func sendOneContractBatch(for row: SyncProjectRow) async {
+        guard let contractStructureSender else {
+            contractSendReport = "계약 구조 전송을 사용할 수 없습니다."
+            return
+        }
+        isWorking = true
+        defer { isWorking = false }
+        do {
+            let report = try await contractStructureSender.sendNext(
+                localProjectID: row.project.id
+            )
+            contractSendReport = """
+            batch_id: \(report.batchID.uuidString.lowercased())
+            status: \(report.status.rawValue)
+            operations: \(report.operationCount)
+            """
+        } catch {
+            contractSendReport = "실패: \(error)"
+        }
+    }
 
     func runPullOnly(for row: SyncProjectRow) async {
         guard let snapshotPuller else {
@@ -218,7 +245,7 @@ final class SyncSettingsModel: ObservableObject {
     }
 
     func runHandshake(for row: SyncProjectRow) async {
-        guard let handshakeService else {
+        guard handshakeService != nil else {
             handshakeReport = "핸드셰이크 전송이 없습니다. Supabase 설정을 확인하세요."
             return
         }
@@ -689,6 +716,7 @@ struct SyncSettingsView: View {
             SyncV2BackgroundSyncCoordinator? = nil,
         editLeaseManager: (any EditLeaseManaging)? = nil,
         handshakeService: SyncV2HandshakeService? = nil,
+        contractStructureSender: SyncV2ContractStructureSender? = nil,
         snapshotPuller: (any SyncV2SnapshotPulling)? = nil,
     ) {
         _model = StateObject(
@@ -700,6 +728,7 @@ struct SyncSettingsView: View {
                 backgroundSyncCoordinator: backgroundSyncCoordinator,
                 editLeaseManager: editLeaseManager,
                 handshakeService: handshakeService,
+                contractStructureSender: contractStructureSender,
                 snapshotPuller: snapshotPuller
             )
         )
@@ -840,6 +869,10 @@ struct SyncSettingsView: View {
                     Task { await model.runHandshake(for: row) }
                 }
                 .disabled(model.isWorking)
+                Button("\(row.project.name) — 대기 계약 배치 1건 전송") {
+                    Task { await model.sendOneContractBatch(for: row) }
+                }
+                .disabled(model.isWorking || !model.isGateOpen(for: row))
             }
             if let report = model.gateReport {
                 Text(report)
@@ -855,7 +888,12 @@ struct SyncSettingsView: View {
                     .font(.footnote.monospaced())
                     .textSelection(.enabled)
             }
-            Text("서버에 읽기만 합니다. 관문은 닫힌 채이고 원고도 구조도 보내지 않습니다.")
+            if let report = model.contractSendReport {
+                Text(report)
+                    .font(.footnote.monospaced())
+                    .textSelection(.enabled)
+            }
+            Text("핸드셰크와 관문은 자체로는 읽기만 합니다. ‘대기 계약 배치 1건 전송’만 서버 구조를 쓸 수 있습니다.")
                 .font(.footnote)
                 .foregroundStyle(.secondary)
         }

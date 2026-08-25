@@ -35,6 +35,7 @@ struct AppearanceSettingsView: View {
     let backgroundSyncCoordinator: SyncV2BackgroundSyncCoordinator?
     let editLeaseManager: (any EditLeaseManaging)?
     var handshakeService: SyncV2HandshakeService?
+    var contractStructureSender: SyncV2ContractStructureSender?
     var snapshotPuller: (any SyncV2SnapshotPulling)?
     @Environment(\.dismiss) private var dismiss
 
@@ -79,6 +80,7 @@ struct AppearanceSettingsView: View {
                                 backgroundSyncCoordinator,
                             editLeaseManager: editLeaseManager,
                             handshakeService: handshakeService,
+                            contractStructureSender: contractStructureSender,
                             snapshotPuller: snapshotPuller
                         )
                     } label: {

@@ -284,6 +284,13 @@ struct BinderPanel: View {
                 await model.prepareDisclosureState(for: row.node)
             }
             .padding(.leading, CGFloat(row.depth * 14))
+            .accessibilityActions {
+                if row.node.isFolder {
+                    Button("새 폴더") {
+                        beginPrompt(.create(kind: .folder, parent: row.node))
+                    }
+                }
+            }
     }
 
     private func binderEditRow(_ row: BinderVisibleRow) -> some View {

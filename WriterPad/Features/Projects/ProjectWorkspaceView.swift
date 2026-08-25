@@ -42,6 +42,7 @@ struct ProjectWorkspaceView: View {
         SyncV2BackgroundSyncCoordinator?
     private let editLeaseManager: EditLeaseManager?
     private let handshakeService: SyncV2HandshakeService?
+    private let contractStructureSender: SyncV2ContractStructureSender?
     private let snapshotPuller: (any SyncV2SnapshotPulling)?
     @Binding private var isDarkMode: Bool
     @Binding private var smartPairsEnabled: Bool
@@ -71,6 +72,7 @@ struct ProjectWorkspaceView: View {
             SyncV2BackgroundSyncCoordinator? = nil,
         editLeaseManager: EditLeaseManager? = nil,
         handshakeService: SyncV2HandshakeService? = nil,
+        contractStructureSender: SyncV2ContractStructureSender? = nil,
         snapshotPuller: (any SyncV2SnapshotPulling)? = nil,
         isDarkMode: Binding<Bool>,
         smartPairsEnabled: Binding<Bool>
@@ -96,6 +98,7 @@ struct ProjectWorkspaceView: View {
         self.backgroundSyncCoordinator = backgroundSyncCoordinator
         self.editLeaseManager = editLeaseManager
         self.handshakeService = handshakeService
+        self.contractStructureSender = contractStructureSender
         self.snapshotPuller = snapshotPuller
         _isDarkMode = isDarkMode
         _smartPairsEnabled = smartPairsEnabled
@@ -169,6 +172,7 @@ struct ProjectWorkspaceView: View {
                     backgroundSyncCoordinator,
                 editLeaseManager: editLeaseManager,
                 handshakeService: handshakeService,
+                contractStructureSender: contractStructureSender,
                 snapshotPuller: snapshotPuller
             )
         }

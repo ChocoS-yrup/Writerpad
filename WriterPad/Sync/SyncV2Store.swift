@@ -710,8 +710,8 @@ actor SyncV2Store:
     SyncV2DocumentRevisionProviding,
     SyncV2FolderMigrationMarking,
     SyncV2SnapshotStateStoring {
-    static let currentSchemaVersion = 6
-    static let migrationName = "SyncV2StoreSchemaV6"
+    static let currentSchemaVersion = 7
+    static let migrationName = "SyncV2StoreSchemaV7"
     static let maximumContentByteCount = 10 * 1_024 * 1_024
     static let contentTooLargeErrorCode = "CONTENT_TOO_LARGE"
 
@@ -2565,6 +2565,24 @@ actor SyncV2Store:
                     type: .enqueued,
                     errorCode: nil,
                     timestamp: timestamp
+                )
+                // atomic_structure_commit은 같은 batch_id 재시도를 멱등하게
+                // 돌려준다. 응답을 받기 전 종료된 경우에도 불변 요청을
+                // 준비 상태로 돌려 다음 1회 전송이 같은 배치를 재사용하게 한다.
+                try execute(
+                    """
+                    UPDATE sync_contract_operations
+                    SET status = 'pending', updated_at = strftime(
+                        '%Y-%m-%dT%H:%M:%fZ', 'now'
+                    )
+                    WHERE status = 'inflight';
+
+                    UPDATE sync_contract_batches
+                    SET status = 'ready', updated_at = strftime(
+                        '%Y-%m-%dT%H:%M:%fZ', 'now'
+                    )
+                    WHERE status = 'processing';
+                    """
                 )
                 try execute(
                     """
@@ -7042,6 +7060,8 @@ actor SyncV2Store:
             "sync_operations",
             "sync_conflicts",
             "sync_tree_orders",
+            "sync_contract_batches",
+            "sync_contract_operations",
         ]
         for table in expectedTables {
             let count = try withStatement(
@@ -7141,6 +7161,18 @@ actor SyncV2Store:
             """
             SELECT conflict_id, operation_id, document_id
             FROM sync_conflicts;
+            """
+        )
+        try verifyUUIDColumns(
+            """
+            SELECT batch_id, local_project_id, project_id
+            FROM sync_contract_batches;
+            """
+        )
+        try verifyUUIDColumns(
+            """
+            SELECT operation_id, batch_id, entity_id
+            FROM sync_contract_operations;
             """
         )
     }
@@ -8115,6 +8147,509 @@ actor SyncV2Store:
             .joined()
     }
 
+    // MARK: - Contract structure queue
+
+    /// 첫 canary에서 필요한 최소 단위다. 새 폴더 하나와 그 부모의
+    /// 전체 자식 순서를 같은 불변 배치로 기록한다. 이보다 넓은 구조
+    /// 편집은 추측하지 않고 거부한다.
+    func enqueueContractStructure(
+        _ batch: LocalMutationBatch,
+        binding: ProjectSyncBinding,
+        handshake: SyncV2ValidatedHandshake,
+        writerDeviceID: UUID
+    ) async throws -> [UUID] {
+        let batchValue = batch.batchID.uuidString.lowercased()
+        let existing = try withStatement(
+            """
+            SELECT local_project_id FROM sync_contract_batches
+            WHERE batch_id = ? LIMIT 1;
+            """
+        ) { statement -> String? in
+            try bind(batchValue, at: 1, to: statement)
+            let status = sqlite3_step(statement)
+            if status == SQLITE_DONE { return nil }
+            guard status == SQLITE_ROW else { throw sqliteError() }
+            return columnText(statement, at: 0)
+        }
+        if let existing {
+            guard existing == batch.projectID.rawValue.uuidString.lowercased()
+            else { throw SyncV2EnqueueError.batchIDReused }
+            return try withStatement(
+                """
+                SELECT operation_id FROM sync_contract_operations
+                WHERE batch_id = ? ORDER BY sequence;
+                """
+            ) { statement in
+                try bind(batchValue, at: 1, to: statement)
+                var identifiers: [UUID] = []
+                while sqlite3_step(statement) == SQLITE_ROW {
+                    guard let value = columnText(statement, at: 0),
+                          let identifier = UUID(uuidString: value)
+                    else { throw SyncV2EnqueueError.integrityFailure }
+                    identifiers.append(identifier)
+                }
+                return identifiers
+            }
+        }
+
+        guard batch.kind == .structureChange,
+              let serverProjectID = binding.serverProjectID,
+              binding.localProjectID == batch.projectID
+        else { throw SyncV2ContractStructureError.unsupportedLocalBatch }
+
+        var folderSource: (
+            operationID: UUID,
+            folderID: UUID,
+            parentFolderID: UUID?,
+            name: String
+        )?
+        var treeOperationID: UUID?
+        for mutation in batch.mutations {
+            switch mutation {
+            case let .folderSnapshot(
+                operationID, folderID, parentFolderID, name, isDeleted
+            ) where !isDeleted && folderSource == nil:
+                folderSource = (
+                    operationID,
+                    folderID.rawValue,
+                    parentFolderID?.rawValue,
+                    name
+                )
+            case let .treeOrder(operationID, _, _) where treeOperationID == nil:
+                treeOperationID = operationID
+            default:
+                throw SyncV2ContractStructureError.unsupportedLocalBatch
+            }
+        }
+        guard let folderSource, let treeOperationID,
+              batch.mutations.count == 2,
+              try folderState(folderID: folderSource.folderID) == nil
+        else { throw SyncV2ContractStructureError.unsupportedLocalBatch }
+
+        if let parentFolderID = folderSource.parentFolderID {
+            let parentExists = try withStatement(
+                """
+                SELECT EXISTS(
+                    SELECT 1 FROM sync_folders
+                    WHERE folder_id = ? AND local_project_id = ?
+                      AND server_revision > 0 AND is_deleted = 0
+                );
+                """
+            ) { statement in
+                try bind(
+                    parentFolderID.uuidString.lowercased(),
+                    at: 1,
+                    to: statement
+                )
+                try bind(
+                    batch.projectID.rawValue.uuidString.lowercased(),
+                    at: 2,
+                    to: statement
+                )
+                guard sqlite3_step(statement) == SQLITE_ROW else {
+                    throw sqliteError()
+                }
+                return sqlite3_column_int(statement, 0) == 1
+            }
+            guard parentExists else {
+                throw SyncV2ContractStructureError.unsupportedLocalBatch
+            }
+        }
+        guard let order = try await storedTreeOrder(
+            localProjectID: batch.projectID,
+            parentFolderID: folderSource.parentFolderID
+        ), order.serverRevision > 0,
+              !order.children.contains(folderSource.folderID)
+        else { throw SyncV2ContractStructureError.missingTreeOrder }
+        let orderedChildren = order.children + [folderSource.folderID]
+
+        let folderPayload = SyncV2JSON.object([
+            "parent_folder_id": folderSource.parentFolderID.map {
+                .string(SyncV2Contract.canonicalUUID($0))
+            } ?? .null,
+            "name": .string(folderSource.name),
+        ])
+        let orderPayload = SyncV2JSON.object([
+            "children": .array(orderedChildren.map {
+                .string(SyncV2Contract.canonicalUUID($0))
+            }),
+        ])
+        let intents = [
+            SyncV2StructureIntent(
+                entityKind: .folder,
+                entityID: folderSource.folderID,
+                intentKind: .create,
+                payload: folderPayload,
+                operationID: folderSource.operationID
+            ),
+            SyncV2StructureIntent(
+                entityKind: .treeOrder,
+                entityID: order.treeOrderID,
+                intentKind: .reorder,
+                baseRevision: Int(order.serverRevision),
+                payload: orderPayload,
+                operationID: treeOperationID
+            ),
+        ]
+        let request = try SyncV2Contract.buildAtomicStructureRequest(
+            projectID: serverProjectID,
+            projectSyncMode: handshake.projectSyncMode,
+            migrationEpoch: handshake.migrationEpoch,
+            writerDeviceID: writerDeviceID,
+            orderedIntents: intents,
+            batchID: batch.batchID
+        )
+        let requestJSON = try request.json.canonicalJSON()
+        let timestamp = Self.timestamp()
+        let localValue = batch.projectID.rawValue.uuidString.lowercased()
+        let projectValue = serverProjectID.uuidString.lowercased()
+        let childrenJSON = try Self.encodeTreeOrderChildren(orderedChildren)
+
+        try transaction {
+            try withStatement(
+                """
+                INSERT INTO sync_contract_batches(
+                    batch_id, local_project_id, project_id, request_json,
+                    batch_payload_sha256, status, attempts,
+                    created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, 'ready', 0, ?, ?);
+                """
+            ) { statement in
+                try bind(batchValue, at: 1, to: statement)
+                try bind(localValue, at: 2, to: statement)
+                try bind(projectValue, at: 3, to: statement)
+                try bind(requestJSON, at: 4, to: statement)
+                try bind(request.batchPayloadSHA256, at: 5, to: statement)
+                try bind(timestamp, at: 6, to: statement)
+                try bind(timestamp, at: 7, to: statement)
+                try stepDone(statement)
+            }
+            for intentJSON in request.orderedIntents {
+                guard let fields = intentJSON.objectValue,
+                      let operationID = fields["operation_id"]?.stringValue,
+                      let sequence = fields["sequence"]?.intValue,
+                      let entityKind = fields["entity_kind"]?.stringValue,
+                      let entityID = fields["entity_id"]?.stringValue,
+                      let intentKind = fields["intent_kind"]?.stringValue,
+                      let baseRevision = fields["base_revision"]?.intValue,
+                      let payload = fields["payload"],
+                      let payloadSHA256 = fields["payload_sha256"]?.stringValue
+                else { throw SyncV2ContractStructureError.invalidStoredRequest }
+                try withStatement(
+                    """
+                    INSERT INTO sync_contract_operations(
+                        operation_id, batch_id, sequence, entity_kind,
+                        entity_id, intent_kind, base_revision, payload_json,
+                        payload_sha256, status, created_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?);
+                    """
+                ) { statement in
+                    try bind(operationID, at: 1, to: statement)
+                    try bind(batchValue, at: 2, to: statement)
+                    try bind(sequence, at: 3, to: statement)
+                    try bind(entityKind, at: 4, to: statement)
+                    try bind(entityID, at: 5, to: statement)
+                    try bind(intentKind, at: 6, to: statement)
+                    try bind(baseRevision, at: 7, to: statement)
+                    try bind(try payload.canonicalJSON(), at: 8, to: statement)
+                    try bind(payloadSHA256, at: 9, to: statement)
+                    try bind(timestamp, at: 10, to: statement)
+                    try bind(timestamp, at: 11, to: statement)
+                    try stepDone(statement)
+                }
+            }
+            try withStatement(
+                """
+                INSERT INTO sync_folders(
+                    folder_id, local_project_id, project_id,
+                    parent_folder_id, name, server_revision, is_deleted,
+                    sync_state, next_folder_sequence, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, 0, 0, 'pending', 1, ?, ?);
+                """
+            ) { statement in
+                try bind(
+                    folderSource.folderID.uuidString.lowercased(),
+                    at: 1,
+                    to: statement
+                )
+                try bind(localValue, at: 2, to: statement)
+                try bind(projectValue, at: 3, to: statement)
+                try bind(
+                    folderSource.parentFolderID?.uuidString.lowercased(),
+                    at: 4,
+                    to: statement
+                )
+                try bind(folderSource.name, at: 5, to: statement)
+                try bind(timestamp, at: 6, to: statement)
+                try bind(timestamp, at: 7, to: statement)
+                try stepDone(statement)
+            }
+            try withStatement(
+                """
+                UPDATE sync_tree_orders
+                SET children_json = ?, sync_state = 'pending',
+                    last_error_code = NULL, updated_at = ?
+                WHERE tree_order_id = ? AND local_project_id = ?;
+                """
+            ) { statement in
+                try bind(childrenJSON, at: 1, to: statement)
+                try bind(timestamp, at: 2, to: statement)
+                try bind(
+                    order.treeOrderID.uuidString.lowercased(),
+                    at: 3,
+                    to: statement
+                )
+                try bind(localValue, at: 4, to: statement)
+                try stepDone(statement)
+            }
+        }
+        return [folderSource.operationID, treeOperationID]
+    }
+
+    func claimNextContractStructure(
+        localProjectID: ProjectID
+    ) async throws -> SyncV2PendingContractBatch {
+        let localValue = localProjectID.rawValue.uuidString.lowercased()
+        let row = try transaction {
+            let row = try withStatement(
+                """
+                SELECT batch_id, project_id, request_json
+                FROM sync_contract_batches
+                WHERE local_project_id = ? AND status = 'ready'
+                ORDER BY created_at, batch_id LIMIT 1;
+                """
+            ) { statement -> (String, String, String)? in
+                try bind(localValue, at: 1, to: statement)
+                let status = sqlite3_step(statement)
+                if status == SQLITE_DONE { return nil }
+                guard status == SQLITE_ROW,
+                      let batchID = columnText(statement, at: 0),
+                      let projectID = columnText(statement, at: 1),
+                      let requestJSON = columnText(statement, at: 2)
+                else { throw sqliteError() }
+                return (batchID, projectID, requestJSON)
+            }
+            guard let row else {
+                throw SyncV2ContractStructureError.noReadyBatch
+            }
+            let timestamp = Self.timestamp()
+            try withStatement(
+                """
+                UPDATE sync_contract_batches
+                SET status = 'processing', attempts = attempts + 1,
+                    updated_at = ?
+                WHERE batch_id = ? AND status = 'ready';
+                """
+            ) { statement in
+                try bind(timestamp, at: 1, to: statement)
+                try bind(row.0, at: 2, to: statement)
+                try stepDone(statement)
+            }
+            try withStatement(
+                """
+                UPDATE sync_contract_operations
+                SET status = 'inflight', updated_at = ?
+                WHERE batch_id = ? AND status = 'pending';
+                """
+            ) { statement in
+                try bind(timestamp, at: 1, to: statement)
+                try bind(row.0, at: 2, to: statement)
+                try stepDone(statement)
+            }
+            return row
+        }
+        guard let serverProjectID = UUID(uuidString: row.1),
+              let data = row.2.data(using: .utf8),
+              let json = try? JSONDecoder().decode(SyncV2JSON.self, from: data)
+        else { throw SyncV2ContractStructureError.invalidStoredRequest }
+        return SyncV2PendingContractBatch(
+            localProjectID: localProjectID,
+            serverProjectID: serverProjectID,
+            request: try SyncV2ContractRequest(storedJSON: json)
+        )
+    }
+
+    func completeContractStructure(
+        _ pending: SyncV2PendingContractBatch,
+        response: SyncV2JSON
+    ) async throws {
+        guard let results = response.objectValue?["results"]?.arrayValue
+        else { throw SyncV2ContractStructureError.invalidStoredRequest }
+        let timestamp = Self.timestamp()
+        let responseJSON = try response.canonicalJSON()
+        try transaction {
+            for resultJSON in results {
+                guard let result = resultJSON.objectValue,
+                      let operationID = result["operation_id"]?.stringValue,
+                      let entityID = result["entity_id"]?.stringValue,
+                      let revision = result["result_revision"]?.intValue
+                else { throw SyncV2ContractStructureError.invalidStoredRequest }
+                let entityKind = try withStatement(
+                    """
+                    SELECT entity_kind FROM sync_contract_operations
+                    WHERE operation_id = ? AND batch_id = ? LIMIT 1;
+                    """
+                ) { statement -> String in
+                    try bind(operationID, at: 1, to: statement)
+                    try bind(
+                        pending.request.batchID.uuidString.lowercased(),
+                        at: 2,
+                        to: statement
+                    )
+                    guard sqlite3_step(statement) == SQLITE_ROW,
+                          let value = columnText(statement, at: 0)
+                    else { throw SyncV2ContractStructureError.invalidStoredRequest }
+                    return value
+                }
+                try withStatement(
+                    """
+                    UPDATE sync_contract_operations
+                    SET status = 'completed', result_revision = ?,
+                        last_error_code = NULL, updated_at = ?
+                    WHERE operation_id = ?;
+                    """
+                ) { statement in
+                    try bind(revision, at: 1, to: statement)
+                    try bind(timestamp, at: 2, to: statement)
+                    try bind(operationID, at: 3, to: statement)
+                    try stepDone(statement)
+                }
+                let table = entityKind == "folder"
+                    ? "sync_folders" : "sync_tree_orders"
+                let idColumn = entityKind == "folder"
+                    ? "folder_id" : "tree_order_id"
+                try withStatement(
+                    """
+                    UPDATE \(table)
+                    SET server_revision = ?, sync_state = 'synced',
+                        last_error_code = NULL, updated_at = ?
+                    WHERE \(idColumn) = ?;
+                    """
+                ) { statement in
+                    try bind(revision, at: 1, to: statement)
+                    try bind(timestamp, at: 2, to: statement)
+                    try bind(entityID, at: 3, to: statement)
+                    try stepDone(statement)
+                }
+            }
+            try withStatement(
+                """
+                UPDATE sync_contract_batches
+                SET status = 'completed', response_json = ?,
+                    last_error_code = NULL, last_error_detail = NULL,
+                    updated_at = ?
+                WHERE batch_id = ?;
+                """
+            ) { statement in
+                try bind(responseJSON, at: 1, to: statement)
+                try bind(timestamp, at: 2, to: statement)
+                try bind(
+                    pending.request.batchID.uuidString.lowercased(),
+                    at: 3,
+                    to: statement
+                )
+                try stepDone(statement)
+            }
+        }
+    }
+
+    func failContractStructure(
+        _ pending: SyncV2PendingContractBatch,
+        error: Error,
+        response: SyncV2JSON? = nil
+    ) async {
+        let contractError = error as? SyncV2ContractError
+        let code = contractError?.code ?? String(describing: error)
+        let isRetryable = error as? SyncV2ContractStructureError
+            == .transportRejected
+        let batchStatus = isRetryable ? "ready" : (
+            code == "REVISION_CONFLICT" ? "conflict" : "blocked"
+        )
+        let operationStatus = isRetryable ? "pending" : (
+            code == "REVISION_CONFLICT" ? "conflict" : "blocked"
+        )
+        let timestamp = Self.timestamp()
+        try? transaction {
+            try withStatement(
+                """
+                UPDATE sync_contract_batches
+                SET status = ?, response_json = ?, last_error_code = ?,
+                    last_error_detail = ?, updated_at = ?
+                WHERE batch_id = ?;
+                """
+            ) { statement in
+                try bind(batchStatus, at: 1, to: statement)
+                try bind(try response?.canonicalJSON(), at: 2, to: statement)
+                try bind(code, at: 3, to: statement)
+                try bind(contractError?.detail, at: 4, to: statement)
+                try bind(timestamp, at: 5, to: statement)
+                try bind(
+                    pending.request.batchID.uuidString.lowercased(),
+                    at: 6,
+                    to: statement
+                )
+                try stepDone(statement)
+            }
+            try withStatement(
+                """
+                UPDATE sync_contract_operations
+                SET status = ?, last_error_code = ?, updated_at = ?
+                WHERE batch_id = ? AND status = 'inflight';
+                """
+            ) { statement in
+                try bind(operationStatus, at: 1, to: statement)
+                try bind(code, at: 2, to: statement)
+                try bind(timestamp, at: 3, to: statement)
+                try bind(
+                    pending.request.batchID.uuidString.lowercased(),
+                    at: 4,
+                    to: statement
+                )
+                try stepDone(statement)
+            }
+            try withStatement(
+                """
+                UPDATE sync_folders
+                SET sync_state = ?, last_error_code = ?, updated_at = ?
+                WHERE folder_id IN (
+                    SELECT entity_id FROM sync_contract_operations
+                    WHERE batch_id = ? AND entity_kind = 'folder'
+                );
+                """
+            ) { statement in
+                try bind(operationStatus, at: 1, to: statement)
+                try bind(code, at: 2, to: statement)
+                try bind(timestamp, at: 3, to: statement)
+                try bind(
+                    pending.request.batchID.uuidString.lowercased(),
+                    at: 4,
+                    to: statement
+                )
+                try stepDone(statement)
+            }
+            try withStatement(
+                """
+                UPDATE sync_tree_orders
+                SET sync_state = ?, last_error_code = ?, updated_at = ?
+                WHERE tree_order_id IN (
+                    SELECT entity_id FROM sync_contract_operations
+                    WHERE batch_id = ? AND entity_kind = 'tree_order'
+                );
+                """
+            ) { statement in
+                try bind(operationStatus, at: 1, to: statement)
+                try bind(code, at: 2, to: statement)
+                try bind(timestamp, at: 3, to: statement)
+                try bind(
+                    pending.request.batchID.uuidString.lowercased(),
+                    at: 4,
+                    to: statement
+                )
+                try stepDone(statement)
+            }
+        }
+    }
+
     private static func diagnostic(
         _ reason: SyncV2StoreDiagnosticReason,
         sqliteCode: Int32? = nil,
@@ -8551,6 +9086,61 @@ actor LazySyncV2ProjectBindingStore:
         return try await store.storedTreeOrder(
             localProjectID: localProjectID,
             parentFolderID: parentFolderID
+        )
+    }
+
+    func enqueueContractStructure(
+        _ batch: LocalMutationBatch,
+        binding: ProjectSyncBinding,
+        handshake: SyncV2ValidatedHandshake
+    ) async throws -> [UUID] {
+        guard let store = await resolvedStore(),
+              let deviceIdentityProvider
+        else { throw SyncV2ContractStructureError.unavailable }
+        let writerDeviceID = try await deviceIdentityProvider
+            .currentIdentifier().uuid
+        return try await store.enqueueContractStructure(
+            batch,
+            binding: binding,
+            handshake: handshake,
+            writerDeviceID: writerDeviceID
+        )
+    }
+
+    func claimNextContractStructure(
+        localProjectID: ProjectID
+    ) async throws -> SyncV2PendingContractBatch {
+        guard let store = await resolvedStore() else {
+            throw SyncV2ContractStructureError.unavailable
+        }
+        return try await store.claimNextContractStructure(
+            localProjectID: localProjectID
+        )
+    }
+
+    func completeContractStructure(
+        _ pending: SyncV2PendingContractBatch,
+        response: SyncV2JSON
+    ) async throws {
+        guard let store = await resolvedStore() else {
+            throw SyncV2ContractStructureError.unavailable
+        }
+        try await store.completeContractStructure(
+            pending,
+            response: response
+        )
+    }
+
+    func failContractStructure(
+        _ pending: SyncV2PendingContractBatch,
+        error: Error,
+        response: SyncV2JSON? = nil
+    ) async {
+        guard let store = await resolvedStore() else { return }
+        await store.failContractStructure(
+            pending,
+            error: error,
+            response: response
         )
     }
 

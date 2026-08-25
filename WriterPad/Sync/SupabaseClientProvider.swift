@@ -8,6 +8,7 @@ protocol SupabaseClientProviding: AnyObject {
     func makeProjectBindingTransport() -> (any EnsureProjectTransporting)?
     func makeSyncV2Client() -> SyncV2Client?
     func makeHandshakeTransport() -> (any SyncV2HandshakeTransporting)?
+    func makeAtomicStructureTransport() -> (any SyncV2AtomicStructureTransporting)?
     func makeSnapshotClient() -> SyncV2SnapshotClient?
     func makeRealtimeTrigger() -> (any SyncV2RealtimeTriggering)?
     func makeEditLeaseClient() -> EditLeaseClient?
@@ -15,6 +16,7 @@ protocol SupabaseClientProviding: AnyObject {
 
 extension SupabaseClientProviding {
     func makeHandshakeTransport() -> (any SyncV2HandshakeTransporting)? { nil }
+    func makeAtomicStructureTransport() -> (any SyncV2AtomicStructureTransporting)? { nil }
     func makeSnapshotClient() -> SyncV2SnapshotClient? { nil }
     func makeRealtimeTrigger() -> (any SyncV2RealtimeTriggering)? { nil }
 }
@@ -76,6 +78,11 @@ final class SupabaseClientProvider: SupabaseClientProviding {
     /// 것은 이것을 쓰는 쪽의 몫이다.
     func makeHandshakeTransport() -> (any SyncV2HandshakeTransporting)? {
         client.map { LiveSyncV2HandshakeTransport(client: $0) }
+    }
+
+    func makeAtomicStructureTransport() ->
+        (any SyncV2AtomicStructureTransporting)? {
+        client.map { LiveSyncV2AtomicStructureTransport(client: $0) }
     }
 
     func makeSnapshotClient() -> SyncV2SnapshotClient? {

@@ -4573,6 +4573,8 @@ final class SyncV2StoreTests: XCTestCase {
         let downgrade = try RawSQLite(url: url)
         try downgrade.execute(
             """
+            DROP TABLE sync_contract_operations;
+            DROP TABLE sync_contract_batches;
             DROP TABLE sync_folders;
             DROP TABLE sync_operation_events;
             DROP TABLE sync_tree_orders;
@@ -6579,6 +6581,203 @@ final class SyncV2StoreTests: XCTestCase {
         XCTAssertTrue(
             reason.contains("계약 순서"),
             "막힌 이유가 사용자에게 설명되지 않는다: \(reason)"
+        )
+    }
+
+    func testContractFolderCreatePersistsImmutableAtomicBatchBeforeSend()
+        async throws {
+        let url = try databaseURL()
+        let deviceID = UUID()
+        let recorder = LazySyncV2ProjectBindingStore(
+            databaseURL: url,
+            deviceIdentityProvider: DeviceIdentityService(
+                store: InMemoryDeviceIdentityStore(),
+                generateUUID: { deviceID }
+            )
+        )
+        let localProjectID = ProjectID(rawValue: UUID())
+        let serverProjectID = UUID()
+        let ownerID = UUID()
+        let binding = ProjectSyncBinding.connected(
+            localProjectID: localProjectID,
+            serverProjectID: serverProjectID,
+            kind: .existingServerProject,
+            projectName: "contract canary",
+            ownerSubject: ownerID
+        )
+        try await recorder.save(binding)
+        let parentID = UUID()
+        let existingChild = UUID()
+        let treeOrderID = UUID()
+        try await recorder.applyFolderSnapshotBaselines(
+            localProjectID: localProjectID,
+            serverProjectID: serverProjectID,
+            folders: [
+                SyncV2RemoteFolder(
+                    folderID: parentID,
+                    parentFolderID: nil,
+                    name: "메모장",
+                    revision: 1,
+                    isDeleted: false,
+                    updatedAt: Date(timeIntervalSince1970: 10)
+                )
+            ],
+            excluding: []
+        )
+        try await recorder.applyTreeOrderSnapshotBaselines(
+            localProjectID: localProjectID,
+            serverProjectID: serverProjectID,
+            treeOrders: [
+                SyncV2RemoteTreeOrder(
+                    treeOrderID: treeOrderID,
+                    parentFolderID: parentID,
+                    children: [existingChild],
+                    revision: 3,
+                    updatedAt: Date(timeIntervalSince1970: 20)
+                )
+            ]
+        )
+        let batchID = UUID()
+        let folderOperationID = UUID()
+        let orderOperationID = UUID()
+        let folderID = DocumentID(rawValue: UUID())
+        let batch = LocalMutationBatch(
+            batchID: batchID,
+            projectID: localProjectID,
+            localTransactionID: UUID(),
+            kind: .structureChange,
+            mutations: [
+                .folderSnapshot(
+                    operationID: folderOperationID,
+                    folderID: folderID,
+                    parentFolderID: DocumentID(rawValue: parentID),
+                    name: "계약경로검증4",
+                    isDeleted: false
+                ),
+                .treeOrder(
+                    operationID: orderOperationID,
+                    content: "{\"tree_order\":{},\"version\":1}",
+                    generation: 1
+                ),
+            ]
+        )
+        let handshake = SyncV2ValidatedHandshake(
+            serverProjectID: serverProjectID,
+            projectSyncMode: .legacy,
+            migrationEpoch: 0,
+            contractVersion: SyncV2Contract.version,
+            contractSHA256: SyncV2Contract.canonicalSHA256,
+            serverProtocolVersion: SyncV2Contract.syncProtocolVersion,
+            supportedProtocolVersions: [SyncV2Contract.syncProtocolVersion],
+            serverCapabilities: Array(
+                SyncV2Contract.requiredServerCapabilities
+            ).sorted()
+        )
+
+        let operationIDs = try await recorder.enqueueContractStructure(
+            batch,
+            binding: binding,
+            handshake: handshake
+        )
+
+        XCTAssertEqual(operationIDs, [folderOperationID, orderOperationID])
+        let raw = try RawSQLite(url: url)
+        XCTAssertEqual(
+            try raw.scalarText(
+                "SELECT status FROM sync_contract_batches LIMIT 1;"
+            ),
+            "ready"
+        )
+        XCTAssertEqual(
+            try raw.scalarInt(
+                "SELECT COUNT(*) FROM sync_contract_operations;"
+            ),
+            2
+        )
+        XCTAssertEqual(
+            try raw.scalarInt(
+                """
+                SELECT base_revision FROM sync_contract_operations
+                WHERE entity_kind = 'tree_order';
+                """
+            ),
+            3
+        )
+        let request = try raw.scalarText(
+            "SELECT request_json FROM sync_contract_batches LIMIT 1;"
+        )
+        XCTAssertTrue(request.contains("atomic_structure_commit_request"))
+        XCTAssertTrue(request.contains(folderID.rawValue.uuidString.lowercased()))
+        XCTAssertTrue(request.contains(existingChild.uuidString.lowercased()))
+        XCTAssertTrue(request.contains("\"status\"") == false)
+
+        let firstClaim = try await recorder.claimNextContractStructure(
+            localProjectID: localProjectID
+        )
+        XCTAssertEqual(firstClaim.request.batchID, batchID)
+        try await recorder.recoverInterruptedWork()
+        let pending = try await recorder.claimNextContractStructure(
+            localProjectID: localProjectID
+        )
+        XCTAssertEqual(pending.request.batchID, batchID)
+        XCTAssertEqual(pending.request.json, firstClaim.request.json)
+        let resultRevisions = [1, 4]
+        let results = zip(
+            pending.request.orderedIntents,
+            resultRevisions
+        ).map { intent, revision -> SyncV2JSON in
+            let fields = intent.objectValue!
+            return .object([
+                "sequence": fields["sequence"]!,
+                "operation_id": fields["operation_id"]!,
+                "entity_id": fields["entity_id"]!,
+                "result_revision": .int(revision),
+            ])
+        }
+        let response = SyncV2JSON.object([
+            "kind": .string("atomic_structure_commit_success"),
+            "batch_id": .string(batchID.uuidString.lowercased()),
+            "batch_payload_sha256": .string(
+                pending.request.batchPayloadSHA256
+            ),
+            "status": .string("committed"),
+            "applied": .bool(true),
+            "results": .array(results),
+        ])
+        XCTAssertEqual(
+            try SyncV2Contract.validateAtomicStructureResponse(
+                request: pending.request,
+                response: response
+            ),
+            .committed
+        )
+        try await recorder.completeContractStructure(
+            pending,
+            response: response
+        )
+        XCTAssertEqual(
+            try raw.scalarText(
+                "SELECT status FROM sync_contract_batches LIMIT 1;"
+            ),
+            "completed"
+        )
+        XCTAssertEqual(
+            try raw.scalarInt(
+                """
+                SELECT server_revision FROM sync_tree_orders
+                WHERE tree_order_id = '\(treeOrderID.uuidString.lowercased())';
+                """
+            ),
+            4
+        )
+        XCTAssertEqual(
+            try raw.scalarInt(
+                """
+                SELECT server_revision FROM sync_folders
+                WHERE folder_id = '\(folderID.rawValue.uuidString.lowercased())';
+                """
+            ),
+            1
         )
     }
 

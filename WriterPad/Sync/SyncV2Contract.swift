@@ -117,6 +117,48 @@ indirect enum SyncV2JSON: Equatable, Sendable {
     case object([String: SyncV2JSON])
 }
 
+extension SyncV2JSON: Codable {
+    init(from decoder: Decoder) throws {
+        let container = try decoder.singleValueContainer()
+        if container.decodeNil() {
+            self = .null
+        } else if let value = try? container.decode(Bool.self) {
+            self = .bool(value)
+        } else if let value = try? container.decode(Int.self) {
+            self = .int(value)
+        } else if let value = try? container.decode(String.self) {
+            self = .string(value)
+        } else if let value = try? container.decode([SyncV2JSON].self) {
+            self = .array(value)
+        } else if let value = try? container.decode([String: SyncV2JSON].self) {
+            self = .object(value)
+        } else {
+            throw DecodingError.dataCorruptedError(
+                in: container,
+                debugDescription: "contract JSON permits integers only"
+            )
+        }
+    }
+
+    func encode(to encoder: Encoder) throws {
+        var container = encoder.singleValueContainer()
+        switch self {
+        case .null:
+            try container.encodeNil()
+        case let .bool(value):
+            try container.encode(value)
+        case let .int(value):
+            try container.encode(value)
+        case let .string(value):
+            try container.encode(value)
+        case let .array(value):
+            try container.encode(value)
+        case let .object(value):
+            try container.encode(value)
+        }
+    }
+}
+
 extension SyncV2JSON {
     /// 계약이 허용하는 키인지 본다. `^[A-Za-z_][A-Za-z0-9_]*$`와 같은 판정을
     /// 정규식 없이 한다. Swift 5 언어 모드에서는 슬래시 정규식 리터럴이 기본

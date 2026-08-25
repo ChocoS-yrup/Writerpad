@@ -33,6 +33,7 @@ final class AppEnvironment: ObservableObject {
     /// 계약 핸드셰이크는 답을 메모리에만 들고 있으므로 하나만 만들어 든다.
     /// 부를 때마다 새로 만들면 들고 있던 답이 매번 사라진다.
     let handshakeService: SyncV2HandshakeService?
+    let contractStructureSender: SyncV2ContractStructureSender?
 
     @Published private(set) var storageStatus: LocalStorageStatus = .ready
 
@@ -63,6 +64,8 @@ final class AppEnvironment: ObservableObject {
         realtimeTrigger: (any SyncV2RealtimeTriggering)? = nil,
         backgroundSyncCoordinator: SyncV2BackgroundSyncCoordinator? = nil,
         editLeaseManager: EditLeaseManager? = nil,
+        handshakeService: SyncV2HandshakeService? = nil,
+        contractStructureSender: SyncV2ContractStructureSender? = nil,
         exporter: (any Exporting)? = nil
     ) {
         self.modelContainer = modelContainer
@@ -95,8 +98,10 @@ final class AppEnvironment: ObservableObject {
         self.realtimeTrigger = realtimeTrigger
         self.backgroundSyncCoordinator = backgroundSyncCoordinator
         self.editLeaseManager = editLeaseManager
-        handshakeService = supabaseClientProvider.makeHandshakeTransport()
-            .map { SyncV2HandshakeService(transport: $0) }
+        self.handshakeService = handshakeService
+            ?? supabaseClientProvider.makeHandshakeTransport()
+                .map { SyncV2HandshakeService(transport: $0) }
+        self.contractStructureSender = contractStructureSender
     }
 
     static func live() throws -> AppEnvironment {
@@ -169,6 +174,9 @@ final class AppEnvironment: ObservableObject {
             transport: supabaseClientProvider.makeAuthTransport(),
             sessionStore: KeychainSessionStore()
         )
+        let handshakeService = supabaseClientProvider
+            .makeHandshakeTransport()
+            .map { SyncV2HandshakeService(transport: $0) }
         let projectBindingTransport =
             supabaseClientProvider.makeProjectBindingTransport()
         let deviceIdentityStore: any DeviceIdentityStoring
@@ -191,6 +199,7 @@ final class AppEnvironment: ObservableObject {
         // 이름 변경을 폴더 기록에도 올려야 그 기록이 낡지 않는다.
         let localSnapshotApplier: LocalSyncV2SnapshotApplier
         let editLeaseManager: EditLeaseManager?
+        let contractStructureSender: SyncV2ContractStructureSender?
         if isStoredInMemoryOnly {
             projectBindingStore = InMemoryProjectBindingStore()
             durableChangeRecorder = NoOpDurableLocalChangeRecorder()
@@ -205,6 +214,7 @@ final class AppEnvironment: ObservableObject {
                 backupStore: backupStore
             )
             editLeaseManager = nil
+            contractStructureSender = nil
         } else {
             let dispatchWakeup = SyncV2DispatchWakeup()
             networkRecoveryHub = SyncV2NetworkRecoveryHub()
@@ -214,7 +224,11 @@ final class AppEnvironment: ObservableObject {
                 dispatchWakeup: dispatchWakeup
             )
             projectBindingStore = syncV2Store
-            durableChangeRecorder = syncV2Store
+            durableChangeRecorder = SyncV2ContractPathRecorder(
+                store: syncV2Store,
+                handshakeService: handshakeService,
+                authenticationService: authenticationService
+            )
             conflictResolutionService = syncV2Store
             snapshotStateStore = syncV2Store
             folderMigrationMarker = syncV2Store
@@ -224,7 +238,7 @@ final class AppEnvironment: ObservableObject {
                 backupStore: backupStore,
                 folderIdentityPublisher:
                     DurableSyncV2FolderIdentityPublisher(
-                        changeRecorder: syncV2Store
+                        changeRecorder: durableChangeRecorder
                     )
             )
             editLeaseManager = supabaseClientProvider
@@ -242,6 +256,18 @@ final class AppEnvironment: ObservableObject {
                         }
                     )
                 }
+            if let handshakeService,
+               let transport = supabaseClientProvider
+                   .makeAtomicStructureTransport() {
+                contractStructureSender = SyncV2ContractStructureSender(
+                    store: syncV2Store,
+                    transport: transport,
+                    handshakeService: handshakeService,
+                    authenticationService: authenticationService
+                )
+            } else {
+                contractStructureSender = nil
+            }
             let snapshotClient =
                 supabaseClientProvider.makeSnapshotClient()
             syncDispatcher = supabaseClientProvider.makeSyncV2Client().map {
@@ -406,6 +432,8 @@ final class AppEnvironment: ObservableObject {
             realtimeTrigger: workspaceRealtimeTrigger,
             backgroundSyncCoordinator: backgroundSyncCoordinator,
             editLeaseManager: editLeaseManager,
+            handshakeService: handshakeService,
+            contractStructureSender: contractStructureSender,
             exporter: exporter
         )
     }
