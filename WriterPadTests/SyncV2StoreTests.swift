@@ -4703,6 +4703,9 @@ final class SyncV2StoreTests: XCTestCase {
             """
             DROP TABLE conflict_recovery_entities;
             DROP TABLE conflict_recovery_packages;
+            DROP TABLE sync_contract_operations;
+            DROP TABLE sync_contract_batches;
+            DROP TABLE sync_tree_orders;
             DROP TABLE sync_folders;
             DROP TABLE sync_operation_events;
             DROP INDEX sync_operations_supersedes_idx;
@@ -4739,6 +4742,123 @@ final class SyncV2StoreTests: XCTestCase {
             ),
             1
         )
+    }
+
+    func testCanaryVersion7DatabaseJoinsUnifiedSchemaWithoutLosingContractRows()
+        async throws {
+        let url = try databaseURL()
+        let context = QueueAPIContext()
+        let treeOrderID = UUID()
+        let batchID = UUID()
+        let store = try await connectedStore(at: url, context: context)
+        await store.close()
+
+        // fielded canary는 V6/V7 번호를 tree_order와 계약 배치에 썼다. 통합선의
+        // 같은 번호가 더한 operation 계보 열과 V8 복구 장부는 없는 모양이다.
+        let canary = try RawSQLite(url: url)
+        try canary.execute(
+            """
+            INSERT INTO sync_tree_orders(
+                tree_order_id, local_project_id, project_id,
+                parent_folder_id, children_json, server_revision,
+                server_updated_at, sync_state, last_error_code,
+                created_at, updated_at
+            ) VALUES (
+                '\(treeOrderID.uuidString)',
+                '\(context.localProjectID.rawValue.uuidString.lowercased())',
+                '\(context.serverProjectID.uuidString.lowercased())',
+                NULL, '[]', 4,
+                '2026-08-26T00:00:00.000Z', 'synced', NULL,
+                '2026-08-26T00:00:00.000Z',
+                '2026-08-26T00:00:00.000Z'
+            );
+            INSERT INTO sync_contract_batches(
+                batch_id, local_project_id, project_id, request_json,
+                batch_payload_sha256, status, attempts, response_json,
+                last_error_code, last_error_detail, created_at, updated_at
+            ) VALUES (
+                '\(batchID.uuidString)',
+                '\(context.localProjectID.rawValue.uuidString.lowercased())',
+                '\(context.serverProjectID.uuidString.lowercased())',
+                '{"operations":[]}',
+                '\(String(repeating: "a", count: 64))',
+                'ready', 0, NULL, NULL, NULL,
+                '2026-08-26T00:00:00.000Z',
+                '2026-08-26T00:00:00.000Z'
+            );
+
+            DROP TABLE conflict_recovery_entities;
+            DROP TABLE conflict_recovery_packages;
+            DROP INDEX sync_operations_supersedes_idx;
+            ALTER TABLE sync_operations
+                DROP COLUMN automatic_rebase_count;
+            ALTER TABLE sync_operations
+                DROP COLUMN supersedes_operation_id;
+
+            DELETE FROM schema_migrations WHERE version >= 6;
+            INSERT INTO schema_migrations(version, name, checksum, applied_at)
+            VALUES
+                (6, 'SyncV2StoreSchemaV6', 'fielded-canary-v6',
+                 '2026-08-26T00:00:00.000Z'),
+                (7, 'SyncV2StoreSchemaV7', 'fielded-canary-v7',
+                 '2026-08-26T00:00:00.000Z');
+            PRAGMA user_version = 7;
+            """
+        )
+        canary.close()
+
+        let reopened = try await openStore(at: url)
+        let integratedVersion = try await reopened.schemaVersion()
+        XCTAssertEqual(integratedVersion, SyncV2Store.currentSchemaVersion)
+        await reopened.close()
+
+        let integrated = try RawSQLite(url: url)
+        XCTAssertEqual(
+            try integrated.scalarInt(
+                """
+                SELECT server_revision FROM sync_tree_orders
+                WHERE tree_order_id = '\(treeOrderID.uuidString)';
+                """
+            ),
+            4
+        )
+        XCTAssertEqual(
+            try integrated.scalarText(
+                """
+                SELECT status FROM sync_contract_batches
+                WHERE batch_id = '\(batchID.uuidString)';
+                """
+            ),
+            "ready"
+        )
+        for column in [
+            "supersedes_operation_id",
+            "automatic_rebase_count",
+        ] {
+            XCTAssertEqual(
+                try integrated.scalarInt(
+                    """
+                    SELECT COUNT(*) FROM pragma_table_info('sync_operations')
+                    WHERE name = '\(column)';
+                    """
+                ),
+                1
+            )
+        }
+        XCTAssertEqual(
+            try integrated.scalarInt(
+                """
+                SELECT COUNT(*) FROM sqlite_master
+                WHERE type = 'table'
+                  AND name IN (
+                    'conflict_recovery_packages',
+                    'conflict_recovery_entities'
+                  );
+                """
+            ),
+            2
+        )
+        integrated.close()
     }
 
     func testFolderNameWithPathSeparatorIsRejected() async throws {
@@ -6953,6 +7073,531 @@ final class SyncV2StoreTests: XCTestCase {
             try? FileManager.default.removeItem(at: directory)
         }
         return directory.appendingPathComponent("sync-v2.sqlite3")
+    }
+
+    /// 계약 순서를 받은 작품은 레거시 순서 쓰기를 서버로 보내지 않는다.
+    ///
+    /// 보내면 계약 표가 아는 자식이 빠진 목록이 나가고, 그건 남이 넣은 폴더를
+    /// 순서에서 지우는 일이다. 로컬 저장은 이미 끝났으므로 사용자가 방금 바꾼
+    /// 순서는 화면에 남는다 — 막는 것은 전송뿐이다.
+    func testLegacyTreeOrderWriteIsRefusedOnceContractOrderArrives()
+        async throws {
+        let url = try databaseURL()
+        let identity = DeviceIdentityService(
+            store: InMemoryDeviceIdentityStore(),
+            generateUUID: { UUID() }
+        )
+        let recorder = LazySyncV2ProjectBindingStore(
+            databaseURL: url,
+            deviceIdentityProvider: identity
+        )
+        let localProjectID = ProjectID(rawValue: UUID())
+        let serverProjectID = UUID()
+        try await recorder.save(
+            .connected(
+                localProjectID: localProjectID,
+                serverProjectID: serverProjectID,
+                kind: .existingServerProject,
+                projectName: "계약 순서 작품",
+                ownerSubject: UUID()
+            )
+        )
+
+        func recordTreeOrder() async -> DurableRecordResult {
+            await recorder.record(
+                LocalMutationBatch(
+                    batchID: UUID(),
+                    projectID: localProjectID,
+                    localTransactionID: UUID(),
+                    kind: .structureChange,
+                    mutations: [
+                        .treeOrder(
+                            operationID: UUID(),
+                            content: "{\"tree_order\":{},\"version\":1}",
+                            generation: 7
+                        )
+                    ]
+                )
+            )
+        }
+
+        // 계약 순서를 받기 전에는 막을 이유가 없다.
+        guard case .queued = await recordTreeOrder() else {
+            return XCTFail("계약 순서 이전에는 레거시 순서가 나가야 한다.")
+        }
+
+        try await recorder.applyTreeOrderSnapshotBaselines(
+            localProjectID: localProjectID,
+            serverProjectID: serverProjectID,
+            treeOrders: [
+                SyncV2RemoteTreeOrder(
+                    treeOrderID: UUID(),
+                    parentFolderID: UUID(),
+                    children: [UUID(), UUID()],
+                    revision: 3,
+                    updatedAt: Date(timeIntervalSince1970: 30)
+                )
+            ]
+        )
+
+        guard case let .localSavedButNotQueued(reason) = await recordTreeOrder()
+        else {
+            return XCTFail("계약 순서를 받은 뒤에도 레거시 순서가 나갔다.")
+        }
+        XCTAssertTrue(
+            reason.contains("계약 순서"),
+            "막힌 이유가 사용자에게 설명되지 않는다: \(reason)"
+        )
+    }
+
+    func testContractFolderCreatePersistsImmutableAtomicBatchBeforeSend()
+        async throws {
+        let url = try databaseURL()
+        let deviceID = UUID()
+        let recorder = LazySyncV2ProjectBindingStore(
+            databaseURL: url,
+            deviceIdentityProvider: DeviceIdentityService(
+                store: InMemoryDeviceIdentityStore(),
+                generateUUID: { deviceID }
+            )
+        )
+        let localProjectID = ProjectID(rawValue: UUID())
+        let serverProjectID = UUID()
+        let ownerID = UUID()
+        let binding = ProjectSyncBinding.connected(
+            localProjectID: localProjectID,
+            serverProjectID: serverProjectID,
+            kind: .existingServerProject,
+            projectName: "contract canary",
+            ownerSubject: ownerID
+        )
+        try await recorder.save(binding)
+        let parentID = UUID()
+        let existingChild = UUID()
+        let treeOrderID = UUID()
+        try await recorder.applyFolderSnapshotBaselines(
+            localProjectID: localProjectID,
+            serverProjectID: serverProjectID,
+            folders: [
+                SyncV2RemoteFolder(
+                    folderID: parentID,
+                    parentFolderID: nil,
+                    name: "메모장",
+                    revision: 1,
+                    isDeleted: false,
+                    updatedAt: Date(timeIntervalSince1970: 10)
+                )
+            ],
+            excluding: []
+        )
+        try await recorder.applyTreeOrderSnapshotBaselines(
+            localProjectID: localProjectID,
+            serverProjectID: serverProjectID,
+            treeOrders: [
+                SyncV2RemoteTreeOrder(
+                    treeOrderID: treeOrderID,
+                    parentFolderID: parentID,
+                    children: [existingChild],
+                    revision: 3,
+                    updatedAt: Date(timeIntervalSince1970: 20)
+                )
+            ]
+        )
+        let batchID = UUID()
+        let folderOperationID = UUID()
+        let orderOperationID = UUID()
+        let folderID = DocumentID(rawValue: UUID())
+        let batch = LocalMutationBatch(
+            batchID: batchID,
+            projectID: localProjectID,
+            localTransactionID: UUID(),
+            kind: .structureChange,
+            mutations: [
+                .folderSnapshot(
+                    operationID: folderOperationID,
+                    folderID: folderID,
+                    parentFolderID: DocumentID(rawValue: parentID),
+                    name: "계약경로검증4",
+                    isDeleted: false
+                ),
+                .treeOrder(
+                    operationID: orderOperationID,
+                    content: "{\"tree_order\":{},\"version\":1}",
+                    generation: 1
+                ),
+            ]
+        )
+        let handshake = SyncV2ValidatedHandshake(
+            serverProjectID: serverProjectID,
+            projectSyncMode: .legacy,
+            migrationEpoch: 0,
+            contractVersion: SyncV2Contract.version,
+            contractSHA256: SyncV2Contract.canonicalSHA256,
+            serverProtocolVersion: SyncV2Contract.syncProtocolVersion,
+            supportedProtocolVersions: [SyncV2Contract.syncProtocolVersion],
+            serverCapabilities: Array(
+                SyncV2Contract.requiredServerCapabilities
+            ).sorted()
+        )
+
+        let operationIDs = try await recorder.enqueueContractStructure(
+            batch,
+            binding: binding,
+            handshake: handshake
+        )
+
+        XCTAssertEqual(operationIDs, [folderOperationID, orderOperationID])
+        let raw = try RawSQLite(url: url)
+        XCTAssertEqual(
+            try raw.scalarText(
+                "SELECT status FROM sync_contract_batches LIMIT 1;"
+            ),
+            "ready"
+        )
+        XCTAssertEqual(
+            try raw.scalarInt(
+                "SELECT COUNT(*) FROM sync_contract_operations;"
+            ),
+            2
+        )
+        XCTAssertEqual(
+            try raw.scalarInt(
+                """
+                SELECT base_revision FROM sync_contract_operations
+                WHERE entity_kind = 'tree_order';
+                """
+            ),
+            3
+        )
+        let request = try raw.scalarText(
+            "SELECT request_json FROM sync_contract_batches LIMIT 1;"
+        )
+        XCTAssertTrue(request.contains("atomic_structure_commit_request"))
+        XCTAssertTrue(request.contains(folderID.rawValue.uuidString.lowercased()))
+        XCTAssertTrue(request.contains(existingChild.uuidString.lowercased()))
+        XCTAssertTrue(request.contains("\"status\"") == false)
+
+        let firstClaim = try await recorder.claimNextContractStructure(
+            localProjectID: localProjectID
+        )
+        XCTAssertEqual(firstClaim.request.batchID, batchID)
+        try await recorder.recoverInterruptedWork()
+        let pending = try await recorder.claimNextContractStructure(
+            localProjectID: localProjectID
+        )
+        XCTAssertEqual(pending.request.batchID, batchID)
+        XCTAssertEqual(pending.request.json, firstClaim.request.json)
+        let resultRevisions = [1, 4]
+        let results = zip(
+            pending.request.orderedIntents,
+            resultRevisions
+        ).map { intent, revision -> SyncV2JSON in
+            let fields = intent.objectValue!
+            return .object([
+                "sequence": fields["sequence"]!,
+                "operation_id": fields["operation_id"]!,
+                "entity_id": fields["entity_id"]!,
+                "result_revision": .int(revision),
+            ])
+        }
+        let response = SyncV2JSON.object([
+            "kind": .string("atomic_structure_commit_success"),
+            "batch_id": .string(batchID.uuidString.lowercased()),
+            "batch_payload_sha256": .string(
+                pending.request.batchPayloadSHA256
+            ),
+            "status": .string("committed"),
+            "applied": .bool(true),
+            "results": .array(results),
+        ])
+        XCTAssertEqual(
+            try SyncV2Contract.validateAtomicStructureResponse(
+                request: pending.request,
+                response: response
+            ),
+            .committed
+        )
+        try await recorder.completeContractStructure(
+            pending,
+            response: response
+        )
+        XCTAssertEqual(
+            try raw.scalarText(
+                "SELECT status FROM sync_contract_batches LIMIT 1;"
+            ),
+            "completed"
+        )
+        XCTAssertEqual(
+            try raw.scalarInt(
+                """
+                SELECT server_revision FROM sync_tree_orders
+                WHERE tree_order_id = '\(treeOrderID.uuidString.lowercased())';
+                """
+            ),
+            4
+        )
+        XCTAssertEqual(
+            try raw.scalarInt(
+                """
+                SELECT server_revision FROM sync_folders
+                WHERE folder_id = '\(folderID.rawValue.uuidString.lowercased())';
+                """
+            ),
+            1
+        )
+    }
+
+    /// 순서 문서만 막고 폴더는 내보내면 서버에 반쯤 적용된 구조가 남는다.
+    ///
+    /// 폴더 생성·이름변경·삭제는 commit_folder로 따로 나가므로, 순서만 막는
+    /// 구현은 이 시험을 통과하지 못한다.
+    func testLegacyFolderWritesAreRefusedOnceContractOrderArrives()
+        async throws {
+        let url = try databaseURL()
+        let identity = DeviceIdentityService(
+            store: InMemoryDeviceIdentityStore(),
+            generateUUID: { UUID() }
+        )
+        let recorder = LazySyncV2ProjectBindingStore(
+            databaseURL: url,
+            deviceIdentityProvider: identity
+        )
+        let localProjectID = ProjectID(rawValue: UUID())
+        let serverProjectID = UUID()
+        try await recorder.save(
+            .connected(
+                localProjectID: localProjectID,
+                serverProjectID: serverProjectID,
+                kind: .existingServerProject,
+                projectName: "계약 순서 작품",
+                ownerSubject: UUID()
+            )
+        )
+
+        func recordFolder(
+            folderID: DocumentID,
+            name: String,
+            isDeleted: Bool
+        ) async -> DurableRecordResult {
+            await recorder.record(
+                LocalMutationBatch(
+                    batchID: UUID(),
+                    projectID: localProjectID,
+                    localTransactionID: UUID(),
+                    kind: .structureChange,
+                    mutations: [
+                        .folderSnapshot(
+                            operationID: UUID(),
+                            folderID: folderID,
+                            parentFolderID: nil,
+                            name: name,
+                            isDeleted: isDeleted
+                        )
+                    ]
+                )
+            )
+        }
+
+        try await recorder.applyTreeOrderSnapshotBaselines(
+            localProjectID: localProjectID,
+            serverProjectID: serverProjectID,
+            treeOrders: [
+                SyncV2RemoteTreeOrder(
+                    treeOrderID: UUID(),
+                    parentFolderID: UUID(),
+                    children: [UUID()],
+                    revision: 3,
+                    updatedAt: Date(timeIntervalSince1970: 30)
+                )
+            ]
+        )
+
+        // 생성·이름변경·삭제 셋 다 나가지 않아야 한다.
+        let folderID = DocumentID(rawValue: UUID())
+        for (name, isDeleted) in [
+            ("새 폴더", false), ("바뀐 이름", false), ("바뀐 이름", true),
+        ] {
+            guard case .localSavedButNotQueued = await recordFolder(
+                folderID: folderID,
+                name: name,
+                isDeleted: isDeleted
+            ) else {
+                return XCTFail(
+                    "계약 순서를 받은 뒤에도 레거시 폴더 변경이 나갔다: \(name)"
+                )
+            }
+        }
+
+        // 큐에 아무것도 남지 않아야 한다. 하나라도 있으면 서버에 반쯤 적용된
+        // 구조가 생긴다.
+        let inspection = try await openStore(at: url)
+        let queued = try await inspection.queuedOperations(
+            documentID: folderID.rawValue
+        )
+        XCTAssertTrue(
+            queued.isEmpty,
+            "레거시 폴더 작업이 큐에 남았다: \(queued.count)건"
+        )
+        await inspection.close()
+    }
+
+    /// 계약 이력은 한 번 생기면 되돌아가지 않는다.
+    ///
+    /// 서버가 빈 응답을 주거나 RLS가 어긋나 아무것도 못 읽는 날, 이력이 지워지면
+    /// 방어가 조용히 풀린다. 빈 적용이 이력을 지우지 않는지 못 박는다.
+    func testContractTreeOrderHistorySurvivesAnEmptySnapshot() async throws {
+        let url = try databaseURL()
+        let context = QueueAPIContext()
+        let store = try await connectedStore(at: url, context: context)
+
+        try await store.applyTreeOrderSnapshotBaselines(
+            localProjectID: context.localProjectID,
+            serverProjectID: context.serverProjectID,
+            treeOrders: [
+                SyncV2RemoteTreeOrder(
+                    treeOrderID: UUID(),
+                    parentFolderID: UUID(),
+                    children: [UUID()],
+                    revision: 2,
+                    updatedAt: Date(timeIntervalSince1970: 30)
+                )
+            ]
+        )
+        var hasHistory = try await store.hasContractTreeOrderHistory(
+            localProjectID: context.localProjectID
+        )
+        XCTAssertTrue(hasHistory)
+
+        // 빈 응답을 그대로 적용해도 이력은 남아야 한다.
+        try await store.applyTreeOrderSnapshotBaselines(
+            localProjectID: context.localProjectID,
+            serverProjectID: context.serverProjectID,
+            treeOrders: []
+        )
+        hasHistory = try await store.hasContractTreeOrderHistory(
+            localProjectID: context.localProjectID
+        )
+        XCTAssertTrue(hasHistory, "빈 snapshot 적용으로 계약 이력이 지워졌다")
+        await store.close()
+
+        let reopened = try await openStore(at: url)
+        let restoredHistory = try await reopened.hasContractTreeOrderHistory(
+            localProjectID: context.localProjectID
+        )
+        XCTAssertTrue(restoredHistory, "재시작 뒤 계약 이력이 사라졌다")
+        await reopened.close()
+    }
+
+    // MARK: - 계약 tree_order
+
+    /// 서버가 말한 순서와 revision을 그대로 들고 있어야 한다. revision은 우리가
+    /// 만들어낼 수 없는 값이고, 그게 없으면 base 0으로 보내 거절당한다.
+    func testContractTreeOrderKeepsServerChildrenAndRevision() async throws {
+        let url = try databaseURL()
+        let context = QueueAPIContext()
+        let store = try await connectedStore(at: url, context: context)
+        let parent = UUID()
+        let children = [UUID(), UUID(), UUID()]
+
+        try await store.applyTreeOrderSnapshotBaselines(
+            localProjectID: context.localProjectID,
+            serverProjectID: context.serverProjectID,
+            treeOrders: [
+                SyncV2RemoteTreeOrder(
+                    treeOrderID: UUID(),
+                    parentFolderID: parent,
+                    children: children,
+                    revision: 3,
+                    updatedAt: Date(timeIntervalSince1970: 30)
+                )
+            ]
+        )
+
+        let stored = try await store.storedTreeOrder(
+            localProjectID: context.localProjectID,
+            parentFolderID: parent
+        )
+        XCTAssertEqual(stored?.children, children)
+        XCTAssertEqual(stored?.serverRevision, 3)
+        await store.close()
+
+        // 재시작해도 남아 있어야 한다. 순서는 쓰기 직전에 필요한 값이라
+        // 세션 안에서만 살아 있으면 다음 실행의 첫 쓰기가 막힌다.
+        let reopened = try await openStore(at: url)
+        let restored = try await reopened.storedTreeOrder(
+            localProjectID: context.localProjectID,
+            parentFolderID: parent
+        )
+        XCTAssertEqual(restored?.children, children)
+        XCTAssertEqual(restored?.serverRevision, 3)
+        await reopened.close()
+    }
+
+    /// 최상위는 parent가 NULL이다. SQLite는 UNIQUE에서 NULL을 서로 다르게 보므로
+    /// 두 번 받아도 한 줄이어야 한다.
+    func testContractTreeOrderRootStaysASingleRow() async throws {
+        let url = try databaseURL()
+        let context = QueueAPIContext()
+        let store = try await connectedStore(at: url, context: context)
+        let first = [UUID()]
+        let second = [UUID(), UUID()]
+        let treeOrderID = UUID()
+
+        for (children, revision) in [(first, Int64(1)), (second, Int64(2))] {
+            try await store.applyTreeOrderSnapshotBaselines(
+                localProjectID: context.localProjectID,
+                serverProjectID: context.serverProjectID,
+                treeOrders: [
+                    SyncV2RemoteTreeOrder(
+                        treeOrderID: treeOrderID,
+                        parentFolderID: nil,
+                        children: children,
+                        revision: revision,
+                        updatedAt: Date(timeIntervalSince1970: 30)
+                    )
+                ]
+            )
+        }
+
+        let stored = try await store.storedTreeOrder(
+            localProjectID: context.localProjectID,
+            parentFolderID: nil
+        )
+        XCTAssertEqual(stored?.children, second)
+        XCTAssertEqual(stored?.serverRevision, 2)
+        await store.close()
+    }
+
+    /// 계약 순서를 받은 적이 없으면 레거시 순서 쓰기를 막을 이유가 없다.
+    func testContractTreeOrderHistoryIsFalseUntilServerSpeaks() async throws {
+        let url = try databaseURL()
+        let context = QueueAPIContext()
+        let store = try await connectedStore(at: url, context: context)
+
+        var hasHistory = try await store.hasContractTreeOrderHistory(
+            localProjectID: context.localProjectID
+        )
+        XCTAssertFalse(hasHistory)
+
+        try await store.applyTreeOrderSnapshotBaselines(
+            localProjectID: context.localProjectID,
+            serverProjectID: context.serverProjectID,
+            treeOrders: [
+                SyncV2RemoteTreeOrder(
+                    treeOrderID: UUID(),
+                    parentFolderID: UUID(),
+                    children: [UUID()],
+                    revision: 1,
+                    updatedAt: Date(timeIntervalSince1970: 30)
+                )
+            ]
+        )
+
+        hasHistory = try await store.hasContractTreeOrderHistory(
+            localProjectID: context.localProjectID
+        )
+        XCTAssertTrue(hasHistory)
+        await store.close()
     }
 
     private func openStore(at url: URL) async throws -> SyncV2Store {

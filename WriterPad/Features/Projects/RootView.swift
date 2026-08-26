@@ -31,6 +31,9 @@ struct RootView: View {
             backgroundSyncCoordinator:
                 environment.backgroundSyncCoordinator,
             editLeaseManager: environment.editLeaseManager,
+            handshakeService: environment.handshakeService,
+            contractStructureSender: environment.contractStructureSender,
+            snapshotPuller: environment.snapshotPullService,
             isDarkMode: $isDarkMode,
             smartPairsEnabled: $smartPairsEnabled
         )

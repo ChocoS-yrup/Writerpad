@@ -43,6 +43,9 @@ struct ProjectWorkspaceView: View {
     private let backgroundSyncCoordinator:
         SyncV2BackgroundSyncCoordinator?
     private let editLeaseManager: EditLeaseManager?
+    private let handshakeService: SyncV2HandshakeService?
+    private let contractStructureSender: SyncV2ContractStructureSender?
+    private let snapshotPuller: (any SyncV2SnapshotPulling)?
     @Binding private var isDarkMode: Bool
     @Binding private var smartPairsEnabled: Bool
 
@@ -71,6 +74,9 @@ struct ProjectWorkspaceView: View {
         backgroundSyncCoordinator:
             SyncV2BackgroundSyncCoordinator? = nil,
         editLeaseManager: EditLeaseManager? = nil,
+        handshakeService: SyncV2HandshakeService? = nil,
+        contractStructureSender: SyncV2ContractStructureSender? = nil,
+        snapshotPuller: (any SyncV2SnapshotPulling)? = nil,
         isDarkMode: Binding<Bool>,
         smartPairsEnabled: Binding<Bool>
     ) {
@@ -95,6 +101,9 @@ struct ProjectWorkspaceView: View {
         self.realtimeTrigger = realtimeTrigger
         self.backgroundSyncCoordinator = backgroundSyncCoordinator
         self.editLeaseManager = editLeaseManager
+        self.handshakeService = handshakeService
+        self.contractStructureSender = contractStructureSender
+        self.snapshotPuller = snapshotPuller
         _isDarkMode = isDarkMode
         _smartPairsEnabled = smartPairsEnabled
         _model = StateObject(
@@ -166,7 +175,10 @@ struct ProjectWorkspaceView: View {
                 syncDispatcher: syncDispatcher,
                 backgroundSyncCoordinator:
                     backgroundSyncCoordinator,
-                editLeaseManager: editLeaseManager
+                editLeaseManager: editLeaseManager,
+                handshakeService: handshakeService,
+                contractStructureSender: contractStructureSender,
+                snapshotPuller: snapshotPuller
             )
         }
         .sheet(isPresented: $isShowingDeletedProjects) {

@@ -72,6 +72,9 @@ final class SyncSettingsModel: ObservableObject {
     private let backgroundSyncCoordinator:
         SyncV2BackgroundSyncCoordinator?
     private let editLeaseManager: (any EditLeaseManaging)?
+    private let handshakeService: SyncV2HandshakeService?
+    private let contractStructureSender: SyncV2ContractStructureSender?
+    private let snapshotPuller: (any SyncV2SnapshotPulling)?
     private let defaults: UserDefaults
 
     init(
@@ -82,6 +85,9 @@ final class SyncSettingsModel: ObservableObject {
         backgroundSyncCoordinator:
             SyncV2BackgroundSyncCoordinator? = nil,
         editLeaseManager: (any EditLeaseManaging)? = nil,
+        handshakeService: SyncV2HandshakeService? = nil,
+        contractStructureSender: SyncV2ContractStructureSender? = nil,
+        snapshotPuller: (any SyncV2SnapshotPulling)? = nil,
         defaults: UserDefaults = .standard
     ) {
         projectLister = ProjectManagerSyncProjectLister(
@@ -92,6 +98,9 @@ final class SyncSettingsModel: ObservableObject {
         self.syncDispatcher = syncDispatcher
         self.backgroundSyncCoordinator = backgroundSyncCoordinator
         self.editLeaseManager = editLeaseManager
+        self.handshakeService = handshakeService
+        self.contractStructureSender = contractStructureSender
+        self.snapshotPuller = snapshotPuller
         self.defaults = defaults
         isSyncAllEnabled = GlobalSyncPreference.isEnabled(in: defaults)
     }
@@ -104,6 +113,9 @@ final class SyncSettingsModel: ObservableObject {
         backgroundSyncCoordinator:
             SyncV2BackgroundSyncCoordinator? = nil,
         editLeaseManager: (any EditLeaseManaging)? = nil,
+        handshakeService: SyncV2HandshakeService? = nil,
+        contractStructureSender: SyncV2ContractStructureSender? = nil,
+        snapshotPuller: (any SyncV2SnapshotPulling)? = nil,
         defaults: UserDefaults
     ) {
         self.projectLister = projectLister
@@ -112,9 +124,187 @@ final class SyncSettingsModel: ObservableObject {
         self.syncDispatcher = syncDispatcher
         self.backgroundSyncCoordinator = backgroundSyncCoordinator
         self.editLeaseManager = editLeaseManager
+        self.handshakeService = handshakeService
+        self.contractStructureSender = contractStructureSender
+        self.snapshotPuller = snapshotPuller
         self.defaults = defaults
         isSyncAllEnabled = GlobalSyncPreference.isEnabled(in: defaults)
     }
+
+#if DEBUG
+    /// 서버가 이 작품에 대해 무엇을 지원하는지 한 번 묻고 그 답을 보여 준다.
+    ///
+    /// 읽기 전용이다. 답이 무엇이든 계약 경로를 열지 않으며, 관문은 이 화면에서
+    /// 건드리지 않는다. 개발 빌드에서 서버와 처음 대화해 보기 위한 자리다.
+    @Published private(set) var handshakeReport: String?
+
+    /// 연결하지 않은 서버 작품에도 물을 수 있게 한다.
+    ///
+    /// 작품을 연결하면 `ensure_project`가 서버에 쓴다. 핸드셰이크만 확인하려는
+    /// 자리에서 그 쓰기를 유발하지 않으려고 서버 작품 id를 직접 받는다. 로컬
+    /// 작품 id는 캐시 키에만 쓰이고 요청에는 실리지 않는다.
+    /// 서버 구조를 내려받아 로컬에 반영만 한다. 서버로 나가는 것은 없다.
+    ///
+    /// 전체 동기화 토글은 dispatcher 를 함께 시작해서 나가는 쪽도 연다. 대조만
+    /// 하려는 자리에서 그걸 켜면, 이름은 같고 id 가 다른 로컬 폴더가 서버로
+    /// 나가 중복이 되거나 FOLDER_NAME_CONFLICT 로 막힌다. 그래서 pull 만 부른다.
+    @Published private(set) var pullReport: String?
+
+    /// 작품별 계약 경로 관문이다. 로컬 스위치이고 서버에 나가는 것이 없다.
+    ///
+    /// 켜도 그 자체로는 아무것도 쓰지 않는다. 서 있는 핸드셰이크와 함께여야
+    /// 계약 경로가 쓰이고, 그 둘 중 어느 것도 서버가 움직일 수 없다.
+    @Published private(set) var openContractPathProjectIDs: Set<ProjectID> = []
+
+    func isGateOpen(for row: SyncProjectRow) -> Bool {
+        openContractPathProjectIDs.contains(row.project.id)
+    }
+
+    func setGateOpen(_ isOpen: Bool, for row: SyncProjectRow) {
+        if isOpen {
+            ContractPathGate.setOpen(true, for: row.project.id, in: defaults)
+            openContractPathProjectIDs.insert(row.project.id)
+        } else {
+            ContractPathGate.close(for: row.project.id, in: defaults)
+            openContractPathProjectIDs.remove(row.project.id)
+            // 관문을 닫으면 들고 있던 답도 버린다. 닫힌 뒤에도 답이 서 있으면
+            // 다시 열었을 때 낡은 답으로 곧장 쓰기 시작한다.
+            Task { await handshakeService?.gateClosed() }
+        }
+        gateReport = "\(row.project.name) 관문: \(isOpen ? "열림" : "닫힘")"
+    }
+
+    @Published private(set) var gateReport: String?
+    @Published private(set) var contractSendReport: String?
+
+    func sendOneContractBatch(for row: SyncProjectRow) async {
+        guard let contractStructureSender else {
+            contractSendReport = "계약 구조 전송을 사용할 수 없습니다."
+            return
+        }
+        isWorking = true
+        defer { isWorking = false }
+        do {
+            let report = try await contractStructureSender.sendNext(
+                localProjectID: row.project.id
+            )
+            contractSendReport = """
+            batch_id: \(report.batchID.uuidString.lowercased())
+            status: \(report.status.rawValue)
+            operations: \(report.operationCount)
+            """
+        } catch {
+            contractSendReport = "실패: \(error)"
+        }
+    }
+
+    func runPullOnly(for row: SyncProjectRow) async {
+        guard let snapshotPuller else {
+            pullReport = "snapshot 전송이 없습니다. Supabase 설정을 확인하세요."
+            return
+        }
+        guard let serverProjectID = row.binding?.serverProjectID else {
+            pullReport = "이 작품은 서버에 연결되어 있지 않습니다."
+            return
+        }
+        isWorking = true
+        defer { isWorking = false }
+        do {
+            let report = try await snapshotPuller.pull(
+                localProjectID: row.project.id,
+                serverProjectID: serverProjectID,
+                editingGuards: [:]
+            )
+            var lines = [
+                "적용된 스냅샷: \(report.appliedSnapshots.count)",
+                "결과: \(report.outcomes.count)",
+            ]
+            if report.rejectedStructureNames.isEmpty {
+                lines.append("거부된 구조 이름: 없음")
+            } else {
+                lines.append("거부된 구조 이름 \(report.rejectedStructureNames.count):")
+                for rejected in report.rejectedStructureNames.prefix(5) {
+                    lines.append("  \(rejected.parent)/\(rejected.name) — \(rejected.reason)")
+                }
+            }
+            pullReport = lines.joined(separator: "\n")
+            await reloadProjects()
+        } catch {
+            pullReport = "실패: \(error)"
+        }
+    }
+
+    func runHandshake(serverProjectIDText: String) async {
+        guard let serverProjectID = UUID(uuidString: serverProjectIDText.trimmingCharacters(in: .whitespacesAndNewlines)) else {
+            handshakeReport = "서버 작품 id가 UUID 형식이 아닙니다."
+            return
+        }
+        await runHandshake(
+            localProjectID: ProjectID(rawValue: serverProjectID),
+            serverProjectID: serverProjectID
+        )
+    }
+
+    func runHandshake(for row: SyncProjectRow) async {
+        guard handshakeService != nil else {
+            handshakeReport = "핸드셰이크 전송이 없습니다. Supabase 설정을 확인하세요."
+            return
+        }
+        guard let serverProjectID = row.binding?.serverProjectID else {
+            handshakeReport = "이 작품은 서버에 연결되어 있지 않습니다."
+            return
+        }
+        await runHandshake(
+            localProjectID: row.project.id,
+            serverProjectID: serverProjectID
+        )
+    }
+
+    private func runHandshake(
+        localProjectID: ProjectID,
+        serverProjectID: UUID
+    ) async {
+        guard let handshakeService else {
+            handshakeReport = "핸드셰이크 전송이 없습니다. Supabase 설정을 확인하세요."
+            return
+        }
+        guard let context = SyncV2HandshakeContext.make(
+            authenticationState: authenticationState,
+            localProjectID: localProjectID,
+            serverProjectID: serverProjectID
+        ) else {
+            handshakeReport = "로그인 상태가 아니라 누구로서 묻는지 확정할 수 없습니다."
+            return
+        }
+
+        isWorking = true
+        defer { isWorking = false }
+        do {
+            let handshake = try await handshakeService.refresh(context: context)
+            let gateIsOpen = ContractPathGate.isOpen(
+                for: localProjectID,
+                in: defaults
+            )
+            let usesContractPath = await handshakeService.usesContractStructure(
+                context: context,
+                gateIsOpen: gateIsOpen
+            )
+            handshakeReport = """
+            supported: 예
+            mode: \(handshake.projectSyncMode.rawValue) / epoch \(handshake.migrationEpoch)
+            contract: \(handshake.contractVersion)
+            protocol: \(handshake.serverProtocolVersion)
+            supported_protocol_versions: \(handshake.supportedProtocolVersions)
+            digest: \(handshake.contractSHA256.prefix(12))…
+            capabilities: \(handshake.serverCapabilities.count)개
+            관문: \(gateIsOpen ? "열림" : "닫힘")
+            계약 경로: \(usesContractPath ? "사용" : "미사용")
+            """
+        } catch {
+            handshakeReport = "실패: \(error)"
+        }
+    }
+#endif
 
     var isAuthenticated: Bool {
         authenticationState.isAuthenticated
@@ -347,6 +537,20 @@ final class SyncSettingsModel: ObservableObject {
                 )
             }
             projectRows = rows
+#if DEBUG
+            // UserDefaults만 읽으면 토글 자체는 관찰할 상태가 없어 탭 직후 예전
+            // 값으로 돌아간다. 로드할 때 저장값을 화면 상태로 한 번 끌어올린다.
+            openContractPathProjectIDs = Set(
+                rows.lazy
+                    .filter {
+                        ContractPathGate.isOpen(
+                            for: $0.project.id,
+                            in: self.defaults
+                        )
+                    }
+                    .map(\.project.id)
+            )
+#endif
         } catch {
             errorMessage = "작품 목록을 불러오지 못했습니다: \(error.localizedDescription)"
         }
@@ -662,6 +866,9 @@ struct SyncSettingsView: View {
     @State private var isConfirmingEnableAll = false
     @State private var connectionRequest: ExistingConnectionRequest?
     @State private var disconnectTarget: SyncProjectRow?
+#if DEBUG
+    @State private var handshakeProjectIDText = ""
+#endif
 
     init(
         projectManager: any ProjectManaging,
@@ -670,7 +877,10 @@ struct SyncSettingsView: View {
         syncDispatcher: SyncV2Dispatcher?,
         backgroundSyncCoordinator:
             SyncV2BackgroundSyncCoordinator? = nil,
-        editLeaseManager: (any EditLeaseManaging)? = nil
+        editLeaseManager: (any EditLeaseManaging)? = nil,
+        handshakeService: SyncV2HandshakeService? = nil,
+        contractStructureSender: SyncV2ContractStructureSender? = nil,
+        snapshotPuller: (any SyncV2SnapshotPulling)? = nil,
     ) {
         _model = StateObject(
             wrappedValue: SyncSettingsModel(
@@ -679,7 +889,10 @@ struct SyncSettingsView: View {
                 projectBindingService: projectBindingService,
                 syncDispatcher: syncDispatcher,
                 backgroundSyncCoordinator: backgroundSyncCoordinator,
-                editLeaseManager: editLeaseManager
+                editLeaseManager: editLeaseManager,
+                handshakeService: handshakeService,
+                contractStructureSender: contractStructureSender,
+                snapshotPuller: snapshotPuller
             )
         )
     }
@@ -690,6 +903,9 @@ struct SyncSettingsView: View {
             if model.isAuthenticated {
                 globalSyncSection
                 projectConnectionsSection
+#if DEBUG
+                handshakeDiagnosticsSection
+#endif
             } else {
                 protectedCloudSection
             }
@@ -786,6 +1002,72 @@ struct SyncSettingsView: View {
             Text(model.informationMessage ?? "")
         }
     }
+
+#if DEBUG
+    /// 개발 빌드에서만 보이는 진단 자리다. 서버에 읽기만 하고 아무것도 쓰지 않는다.
+    private var handshakeDiagnosticsSection: some View {
+        Section("계약 핸드셰이크 (개발용)") {
+            TextField("서버 작품 id (UUID)", text: $handshakeProjectIDText)
+                .textInputAutocapitalization(.never)
+                .autocorrectionDisabled()
+                .keyboardType(.asciiCapable)
+                .font(.footnote.monospaced())
+            Button("이 id로 확인") {
+                Task {
+                    await model.runHandshake(
+                        serverProjectIDText: handshakeProjectIDText
+                    )
+                }
+            }
+            .disabled(model.isWorking || handshakeProjectIDText.isEmpty)
+            ForEach(model.projectRows.filter(\.isConnected)) { row in
+                Toggle(
+                    "\(row.project.name) 관문",
+                    isOn: Binding(
+                        get: { model.isGateOpen(for: row) },
+                        set: { newValue in
+                            model.setGateOpen(newValue, for: row)
+                        }
+                    )
+                )
+                Button("\(row.project.name) — pull만 실행") {
+                    Task { await model.runPullOnly(for: row) }
+                }
+                .disabled(model.isWorking)
+                Button("\(row.project.name) 확인") {
+                    Task { await model.runHandshake(for: row) }
+                }
+                .disabled(model.isWorking)
+                Button("\(row.project.name) — 대기 계약 배치 1건 전송") {
+                    Task { await model.sendOneContractBatch(for: row) }
+                }
+                .disabled(model.isWorking || !model.isGateOpen(for: row))
+            }
+            if let report = model.gateReport {
+                Text(report)
+                    .font(.footnote.monospaced())
+            }
+            if let report = model.pullReport {
+                Text(report)
+                    .font(.footnote.monospaced())
+                    .textSelection(.enabled)
+            }
+            if let report = model.handshakeReport {
+                Text(report)
+                    .font(.footnote.monospaced())
+                    .textSelection(.enabled)
+            }
+            if let report = model.contractSendReport {
+                Text(report)
+                    .font(.footnote.monospaced())
+                    .textSelection(.enabled)
+            }
+            Text("핸드셰크와 관문은 자체로는 읽기만 합니다. ‘대기 계약 배치 1건 전송’만 서버 구조를 쓸 수 있습니다.")
+                .font(.footnote)
+                .foregroundStyle(.secondary)
+        }
+    }
+#endif
 
     @ViewBuilder
     private var accountSection: some View {

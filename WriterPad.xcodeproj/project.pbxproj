@@ -119,8 +119,11 @@
 		A9000000000000000000000C /* SyncV2Store.swift in Sources */ = {isa = PBXBuildFile; fileRef = B90000000000000000000010 /* SyncV2Store.swift */; };
 		A9000000000000000000000D /* SyncV2StoreTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = B90000000000000000000011 /* SyncV2StoreTests.swift */; };
 		A96000000000000000000001 /* SyncV2Contract.swift in Sources */ = {isa = PBXBuildFile; fileRef = B96000000000000000000001 /* SyncV2Contract.swift */; };
+		A96000000000000000000008 /* SyncV2Handshake.swift in Sources */ = {isa = PBXBuildFile; fileRef = B96000000000000000000008 /* SyncV2Handshake.swift */; };
+		A96000000000000000000012 /* SyncV2ContractStructure.swift in Sources */ = {isa = PBXBuildFile; fileRef = B96000000000000000000012 /* SyncV2ContractStructure.swift */; };
 		A96000000000000000000007 /* SyncV2UnicodeCasefold.swift in Sources */ = {isa = PBXBuildFile; fileRef = B96000000000000000000007 /* SyncV2UnicodeCasefold.swift */; };
 		A96000000000000000000002 /* SyncV2ContractTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = B96000000000000000000002 /* SyncV2ContractTests.swift */; };
+		A96000000000000000000009 /* SyncV2HandshakeTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = B96000000000000000000009 /* SyncV2HandshakeTests.swift */; };
 		A96000000000000000000003 /* SyncV2TransitionVector.swift in Sources */ = {isa = PBXBuildFile; fileRef = B96000000000000000000003 /* SyncV2TransitionVector.swift */; };
 		A96000000000000000000004 /* SyncV2VectorHarness.swift in Sources */ = {isa = PBXBuildFile; fileRef = B96000000000000000000004 /* SyncV2VectorHarness.swift */; };
 		A96000000000000000000005 /* SyncV2TransitionVectorTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = B96000000000000000000005 /* SyncV2TransitionVectorTests.swift */; };
@@ -138,6 +141,8 @@
 		A97000000000000000000007 /* SyncV2StoreSchemaV6.sql in Resources */ = {isa = PBXBuildFile; fileRef = B97000000000000000000007 /* SyncV2StoreSchemaV6.sql */; };
 		A97000000000000000000008 /* SyncV2StoreSchemaV7.sql in Resources */ = {isa = PBXBuildFile; fileRef = B97000000000000000000008 /* SyncV2StoreSchemaV7.sql */; };
 		A98000000000000000000008 /* SyncV2StoreSchemaV8.sql in Resources */ = {isa = PBXBuildFile; fileRef = B98000000000000000000008 /* SyncV2StoreSchemaV8.sql */; };
+		A98000000000000000000009 /* SyncV2StoreSchemaV9.sql in Resources */ = {isa = PBXBuildFile; fileRef = B98000000000000000000009 /* SyncV2StoreSchemaV9.sql */; };
+		A9800000000000000000000A /* SyncV2StoreSchemaV10.sql in Resources */ = {isa = PBXBuildFile; fileRef = B9800000000000000000000A /* SyncV2StoreSchemaV10.sql */; };
 		A9000000000000000000000F /* SyncV2Client.swift in Sources */ = {isa = PBXBuildFile; fileRef = B90000000000000000000013 /* SyncV2Client.swift */; };
 		A90000000000000000000010 /* SyncV2ClientTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = B90000000000000000000014 /* SyncV2ClientTests.swift */; };
 		A90000000000000000000011 /* SyncV2Dispatcher.swift in Sources */ = {isa = PBXBuildFile; fileRef = B90000000000000000000015 /* SyncV2Dispatcher.swift */; };
@@ -302,8 +307,11 @@
 		B90000000000000000000010 /* SyncV2Store.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SyncV2Store.swift; sourceTree = "<group>"; };
 		B90000000000000000000011 /* SyncV2StoreTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SyncV2StoreTests.swift; sourceTree = "<group>"; };
 		B96000000000000000000001 /* SyncV2Contract.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SyncV2Contract.swift; sourceTree = "<group>"; };
+		B96000000000000000000008 /* SyncV2Handshake.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SyncV2Handshake.swift; sourceTree = "<group>"; };
+		B96000000000000000000012 /* SyncV2ContractStructure.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SyncV2ContractStructure.swift; sourceTree = "<group>"; };
 		B96000000000000000000007 /* SyncV2UnicodeCasefold.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SyncV2UnicodeCasefold.swift; sourceTree = "<group>"; };
 		B96000000000000000000002 /* SyncV2ContractTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SyncV2ContractTests.swift; sourceTree = "<group>"; };
+		B96000000000000000000009 /* SyncV2HandshakeTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SyncV2HandshakeTests.swift; sourceTree = "<group>"; };
 		B96000000000000000000003 /* SyncV2TransitionVector.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SyncV2TransitionVector.swift; sourceTree = "<group>"; };
 		B96000000000000000000004 /* SyncV2VectorHarness.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SyncV2VectorHarness.swift; sourceTree = "<group>"; };
 		B96000000000000000000005 /* SyncV2TransitionVectorTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SyncV2TransitionVectorTests.swift; sourceTree = "<group>"; };
@@ -321,6 +329,8 @@
 		B97000000000000000000007 /* SyncV2StoreSchemaV6.sql */ = {isa = PBXFileReference; lastKnownFileType = text; path = Scripts/fixtures/SyncV2StoreSchemaV6.sql; sourceTree = SOURCE_ROOT; };
 		B97000000000000000000008 /* SyncV2StoreSchemaV7.sql */ = {isa = PBXFileReference; lastKnownFileType = text; path = Scripts/fixtures/SyncV2StoreSchemaV7.sql; sourceTree = SOURCE_ROOT; };
 		B98000000000000000000008 /* SyncV2StoreSchemaV8.sql */ = {isa = PBXFileReference; lastKnownFileType = text; path = Scripts/fixtures/SyncV2StoreSchemaV8.sql; sourceTree = SOURCE_ROOT; };
+		B98000000000000000000009 /* SyncV2StoreSchemaV9.sql */ = {isa = PBXFileReference; lastKnownFileType = text; path = Scripts/fixtures/SyncV2StoreSchemaV9.sql; sourceTree = SOURCE_ROOT; };
+		B9800000000000000000000A /* SyncV2StoreSchemaV10.sql */ = {isa = PBXFileReference; lastKnownFileType = text; path = Scripts/fixtures/SyncV2StoreSchemaV10.sql; sourceTree = SOURCE_ROOT; };
 		B90000000000000000000013 /* SyncV2Client.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SyncV2Client.swift; sourceTree = "<group>"; };
 		B90000000000000000000014 /* SyncV2ClientTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SyncV2ClientTests.swift; sourceTree = "<group>"; };
 		B90000000000000000000015 /* SyncV2Dispatcher.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SyncV2Dispatcher.swift; sourceTree = "<group>"; };
@@ -387,6 +397,8 @@
 				B97000000000000000000007 /* SyncV2StoreSchemaV6.sql */,
 				B97000000000000000000008 /* SyncV2StoreSchemaV7.sql */,
 				B98000000000000000000008 /* SyncV2StoreSchemaV8.sql */,
+				B98000000000000000000009 /* SyncV2StoreSchemaV9.sql */,
+				B9800000000000000000000A /* SyncV2StoreSchemaV10.sql */,
 				G10000000000000000000013 /* Products */,
 			);
 			sourceTree = "<group>";
@@ -475,6 +487,8 @@
 				B9000000000000000000000C /* DeviceIdentityService.swift */,
 				B9000000000000000000000E /* SupabaseProjectBindingService.swift */,
 				B96000000000000000000001 /* SyncV2Contract.swift */,
+				B96000000000000000000008 /* SyncV2Handshake.swift */,
+				B96000000000000000000012 /* SyncV2ContractStructure.swift */,
 				B96000000000000000000007 /* SyncV2UnicodeCasefold.swift */,
 				B90000000000000000000010 /* SyncV2Store.swift */,
 				B90000000000000000000013 /* SyncV2Client.swift */,
@@ -540,6 +554,7 @@
 				B9000000000000000000000D /* DeviceIdentityServiceTests.swift */,
 				B9000000000000000000000F /* SupabaseProjectBindingServiceTests.swift */,
 				B96000000000000000000002 /* SyncV2ContractTests.swift */,
+				B96000000000000000000009 /* SyncV2HandshakeTests.swift */,
 				B96000000000000000000003 /* SyncV2TransitionVector.swift */,
 				B96000000000000000000004 /* SyncV2VectorHarness.swift */,
 				B96000000000000000000005 /* SyncV2TransitionVectorTests.swift */,
@@ -876,6 +891,8 @@
 				A97000000000000000000007 /* SyncV2StoreSchemaV6.sql in Resources */,
 				A97000000000000000000008 /* SyncV2StoreSchemaV7.sql in Resources */,
 				A98000000000000000000008 /* SyncV2StoreSchemaV8.sql in Resources */,
+				A98000000000000000000009 /* SyncV2StoreSchemaV9.sql in Resources */,
+				A9800000000000000000000A /* SyncV2StoreSchemaV10.sql in Resources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -981,6 +998,8 @@
 				A90000000000000000000008 /* DeviceIdentityService.swift in Sources */,
 				A9000000000000000000000A /* SupabaseProjectBindingService.swift in Sources */,
 				A96000000000000000000001 /* SyncV2Contract.swift in Sources */,
+				A96000000000000000000008 /* SyncV2Handshake.swift in Sources */,
+				A96000000000000000000012 /* SyncV2ContractStructure.swift in Sources */,
 				A96000000000000000000007 /* SyncV2UnicodeCasefold.swift in Sources */,
 				A9000000000000000000000C /* SyncV2Store.swift in Sources */,
 				A9000000000000000000000F /* SyncV2Client.swift in Sources */,
@@ -1033,6 +1052,7 @@
 				A90000000000000000000009 /* DeviceIdentityServiceTests.swift in Sources */,
 				A9000000000000000000000B /* SupabaseProjectBindingServiceTests.swift in Sources */,
 				A96000000000000000000002 /* SyncV2ContractTests.swift in Sources */,
+				A96000000000000000000009 /* SyncV2HandshakeTests.swift in Sources */,
 				A96000000000000000000003 /* SyncV2TransitionVector.swift in Sources */,
 				A96000000000000000000004 /* SyncV2VectorHarness.swift in Sources */,
 				A96000000000000000000005 /* SyncV2TransitionVectorTests.swift in Sources */,

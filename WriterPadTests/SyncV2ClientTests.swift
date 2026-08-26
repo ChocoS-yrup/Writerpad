@@ -3105,6 +3105,15 @@ private actor AutomaticRebaseSnapshotClientStub:
         guard snapshot?.documentID == documentID else { return nil }
         return snapshot
     }
+
+    /// 이 대역은 계약 순서를 다루지 않는다. 비어 있다고 답하는 것이 아니라
+    /// 다루지 않음을 여기 적어 둔다 — 기본 구현에 기대면 전달자 누락이 성공으로
+    /// 보인다.
+    func fetchTreeOrders(
+        projectID: UUID
+    ) async throws -> [SyncV2RemoteTreeOrder] {
+        []
+    }
 }
 
 private actor AutomaticRebaseStoreStub: SyncV2DispatchStoring {

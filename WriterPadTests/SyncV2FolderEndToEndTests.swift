@@ -1267,4 +1267,11 @@ private struct EndToEndFolderSnapshotClient: SyncV2SnapshotClienting {
     ) async throws -> [SyncV2RemoteFolder] {
         await server.folderList()
     }
+
+    func fetchTreeOrders(
+        projectID: UUID
+    ) async throws -> [SyncV2RemoteTreeOrder] {
+        _ = projectID
+        return []
+    }
 }

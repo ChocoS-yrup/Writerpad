@@ -32,6 +32,15 @@ protocol SyncV2SnapshotStateStoring: Sendable {
         excluding blockedFolderIDs: Set<UUID>
     ) async throws
 
+    /// 계약 tree_order를 서버가 말한 그대로 적어 둔다. 순서는 자식 목록 전체를
+    /// 보내는 구조라, 서버가 무엇을 담고 있는지와 그 revision을 모르면 안전하게
+    /// 쓸 수 없다.
+    func applyTreeOrderSnapshotBaselines(
+        localProjectID: ProjectID,
+        serverProjectID: UUID,
+        treeOrders: [SyncV2RemoteTreeOrder]
+    ) async throws
+
     /// 두 기기가 빈 서버 작품을 동시에 채울면 같은 초기 문서에
     /// 서로 다른 UUID가 생길 수 있다. 로컬 대기열이 정말 revision 0의
     /// 동일한 초기 snapshot인 경우에만 서버 UUID를 정식 기준으로
@@ -222,6 +231,19 @@ actor SyncV2SnapshotPullService: SyncV2SnapshotPulling {
             await localApplier.prepareRemoteFolders(
                 localProjectID: localProjectID,
                 projection: .unsupported
+            )
+        }
+
+        // 폴더가 제자리에 놓인 뒤에 순서를 받는다. 순서는 folder_id를 가리키므로
+        // 폴더가 먼저 있어야 가리킬 대상이 있다.
+        let treeOrders = try await client.fetchTreeOrders(
+            projectID: serverProjectID
+        )
+        if !treeOrders.isEmpty {
+            try await stateStore.applyTreeOrderSnapshotBaselines(
+                localProjectID: localProjectID,
+                serverProjectID: serverProjectID,
+                treeOrders: treeOrders
             )
         }
 
