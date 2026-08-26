@@ -8028,6 +8028,105 @@ final class SyncV2StoreTests: XCTestCase {
         )
     }
 
+    func testContractPathRecorderForwardsRecordedInitialSnapshotAndSkipsReplay()
+        async throws {
+        let database = try databaseURL()
+        let context = QueueAPIContext()
+        let store = try await connectedStore(at: database, context: context)
+        _ = try await store.enqueue(
+            context.batch(
+                kind: .projectBinding,
+                mutations: [
+                    .ensureProject(
+                        SyncV2EnsureProjectMutation(
+                            operationID: UUID(),
+                            projectName: context.binding.projectName
+                        )
+                    ),
+                ]
+            )
+        )
+        await store.close()
+
+        let defaultsName = "WriterPad-ContractRecorder-\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: defaultsName))
+        addTeardownBlock {
+            UserDefaults.standard.removePersistentDomain(forName: defaultsName)
+        }
+        let recorder = SyncV2ContractPathRecorder(
+            store: LazySyncV2ProjectBindingStore(databaseURL: database),
+            handshakeService: nil,
+            authenticationService: InitialSnapshotAuthenticationStub(),
+            defaults: defaults
+        )
+
+        let hasRecorded = try await recorder.hasRecordedInitialSnapshot(
+            for: context.localProjectID,
+            kind: .projectBinding
+        )
+        XCTAssertTrue(hasRecorded)
+
+        let workspace = FileManager.default.temporaryDirectory
+            .appendingPathComponent(
+                "WriterPad-ContractRecorder-\(UUID().uuidString)",
+                isDirectory: true
+            )
+        try FileManager.default.createDirectory(
+            at: workspace,
+            withIntermediateDirectories: true
+        )
+        addTeardownBlock { try? FileManager.default.removeItem(at: workspace) }
+        let initial = ProjectInitialSyncRecorder(
+            documentRepository: InitialSnapshotDocumentRepository([]),
+            workspaceLocator: FixedWorkspaceLocator(root: workspace),
+            durableChangeRecorder: recorder
+        )
+
+        let result = await initial.recordInitialSnapshot(
+            projectID: context.localProjectID,
+            projectName: context.binding.projectName,
+            batchKind: .projectBinding
+        )
+
+        XCTAssertEqual(result, .notNeeded)
+        let raw = try RawSQLite(url: database)
+        XCTAssertEqual(
+            try raw.scalarInt(
+                "SELECT COUNT(*) FROM sync_batches WHERE batch_kind = 'project_binding';"
+            ),
+            1
+        )
+        raw.close()
+    }
+
+    func testContractPathRecorderPropagatesInitialSnapshotLookupFailure()
+        async throws {
+        let database = try databaseURL()
+        let raw = try RawSQLite(url: database)
+        try raw.execute(
+            """
+            CREATE TABLE unknown_user_data(value TEXT NOT NULL);
+            PRAGMA user_version = 0;
+            """
+        )
+        raw.close()
+        let recorder = SyncV2ContractPathRecorder(
+            store: LazySyncV2ProjectBindingStore(databaseURL: database),
+            handshakeService: nil,
+            authenticationService: InitialSnapshotAuthenticationStub()
+        )
+
+        do {
+            _ = try await recorder.hasRecordedInitialSnapshot(
+                for: ProjectID(rawValue: UUID()),
+                kind: .projectBinding
+            )
+            XCTFail("초기 snapshot 조회 실패를 false로 바꾸면 안 됩니다.")
+        } catch {
+            // fail-closed: 저장소 조회 실패를 호출자에게 그대로 전달한다.
+        }
+    }
+
     func testNativeBindingAtomicallyCompletesFolderMigrationButLegacyDoesNot()
         async throws {
         let store = try await openStore(at: databaseURL())
@@ -8385,6 +8484,21 @@ final class SyncV2StoreTests: XCTestCase {
 
 private enum TestFailure: Error {
     case openFailed
+}
+
+private actor InitialSnapshotAuthenticationStub: AuthenticationServicing {
+    func currentState() -> AuthenticationState { .localOnly }
+    func restoreSession() -> AuthenticationState { .localOnly }
+    func refreshSession(force: Bool) -> AuthenticationState {
+        _ = force
+        return .localOnly
+    }
+    func signIn(email: String, password: String) -> AuthenticationState {
+        _ = email
+        _ = password
+        return .localOnly
+    }
+    func signOut() -> AuthenticationState { .signedOut(.userInitiated) }
 }
 
 private struct QueueAPIContext {

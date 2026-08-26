@@ -1938,6 +1938,15 @@ private actor RecordingDurableChangeRecorder: DurableLocalChangeRecording {
         .durableQueue
     }
 
+    func hasRecordedInitialSnapshot(
+        for projectID: ProjectID,
+        kind: DurableLocalBatchKind
+    ) async throws -> Bool {
+        _ = projectID
+        _ = kind
+        return false
+    }
+
     func record(_ batch: LocalMutationBatch) async -> DurableRecordResult {
         batches.append(batch)
         return result

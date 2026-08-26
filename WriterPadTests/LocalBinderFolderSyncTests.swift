@@ -291,6 +291,15 @@ private actor FolderMutationRecorder: DurableLocalChangeRecording {
         return .durableQueue
     }
 
+    func hasRecordedInitialSnapshot(
+        for projectID: ProjectID,
+        kind: DurableLocalBatchKind
+    ) async throws -> Bool {
+        _ = projectID
+        _ = kind
+        return false
+    }
+
     func record(_ batch: LocalMutationBatch) async -> DurableRecordResult {
         recordCount += 1
         for mutation in batch.mutations {

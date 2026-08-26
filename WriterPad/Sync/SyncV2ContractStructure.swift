@@ -110,6 +110,16 @@ actor SyncV2ContractPathRecorder: DurableLocalChangeRecording {
         await store.requirement(for: projectID)
     }
 
+    func hasRecordedInitialSnapshot(
+        for projectID: ProjectID,
+        kind: DurableLocalBatchKind
+    ) async throws -> Bool {
+        try await store.hasRecordedInitialSnapshot(
+            for: projectID,
+            kind: kind
+        )
+    }
+
     func record(_ batch: LocalMutationBatch) async -> DurableRecordResult {
         let touchesStructure = batch.mutations.contains { mutation in
             switch mutation {

@@ -162,15 +162,6 @@ extension DurableLocalChangeRecording {
         .durableQueue
     }
 
-    func hasRecordedInitialSnapshot(
-        for projectID: ProjectID,
-        kind: DurableLocalBatchKind
-    ) async throws -> Bool {
-        _ = projectID
-        _ = kind
-        return false
-    }
-
     func preservedResult(
         for projectID: ProjectID,
         documentID: DocumentID
