@@ -101,6 +101,8 @@ enum WorkspaceSyncStatusReducer {
         ) {
         case (_, .conflictRequired), (_, .structuralConflict),
              (_, .notApplied), (_, .notPublished), (_, .waiting),
+             (_, .uploadPending), (_, .retryWaiting),
+             (_, .actualConflict), (_, .blocked),
              (_, .automaticallyMerged):
             // 결과 축은 연결 수명주기와 독립적이다. 사용자 조치가 필요하거나
             // 아직 확인해야 할 pull 결과는 Realtime 전이로 가리지 않는다.
@@ -202,6 +204,35 @@ enum WorkspaceSyncStatusReducer {
         }
 
         switch workspaceState.lastResult {
+        case let .uploadPending(count):
+            return value(
+                "전송 대기",
+                "icloud.and.arrow.up",
+                "이 iPad의 로컬 변경 \(count)건이 서버 전송 순서를 기다리고 있습니다."
+            )
+        case let .retryWaiting(count):
+            return value(
+                "재시도 대기",
+                "clock.arrow.circlepath",
+                "일시적인 전송 실패 \(count)건을 보존했습니다. 다음 재시도 전에는 서버 snapshot을 적용하지 않습니다.",
+                severity: .warning,
+                retry: true
+            )
+        case let .actualConflict(count):
+            return value(
+                "실제 충돌 \(count)건",
+                "exclamationmark.arrow.triangle.2.circlepath",
+                "서버 revision과 겹친 변경입니다. 충돌 해소용 읽기와 병합 절차가 필요합니다.",
+                severity: .failure,
+                retry: true
+            )
+        case let .blocked(count):
+            return value(
+                "적용 거부 \(count)건",
+                "exclamationmark.icloud",
+                "서버 계약 또는 권한에 의해 영구 거부된 로컬 변경입니다. 자동 반복하지 않습니다.",
+                severity: .failure
+            )
         case .waiting:
             return value(
                 "동기화 대기",

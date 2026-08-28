@@ -263,6 +263,29 @@ enum SyncV2OperationStatus: String, Codable, Equatable, Sendable {
     case blocked
 }
 
+/// 작품별 upload/pull 관문이 durable queue의 실제 상태를 판단할 때 쓰는
+/// 읽기 모델이다. LEGACY operation과 계약 구조 batch를 같은 단위로 합친다.
+struct SyncV2UploadQueueSnapshot: Equatable, Sendable {
+    var pendingCount: Int = 0
+    var inflightCount: Int = 0
+    var retryWaitingCount: Int = 0
+    var conflictCount: Int = 0
+    var blockedCount: Int = 0
+
+    static let idle = SyncV2UploadQueueSnapshot()
+
+    var hasQueuedOrRunningUpload: Bool {
+        pendingCount > 0 || inflightCount > 0
+    }
+
+    var hasUnsentLocalChanges: Bool {
+        hasQueuedOrRunningUpload
+            || retryWaitingCount > 0
+            || conflictCount > 0
+            || blockedCount > 0
+    }
+}
+
 struct SyncV2EnsureProjectMutation: Equatable, Sendable {
     let operationID: UUID
     let projectName: String
@@ -768,9 +791,29 @@ protocol SyncV2DispatchStoring: Sendable {
     func nextRetryDate(
         localProjectID: ProjectID?
     ) async throws -> Date?
+    func uploadQueueSnapshot(
+        localProjectID: ProjectID
+    ) async throws -> SyncV2UploadQueueSnapshot
+    func hasServerSnapshotBaseline(
+        localProjectID: ProjectID
+    ) async throws -> Bool
 }
 
 extension SyncV2DispatchStoring {
+    func uploadQueueSnapshot(
+        localProjectID: ProjectID
+    ) async throws -> SyncV2UploadQueueSnapshot {
+        _ = localProjectID
+        return .idle
+    }
+
+    func hasServerSnapshotBaseline(
+        localProjectID: ProjectID
+    ) async throws -> Bool {
+        _ = localProjectID
+        return true
+    }
+
     func rebaseFolderAfterRevisionConflict(
         _ operation: SyncV2FolderDispatchOperation,
         remote: SyncV2RemoteFolder
@@ -2908,6 +2951,24 @@ actor SyncV2Store:
               AND (
                   (
                       o.document_id IS NOT NULL
+                      -- LEGACY volume_creation의 권 폴더가 하나라도 미확정이면
+                      -- 새 문서를 claim하지 않는다. 이미 inflight인 문서는 이
+                      -- 조회를 다시 타지 않으므로 끝까지 보내고, 다음 선택부터
+                      -- 새 권 폴더가 앞선다.
+                      AND NOT EXISTS (
+                          SELECT 1
+                          FROM sync_operations priorityFolder
+                          JOIN sync_batches priorityBatch
+                            ON priorityBatch.batch_id
+                                = priorityFolder.batch_id
+                          WHERE priorityFolder.local_project_id
+                                = o.local_project_id
+                            AND priorityFolder.folder_id IS NOT NULL
+                            AND priorityBatch.batch_kind = 'volume_creation'
+                            AND priorityFolder.status NOT IN (
+                                'completed', 'cancelled'
+                            )
+                      )
                       AND NOT EXISTS (
                           SELECT 1
                           FROM sync_operations earlier
@@ -3056,6 +3117,81 @@ actor SyncV2Store:
                 }
                 projectIDs.append(ProjectID(rawValue: identifier))
             }
+        }
+    }
+
+    func uploadQueueSnapshot(
+        localProjectID: ProjectID
+    ) async throws -> SyncV2UploadQueueSnapshot {
+        guard availability() == .available else {
+            throw SyncV2DispatchStoreError.unavailable
+        }
+        let localValue = localProjectID.rawValue.uuidString.lowercased()
+        return try withStatement(
+            """
+            SELECT
+                (SELECT COUNT(*) FROM sync_operations
+                 WHERE local_project_id = ?1 AND status = 'pending')
+                + (SELECT COUNT(*) FROM sync_contract_batches
+                   WHERE local_project_id = ?1 AND status = 'ready'),
+                (SELECT COUNT(*) FROM sync_operations
+                 WHERE local_project_id = ?1 AND status = 'inflight')
+                + (SELECT COUNT(*) FROM sync_contract_batches
+                   WHERE local_project_id = ?1 AND status = 'processing'),
+                (SELECT COUNT(*) FROM sync_operations
+                 WHERE local_project_id = ?1 AND status = 'retry_wait'),
+                (SELECT COUNT(*) FROM sync_operations
+                 WHERE local_project_id = ?1 AND status = 'conflict')
+                + (SELECT COUNT(*) FROM sync_contract_batches
+                   WHERE local_project_id = ?1 AND status = 'conflict'),
+                (SELECT COUNT(*) FROM sync_operations
+                 WHERE local_project_id = ?1 AND status = 'blocked')
+                + (SELECT COUNT(*) FROM sync_contract_batches
+                   WHERE local_project_id = ?1 AND status = 'blocked');
+            """
+        ) { statement in
+            try bind(localValue, at: 1, to: statement)
+            guard sqlite3_step(statement) == SQLITE_ROW else {
+                throw SyncV2DispatchStoreError.integrityFailure
+            }
+            return SyncV2UploadQueueSnapshot(
+                pendingCount: Int(sqlite3_column_int64(statement, 0)),
+                inflightCount: Int(sqlite3_column_int64(statement, 1)),
+                retryWaitingCount: Int(sqlite3_column_int64(statement, 2)),
+                conflictCount: Int(sqlite3_column_int64(statement, 3)),
+                blockedCount: Int(sqlite3_column_int64(statement, 4))
+            )
+        }
+    }
+
+    func hasServerSnapshotBaseline(
+        localProjectID: ProjectID
+    ) async throws -> Bool {
+        guard availability() == .available else {
+            throw SyncV2DispatchStoreError.unavailable
+        }
+        let localValue = localProjectID.rawValue.uuidString.lowercased()
+        return try withStatement(
+            """
+            SELECT EXISTS(
+                SELECT 1 FROM sync_documents
+                WHERE local_project_id = ? AND server_revision > 0
+                UNION ALL
+                SELECT 1 FROM sync_folders
+                WHERE local_project_id = ? AND server_revision > 0
+                UNION ALL
+                SELECT 1 FROM sync_tree_orders
+                WHERE local_project_id = ? AND server_revision > 0
+            );
+            """
+        ) { statement in
+            try bind(localValue, at: 1, to: statement)
+            try bind(localValue, at: 2, to: statement)
+            try bind(localValue, at: 3, to: statement)
+            guard sqlite3_step(statement) == SQLITE_ROW else {
+                throw SyncV2DispatchStoreError.integrityFailure
+            }
+            return sqlite3_column_int(statement, 0) == 1
         }
     }
 
@@ -6000,6 +6136,7 @@ actor SyncV2Store:
                    o.content, o.is_deleted, o.attempts,
                    o.automatic_rebase_count
             FROM sync_operations o
+            JOIN sync_batches b ON b.batch_id = o.batch_id
             JOIN sync_documents d ON d.document_id = o.document_id
             WHERE o.document_id IS NOT NULL
               AND o.base_revision IS NOT NULL
@@ -6020,6 +6157,45 @@ actor SyncV2Store:
                   WHERE earlier.document_id = o.document_id
                     AND earlier.document_sequence < o.document_sequence
                     AND earlier.status NOT IN ('completed', 'cancelled')
+              )
+              -- 새 권 폴더가 서버에 확정될 때까지 이 작품의 새 문서 claim을
+              -- 멈춘다. 이미 inflight인 작업은 건드리지 않는다.
+              AND NOT EXISTS (
+                  SELECT 1
+                  FROM sync_operations priorityFolder
+                  JOIN sync_batches priorityBatch
+                    ON priorityBatch.batch_id = priorityFolder.batch_id
+                  WHERE priorityFolder.local_project_id = o.local_project_id
+                    AND priorityFolder.folder_id IS NOT NULL
+                    AND priorityBatch.batch_kind = 'volume_creation'
+                    AND priorityFolder.status NOT IN (
+                        'completed', 'cancelled'
+                    )
+              )
+              -- volume_creation의 장 문서는 한 번에 하나만 claim한다. 그래서
+              -- 첫 장 전송 중 다음 권이 추가되면 선점되지 않은 나머지 장 대신
+              -- 새 권 폴더가 바로 다음 선택이 된다.
+              AND (
+                  b.batch_kind <> 'volume_creation'
+                  OR o.operation_kind = 'tree_order'
+                  OR NOT EXISTS (
+                      SELECT 1
+                      FROM sync_operations earlierVolumeDocument
+                      JOIN sync_batches earlierVolumeBatch
+                        ON earlierVolumeBatch.batch_id
+                            = earlierVolumeDocument.batch_id
+                      WHERE earlierVolumeDocument.local_project_id
+                            = o.local_project_id
+                        AND earlierVolumeDocument.document_id IS NOT NULL
+                        AND earlierVolumeDocument.operation_kind
+                            <> 'tree_order'
+                        AND earlierVolumeBatch.batch_kind
+                            = 'volume_creation'
+                        AND earlierVolumeDocument.queue_id < o.queue_id
+                        AND earlierVolumeDocument.status NOT IN (
+                            'completed', 'cancelled'
+                        )
+                  )
               )
               -- 구조 변경 batch의 문서 경로는 폴더 행이
               -- 서버에 확정된 뒤에만 공개한다.
@@ -6911,12 +7087,14 @@ actor SyncV2Store:
         if payload.kind == .treeOrder {
             try coalescePendingTreeOrderOperations(
                 documentID: payload.documentID,
-                preserveEarlierCheckpoint: batch.operations.contains {
-                    guard case let .document(document) = $0.payload else {
-                        return false
-                    }
-                    return document.kind != .treeOrder
-                },
+                preserveEarlierCheckpoint:
+                    batch.kind != .volumeCreation
+                    && batch.operations.contains {
+                        guard case let .document(document) = $0.payload else {
+                            return false
+                        }
+                        return document.kind != .treeOrder
+                    },
                 timestamp: timestamp
             )
         }
@@ -10509,17 +10687,22 @@ actor LazySyncV2ProjectBindingStore:
     private let databaseURL: URL?
     private let deviceIdentityProvider: (any DeviceIdentityProviding)?
     private let dispatchWakeup: SyncV2DispatchWakeup?
+    private let uploadPullCoordinator:
+        SyncV2ProjectUploadPullCoordinator?
     private var store: SyncV2Store?
     private(set) var diagnostic: SyncV2StoreDiagnostic?
 
     init(
         databaseURL: URL?,
         deviceIdentityProvider: (any DeviceIdentityProviding)? = nil,
-        dispatchWakeup: SyncV2DispatchWakeup? = nil
+        dispatchWakeup: SyncV2DispatchWakeup? = nil,
+        uploadPullCoordinator:
+            SyncV2ProjectUploadPullCoordinator? = nil
     ) {
         self.databaseURL = databaseURL
         self.deviceIdentityProvider = deviceIdentityProvider
         self.dispatchWakeup = dispatchWakeup
+        self.uploadPullCoordinator = uploadPullCoordinator
     }
 
     func availability() async -> ProjectBindingStoreAvailability {
@@ -10787,6 +10970,9 @@ actor LazySyncV2ProjectBindingStore:
             }
         }
 
+        let enqueueReservation = await uploadPullCoordinator?.beginEnqueue(
+            localProjectID: batch.projectID
+        )
         do {
             let receipt = try await store.enqueue(
                 SyncV2EnqueueBatch(
@@ -10797,6 +10983,15 @@ actor LazySyncV2ProjectBindingStore:
                     mutations: syncMutations
                 )
             )
+            if let enqueueReservation, let uploadPullCoordinator {
+                let queue = (try? await store.uploadQueueSnapshot(
+                    localProjectID: batch.projectID
+                )) ?? SyncV2UploadQueueSnapshot(pendingCount: 1)
+                await uploadPullCoordinator.finishEnqueue(
+                    enqueueReservation,
+                    queue: queue
+                )
+            }
             if let blocked = receipt.blockedOperations.max(
                 by: { $0.contentByteCount < $1.contentByteCount }
             ) {
@@ -10814,10 +11009,28 @@ actor LazySyncV2ProjectBindingStore:
             }
             return .queued(operationIDs: receipt.operationIDs)
         } catch let error as SyncV2EnqueueError {
+            if let enqueueReservation, let uploadPullCoordinator {
+                let queue = (try? await store.uploadQueueSnapshot(
+                    localProjectID: batch.projectID
+                )) ?? SyncV2UploadQueueSnapshot(retryWaitingCount: 1)
+                await uploadPullCoordinator.finishEnqueue(
+                    enqueueReservation,
+                    queue: queue
+                )
+            }
             return .localSavedButNotQueued(
                 reason: Self.recordFailureMessage(error)
             )
         } catch {
+            if let enqueueReservation, let uploadPullCoordinator {
+                let queue = (try? await store.uploadQueueSnapshot(
+                    localProjectID: batch.projectID
+                )) ?? SyncV2UploadQueueSnapshot(retryWaitingCount: 1)
+                await uploadPullCoordinator.finishEnqueue(
+                    enqueueReservation,
+                    queue: queue
+                )
+            }
             return .localSavedButNotQueued(
                 reason: "동기화 기록 중 알 수 없는 오류가 발생했습니다."
             )
@@ -11048,12 +11261,38 @@ actor LazySyncV2ProjectBindingStore:
         else { throw SyncV2ContractStructureError.unavailable }
         let writerDeviceID = try await deviceIdentityProvider
             .currentIdentifier().uuid
-        return try await store.enqueueContractStructure(
-            batch,
-            binding: binding,
-            handshake: handshake,
-            writerDeviceID: writerDeviceID
+        let reservation = await uploadPullCoordinator?.beginEnqueue(
+            localProjectID: batch.projectID
         )
+        do {
+            let identifiers = try await store.enqueueContractStructure(
+                batch,
+                binding: binding,
+                handshake: handshake,
+                writerDeviceID: writerDeviceID
+            )
+            if let reservation, let uploadPullCoordinator {
+                let queue = (try? await store.uploadQueueSnapshot(
+                    localProjectID: batch.projectID
+                )) ?? SyncV2UploadQueueSnapshot(pendingCount: 1)
+                await uploadPullCoordinator.finishEnqueue(
+                    reservation,
+                    queue: queue
+                )
+            }
+            return identifiers
+        } catch {
+            if let reservation, let uploadPullCoordinator {
+                let queue = (try? await store.uploadQueueSnapshot(
+                    localProjectID: batch.projectID
+                )) ?? SyncV2UploadQueueSnapshot(retryWaitingCount: 1)
+                await uploadPullCoordinator.finishEnqueue(
+                    reservation,
+                    queue: queue
+                )
+            }
+            throw error
+        }
     }
 
     func claimNextContractStructure(
@@ -11263,6 +11502,28 @@ actor LazySyncV2ProjectBindingStore:
             throw SyncV2DispatchStoreError.unavailable
         }
         return try await store.readyLocalProjectIDs(now: now)
+    }
+
+    func uploadQueueSnapshot(
+        localProjectID: ProjectID
+    ) async throws -> SyncV2UploadQueueSnapshot {
+        guard let store = await resolvedStore() else {
+            throw SyncV2DispatchStoreError.unavailable
+        }
+        return try await store.uploadQueueSnapshot(
+            localProjectID: localProjectID
+        )
+    }
+
+    func hasServerSnapshotBaseline(
+        localProjectID: ProjectID
+    ) async throws -> Bool {
+        guard let store = await resolvedStore() else {
+            throw SyncV2DispatchStoreError.unavailable
+        }
+        return try await store.hasServerSnapshotBaseline(
+            localProjectID: localProjectID
+        )
     }
 
     func complete(

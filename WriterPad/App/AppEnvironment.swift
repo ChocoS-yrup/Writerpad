@@ -197,6 +197,8 @@ final class AppEnvironment: ObservableObject {
         )
         let projectBindingStore: any ProjectBindingStoring
         let durableChangeRecorder: any DurableLocalChangeRecording
+        let uploadPullCoordinator = SyncV2ProjectUploadPullCoordinator()
+        let syncV2Store: LazySyncV2ProjectBindingStore?
         let syncDispatcher: SyncV2Dispatcher?
         let networkRecoveryHub: SyncV2NetworkRecoveryHub?
         let conflictResolutionService: (any SyncV2ConflictResolving)?
@@ -211,6 +213,7 @@ final class AppEnvironment: ObservableObject {
         if isStoredInMemoryOnly {
             projectBindingStore = InMemoryProjectBindingStore()
             durableChangeRecorder = NoOpDurableLocalChangeRecorder()
+            syncV2Store = nil
             syncDispatcher = nil
             networkRecoveryHub = nil
             conflictResolutionService = nil
@@ -227,29 +230,31 @@ final class AppEnvironment: ObservableObject {
         } else {
             let dispatchWakeup = SyncV2DispatchWakeup()
             networkRecoveryHub = SyncV2NetworkRecoveryHub()
-            let syncV2Store = LazySyncV2ProjectBindingStore(
+            let liveSyncV2Store = LazySyncV2ProjectBindingStore(
                 databaseURL: SyncV2Store.defaultDatabaseURL(),
                 deviceIdentityProvider: deviceIdentityService,
-                dispatchWakeup: dispatchWakeup
+                dispatchWakeup: dispatchWakeup,
+                uploadPullCoordinator: uploadPullCoordinator
             )
-            projectBindingStore = syncV2Store
+            syncV2Store = liveSyncV2Store
+            projectBindingStore = liveSyncV2Store
             durableChangeRecorder = SyncV2ContractPathRecorder(
-                store: syncV2Store,
+                store: liveSyncV2Store,
                 handshakeService: handshakeService,
                 authenticationService: authenticationService
             )
-            conflictResolutionService = syncV2Store
-            snapshotStateStore = syncV2Store
-            folderMigrationMarker = syncV2Store
+            conflictResolutionService = liveSyncV2Store
+            snapshotStateStore = liveSyncV2Store
+            folderMigrationMarker = liveSyncV2Store
             conflictRecoveryStore = ConflictRecoveryStore
                 .defaultPackagesRootURL()
                 .map {
                     ConflictRecoveryStore(
-                        ledger: syncV2Store,
+                        ledger: liveSyncV2Store,
                         documentRepository: repository,
                         workspaceLocator: workspaceLocator,
                         packagesRootURL: $0,
-                        durableChangeRecorder: syncV2Store
+                        durableChangeRecorder: liveSyncV2Store
                     )
                 }
             localSnapshotApplier = LocalSyncV2SnapshotApplier(
@@ -266,7 +271,7 @@ final class AppEnvironment: ObservableObject {
                 .map {
                     EditLeaseManager(
                         client: $0,
-                        revisionProvider: syncV2Store,
+                        revisionProvider: liveSyncV2Store,
                         deviceIdentityProvider: deviceIdentityService,
                         isEnabled: {
                             GlobalSyncPreference.isEnabled()
@@ -280,10 +285,11 @@ final class AppEnvironment: ObservableObject {
                let transport = supabaseClientProvider
                    .makeAtomicStructureTransport() {
                 contractStructureSender = SyncV2ContractStructureSender(
-                    store: syncV2Store,
+                    store: liveSyncV2Store,
                     transport: transport,
                     handshakeService: handshakeService,
-                    authenticationService: authenticationService
+                    authenticationService: authenticationService,
+                    uploadPullCoordinator: uploadPullCoordinator
                 )
             } else {
                 contractStructureSender = nil
@@ -293,7 +299,7 @@ final class AppEnvironment: ObservableObject {
             syncDispatcher = supabaseClientProvider.makeSyncV2Client().map {
                 let automaticRebaser = snapshotClient.map {
                     SyncV2AutomaticRebaser(
-                        store: syncV2Store,
+                        store: liveSyncV2Store,
                         snapshotClient: $0,
                         localApplier: localSnapshotApplier,
                         openLocalProvider:
@@ -302,13 +308,14 @@ final class AppEnvironment: ObservableObject {
                     )
                 }
                 return SyncV2Dispatcher(
-                    store: syncV2Store,
+                    store: liveSyncV2Store,
                     client: $0,
                     leaseManager: editLeaseManager,
                     projectRecoveryTransport: projectBindingTransport,
                     automaticRebaser: automaticRebaser,
                     wakeup: dispatchWakeup,
-                    networkRecoveryHub: networkRecoveryHub
+                    networkRecoveryHub: networkRecoveryHub,
+                    uploadPullCoordinator: uploadPullCoordinator
                 )
             }
         }
@@ -373,7 +380,23 @@ final class AppEnvironment: ObservableObject {
                 puller: snapshotPullService,
                 realtime: backgroundRealtimeTrigger,
                 projectBindingService: projectBindingService,
-                authenticationService: authenticationService
+                authenticationService: authenticationService,
+                uploadPullCoordinator: uploadPullCoordinator,
+                readUploadQueueSnapshot: { localProjectID in
+                    guard let syncV2Store else { return nil }
+                    return try? await syncV2Store.uploadQueueSnapshot(
+                        localProjectID: localProjectID
+                    )
+                },
+                isBootstrapPullAllowed: { localProjectID in
+                    guard let syncV2Store,
+                          let hasBaseline = try? await syncV2Store
+                            .hasServerSnapshotBaseline(
+                            localProjectID: localProjectID
+                        )
+                    else { return false }
+                    return !hasBaseline
+                }
             )
         } else {
             backgroundSyncCoordinator = nil

@@ -153,6 +153,18 @@ struct WritingWorkspaceShell: View {
                     await syncDispatcher?.stalledFolderChanges(
                         localProjectID: localProjectID
                     ) ?? []
+                },
+                uploadPullCoordinator:
+                    syncDispatcher?.uploadPullCoordinator,
+                readUploadQueueSnapshot: { localProjectID in
+                    await syncDispatcher?.uploadQueueSnapshot(
+                        localProjectID: localProjectID
+                    )
+                },
+                isBootstrapPullAllowed: { localProjectID in
+                    await syncDispatcher?.isBootstrapPullAllowed(
+                        localProjectID: localProjectID
+                    ) ?? false
                 }
             )
         )

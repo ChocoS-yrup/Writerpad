@@ -1122,6 +1122,9 @@ final class LocalBinderCommandServiceTests: XCTestCase {
         batches = await recorder.recordedBatches()
         XCTAssertEqual(batches.count, 1)
         XCTAssertEqual(batches[0].kind, .volumeCreation)
+        guard case .folderSnapshot = batches[0].mutations.first else {
+            return XCTFail("새 권 폴더가 장 문서보다 먼저 기록되지 않았습니다.")
+        }
         XCTAssertEqual(
             batches[0].mutations.filter {
                 if case .documentSnapshot = $0 { return true }
@@ -1136,6 +1139,9 @@ final class LocalBinderCommandServiceTests: XCTestCase {
             }.count,
             1
         )
+        guard case .treeOrder = batches[0].mutations.last else {
+            return XCTFail("새 권 tree-order가 batch 마지막이 아닙니다.")
+        }
     }
 
     func testEmptyFolderCreationQueuesTreeOrderBatch() async throws {

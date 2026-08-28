@@ -691,10 +691,18 @@ extension LocalBinderCommandService {
             break
         }
 
-        // 폴더 자체를 서버에 알린다. tree_order는 이름 목록이라 이름이 바뀌면
-        // "옛 이름 사라짐 + 새 이름 생김"으로 도착한다. 같은 folder_id로 보내야
-        // 받는 기기가 옮기기로 처리한다.
-        mutations.append(contentsOf: folderMutations(for: journal))
+        // 새 권은 장 문서보다 권 폴더를 먼저 durable queue에 둔다. 실제 claim도
+        // volume_creation 폴더 장벽을 쓰지만, 재시작 뒤 queue 순서와 감사 기록도
+        // "권 폴더 -> 장 문서 -> tree_order"를 그대로 보여야 한다.
+        let folders = folderMutations(for: journal)
+        if journal.kind == .createVolume {
+            mutations.insert(contentsOf: folders, at: 0)
+        } else {
+            // 폴더 자체를 서버에 알린다. tree_order는 이름 목록이라 이름이 바뀌면
+            // "옛 이름 사라짐 + 새 이름 생김"으로 도착한다. 같은 folder_id로
+            // 보내야 받는 기기가 옮기기로 처리한다.
+            mutations.append(contentsOf: folders)
+        }
 
         if journal.kind != .permanentDelete && journal.kind != .emptyTrash {
             let documents = try await metadataStore.binderDocuments(

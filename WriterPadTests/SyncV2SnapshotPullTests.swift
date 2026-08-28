@@ -8064,3 +8064,362 @@ private actor FolderIdentityPublisherSpy: SyncV2FolderIdentityPublishing {
 
     func published() -> [PublishedFolder] { recorded }
 }
+
+final class SyncV2ProjectUploadPullCoordinatorTests: XCTestCase {
+    @MainActor
+    func testWorkspaceRealtimeDoesNotPullUntilUploadLaneFinishes()
+        async throws {
+        let previous = GlobalSyncPreference.isEnabled()
+        GlobalSyncPreference.setEnabled(true)
+        defer { GlobalSyncPreference.setEnabled(previous) }
+        let coordinator = SyncV2ProjectUploadPullCoordinator()
+        let localProjectID = ProjectID(rawValue: UUID())
+        let queueBox = UploadQueueSnapshotBox(
+            SyncV2UploadQueueSnapshot(pendingCount: 50)
+        )
+        let uploadCandidate = await coordinator.beginUploadDrain(
+            localProjectID: localProjectID,
+            queue: await queueBox.value()
+        )
+        let upload = try XCTUnwrap(uploadCandidate)
+        let puller = WorkspacePullerStub()
+        let realtime = WorkspaceRealtimeStub()
+        let model = SyncV2WorkspaceSyncModel(
+            localProjectID: localProjectID,
+            puller: puller,
+            realtime: realtime,
+            authenticationService: WorkspaceAuthenticationStub(
+                state: .authenticated(
+                    AuthenticatedAccount(userID: UUID(), maskedEmail: nil)
+                )
+            ),
+            projectBindingService: WorkspaceBindingStub(
+                binding: .connected(
+                    localProjectID: localProjectID,
+                    serverProjectID: UUID(),
+                    kind: .existingServerProject,
+                    projectName: "upload gated realtime",
+                    ownerSubject: UUID()
+                )
+            ),
+            uploadPullCoordinator: coordinator,
+            readUploadQueueSnapshot: { _ in await queueBox.value() },
+            isBootstrapPullAllowed: { _ in false },
+            debounceDelay: .milliseconds(5),
+            periodicDelay: .seconds(600)
+        )
+
+        await model.start(editingGuards: { [:] }) { _ in }
+        for _ in 0..<50 {
+            await realtime.emitChange()
+        }
+        try await Task.sleep(for: .milliseconds(30))
+        var pullCount = await puller.count()
+        XCTAssertEqual(pullCount, 0)
+
+        await queueBox.set(.idle)
+        await coordinator.finishUploadDrain(upload, queue: .idle)
+        for _ in 0..<500 where await puller.count() == 0 {
+            await Task.yield()
+        }
+        pullCount = await puller.count()
+        XCTAssertEqual(pullCount, 1)
+        await model.stop()
+    }
+
+    func testFiftyRealtimeGenerationsWaitForUploadDrainThenCoalesceToOnePull()
+        async throws {
+        let coordinator = SyncV2ProjectUploadPullCoordinator()
+        let projectID = ProjectID(rawValue: UUID())
+        let uploading = SyncV2UploadQueueSnapshot(
+            pendingCount: 50,
+            inflightCount: 1
+        )
+        let uploadCandidate = await coordinator.beginUploadDrain(
+            localProjectID: projectID,
+            queue: uploading
+        )
+        let upload = try XCTUnwrap(uploadCandidate)
+
+        for _ in 0..<50 {
+            let pull = await coordinator.observeServerChange(
+                localProjectID: projectID,
+                queue: uploading,
+                bootstrapAllowed: false
+            )
+            XCTAssertNil(pull)
+        }
+        var snapshot = await coordinator.snapshot(localProjectID: projectID)
+        XCTAssertEqual(snapshot.observedGeneration, 50)
+        XCTAssertEqual(snapshot.runningPullCount, 0)
+
+        await coordinator.finishUploadDrain(upload, queue: .idle)
+        let pullCandidate = await coordinator.beginDeferredPull(
+            localProjectID: projectID,
+            queue: .idle,
+            bootstrapAllowed: false
+        )
+        let pull = try XCTUnwrap(pullCandidate)
+        XCTAssertEqual(pull.generation, 50)
+        let duplicate = await coordinator.beginDeferredPull(
+            localProjectID: projectID,
+            queue: .idle,
+            bootstrapAllowed: false
+        )
+        XCTAssertNil(duplicate)
+        snapshot = await coordinator.finishPull(
+            pull,
+            succeeded: true,
+            queue: .idle
+        )
+        XCTAssertTrue(snapshot.isServerSynced)
+    }
+
+    func testUploadPermitCoversEmptyGapBeforeNextClaim() async throws {
+        let coordinator = SyncV2ProjectUploadPullCoordinator()
+        let projectID = ProjectID(rawValue: UUID())
+        let uploadCandidate = await coordinator.beginUploadDrain(
+            localProjectID: projectID,
+            queue: SyncV2UploadQueueSnapshot(pendingCount: 2)
+        )
+        let upload = try XCTUnwrap(uploadCandidate)
+        await coordinator.restore(localProjectID: projectID, queue: .idle)
+        let duringGap = await coordinator.observeServerChange(
+            localProjectID: projectID,
+            queue: .idle,
+            bootstrapAllowed: false
+        )
+        XCTAssertNil(duringGap)
+        await coordinator.restore(
+            localProjectID: projectID,
+            queue: SyncV2UploadQueueSnapshot(pendingCount: 1)
+        )
+        let beforeNextClaim = await coordinator.beginDeferredPull(
+            localProjectID: projectID,
+            queue: .idle,
+            bootstrapAllowed: false
+        )
+        XCTAssertNil(beforeNextClaim)
+        await coordinator.finishUploadDrain(upload, queue: .idle)
+        let afterDrain = await coordinator.beginDeferredPull(
+            localProjectID: projectID,
+            queue: .idle,
+            bootstrapAllowed: false
+        )
+        XCTAssertNotNil(afterDrain)
+    }
+
+    func testEnqueueReservationWinsQueueZeroToPullTransition() async throws {
+        let coordinator = SyncV2ProjectUploadPullCoordinator()
+        let projectID = ProjectID(rawValue: UUID())
+        let reservation = await coordinator.beginEnqueue(
+            localProjectID: projectID
+        )
+        let racedPull = await coordinator.observeServerChange(
+            localProjectID: projectID,
+            queue: .idle,
+            bootstrapAllowed: false
+        )
+        XCTAssertNil(racedPull)
+        await coordinator.finishEnqueue(
+            reservation,
+            queue: SyncV2UploadQueueSnapshot(pendingCount: 1)
+        )
+        let queuedPull = await coordinator.beginDeferredPull(
+            localProjectID: projectID,
+            queue: SyncV2UploadQueueSnapshot(pendingCount: 1),
+            bootstrapAllowed: false
+        )
+        XCTAssertNil(queuedPull)
+        let uploadCandidate = await coordinator.beginUploadDrain(
+            localProjectID: projectID,
+            queue: SyncV2UploadQueueSnapshot(pendingCount: 1)
+        )
+        let upload = try XCTUnwrap(uploadCandidate)
+        await coordinator.finishUploadDrain(upload, queue: .idle)
+        let verificationPull = await coordinator.beginDeferredPull(
+            localProjectID: projectID,
+            queue: .idle,
+            bootstrapAllowed: false
+        )
+        XCTAssertNotNil(verificationPull)
+    }
+
+    func testGenerationObservedDuringPullRunsExactlyOneFollowUp()
+        async throws {
+        let coordinator = SyncV2ProjectUploadPullCoordinator()
+        let projectID = ProjectID(rawValue: UUID())
+        let firstCandidate = await coordinator.observeServerChange(
+            localProjectID: projectID,
+            queue: .idle,
+            bootstrapAllowed: false
+        )
+        let first = try XCTUnwrap(firstCandidate)
+        for _ in 0..<20 {
+            let whilePulling = await coordinator.observeServerChange(
+                localProjectID: projectID,
+                queue: .idle,
+                bootstrapAllowed: false
+            )
+            XCTAssertNil(whilePulling)
+        }
+        _ = await coordinator.finishPull(
+            first,
+            succeeded: true,
+            queue: .idle
+        )
+        let followUpCandidate = await coordinator.beginDeferredPull(
+            localProjectID: projectID,
+            queue: .idle,
+            bootstrapAllowed: false
+        )
+        let followUp = try XCTUnwrap(followUpCandidate)
+        XCTAssertEqual(followUp.generation, 21)
+        _ = await coordinator.finishPull(
+            followUp,
+            succeeded: true,
+            queue: .idle
+        )
+        let third = await coordinator.beginDeferredPull(
+            localProjectID: projectID,
+            queue: .idle,
+            bootstrapAllowed: false
+        )
+        XCTAssertNil(third)
+    }
+
+    func testBootstrapMayPullWithPendingInitialUpload() async {
+        let coordinator = SyncV2ProjectUploadPullCoordinator()
+        let projectID = ProjectID(rawValue: UUID())
+        let permit = await coordinator.observeServerChange(
+            localProjectID: projectID,
+            queue: SyncV2UploadQueueSnapshot(pendingCount: 1),
+            bootstrapAllowed: true
+        )
+        XCTAssertEqual(permit?.isBootstrap, true)
+        let snapshot = await coordinator.snapshot(localProjectID: projectID)
+        XCTAssertEqual(snapshot.phase, .initialPull)
+    }
+
+    func testProjectsHaveIndependentGates() async throws {
+        let coordinator = SyncV2ProjectUploadPullCoordinator()
+        let projectA = ProjectID(rawValue: UUID())
+        let projectB = ProjectID(rawValue: UUID())
+        let uploadA = await coordinator.beginUploadDrain(
+            localProjectID: projectA,
+            queue: SyncV2UploadQueueSnapshot(pendingCount: 1)
+        )
+        _ = try XCTUnwrap(uploadA)
+        let pullA = await coordinator.observeServerChange(
+            localProjectID: projectA,
+            queue: SyncV2UploadQueueSnapshot(pendingCount: 1),
+            bootstrapAllowed: false
+        )
+        XCTAssertNil(pullA)
+        let pullB = await coordinator.observeServerChange(
+            localProjectID: projectB,
+            queue: .idle,
+            bootstrapAllowed: false
+        )
+        XCTAssertNotNil(pullB)
+    }
+
+    func testApplyingPullBlocksUploadForSameProject() async throws {
+        let coordinator = SyncV2ProjectUploadPullCoordinator()
+        let projectID = ProjectID(rawValue: UUID())
+        let pullCandidate = await coordinator.observeServerChange(
+            localProjectID: projectID,
+            queue: .idle,
+            bootstrapAllowed: false
+        )
+        let pull = try XCTUnwrap(pullCandidate)
+        let uploadDuringPull = await coordinator.beginUploadDrain(
+            localProjectID: projectID,
+            queue: SyncV2UploadQueueSnapshot(pendingCount: 1)
+        )
+        XCTAssertNil(uploadDuringPull)
+        _ = await coordinator.finishPull(
+            pull,
+            succeeded: true,
+            queue: SyncV2UploadQueueSnapshot(pendingCount: 1)
+        )
+        let uploadAfterPull = await coordinator.beginUploadDrain(
+            localProjectID: projectID,
+            queue: SyncV2UploadQueueSnapshot(pendingCount: 1)
+        )
+        XCTAssertNotNil(uploadAfterPull)
+    }
+
+    func testRetryConflictAndBlockedQueuesNeverBecomeSynced() async {
+        let coordinator = SyncV2ProjectUploadPullCoordinator()
+        let retryProject = ProjectID(rawValue: UUID())
+        let conflictProject = ProjectID(rawValue: UUID())
+        let blockedProject = ProjectID(rawValue: UUID())
+        await coordinator.restore(
+            localProjectID: retryProject,
+            queue: SyncV2UploadQueueSnapshot(retryWaitingCount: 1)
+        )
+        await coordinator.restore(
+            localProjectID: conflictProject,
+            queue: SyncV2UploadQueueSnapshot(conflictCount: 1)
+        )
+        await coordinator.restore(
+            localProjectID: blockedProject,
+            queue: SyncV2UploadQueueSnapshot(blockedCount: 1)
+        )
+        let retry = await coordinator.snapshot(localProjectID: retryProject)
+        let conflict = await coordinator.snapshot(
+            localProjectID: conflictProject
+        )
+        let blocked = await coordinator.snapshot(
+            localProjectID: blockedProject
+        )
+        XCTAssertEqual(retry.phase, .retryWaiting)
+        XCTAssertEqual(conflict.phase, .blocked)
+        XCTAssertEqual(blocked.phase, .blocked)
+        XCTAssertFalse(retry.isServerSynced)
+        XCTAssertFalse(conflict.isServerSynced)
+        XCTAssertFalse(blocked.isServerSynced)
+    }
+
+    func testRestartRestorationDrainsQueueBeforeDeferredPull() async throws {
+        let coordinator = SyncV2ProjectUploadPullCoordinator()
+        let projectID = ProjectID(rawValue: UUID())
+        await coordinator.restore(
+            localProjectID: projectID,
+            queue: SyncV2UploadQueueSnapshot(pendingCount: 3)
+        )
+        let initialPull = await coordinator.observeServerChange(
+            localProjectID: projectID,
+            queue: SyncV2UploadQueueSnapshot(pendingCount: 3),
+            bootstrapAllowed: false
+        )
+        XCTAssertNil(initialPull)
+        let uploadCandidate = await coordinator.beginUploadDrain(
+            localProjectID: projectID,
+            queue: SyncV2UploadQueueSnapshot(pendingCount: 3)
+        )
+        let upload = try XCTUnwrap(uploadCandidate)
+        await coordinator.finishUploadDrain(upload, queue: .idle)
+        let pullAfterRestartDrain = await coordinator.beginDeferredPull(
+            localProjectID: projectID,
+            queue: .idle,
+            bootstrapAllowed: false
+        )
+        XCTAssertNotNil(pullAfterRestartDrain)
+    }
+}
+
+private actor UploadQueueSnapshotBox {
+    private var snapshot: SyncV2UploadQueueSnapshot
+
+    init(_ snapshot: SyncV2UploadQueueSnapshot) {
+        self.snapshot = snapshot
+    }
+
+    func value() -> SyncV2UploadQueueSnapshot { snapshot }
+
+    func set(_ snapshot: SyncV2UploadQueueSnapshot) {
+        self.snapshot = snapshot
+    }
+}

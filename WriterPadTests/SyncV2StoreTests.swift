@@ -2949,6 +2949,51 @@ final class SyncV2StoreTests: XCTestCase {
         await store.close()
     }
 
+    func testUploadQueueSnapshotTracksLegacyPendingInflightAndRetryWait()
+        async throws {
+        let url = try databaseURL()
+        let context = QueueAPIContext()
+        let store = try await connectedStore(at: url, context: context)
+        _ = try await store.enqueue(
+            context.batch(
+                mutations: [context.documentMutation(operationID: UUID())]
+            )
+        )
+        var snapshot = try await store.uploadQueueSnapshot(
+            localProjectID: context.localProjectID
+        )
+        XCTAssertEqual(snapshot.pendingCount, 1)
+        XCTAssertEqual(snapshot.inflightCount, 0)
+
+        let claimed = try await store.claimReadyOperations(
+            limit: 1,
+            now: Date(timeIntervalSince1970: 10)
+        )
+        let operation = try XCTUnwrap(claimed.first)
+        snapshot = try await store.uploadQueueSnapshot(
+            localProjectID: context.localProjectID
+        )
+        XCTAssertEqual(snapshot.pendingCount, 0)
+        XCTAssertEqual(snapshot.inflightCount, 1)
+
+        try await store.deferRetry(
+            operation,
+            errorCode: "NETWORK_UNAVAILABLE",
+            detail: nil,
+            nextAttemptAt: Date(timeIntervalSince1970: 100)
+        )
+        snapshot = try await store.uploadQueueSnapshot(
+            localProjectID: context.localProjectID
+        )
+        XCTAssertEqual(snapshot.inflightCount, 0)
+        XCTAssertEqual(snapshot.retryWaitingCount, 1)
+        let other = try await store.uploadQueueSnapshot(
+            localProjectID: ProjectID(rawValue: UUID())
+        )
+        XCTAssertEqual(other, .idle)
+        await store.close()
+    }
+
     func testDispatcherClaimIsScopedToOneProjectLane() async throws {
         let url = try databaseURL()
         let firstContext = QueueAPIContext()
@@ -5056,6 +5101,348 @@ final class SyncV2StoreTests: XCTestCase {
         )
         XCTAssertEqual(treeOrder.map(\.operationID), [treeOrderOperationID])
         await store.close()
+    }
+
+    func testRapidVolumeCreationsPublishEveryFolderBeforeAnyChapter()
+        async throws {
+        let url = try databaseURL()
+        let context = QueueAPIContext()
+        let store = try await connectedStore(at: url, context: context)
+        let firstFolderOperationID = UUID()
+        let secondFolderOperationID = UUID()
+        let chapterOperationIDs = (0..<4).map { _ in UUID() }
+        let chapterDocumentIDs = (0..<4).map { _ in UUID() }
+        let treeOrderDocumentID = UUID()
+        let firstTreeOrderOperationID = UUID()
+        let finalTreeOrderOperationID = UUID()
+
+        _ = try await store.enqueue(
+            context.batch(
+                kind: .volumeCreation,
+                mutations: [
+                    context.folderMutation(
+                        operationID: firstFolderOperationID,
+                        folderID: UUID(),
+                        name: "1권"
+                    ),
+                    context.documentMutation(
+                        operationID: chapterOperationIDs[0],
+                        documentID: chapterDocumentIDs[0],
+                        relativePath: "원고/1권/001화.txt"
+                    ),
+                    context.documentMutation(
+                        operationID: chapterOperationIDs[1],
+                        documentID: chapterDocumentIDs[1],
+                        relativePath: "원고/1권/002화.txt"
+                    ),
+                    context.documentMutation(
+                        operationID: firstTreeOrderOperationID,
+                        documentID: treeOrderDocumentID,
+                        relativePath: syncV2TreeOrderPath,
+                        content: "{\"tree_order\":{\"원고\":[\"1권\"]},\"version\":1}",
+                        generation: 1,
+                        kind: .treeOrder
+                    ),
+                ]
+            )
+        )
+        _ = try await store.enqueue(
+            context.batch(
+                kind: .volumeCreation,
+                mutations: [
+                    context.folderMutation(
+                        operationID: secondFolderOperationID,
+                        folderID: UUID(),
+                        name: "2권"
+                    ),
+                    context.documentMutation(
+                        operationID: chapterOperationIDs[2],
+                        documentID: chapterDocumentIDs[2],
+                        relativePath: "원고/2권/026화.txt"
+                    ),
+                    context.documentMutation(
+                        operationID: chapterOperationIDs[3],
+                        documentID: chapterDocumentIDs[3],
+                        relativePath: "원고/2권/027화.txt"
+                    ),
+                    context.documentMutation(
+                        operationID: finalTreeOrderOperationID,
+                        documentID: treeOrderDocumentID,
+                        relativePath: syncV2TreeOrderPath,
+                        content: "{\"tree_order\":{\"원고\":[\"1권\",\"2권\"]},\"version\":1}",
+                        generation: 2,
+                        kind: .treeOrder
+                    ),
+                ]
+            )
+        )
+
+        let documentsBeforeFolders = try await store.claimReadyOperations(
+            limit: 10,
+            now: Date(timeIntervalSince1970: 10)
+        )
+        XCTAssertTrue(documentsBeforeFolders.isEmpty)
+        let folders = try await store.claimReadyFolderOperations(
+            limit: 10,
+            now: Date(timeIntervalSince1970: 10)
+        )
+        XCTAssertEqual(
+            folders.map(\.operationID),
+            [firstFolderOperationID, secondFolderOperationID]
+        )
+        for folder in folders {
+            try await store.complete(
+                folder,
+                result: folderCommitResult(for: folder)
+            )
+        }
+
+        for (index, operationID) in chapterOperationIDs.enumerated() {
+            let claims = try await store.claimReadyOperations(
+                limit: 10,
+                now: Date(timeIntervalSince1970: TimeInterval(20 + index))
+            )
+            let chapter = try XCTUnwrap(claims.first)
+            XCTAssertEqual(claims.map(\.operationID), [operationID])
+            try await store.complete(
+                chapter,
+                result: commitResult(for: chapter)
+            )
+        }
+
+        let treeOrder = try await store.claimReadyOperations(
+            limit: 10,
+            now: Date(timeIntervalSince1970: 30)
+        )
+        XCTAssertEqual(treeOrder.map(\.operationID), [finalTreeOrderOperationID])
+        let firstTreeOrderStatus = try await store.operationStatus(
+            operationID: firstTreeOrderOperationID
+        )
+        XCTAssertEqual(
+            firstTreeOrderStatus,
+            "cancelled"
+        )
+        await store.close()
+    }
+
+    func testSecondVolumeFolderIsNextAfterInflightChapter()
+        async throws {
+        let url = try databaseURL()
+        let context = QueueAPIContext()
+        let store = try await connectedStore(at: url, context: context)
+        let firstFolderOperationID = UUID()
+        let secondFolderOperationID = UUID()
+        let firstChapterOperationID = UUID()
+        let secondChapterOperationID = UUID()
+        let laterChapterOperationID = UUID()
+        let treeOrderDocumentID = UUID()
+
+        _ = try await store.enqueue(
+            context.batch(
+                kind: .volumeCreation,
+                mutations: [
+                    context.folderMutation(
+                        operationID: firstFolderOperationID,
+                        folderID: UUID(),
+                        name: "1권"
+                    ),
+                    context.documentMutation(
+                        operationID: firstChapterOperationID,
+                        documentID: UUID(),
+                        relativePath: "원고/1권/001화.txt"
+                    ),
+                    context.documentMutation(
+                        operationID: secondChapterOperationID,
+                        documentID: UUID(),
+                        relativePath: "원고/1권/002화.txt"
+                    ),
+                    context.documentMutation(
+                        operationID: UUID(),
+                        documentID: treeOrderDocumentID,
+                        relativePath: syncV2TreeOrderPath,
+                        content: "{\"tree_order\":{\"원고\":[\"1권\"]},\"version\":1}",
+                        generation: 1,
+                        kind: .treeOrder
+                    ),
+                ]
+            )
+        )
+        let firstFolderClaims = try await store.claimReadyFolderOperations(
+            limit: 1,
+            now: Date(timeIntervalSince1970: 10)
+        )
+        let firstFolder = try XCTUnwrap(firstFolderClaims.first)
+        try await store.complete(
+            firstFolder,
+            result: folderCommitResult(for: firstFolder)
+        )
+        let inflight = try await store.claimReadyOperations(
+            limit: 10,
+            now: Date(timeIntervalSince1970: 20)
+        )
+        let firstChapter = try XCTUnwrap(inflight.first)
+        XCTAssertEqual(inflight.map(\.operationID), [firstChapterOperationID])
+
+        _ = try await store.enqueue(
+            context.batch(
+                kind: .volumeCreation,
+                mutations: [
+                    context.folderMutation(
+                        operationID: secondFolderOperationID,
+                        folderID: UUID(),
+                        name: "2권"
+                    ),
+                    context.documentMutation(
+                        operationID: laterChapterOperationID,
+                        documentID: UUID(),
+                        relativePath: "원고/2권/026화.txt"
+                    ),
+                    context.documentMutation(
+                        operationID: UUID(),
+                        documentID: treeOrderDocumentID,
+                        relativePath: syncV2TreeOrderPath,
+                        content: "{\"tree_order\":{\"원고\":[\"1권\",\"2권\"]},\"version\":1}",
+                        generation: 2,
+                        kind: .treeOrder
+                    ),
+                ]
+            )
+        )
+
+        let noNewDocument = try await store.claimReadyOperations(
+            limit: 10,
+            now: Date(timeIntervalSince1970: 30)
+        )
+        XCTAssertTrue(noNewDocument.isEmpty)
+        let nextFolders = try await store.claimReadyFolderOperations(
+            limit: 10,
+            now: Date(timeIntervalSince1970: 30)
+        )
+        let secondFolder = try XCTUnwrap(nextFolders.first)
+        XCTAssertEqual(nextFolders.map(\.operationID), [secondFolderOperationID])
+        try await store.complete(
+            secondFolder,
+            result: folderCommitResult(for: secondFolder)
+        )
+        let stillOnlyInflight = try await store.claimReadyOperations(
+            limit: 10,
+            now: Date(timeIntervalSince1970: 40)
+        )
+        XCTAssertTrue(stillOnlyInflight.isEmpty)
+
+        try await store.complete(
+            firstChapter,
+            result: commitResult(for: firstChapter)
+        )
+        let nextChapter = try await store.claimReadyOperations(
+            limit: 10,
+            now: Date(timeIntervalSince1970: 50)
+        )
+        XCTAssertEqual(
+            nextChapter.map(\.operationID),
+            [secondChapterOperationID]
+        )
+        await store.close()
+    }
+
+    func testVolumeFolderPriorityAndDependenciesSurviveRestart()
+        async throws {
+        let url = try databaseURL()
+        let context = QueueAPIContext()
+        let first = try await connectedStore(at: url, context: context)
+        let folderOperationIDs = [UUID(), UUID()]
+        let chapterOperationIDs = [UUID(), UUID()]
+        let treeOrderDocumentID = UUID()
+        let finalTreeOrderOperationID = UUID()
+
+        for index in 0..<2 {
+            _ = try await first.enqueue(
+                context.batch(
+                    kind: .volumeCreation,
+                    mutations: [
+                        context.folderMutation(
+                            operationID: folderOperationIDs[index],
+                            folderID: UUID(),
+                            name: "\(index + 1)권"
+                        ),
+                        context.documentMutation(
+                            operationID: chapterOperationIDs[index],
+                            documentID: UUID(),
+                            relativePath: "원고/\(index + 1)권/\(index * 25 + 1)화.txt"
+                        ),
+                        context.documentMutation(
+                            operationID: index == 1
+                                ? finalTreeOrderOperationID : UUID(),
+                            documentID: treeOrderDocumentID,
+                            relativePath: syncV2TreeOrderPath,
+                            content: "{\"tree_order\":{\"원고\":[\"\(index + 1)권\"]},\"version\":1}",
+                            generation: index + 1,
+                            kind: .treeOrder
+                        ),
+                    ]
+                )
+            )
+        }
+        await first.close()
+
+        let reopened = try await openStore(at: url)
+        let documentsBeforeFolders = try await reopened.claimReadyOperations(
+            localProjectID: context.localProjectID,
+            limit: 10,
+            now: Date(timeIntervalSince1970: 10)
+        )
+        XCTAssertTrue(documentsBeforeFolders.isEmpty)
+        let folders = try await reopened.claimReadyFolderOperations(
+            localProjectID: context.localProjectID,
+            limit: 10,
+            now: Date(timeIntervalSince1970: 10)
+        )
+        XCTAssertEqual(folders.map(\.operationID), folderOperationIDs)
+        for folder in folders {
+            try await reopened.complete(
+                folder,
+                result: folderCommitResult(for: folder)
+            )
+        }
+
+        let firstChapterClaims = try await reopened.claimReadyOperations(
+            localProjectID: context.localProjectID,
+            limit: 10,
+            now: Date(timeIntervalSince1970: 20)
+        )
+        let firstChapter = try XCTUnwrap(firstChapterClaims.first)
+        XCTAssertEqual(
+            firstChapterClaims.map(\.operationID),
+            [chapterOperationIDs[0]]
+        )
+        try await reopened.complete(
+            firstChapter,
+            result: commitResult(for: firstChapter)
+        )
+        await reopened.close()
+
+        let reopenedAgain = try await openStore(at: url)
+        let secondChapterClaims = try await reopenedAgain.claimReadyOperations(
+            localProjectID: context.localProjectID,
+            limit: 10,
+            now: Date(timeIntervalSince1970: 30)
+        )
+        let secondChapter = try XCTUnwrap(secondChapterClaims.first)
+        XCTAssertEqual(
+            secondChapterClaims.map(\.operationID),
+            [chapterOperationIDs[1]]
+        )
+        try await reopenedAgain.complete(
+            secondChapter,
+            result: commitResult(for: secondChapter)
+        )
+        let treeOrder = try await reopenedAgain.claimReadyOperations(
+            localProjectID: context.localProjectID,
+            limit: 10,
+            now: Date(timeIntervalSince1970: 40)
+        )
+        XCTAssertEqual(treeOrder.map(\.operationID), [finalTreeOrderOperationID])
+        await reopenedAgain.close()
     }
 
     func testFolderRebaseSuccessorKeepsOriginalBatchDependenciesBlocked()
@@ -7247,6 +7634,11 @@ final class SyncV2StoreTests: XCTestCase {
         )
 
         XCTAssertEqual(operationIDs, [folderOperationID, orderOperationID])
+        var uploadQueue = try await recorder.uploadQueueSnapshot(
+            localProjectID: localProjectID
+        )
+        XCTAssertEqual(uploadQueue.pendingCount, 1)
+        XCTAssertEqual(uploadQueue.inflightCount, 0)
         let raw = try RawSQLite(url: url)
         XCTAssertEqual(
             try raw.scalarText(
@@ -7280,6 +7672,11 @@ final class SyncV2StoreTests: XCTestCase {
         let firstClaim = try await recorder.claimNextContractStructure(
             localProjectID: localProjectID
         )
+        uploadQueue = try await recorder.uploadQueueSnapshot(
+            localProjectID: localProjectID
+        )
+        XCTAssertEqual(uploadQueue.pendingCount, 0)
+        XCTAssertEqual(uploadQueue.inflightCount, 1)
         XCTAssertEqual(firstClaim.request.batchID, batchID)
         try await recorder.recoverInterruptedWork()
         let pending = try await recorder.claimNextContractStructure(
@@ -7321,6 +7718,10 @@ final class SyncV2StoreTests: XCTestCase {
             pending,
             response: response
         )
+        uploadQueue = try await recorder.uploadQueueSnapshot(
+            localProjectID: localProjectID
+        )
+        XCTAssertEqual(uploadQueue, .idle)
         XCTAssertEqual(
             try raw.scalarText(
                 "SELECT status FROM sync_contract_batches LIMIT 1;"

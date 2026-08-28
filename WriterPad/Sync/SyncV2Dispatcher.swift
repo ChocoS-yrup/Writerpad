@@ -626,6 +626,323 @@ actor SyncV2NetworkRecoveryHub {
     }
 }
 
+/// 한 작품의 outbound queue와 snapshot 적용을 양방향으로 직렬화한다.
+///
+/// 서버 알림은 Bool로 접지 않고 단조 증가 세대로 보존한다. upload lane은
+/// 마지막 작업 뒤의 empty claim까지 하나의 permit으로 잡으므로 작업 사이의
+/// 짧은 공백이 pull 안정 지점으로 보이지 않는다.
+actor SyncV2ProjectUploadPullCoordinator {
+    enum Phase: Equatable, Sendable {
+        case idle
+        case initialPull
+        case drainingUpload
+        case applyingPull
+        case conflictResolutionPull
+        case retryWaiting
+        case blocked
+    }
+
+    struct Snapshot: Equatable, Sendable {
+        let phase: Phase
+        let observedGeneration: UInt64
+        let pulledGeneration: UInt64
+        let queue: SyncV2UploadQueueSnapshot
+        let enqueueReservationCount: Int
+        let runningUploadCount: Int
+        let runningPullCount: Int
+        let lastPullSucceeded: Bool
+
+        var pendingServerGenerationCount: UInt64 {
+            observedGeneration >= pulledGeneration
+                ? observedGeneration - pulledGeneration
+                : 0
+        }
+
+        var isServerSynced: Bool {
+            queue == .idle
+                && enqueueReservationCount == 0
+                && runningUploadCount == 0
+                && runningPullCount == 0
+                && pendingServerGenerationCount == 0
+                && phase == .idle
+                && lastPullSucceeded
+        }
+    }
+
+    struct EnqueueReservation: Hashable, Sendable {
+        fileprivate let id: UUID
+        fileprivate let localProjectID: ProjectID
+    }
+
+    struct UploadPermit: Hashable, Sendable {
+        fileprivate let id: UUID
+        fileprivate let localProjectID: ProjectID
+    }
+
+    struct PullPermit: Hashable, Sendable {
+        fileprivate let id: UUID
+        fileprivate let localProjectID: ProjectID
+        let generation: UInt64
+        let isBootstrap: Bool
+    }
+
+    private struct Entry {
+        var phase: Phase = .idle
+        var observedGeneration: UInt64 = 0
+        var pulledGeneration: UInt64 = 0
+        var queue: SyncV2UploadQueueSnapshot = .idle
+        var enqueueReservations = Set<UUID>()
+        var uploadPermitID: UUID?
+        var pullPermitID: UUID?
+        var pullGeneration: UInt64?
+        var lastPullSucceeded = false
+    }
+
+    private var entries: [ProjectID: Entry] = [:]
+    private var pullReadyHandlers: [UUID: @Sendable () -> Void] = [:]
+    private var uploadReadyHandlers: [UUID: @Sendable () -> Void] = [:]
+
+    func installPullReadyHandler(
+        id: UUID,
+        action: @escaping @Sendable () -> Void
+    ) {
+        pullReadyHandlers[id] = action
+    }
+
+    func removePullReadyHandler(id: UUID) {
+        pullReadyHandlers[id] = nil
+    }
+
+    func installUploadReadyHandler(
+        id: UUID,
+        action: @escaping @Sendable () -> Void
+    ) {
+        uploadReadyHandlers[id] = action
+    }
+
+    func removeUploadReadyHandler(id: UUID) {
+        uploadReadyHandlers[id] = nil
+    }
+
+    func beginEnqueue(
+        localProjectID: ProjectID
+    ) -> EnqueueReservation {
+        let id = UUID()
+        var entry = entries[localProjectID] ?? Entry()
+        // 로컬 enqueue는 곧 이 기기가 만들 서버 변경이다. Realtime echo가
+        // 누락돼도 drain 뒤 검증 pull이 반드시 한 번 남도록 세대를 전진시킨다.
+        entry.observedGeneration &+= 1
+        entry.lastPullSucceeded = false
+        entry.enqueueReservations.insert(id)
+        entry.phase = .drainingUpload
+        entries[localProjectID] = entry
+        signalStateChanged()
+        return EnqueueReservation(id: id, localProjectID: localProjectID)
+    }
+
+    func finishEnqueue(
+        _ reservation: EnqueueReservation,
+        queue: SyncV2UploadQueueSnapshot
+    ) {
+        var entry = entries[reservation.localProjectID] ?? Entry()
+        guard entry.enqueueReservations.remove(reservation.id) != nil else {
+            return
+        }
+        entry.queue = queue
+        settlePhase(&entry)
+        entries[reservation.localProjectID] = entry
+        if queue.pendingCount > 0, entry.pullPermitID == nil {
+            signalUploadReady()
+        }
+        signalStateChanged()
+    }
+
+    func restore(
+        localProjectID: ProjectID,
+        queue: SyncV2UploadQueueSnapshot
+    ) {
+        var entry = entries[localProjectID] ?? Entry()
+        entry.queue = queue
+        settlePhase(&entry)
+        entries[localProjectID] = entry
+        signalStateChanged()
+    }
+
+    func beginUploadDrain(
+        localProjectID: ProjectID,
+        queue: SyncV2UploadQueueSnapshot
+    ) -> UploadPermit? {
+        var entry = entries[localProjectID] ?? Entry()
+        entry.queue = queue
+        guard entry.pullPermitID == nil,
+              entry.uploadPermitID == nil
+        else {
+            entries[localProjectID] = entry
+            return nil
+        }
+        let id = UUID()
+        entry.uploadPermitID = id
+        entry.phase = .drainingUpload
+        entries[localProjectID] = entry
+        signalStateChanged()
+        return UploadPermit(id: id, localProjectID: localProjectID)
+    }
+
+    func finishUploadDrain(
+        _ permit: UploadPermit,
+        queue: SyncV2UploadQueueSnapshot
+    ) {
+        var entry = entries[permit.localProjectID] ?? Entry()
+        guard entry.uploadPermitID == permit.id else { return }
+        entry.uploadPermitID = nil
+        entry.queue = queue
+        settlePhase(&entry)
+        entries[permit.localProjectID] = entry
+        signalStateChanged()
+    }
+
+    func observeServerChange(
+        localProjectID: ProjectID,
+        queue: SyncV2UploadQueueSnapshot,
+        bootstrapAllowed: Bool
+    ) -> PullPermit? {
+        var entry = entries[localProjectID] ?? Entry()
+        entry.observedGeneration &+= 1
+        entry.queue = queue
+        let permit = beginPullIfPossible(
+            localProjectID: localProjectID,
+            entry: &entry,
+            bootstrapAllowed: bootstrapAllowed
+        )
+        entries[localProjectID] = entry
+        return permit
+    }
+
+    func beginDeferredPull(
+        localProjectID: ProjectID,
+        queue: SyncV2UploadQueueSnapshot,
+        bootstrapAllowed: Bool
+    ) -> PullPermit? {
+        var entry = entries[localProjectID] ?? Entry()
+        entry.queue = queue
+        let permit = beginPullIfPossible(
+            localProjectID: localProjectID,
+            entry: &entry,
+            bootstrapAllowed: bootstrapAllowed
+        )
+        entries[localProjectID] = entry
+        return permit
+    }
+
+    @discardableResult
+    func finishPull(
+        _ permit: PullPermit,
+        succeeded: Bool,
+        queue: SyncV2UploadQueueSnapshot
+    ) -> Snapshot {
+        var entry = entries[permit.localProjectID] ?? Entry()
+        guard entry.pullPermitID == permit.id else {
+            return makeSnapshot(entry)
+        }
+        entry.pullPermitID = nil
+        entry.pullGeneration = nil
+        entry.queue = queue
+        entry.lastPullSucceeded = succeeded
+        if succeeded {
+            entry.pulledGeneration = max(
+                entry.pulledGeneration,
+                permit.generation
+            )
+        }
+        settlePhase(&entry)
+        entries[permit.localProjectID] = entry
+        if queue.pendingCount > 0 {
+            signalUploadReady()
+        }
+        signalStateChanged()
+        return makeSnapshot(entry)
+    }
+
+    func snapshot(localProjectID: ProjectID) -> Snapshot {
+        makeSnapshot(entries[localProjectID] ?? Entry())
+    }
+
+    private func beginPullIfPossible(
+        localProjectID: ProjectID,
+        entry: inout Entry,
+        bootstrapAllowed: Bool
+    ) -> PullPermit? {
+        guard entry.observedGeneration > entry.pulledGeneration,
+              entry.pullPermitID == nil,
+              entry.uploadPermitID == nil,
+              entry.enqueueReservations.isEmpty
+        else {
+            settlePhase(&entry)
+            return nil
+        }
+        let mayBypassQueue = bootstrapAllowed
+            && entry.pulledGeneration == 0
+            && !entry.lastPullSucceeded
+        guard mayBypassQueue || !entry.queue.hasUnsentLocalChanges else {
+            settlePhase(&entry)
+            return nil
+        }
+        let id = UUID()
+        let generation = entry.observedGeneration
+        entry.pullPermitID = id
+        entry.pullGeneration = generation
+        entry.phase = mayBypassQueue ? .initialPull : .applyingPull
+        return PullPermit(
+            id: id,
+            localProjectID: localProjectID,
+            generation: generation,
+            isBootstrap: mayBypassQueue
+        )
+    }
+
+    private func settlePhase(_ entry: inout Entry) {
+        if entry.pullPermitID != nil {
+            entry.phase = entry.pulledGeneration == 0
+                && !entry.lastPullSucceeded
+                ? .initialPull
+                : .applyingPull
+        } else if entry.uploadPermitID != nil
+                    || !entry.enqueueReservations.isEmpty
+                    || entry.queue.hasQueuedOrRunningUpload {
+            entry.phase = .drainingUpload
+        } else if entry.queue.conflictCount > 0 {
+            entry.phase = .blocked
+        } else if entry.queue.blockedCount > 0 {
+            entry.phase = .blocked
+        } else if entry.queue.retryWaitingCount > 0 {
+            entry.phase = .retryWaiting
+        } else {
+            entry.phase = .idle
+        }
+    }
+
+    private func signalStateChanged() {
+        pullReadyHandlers.values.forEach { $0() }
+    }
+
+    private func signalUploadReady() {
+        uploadReadyHandlers.values.forEach { $0() }
+    }
+
+    private func makeSnapshot(_ entry: Entry) -> Snapshot {
+        Snapshot(
+            phase: entry.phase,
+            observedGeneration: entry.observedGeneration,
+            pulledGeneration: entry.pulledGeneration,
+            queue: entry.queue,
+            enqueueReservationCount: entry.enqueueReservations.count,
+            runningUploadCount: entry.uploadPermitID == nil ? 0 : 1,
+            runningPullCount: entry.pullPermitID == nil ? 0 : 1,
+            lastPullSucceeded: entry.lastPullSucceeded
+        )
+    }
+}
+
 actor SyncV2Dispatcher {
     private struct ProjectLane {
         let generation: UUID
@@ -644,7 +961,10 @@ actor SyncV2Dispatcher {
     private let automaticRebaser: SyncV2AutomaticRebaser?
     private let wakeup: SyncV2DispatchWakeup?
     private let networkRecoveryHub: SyncV2NetworkRecoveryHub?
+    nonisolated let uploadPullCoordinator:
+        SyncV2ProjectUploadPullCoordinator?
     private let wakeupID = UUID()
+    private let coordinatorHandlerID = UUID()
 
     private var isStarted = false
     private var activeLocalProjectID: ProjectID?
@@ -666,7 +986,9 @@ actor SyncV2Dispatcher {
             (any EnsureProjectTransporting)? = nil,
         automaticRebaser: SyncV2AutomaticRebaser? = nil,
         wakeup: SyncV2DispatchWakeup? = nil,
-        networkRecoveryHub: SyncV2NetworkRecoveryHub? = nil
+        networkRecoveryHub: SyncV2NetworkRecoveryHub? = nil,
+        uploadPullCoordinator:
+            SyncV2ProjectUploadPullCoordinator? = nil
     ) {
         self.store = store
         self.client = client
@@ -682,6 +1004,7 @@ actor SyncV2Dispatcher {
         self.automaticRebaser = automaticRebaser
         self.wakeup = wakeup
         self.networkRecoveryHub = networkRecoveryHub
+        self.uploadPullCoordinator = uploadPullCoordinator
     }
 
     func start() async {
@@ -691,6 +1014,11 @@ actor SyncV2Dispatcher {
             Task {
                 await self?.newOperationsEnqueued()
             }
+        }
+        await uploadPullCoordinator?.installUploadReadyHandler(
+            id: coordinatorHandlerID
+        ) { [weak self] in
+            Task { await self?.newOperationsEnqueued() }
         }
         try? await store.recoverInterruptedWork()
         networkMonitor.start { [weak self] in
@@ -710,6 +1038,9 @@ actor SyncV2Dispatcher {
         projectLanes.removeAll()
         networkMonitor.cancel()
         await wakeup?.remove(id: wakeupID)
+        await uploadPullCoordinator?.removeUploadReadyHandler(
+            id: coordinatorHandlerID
+        )
     }
 
     /// 열린 작품에 더 많은 문서 동시 처리량을 배정한다.
@@ -741,6 +1072,23 @@ actor SyncV2Dispatcher {
         )) ?? []
     }
 
+    func uploadQueueSnapshot(
+        localProjectID: ProjectID
+    ) async -> SyncV2UploadQueueSnapshot {
+        (try? await store.uploadQueueSnapshot(
+            localProjectID: localProjectID
+        )) ?? SyncV2UploadQueueSnapshot(retryWaitingCount: 1)
+    }
+
+    func isBootstrapPullAllowed(
+        localProjectID: ProjectID
+    ) async -> Bool {
+        guard let hasBaseline = try? await store.hasServerSnapshotBaseline(
+            localProjectID: localProjectID
+        ) else { return false }
+        return !hasBaseline
+    }
+
     /// 사용자가 동기화 상세 화면에서 명시적으로 재시도를 선택할 때 호출한다.
     func userRequestedRetry() async {
         await immediateRetryOpportunity()
@@ -769,6 +1117,7 @@ actor SyncV2Dispatcher {
         let leaseManager = self.leaseManager
         let projectRecoveryTransport = self.projectRecoveryTransport
         let automaticRebaser = self.automaticRebaser
+        let uploadPullCoordinator = self.uploadPullCoordinator
         let activeLocalProjectID = self.activeLocalProjectID
         let maximumConcurrentDocuments = self.maximumConcurrentDocuments
         await withTaskGroup(of: Void.self) { group in
@@ -788,6 +1137,7 @@ actor SyncV2Dispatcher {
                         projectRecoveryTransport:
                             projectRecoveryTransport,
                         automaticRebaser: automaticRebaser,
+                        uploadPullCoordinator: uploadPullCoordinator,
                         now: { now }
                     )
                 }
@@ -837,6 +1187,7 @@ actor SyncV2Dispatcher {
                 projectRecoveryTransport:
                     self.projectRecoveryTransport,
                 automaticRebaser: self.automaticRebaser,
+                uploadPullCoordinator: self.uploadPullCoordinator,
                 now: Date.init
             )
             await self.projectLaneFinished(
@@ -881,6 +1232,69 @@ actor SyncV2Dispatcher {
     }
 
     private static func drainReadyOperations(
+        localProjectID: ProjectID,
+        limit: Int,
+        store: any SyncV2DispatchStoring,
+        client: any SyncV2CommitClienting,
+        retryPolicy: SyncV2RetryPolicy,
+        randomUnit: @escaping @Sendable () -> Double,
+        leaseManager: (any EditLeaseManaging)?,
+        projectRecoveryTransport:
+            (any EnsureProjectTransporting)?,
+        automaticRebaser: SyncV2AutomaticRebaser?,
+        uploadPullCoordinator:
+            SyncV2ProjectUploadPullCoordinator?,
+        now: @escaping @Sendable () -> Date
+    ) async -> Bool {
+        let uploadPermit:
+            SyncV2ProjectUploadPullCoordinator.UploadPermit?
+        if let uploadPullCoordinator {
+            let queue: SyncV2UploadQueueSnapshot
+            do {
+                queue = try await store.uploadQueueSnapshot(
+                    localProjectID: localProjectID
+                )
+            } catch {
+                return false
+            }
+            guard let permit = await uploadPullCoordinator.beginUploadDrain(
+                localProjectID: localProjectID,
+                queue: queue
+            ) else {
+                return false
+            }
+            uploadPermit = permit
+        } else {
+            uploadPermit = nil
+        }
+
+        let completedNormally = await drainClaimLoop(
+            localProjectID: localProjectID,
+            limit: limit,
+            store: store,
+            client: client,
+            retryPolicy: retryPolicy,
+            randomUnit: randomUnit,
+            leaseManager: leaseManager,
+            projectRecoveryTransport: projectRecoveryTransport,
+            automaticRebaser: automaticRebaser,
+            now: now
+        )
+        if let uploadPullCoordinator, let uploadPermit {
+            let queue = (try? await store.uploadQueueSnapshot(
+                localProjectID: localProjectID
+            )) ?? SyncV2UploadQueueSnapshot(
+                retryWaitingCount: 1
+            )
+            await uploadPullCoordinator.finishUploadDrain(
+                uploadPermit,
+                queue: queue
+            )
+        }
+        return completedNormally
+    }
+
+    private static func drainClaimLoop(
         localProjectID: ProjectID,
         limit: Int,
         store: any SyncV2DispatchStoring,

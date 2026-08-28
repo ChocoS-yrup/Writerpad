@@ -12,6 +12,7 @@ enum SyncV2ContractStructureError: Error, Equatable, Sendable {
     case invalidStoredRequest
     case noReadyBatch
     case transportRejected
+    case uploadPullGateBusy
 }
 
 struct SyncV2AtomicStructureParameters: Encodable, Equatable, Sendable {
@@ -192,6 +193,8 @@ actor SyncV2ContractStructureSender {
     private let transport: any SyncV2AtomicStructureTransporting
     private let handshakeService: SyncV2HandshakeService
     private let authenticationService: any AuthenticationServicing
+    private let uploadPullCoordinator:
+        SyncV2ProjectUploadPullCoordinator?
     private let defaults: UserDefaults
 
     init(
@@ -199,12 +202,15 @@ actor SyncV2ContractStructureSender {
         transport: any SyncV2AtomicStructureTransporting,
         handshakeService: SyncV2HandshakeService,
         authenticationService: any AuthenticationServicing,
+        uploadPullCoordinator:
+            SyncV2ProjectUploadPullCoordinator? = nil,
         defaults: UserDefaults = .standard
     ) {
         self.store = store
         self.transport = transport
         self.handshakeService = handshakeService
         self.authenticationService = authenticationService
+        self.uploadPullCoordinator = uploadPullCoordinator
         self.defaults = defaults
     }
 
@@ -227,10 +233,28 @@ actor SyncV2ContractStructureSender {
             gateIsOpen: true
         ) else { throw SyncV2ContractStructureError.handshakeMissing }
 
-        let pending = try await store.claimNextContractStructure(
-            localProjectID: localProjectID
-        )
+        let uploadPermit:
+            SyncV2ProjectUploadPullCoordinator.UploadPermit?
+        if let uploadPullCoordinator {
+            let queue = try await store.uploadQueueSnapshot(
+                localProjectID: localProjectID
+            )
+            guard let permit = await uploadPullCoordinator.beginUploadDrain(
+                localProjectID: localProjectID,
+                queue: queue
+            ) else {
+                throw SyncV2ContractStructureError.uploadPullGateBusy
+            }
+            uploadPermit = permit
+        } else {
+            uploadPermit = nil
+        }
+        var claimed: SyncV2PendingContractBatch?
         do {
+            let pending = try await store.claimNextContractStructure(
+                localProjectID: localProjectID
+            )
+            claimed = pending
             let response = try await transport.commit(
                 request: pending.request.json
             )
@@ -252,22 +276,46 @@ actor SyncV2ContractStructureSender {
                 pending,
                 response: response
             )
-            return SyncV2ContractSendReport(
+            let report = SyncV2ContractSendReport(
                 batchID: pending.request.batchID,
                 status: status,
                 operationCount: pending.request.orderedIntents.count
             )
+            await finishUploadPermit(
+                uploadPermit,
+                localProjectID: localProjectID
+            )
+            return report
         } catch {
             // 서버 응답 검증 실패는 위에서 응답과 함께 이미 남겼다.
             // 전송 단계 실패만 재시도 가능 상태로 돌린다.
             if error as? SyncV2ContractStructureError
-                == .transportRejected {
+                    == .transportRejected,
+               let claimed {
                 await store.failContractStructure(
-                    pending,
+                    claimed,
                     error: error
                 )
             }
+            await finishUploadPermit(
+                uploadPermit,
+                localProjectID: localProjectID
+            )
             throw error
         }
+    }
+
+    private func finishUploadPermit(
+        _ permit: SyncV2ProjectUploadPullCoordinator.UploadPermit?,
+        localProjectID: ProjectID
+    ) async {
+        guard let permit, let uploadPullCoordinator else { return }
+        let queue = (try? await store.uploadQueueSnapshot(
+            localProjectID: localProjectID
+        )) ?? SyncV2UploadQueueSnapshot(retryWaitingCount: 1)
+        await uploadPullCoordinator.finishUploadDrain(
+            permit,
+            queue: queue
+        )
     }
 }

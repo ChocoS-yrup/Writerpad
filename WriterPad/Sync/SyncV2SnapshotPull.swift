@@ -317,11 +317,22 @@ private struct ActorSingleFlightTask {
 /// 열지 않은 작품의 서버 변경도 계속 받아오되, 열린 작품은 편집 보호를
 /// 가진 `SyncV2WorkspaceSyncModel`에 맡긴다. 작품별 pull Task를 사용하므로
 /// 한 작품의 지연이나 오류가 다른 작품을 기다리게 하지 않는다.
+typealias SyncV2UploadQueueSnapshotReader =
+    @Sendable (ProjectID) async -> SyncV2UploadQueueSnapshot?
+typealias SyncV2BootstrapPullReader =
+    @Sendable (ProjectID) async -> Bool
+
 actor SyncV2BackgroundSyncCoordinator {
     private let puller: any SyncV2SnapshotPulling
     private let realtime: any SyncV2RealtimeTriggering
     private let projectBindingService: any ProjectBindingServicing
     private let authenticationService: (any AuthenticationServicing)?
+    private let uploadPullCoordinator:
+        SyncV2ProjectUploadPullCoordinator?
+    private let readUploadQueueSnapshot:
+        SyncV2UploadQueueSnapshotReader?
+    private let isBootstrapPullAllowed:
+        SyncV2BootstrapPullReader?
     private let debounceDelay: Duration
     private let periodicDelay: Duration
     private let realtimeSubscriptionTimeout: Duration
@@ -335,6 +346,8 @@ actor SyncV2BackgroundSyncCoordinator {
     private var activeLocalProjectID: ProjectID?
     private var pullTasks: [ProjectID: Task<Void, Never>] = [:]
     private var pullGenerations: [ProjectID: UInt64] = [:]
+    private var coordinatorPullPermits:
+        [ProjectID: SyncV2ProjectUploadPullCoordinator.PullPermit] = [:]
     private var pendingProjects = Set<ProjectID>()
     private var debounceTask = ActorSingleFlightTask()
     private var periodicTask = ActorSingleFlightTask()
@@ -342,6 +355,7 @@ actor SyncV2BackgroundSyncCoordinator {
     private var reconnectTask = ActorSingleFlightTask()
     private var realtimeGeneration: UInt64 = 0
     private var reconnectAttempt = 0
+    private let coordinatorHandlerID = UUID()
 
     private func logTask(
         _ name: String,
@@ -361,6 +375,12 @@ actor SyncV2BackgroundSyncCoordinator {
         realtime: any SyncV2RealtimeTriggering,
         projectBindingService: any ProjectBindingServicing,
         authenticationService: (any AuthenticationServicing)? = nil,
+        uploadPullCoordinator:
+            SyncV2ProjectUploadPullCoordinator? = nil,
+        readUploadQueueSnapshot:
+            SyncV2UploadQueueSnapshotReader? = nil,
+        isBootstrapPullAllowed:
+            SyncV2BootstrapPullReader? = nil,
         debounceDelay: Duration = SyncV2Timing.standard.debounceDelay,
         periodicDelay: Duration = SyncV2Timing.standard.periodicDelay,
         realtimeSubscriptionTimeout: Duration =
@@ -383,6 +403,9 @@ actor SyncV2BackgroundSyncCoordinator {
         self.realtime = realtime
         self.projectBindingService = projectBindingService
         self.authenticationService = authenticationService
+        self.uploadPullCoordinator = uploadPullCoordinator
+        self.readUploadQueueSnapshot = readUploadQueueSnapshot
+        self.isBootstrapPullAllowed = isBootstrapPullAllowed
         self.debounceDelay = debounceDelay
         self.periodicDelay = periodicDelay
         self.realtimeSubscriptionTimeout = realtimeSubscriptionTimeout
@@ -396,6 +419,15 @@ actor SyncV2BackgroundSyncCoordinator {
     func start() async {
         guard !isStarted, GlobalSyncPreference.isEnabled() else { return }
         isStarted = true
+        await uploadPullCoordinator?.installPullReadyHandler(
+            id: coordinatorHandlerID
+        ) { [weak self] in
+            Task {
+                await self?.pullInactiveProjects(
+                    recordsServerObservation: false
+                )
+            }
+        }
         startRealtime()
         startPeriodicPull()
         await pullInactiveProjects()
@@ -411,6 +443,18 @@ actor SyncV2BackgroundSyncCoordinator {
         logTask("reconnectTask", action: "cancel", reason: "stop")
         reconnectTask.cancel()
         pullTasks.values.forEach { $0.cancel() }
+        if let uploadPullCoordinator {
+            for (localProjectID, permit) in coordinatorPullPermits {
+                let queue = await readUploadQueueSnapshot?(localProjectID)
+                    ?? SyncV2UploadQueueSnapshot(retryWaitingCount: 1)
+                await uploadPullCoordinator.finishPull(
+                    permit,
+                    succeeded: false,
+                    queue: queue
+                )
+            }
+        }
+        coordinatorPullPermits.removeAll()
         logTask("debounceTask", action: "clear", reason: "stop")
         logTask("periodicTask", action: "clear", reason: "stop")
         logTask("reconnectTask", action: "clear", reason: "stop")
@@ -424,6 +468,9 @@ actor SyncV2BackgroundSyncCoordinator {
             value: realtimeGeneration,
             reason: "stop"
         )
+        await uploadPullCoordinator?.removePullReadyHandler(
+            id: coordinatorHandlerID
+        )
         await realtime.stop()
     }
 
@@ -436,6 +483,17 @@ actor SyncV2BackgroundSyncCoordinator {
            ) {
             activePull.cancel()
             pullGenerations[localProjectID, default: 0] &+= 1
+            if let permit = coordinatorPullPermits.removeValue(
+                forKey: localProjectID
+            ), let uploadPullCoordinator {
+                let queue = await readUploadQueueSnapshot?(localProjectID)
+                    ?? SyncV2UploadQueueSnapshot(retryWaitingCount: 1)
+                await uploadPullCoordinator.finishPull(
+                    permit,
+                    succeeded: false,
+                    queue: queue
+                )
+            }
         }
         guard isStarted, previous != localProjectID else { return }
         await pullInactiveProjects()
@@ -675,7 +733,9 @@ actor SyncV2BackgroundSyncCoordinator {
         }
     }
 
-    private func pullInactiveProjects() async {
+    private func pullInactiveProjects(
+        recordsServerObservation: Bool = true
+    ) async {
         guard isStarted else { return }
         let bindings = await projectBindingService.connectedBindings()
         for binding in bindings {
@@ -683,20 +743,48 @@ actor SyncV2BackgroundSyncCoordinator {
                   let serverProjectID = binding.serverProjectID
             else { continue }
             let localProjectID = binding.localProjectID
+            let queue = await readUploadQueueSnapshot?(localProjectID)
+                ?? (uploadPullCoordinator == nil
+                    ? .idle
+                    : SyncV2UploadQueueSnapshot(retryWaitingCount: 1))
+            let bootstrapAllowed = await isBootstrapPullAllowed?(
+                localProjectID
+            ) ?? false
+            let coordinatorPermit:
+                SyncV2ProjectUploadPullCoordinator.PullPermit?
+            if let uploadPullCoordinator {
+                coordinatorPermit = recordsServerObservation
+                    ? await uploadPullCoordinator.observeServerChange(
+                        localProjectID: localProjectID,
+                        queue: queue,
+                        bootstrapAllowed: bootstrapAllowed
+                    )
+                    : await uploadPullCoordinator.beginDeferredPull(
+                        localProjectID: localProjectID,
+                        queue: queue,
+                        bootstrapAllowed: bootstrapAllowed
+                    )
+                guard coordinatorPermit != nil else { continue }
+            } else {
+                coordinatorPermit = nil
+            }
             if pullTasks[localProjectID] != nil {
                 pendingProjects.insert(localProjectID)
                 continue
             }
             startPull(
                 localProjectID: localProjectID,
-                serverProjectID: serverProjectID
+                serverProjectID: serverProjectID,
+                coordinatorPermit: coordinatorPermit
             )
         }
     }
 
     private func startPull(
         localProjectID: ProjectID,
-        serverProjectID: UUID
+        serverProjectID: UUID,
+        coordinatorPermit:
+            SyncV2ProjectUploadPullCoordinator.PullPermit? = nil
     ) {
         pullGenerations[localProjectID, default: 0] &+= 1
         let pullGeneration = pullGenerations[localProjectID] ?? 0
@@ -733,24 +821,51 @@ actor SyncV2BackgroundSyncCoordinator {
                     // 정상 pull 또는 coordinator 종료가 먼저 끝났다.
                 }
             }
-            _ = await race.value()
+            let outcome = await race.value()
             operation.cancel()
             watchdog.cancel()
             await self?.pullFinished(
                 localProjectID,
                 serverProjectID: serverProjectID,
-                generation: pullGeneration
+                generation: pullGeneration,
+                outcome: outcome,
+                coordinatorPermit: coordinatorPermit
             )
+        }
+        if let coordinatorPermit {
+            coordinatorPullPermits[localProjectID] = coordinatorPermit
         }
     }
 
     private func pullFinished(
         _ localProjectID: ProjectID,
         serverProjectID: UUID,
-        generation: UInt64
-    ) {
+        generation: UInt64,
+        outcome: SyncV2WorkspacePullOutcome,
+        coordinatorPermit:
+            SyncV2ProjectUploadPullCoordinator.PullPermit?
+    ) async {
         guard pullGenerations[localProjectID] == generation else { return }
         pullTasks[localProjectID] = nil
+        coordinatorPullPermits[localProjectID] = nil
+        if let coordinatorPermit, let uploadPullCoordinator {
+            let queue = await readUploadQueueSnapshot?(localProjectID)
+                ?? SyncV2UploadQueueSnapshot(retryWaitingCount: 1)
+            let succeeded: Bool
+            if case .success = outcome {
+                succeeded = true
+            } else {
+                succeeded = false
+            }
+            await uploadPullCoordinator.finishPull(
+                coordinatorPermit,
+                succeeded: succeeded,
+                queue: queue
+            )
+            guard isStarted else { return }
+            await pullInactiveProjects(recordsServerObservation: false)
+            return
+        }
         guard isStarted,
               activeLocalProjectID != localProjectID,
               pendingProjects.remove(localProjectID) != nil
@@ -781,6 +896,10 @@ struct SyncV2WorkspaceState: Equatable, Sendable {
         case localOnly
         case synced(at: Date)
         case waiting
+        case uploadPending(count: Int)
+        case retryWaiting(count: Int)
+        case actualConflict(count: Int)
+        case blocked(count: Int)
         case authenticationRequired
         case automaticallyMerged
         case conflictRequired(detail: String)
@@ -875,6 +994,12 @@ final class SyncV2WorkspaceSyncModel: ObservableObject {
     private let requestDispatchRetry: SyncV2WorkspaceDispatchRetry?
     private let readStalledFolderChanges:
         SyncV2WorkspaceStalledFolderReader?
+    private let uploadPullCoordinator:
+        SyncV2ProjectUploadPullCoordinator?
+    private let readUploadQueueSnapshot:
+        SyncV2UploadQueueSnapshotReader?
+    private let isBootstrapPullAllowed:
+        SyncV2BootstrapPullReader?
     private let sleep: SyncV2WorkspaceSleep
     private let debounceDelay: Duration
     private let periodicDelay: Duration
@@ -917,6 +1042,9 @@ final class SyncV2WorkspaceSyncModel: ObservableObject {
     private var lastSubscribedAt: ContinuousClock.Instant?
     private var realtimeHealthy = false
     private var hasRealtimeSubscribed = false
+    private let coordinatorHandlerID = UUID()
+    private var activeCoordinatorPullPermit:
+        SyncV2ProjectUploadPullCoordinator.PullPermit?
 
     private func logTask(
         _ name: String,
@@ -941,6 +1069,12 @@ final class SyncV2WorkspaceSyncModel: ObservableObject {
         requestDispatchRetry: SyncV2WorkspaceDispatchRetry? = nil,
         readStalledFolderChanges:
             SyncV2WorkspaceStalledFolderReader? = nil,
+        uploadPullCoordinator:
+            SyncV2ProjectUploadPullCoordinator? = nil,
+        readUploadQueueSnapshot:
+            SyncV2UploadQueueSnapshotReader? = nil,
+        isBootstrapPullAllowed:
+            SyncV2BootstrapPullReader? = nil,
         debounceDelay: Duration = SyncV2Timing.standard.debounceDelay,
         // Realtime 누락에 대비한 저빈도 안전망이다. 실제 재연결 복구는
         // reachability 이벤트가 즉시 시작하므로 이 주기를 기다리지 않는다.
@@ -983,6 +1117,9 @@ final class SyncV2WorkspaceSyncModel: ObservableObject {
         self.projectBindingService = projectBindingService
         self.requestDispatchRetry = requestDispatchRetry
         self.readStalledFolderChanges = readStalledFolderChanges
+        self.uploadPullCoordinator = uploadPullCoordinator
+        self.readUploadQueueSnapshot = readUploadQueueSnapshot
+        self.isBootstrapPullAllowed = isBootstrapPullAllowed
         self.debounceDelay = debounceDelay
         self.periodicDelay = periodicDelay
         self.authenticationTimeout = authenticationTimeout
@@ -1013,6 +1150,13 @@ final class SyncV2WorkspaceSyncModel: ObservableObject {
     ) async {
         self.editingGuards = editingGuards
         self.applyOpenSnapshots = applyOpenSnapshots
+        await uploadPullCoordinator?.installPullReadyHandler(
+            id: coordinatorHandlerID
+        ) { [weak self] in
+            Task { @MainActor in
+                await self?.pullNow(recordsServerObservation: false)
+            }
+        }
         await updateSceneActivity(sceneIsActive)
     }
 
@@ -1037,6 +1181,7 @@ final class SyncV2WorkspaceSyncModel: ObservableObject {
             startBindingObservation()
             await activate()
         } else {
+            await releaseCoordinatorPullPermit()
             realtimeGeneration &+= 1
             SyncV2Diagnostics.generation(
                 scope: "workspace",
@@ -1079,6 +1224,7 @@ final class SyncV2WorkspaceSyncModel: ObservableObject {
     }
 
     func stop() async {
+        await releaseCoordinatorPullPermit()
         generation &+= 1
         SyncV2Diagnostics.generation(
             scope: "workspace",
@@ -1120,6 +1266,9 @@ final class SyncV2WorkspaceSyncModel: ObservableObject {
         authenticationUpdateTask = nil
         pullPending = false
         networkMonitor.cancel()
+        await uploadPullCoordinator?.removePullReadyHandler(
+            id: coordinatorHandlerID
+        )
         await realtime?.stop()
     }
 
@@ -1848,9 +1997,39 @@ final class SyncV2WorkspaceSyncModel: ObservableObject {
     }
 
     private func pullNow(
-        forceVisibleProgress: Bool = false
+        forceVisibleProgress: Bool = false,
+        recordsServerObservation: Bool = true
     ) async {
         guard isActive, let puller, let serverProjectID else { return }
+        let coordinatorPermit:
+            SyncV2ProjectUploadPullCoordinator.PullPermit?
+        if let uploadPullCoordinator {
+            let queue = await readUploadQueueSnapshot?(localProjectID)
+                ?? SyncV2UploadQueueSnapshot(retryWaitingCount: 1)
+            let bootstrapAllowed = await isBootstrapPullAllowed?(
+                localProjectID
+            ) ?? false
+            coordinatorPermit = recordsServerObservation
+                ? await uploadPullCoordinator.observeServerChange(
+                    localProjectID: localProjectID,
+                    queue: queue,
+                    bootstrapAllowed: bootstrapAllowed
+                )
+                : await uploadPullCoordinator.beginDeferredPull(
+                    localProjectID: localProjectID,
+                    queue: queue,
+                    bootstrapAllowed: bootstrapAllowed
+                )
+            guard coordinatorPermit != nil else {
+                let snapshot = await uploadPullCoordinator.snapshot(
+                    localProjectID: localProjectID
+                )
+                applyGateResult(snapshot)
+                return
+            }
+        } else {
+            coordinatorPermit = nil
+        }
         if pullTask.isScheduled {
             pullPending = true
             return
@@ -1889,6 +2068,7 @@ final class SyncV2WorkspaceSyncModel: ObservableObject {
             reason: "pullNow"
         )
         let requestID = pullRequestID
+        activeCoordinatorPullPermit = coordinatorPermit
         logTask(
             "pullTask",
             action: "create",
@@ -1906,6 +2086,7 @@ final class SyncV2WorkspaceSyncModel: ObservableObject {
                 outcome,
                 requestID: requestID,
                 generation: generation,
+                coordinatorPermit: coordinatorPermit,
                 finish: finish
             )
         }
@@ -2010,8 +2191,32 @@ final class SyncV2WorkspaceSyncModel: ObservableObject {
         _ outcome: SyncV2WorkspacePullOutcome,
         requestID: UInt64,
         generation requestGeneration: UInt64,
+        coordinatorPermit:
+            SyncV2ProjectUploadPullCoordinator.PullPermit?,
         finish: @escaping @Sendable () -> Void
     ) async {
+        let gateSnapshot:
+            SyncV2ProjectUploadPullCoordinator.Snapshot?
+        if let coordinatorPermit, let uploadPullCoordinator {
+            let queue = await readUploadQueueSnapshot?(localProjectID)
+                ?? SyncV2UploadQueueSnapshot(retryWaitingCount: 1)
+            let succeeded: Bool
+            if case .success = outcome {
+                succeeded = true
+            } else {
+                succeeded = false
+            }
+            gateSnapshot = await uploadPullCoordinator.finishPull(
+                coordinatorPermit,
+                succeeded: succeeded,
+                queue: queue
+            )
+            if activeCoordinatorPullPermit == coordinatorPermit {
+                activeCoordinatorPullPermit = nil
+            }
+        } else {
+            gateSnapshot = nil
+        }
         guard pullRequestID == requestID else { return }
         logTask(
             "pullTask",
@@ -2031,6 +2236,9 @@ final class SyncV2WorkspaceSyncModel: ObservableObject {
         case .success(let report):
             pullRetryAttempt = 0
             complete(report, stalled: stalled)
+            if let gateSnapshot, !gateSnapshot.isServerSynced {
+                applyGateResult(gateSnapshot)
+            }
         case .clientError(let error):
             complete(error)
             schedulePullRetry()
@@ -2042,10 +2250,56 @@ final class SyncV2WorkspaceSyncModel: ObservableObject {
             schedulePullRetry()
         }
 
-        if pullPending {
+        if uploadPullCoordinator == nil, pullPending {
             pullPending = false
             await pullNow()
         }
+    }
+
+    private func applyGateResult(
+        _ snapshot: SyncV2ProjectUploadPullCoordinator.Snapshot
+    ) {
+        var next = state
+        next.progress = .idle
+        if snapshot.queue.conflictCount > 0 {
+            next.lastResult = .actualConflict(
+                count: snapshot.queue.conflictCount
+            )
+        } else if snapshot.queue.blockedCount > 0 {
+            next.lastResult = .blocked(count: snapshot.queue.blockedCount)
+        } else if snapshot.queue.retryWaitingCount > 0 {
+            next.lastResult = .retryWaiting(
+                count: snapshot.queue.retryWaitingCount
+            )
+        } else if snapshot.queue.hasQueuedOrRunningUpload
+                    || snapshot.enqueueReservationCount > 0
+                    || snapshot.runningUploadCount > 0 {
+            next.lastResult = .uploadPending(
+                count: max(
+                    1,
+                    snapshot.queue.pendingCount
+                        + snapshot.queue.inflightCount
+                )
+            )
+        } else if snapshot.pendingServerGenerationCount > 0
+                    || snapshot.runningPullCount > 0 {
+            next.lastResult = .waiting
+        }
+        state = next
+    }
+
+    private func releaseCoordinatorPullPermit() async {
+        guard let permit = activeCoordinatorPullPermit,
+              let uploadPullCoordinator
+        else { return }
+        activeCoordinatorPullPermit = nil
+        let queue = await readUploadQueueSnapshot?(localProjectID)
+            ?? SyncV2UploadQueueSnapshot(retryWaitingCount: 1)
+        await uploadPullCoordinator.finishPull(
+            permit,
+            succeeded: false,
+            queue: queue
+        )
     }
 
     private func schedulePullRetry() {
