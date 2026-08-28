@@ -4,6 +4,49 @@ import XCTest
 @testable import WriterPad
 
 final class SyncV2SnapshotPullTests: XCTestCase {
+    func testWorkspaceSceneGateReplaysActivePhaseObservedWhileStarting() {
+        var gate = WorkspaceSceneActivityGate()
+        let appearanceID = gate.beginAppearance()
+
+        XCTAssertNil(gate.observe(true))
+        XCTAssertEqual(
+            gate.finishStarting(
+                appearanceID: appearanceID,
+                fallbackActivity: false
+            ),
+            true
+        )
+        XCTAssertEqual(gate.observe(false), false)
+    }
+
+    func testWorkspaceSceneGateUsesCurrentPhaseWithoutEarlyObservation() {
+        var gate = WorkspaceSceneActivityGate()
+        let appearanceID = gate.beginAppearance()
+
+        XCTAssertEqual(
+            gate.finishStarting(
+                appearanceID: appearanceID,
+                fallbackActivity: true
+            ),
+            true
+        )
+    }
+
+    func testWorkspaceSceneGateRejectsLateStartAfterDisappear() {
+        var gate = WorkspaceSceneActivityGate()
+        let appearanceID = gate.beginAppearance()
+        XCTAssertNil(gate.observe(true))
+
+        gate.endAppearance()
+
+        XCTAssertNil(
+            gate.finishStarting(
+                appearanceID: appearanceID,
+                fallbackActivity: true
+            )
+        )
+    }
+
     func testOneShotRaceResolvesOnceAndIntentionallyIgnoresCancellation()
         async {
         let race = SyncV2OneShotRace<Int>()

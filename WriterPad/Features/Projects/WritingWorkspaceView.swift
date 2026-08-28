@@ -2,6 +2,42 @@ import Foundation
 import SwiftUI
 import UIKit
 
+struct WorkspaceSceneActivityGate: Equatable, Sendable {
+    private(set) var nextAppearanceID: UInt64 = 0
+    private var activeAppearanceID: UInt64?
+    private var latestActivity: Bool?
+    private var hasStarted = false
+
+    mutating func beginAppearance() -> UInt64 {
+        nextAppearanceID &+= 1
+        activeAppearanceID = nextAppearanceID
+        latestActivity = nil
+        hasStarted = false
+        return nextAppearanceID
+    }
+
+    mutating func observe(_ active: Bool) -> Bool? {
+        guard activeAppearanceID != nil else { return nil }
+        latestActivity = active
+        return hasStarted ? active : nil
+    }
+
+    mutating func finishStarting(
+        appearanceID: UInt64,
+        fallbackActivity: Bool
+    ) -> Bool? {
+        guard activeAppearanceID == appearanceID else { return nil }
+        hasStarted = true
+        return latestActivity ?? fallbackActivity
+    }
+
+    mutating func endAppearance() {
+        activeAppearanceID = nil
+        latestActivity = nil
+        hasStarted = false
+    }
+}
+
 struct WritingWorkspaceShell: View {
     @Environment(\.colorScheme) private var colorScheme
     @Environment(\.scenePhase) private var scenePhase
@@ -89,6 +125,8 @@ struct WritingWorkspaceShell: View {
     @State private var isProjectSearching = false
     @State private var projectSearchGeneration: UInt64 = 0
     @State private var projectSearchTask: Task<Void, Never>?
+    @State private var workspaceSceneActivityGate =
+        WorkspaceSceneActivityGate()
 
     init(
         project: ManagedProject,
@@ -336,24 +374,37 @@ struct WritingWorkspaceShell: View {
         )
         .onAppear {
             applyAutosaveDelaySetting(autosaveDelayMilliseconds)
+            let appearanceID = workspaceSceneActivityGate.beginAppearance()
             Task {
                 await restoreWorkspaceIfNeeded()
                 await workspaceSyncModel.start(
-                    sceneIsActive: scenePhase == .active,
+                    sceneIsActive: false,
                     editingGuards: currentSyncEditingGuards,
                     applyOpenSnapshots: applyOpenServerSnapshots
                 )
-                await updateSceneActivity(scenePhase == .active)
+                guard let active = workspaceSceneActivityGate.finishStarting(
+                    appearanceID: appearanceID,
+                    fallbackActivity: scenePhase == .active
+                ) else {
+                    await workspaceSyncModel.stop()
+                    return
+                }
+                await updateSceneActivity(active)
             }
         }
         .onChange(of: autosaveDelayMilliseconds) { _, milliseconds in
             applyAutosaveDelaySetting(milliseconds)
         }
-        .onChange(of: scenePhase) { _, phase in
-            Task { await updateSceneActivity(phase == .active) }
+        .task(id: scenePhase) {
+            if let active = workspaceSceneActivityGate.observe(
+                scenePhase == .active
+            ) {
+                await updateSceneActivity(active)
+            }
         }
         .onDisappear {
             projectSearchTask?.cancel()
+            workspaceSceneActivityGate.endAppearance()
             Task {
                 await workspaceSyncModel.stop()
                 await leftEditorModel.releaseEditLease()
