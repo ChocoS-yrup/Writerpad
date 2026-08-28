@@ -121,6 +121,75 @@ final class SyncV2RemoteFolderApplierTests: XCTestCase {
         XCTAssertTrue(fixture.exists("메인/지울 폴더/미전송.txt"))
     }
 
+    /// 휴지통 안의 폴더는 이 기기가 원격 삭제를 이미 보존해 두었다는
+    /// 로컬 표현이다. 안의 TXT를 지우지는 않되, 서버 tombstone을 미적용으로
+    /// 보고해서도 안 된다. 그러면 다른 기기의 복원이 와도 중간 삭제 오류가
+    /// 최종 상태로 남는다.
+    func testTombstoneForFolderAlreadyInTrashKeepsLocalCopyWithoutRejection()
+        async throws {
+        let trashID = DocumentID(rawValue: UUID())
+        let folderID = DocumentID(rawValue: UUID())
+        let childID = DocumentID(rawValue: UUID())
+        let folderPath = "메인/휴지통/보존 폴더"
+        let childPath = folderPath + "/문서.txt"
+        let fixture = try Fixture(
+            projectID: projectID,
+            documents: [
+                folder(id: rootID, path: "메인", parent: nil),
+                folder(id: trashID, path: "메인/휴지통", parent: rootID),
+                folder(id: folderID, path: folderPath, parent: trashID),
+                text(id: childID, path: childPath, parent: folderID),
+            ]
+        )
+        try fixture.makeDirectory(folderPath)
+        try fixture.write(childPath, contents: "휴지통 본문")
+
+        let report = await fixture.applier.applyRemoteFolders(
+            localProjectID: projectID,
+            remote: [
+                remoteFolder(
+                    id: folderID,
+                    parent: rootID,
+                    name: "보존 폴더",
+                    isDeleted: true
+                ),
+            ],
+            blockedFolderIDs: []
+        )
+
+        XCTAssertTrue(report.rejectedNames.isEmpty)
+        XCTAssertTrue(report.rejectedFolderIDs.isEmpty)
+        XCTAssertTrue(fixture.exists(childPath))
+        let stored = try await fixture.repository.documents(in: projectID)
+        XCTAssertEqual(
+            stored.first { $0.id == folderID }?.relativePath.rawValue,
+            folderPath
+        )
+
+        let restored = await fixture.applier.applyRemoteFolders(
+            localProjectID: projectID,
+            remote: [
+                remoteFolder(id: rootID, parent: nil, name: "메인"),
+                remoteFolder(
+                    id: folderID,
+                    parent: rootID,
+                    name: "보존 폴더"
+                ),
+            ],
+            blockedFolderIDs: []
+        )
+
+        XCTAssertEqual(restored.movedFolderIDs, [folderID])
+        XCTAssertTrue(restored.rejectedNames.isEmpty)
+        XCTAssertFalse(fixture.exists(folderPath))
+        XCTAssertTrue(fixture.exists("메인/보존 폴더/문서.txt"))
+        let afterRestore = try await fixture.repository.documents(in: projectID)
+        XCTAssertEqual(
+            afterRestore.first { $0.id == childID }?.relativePath.rawValue,
+            "메인/보존 폴더/문서.txt"
+        )
+    }
+
     func testEmptyTombstonedFolderIsRemoved() async throws {
         let folderID = DocumentID(rawValue: UUID())
         let fixture = try Fixture(

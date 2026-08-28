@@ -7468,6 +7468,13 @@ private actor BackgroundPullerStub: SyncV2SnapshotPulling {
 /// 폴더에 공유 UUID가 없는 채로 서버 폴더와 짝을 맞추게 되어, 모든 원격 폴더가
 /// "이 기기가 모르는 폴더"로 보이고 옮기는 대신 새로 만들어진다.
 final class SyncV2PullFolderWiringTests: XCTestCase {
+    func testRealtimeObservesEverySnapshotStructureTable() {
+        XCTAssertEqual(
+            LiveSyncV2RealtimeTrigger.observedTables,
+            ["documents", "folders", "tree_orders"]
+        )
+    }
+
     func testRemoteFolderApplyWaitsForProjectStructureMutation()
         async throws {
         let localProjectID = ProjectID(rawValue: UUID())

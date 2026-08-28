@@ -90,10 +90,16 @@ struct SyncV2RealtimeSubscriptionGate {
 }
 
 actor LiveSyncV2RealtimeTrigger: SyncV2RealtimeTriggering {
+    /// snapshot pull이 합치는 서버 변경의 세 출처다. 하나라도 빠지면
+    /// 예를 들어 빈 폴더 복원은 주기 확인 전까지 즉시 pull을 만들지
+    /// 못한다. 테이블별 event는 작품 coordinator에서 단조 증가 세대로
+    /// 합쳐지므로, 여기서는 모두 같은 callback으로 올린다.
+    static let observedTables = ["documents", "folders", "tree_orders"]
+
     private let client: SupabaseClient
     private let subscriptionGate: SyncV2RealtimeConnectGate
     private var channel: RealtimeChannelV2?
-    private var changeSubscription: RealtimeSubscription?
+    private var changeSubscriptions: [RealtimeSubscription] = []
     private var statusSubscription: RealtimeSubscription?
     private var channelGeneration: UUID?
     private var hasObservedSubscribing = false
@@ -179,26 +185,27 @@ actor LiveSyncV2RealtimeTrigger: SyncV2RealtimeTriggering {
                 "writerpad-documents-\($0.uuidString.lowercased())"
             } ?? "writerpad-documents-all"
         )
-        if let projectID {
-            changeSubscription = channel.onPostgresChange(
-                AnyAction.self,
-                schema: "public",
-                table: "documents",
-                filter:
-                    "project_id=eq.\(projectID.uuidString.lowercased())"
-            ) { _ in
-                Task {
-                    await self.receivedChange(
-                        generation: generation,
-                        callback: onChange
-                    )
+        changeSubscriptions = Self.observedTables.map { table in
+            if let projectID {
+                return channel.onPostgresChange(
+                    AnyAction.self,
+                    schema: "public",
+                    table: table,
+                    filter:
+                        "project_id=eq.\(projectID.uuidString.lowercased())"
+                ) { _ in
+                    Task {
+                        await self.receivedChange(
+                            generation: generation,
+                            callback: onChange
+                        )
+                    }
                 }
             }
-        } else {
-            changeSubscription = channel.onPostgresChange(
+            return channel.onPostgresChange(
                 AnyAction.self,
                 schema: "public",
-                table: "documents"
+                table: table
             ) { _ in
                 Task {
                     await self.receivedChange(
@@ -255,9 +262,9 @@ actor LiveSyncV2RealtimeTrigger: SyncV2RealtimeTriggering {
     }
 
     func stop() async {
-        changeSubscription?.cancel()
+        changeSubscriptions.forEach { $0.cancel() }
         statusSubscription?.cancel()
-        changeSubscription = nil
+        changeSubscriptions.removeAll()
         statusSubscription = nil
         if let channel {
             // Supabase 2.46.0의 removeChannel은 이미 subscribed인 채널만

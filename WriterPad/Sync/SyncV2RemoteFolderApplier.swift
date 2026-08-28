@@ -278,6 +278,15 @@ actor SyncV2RemoteFolderApplier: SyncV2RemoteFolderApplying {
         root: URL,
         report: inout SyncV2RemoteFolderApplyReport
     ) async -> [DocumentNode] {
+        // 휴지통 안의 폴더는 이 기기에서 삭제를 이미 표현한 보존본이다.
+        // 안의 TXT를 지우면 복구할 수 없고, 남아 있다고 tombstone을 거부하면
+        // 다른 기기가 복원하기 직전의 중간 삭제 상태가 최종 오류로 남는다.
+        // 로컬 보존본은 그대로 두고 folder baseline만 진전시킨다. 나중에
+        // 서버가 live로 복원하면 같은 folder_id를 휴지통에서 원래 자리로
+        // 옮긴다. 활성 경로의 미전송 내용 보호는 아래에서 그대로 유지한다.
+        if isInTrash(path) {
+            return documents
+        }
         // 서버가 지웠다고 알려도 로컬에 아직 내용이 남아 있으면 지우지 않는다.
         // 그 내용은 아직 서버로 못 간 사용자의 자료일 수 있다.
         let prefix = canonical(path.rawValue) + "/"
@@ -343,6 +352,14 @@ actor SyncV2RemoteFolderApplier: SyncV2RemoteFolderApplying {
         } catch {
             return false
         }
+    }
+
+    private func isInTrash(_ path: RelativeDocumentPath) -> Bool {
+        let value = canonical(path.rawValue)
+        let trash = canonical(
+            BinderFixedCategory.trash.relativePath.rawValue
+        )
+        return value.hasPrefix(trash + "/")
     }
 
     private func rejection(
