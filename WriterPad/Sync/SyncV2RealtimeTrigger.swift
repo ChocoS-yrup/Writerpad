@@ -90,11 +90,12 @@ struct SyncV2RealtimeSubscriptionGate {
 }
 
 actor LiveSyncV2RealtimeTrigger: SyncV2RealtimeTriggering {
-    /// snapshot pull이 합치는 서버 변경의 세 출처다. 하나라도 빠지면
-    /// 예를 들어 빈 폴더 복원은 주기 확인 전까지 즉시 pull을 만들지
-    /// 못한다. 테이블별 event는 작품 coordinator에서 단조 증가 세대로
-    /// 합쳐지므로, 여기서는 모두 같은 callback으로 올린다.
-    static let observedTables = ["documents", "folders", "tree_orders"]
+    /// Supabase Realtime publication에 등록된 snapshot 출처만 구독한다.
+    /// publication에 없는 table filter를 같은 channel join에 섞으면 서버가
+    /// callback id를 돌려주지 않아 documents/folders 알림까지 멈출 수 있다.
+    /// tree_orders는 주기 확인·재연결 pull에서 합치며, publication 계약을
+    /// 추가하기 전에는 여기서 직접 구독하지 않는다.
+    static let observedTables = ["documents", "folders"]
 
     private let client: SupabaseClient
     private let subscriptionGate: SyncV2RealtimeConnectGate
