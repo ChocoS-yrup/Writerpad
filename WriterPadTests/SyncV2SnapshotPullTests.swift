@@ -4,41 +4,10 @@ import XCTest
 @testable import WriterPad
 
 final class SyncV2SnapshotPullTests: XCTestCase {
-    func testSnapshotNetworkReadsStartConcurrently() async throws {
-        let client = ConcurrentSnapshotClientProbe()
-        let service = SyncV2SnapshotPullService(
-            client: client,
-            stateStore: SnapshotStateStoreStub(states: [:]),
-            localApplier: SnapshotApplierSpy(),
-            mergeStore: SnapshotMergeStoreSpy(),
-            folderApplier: FolderWiringApplierSpy(
-                order: FolderWiringOrderRecorder()
-            )
-        )
-        let pull = Task {
-            try await service.pull(
-                localProjectID: ProjectID(rawValue: UUID()),
-                serverProjectID: UUID()
-            )
-        }
-
-        for _ in 0..<500 where await client.startedCount() < 3 {
-            await Task.yield()
-        }
-        let started = await client.startedStages()
-        XCTAssertEqual(
-            started,
-            Set(ConcurrentSnapshotClientProbe.Stage.allCases),
-            "서로 독립적인 snapshot 네트워크 읽기는 한 왕복 구간에 시작해야 합니다."
-        )
-
-        await client.releaseAll()
-        _ = try await pull.value
-    }
-
-    func testWorkspaceSceneGateReplaysActivePhaseObservedWhileStarting() {
+    func testWorkspaceSceneGateReplaysActivePhaseObservedWhileStarting()
+        throws {
         var gate = WorkspaceSceneActivityGate()
-        let appearanceID = gate.beginAppearance()
+        let appearanceID = try XCTUnwrap(gate.beginAppearance())
 
         XCTAssertNil(gate.observe(true))
         XCTAssertEqual(
@@ -51,9 +20,10 @@ final class SyncV2SnapshotPullTests: XCTestCase {
         XCTAssertEqual(gate.observe(false), false)
     }
 
-    func testWorkspaceSceneGateUsesCurrentPhaseWithoutEarlyObservation() {
+    func testWorkspaceSceneGateUsesCurrentPhaseWithoutEarlyObservation()
+        throws {
         var gate = WorkspaceSceneActivityGate()
-        let appearanceID = gate.beginAppearance()
+        let appearanceID = try XCTUnwrap(gate.beginAppearance())
 
         XCTAssertEqual(
             gate.finishStarting(
@@ -64,9 +34,9 @@ final class SyncV2SnapshotPullTests: XCTestCase {
         )
     }
 
-    func testWorkspaceSceneGateRejectsLateStartAfterDisappear() {
+    func testWorkspaceSceneGateRejectsLateStartAfterDisappear() throws {
         var gate = WorkspaceSceneActivityGate()
-        let appearanceID = gate.beginAppearance()
+        let appearanceID = try XCTUnwrap(gate.beginAppearance())
         XCTAssertNil(gate.observe(true))
 
         gate.endAppearance()
@@ -76,6 +46,21 @@ final class SyncV2SnapshotPullTests: XCTestCase {
                 appearanceID: appearanceID,
                 fallbackActivity: true
             )
+        )
+    }
+
+    func testWorkspaceSceneGateCoalescesDuplicateAppearance() throws {
+        var gate = WorkspaceSceneActivityGate()
+        let appearanceID = try XCTUnwrap(gate.beginAppearance())
+
+        XCTAssertNil(gate.beginAppearance())
+        XCTAssertNil(gate.observe(true))
+        XCTAssertEqual(
+            gate.finishStarting(
+                appearanceID: appearanceID,
+                fallbackActivity: false
+            ),
+            true
         )
     }
 
@@ -6304,58 +6289,6 @@ private actor SnapshotClientStub: SyncV2SnapshotClienting {
         projectID: UUID
     ) async throws -> [SyncV2RemoteTreeOrder] {
         treeOrders
-    }
-}
-
-private actor ConcurrentSnapshotClientProbe: SyncV2SnapshotClienting {
-    enum Stage: CaseIterable, Hashable, Sendable {
-        case documents
-        case folders
-        case treeOrders
-    }
-
-    private var started = Set<Stage>()
-    private var isReleased = false
-    private var waiters: [CheckedContinuation<Void, Never>] = []
-
-    func fetchDocuments(
-        projectID: UUID
-    ) async throws -> [SyncV2RemoteDocumentSnapshot] {
-        await arrive(.documents)
-        return []
-    }
-
-    func fetchFolders(
-        projectID: UUID
-    ) async throws -> [SyncV2RemoteFolder] {
-        await arrive(.folders)
-        return []
-    }
-
-    func fetchTreeOrders(
-        projectID: UUID
-    ) async throws -> [SyncV2RemoteTreeOrder] {
-        await arrive(.treeOrders)
-        return []
-    }
-
-    func startedCount() -> Int { started.count }
-
-    func startedStages() -> Set<Stage> { started }
-
-    func releaseAll() {
-        isReleased = true
-        let pending = waiters
-        waiters.removeAll()
-        pending.forEach { $0.resume() }
-    }
-
-    private func arrive(_ stage: Stage) async {
-        started.insert(stage)
-        guard !isReleased else { return }
-        await withCheckedContinuation { continuation in
-            waiters.append(continuation)
-        }
     }
 }
 

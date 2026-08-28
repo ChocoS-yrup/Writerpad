@@ -8,12 +8,17 @@ struct WorkspaceSceneActivityGate: Equatable, Sendable {
     private var latestActivity: Bool?
     private var hasStarted = false
 
-    mutating func beginAppearance() -> UInt64 {
+    mutating func beginAppearance() -> UInt64? {
+        guard activeAppearanceID == nil else { return nil }
         nextAppearanceID &+= 1
         activeAppearanceID = nextAppearanceID
         latestActivity = nil
         hasStarted = false
         return nextAppearanceID
+    }
+
+    func isCurrentAppearance(_ appearanceID: UInt64) -> Bool {
+        activeAppearanceID == appearanceID
     }
 
     mutating func observe(_ active: Bool) -> Bool? {
@@ -127,6 +132,7 @@ struct WritingWorkspaceShell: View {
     @State private var projectSearchTask: Task<Void, Never>?
     @State private var workspaceSceneActivityGate =
         WorkspaceSceneActivityGate()
+    @State private var workspaceLifecycleTask: Task<Void, Never>?
 
     init(
         project: ManagedProject,
@@ -374,9 +380,14 @@ struct WritingWorkspaceShell: View {
         )
         .onAppear {
             applyAutosaveDelaySetting(autosaveDelayMilliseconds)
-            let appearanceID = workspaceSceneActivityGate.beginAppearance()
-            Task {
+            guard let appearanceID =
+                workspaceSceneActivityGate.beginAppearance()
+            else { return }
+            enqueueWorkspaceLifecycleOperation {
                 await restoreWorkspaceIfNeeded()
+                guard workspaceSceneActivityGate.isCurrentAppearance(
+                    appearanceID
+                ) else { return }
                 await workspaceSyncModel.start(
                     sceneIsActive: false,
                     editingGuards: currentSyncEditingGuards,
@@ -385,10 +396,7 @@ struct WritingWorkspaceShell: View {
                 guard let active = workspaceSceneActivityGate.finishStarting(
                     appearanceID: appearanceID,
                     fallbackActivity: scenePhase == .active
-                ) else {
-                    await workspaceSyncModel.stop()
-                    return
-                }
+                ) else { return }
                 await updateSceneActivity(active)
             }
         }
@@ -405,7 +413,7 @@ struct WritingWorkspaceShell: View {
         .onDisappear {
             projectSearchTask?.cancel()
             workspaceSceneActivityGate.endAppearance()
-            Task {
+            enqueueWorkspaceLifecycleOperation {
                 await workspaceSyncModel.stop()
                 await leftEditorModel.releaseEditLease()
                 await rightEditorModel.releaseEditLease()
@@ -1984,6 +1992,16 @@ struct WritingWorkspaceShell: View {
         await workspaceSyncModel.updateSceneActivity(active)
         if !active {
             await persistWorkspaceState()
+        }
+    }
+
+    private func enqueueWorkspaceLifecycleOperation(
+        _ operation: @escaping @MainActor () async -> Void
+    ) {
+        let predecessor = workspaceLifecycleTask
+        workspaceLifecycleTask = Task { @MainActor in
+            _ = await predecessor?.value
+            await operation()
         }
     }
 
