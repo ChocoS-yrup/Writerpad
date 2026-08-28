@@ -975,7 +975,9 @@ private typealias SyncV2WorkspacePullRace =
 
 @MainActor
 final class SyncV2WorkspaceSyncModel: ObservableObject {
-    @Published private(set) var state = SyncV2WorkspaceState() {
+    @Published private(set) var state = SyncV2WorkspaceState(
+        connection: .unknown
+    ) {
         didSet {
             guard oldValue != state else { return }
             SyncV2Diagnostics.workspaceState(

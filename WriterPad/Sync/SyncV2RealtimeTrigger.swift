@@ -89,18 +89,25 @@ struct SyncV2RealtimeSubscriptionGate {
     }
 }
 
+struct SyncV2RealtimePostgresScope: Equatable, Sendable {
+    let schema: String
+    let table: String?
+}
+
 actor LiveSyncV2RealtimeTrigger: SyncV2RealtimeTriggering {
-    /// Supabase Realtime publication에 등록된 snapshot 출처만 구독한다.
-    /// publication에 없는 table filter를 같은 channel join에 섞으면 서버가
-    /// callback id를 돌려주지 않아 documents/folders 알림까지 멈출 수 있다.
-    /// tree_orders는 주기 확인·재연결 pull에서 합치며, publication 계약을
-    /// 추가하기 전에는 여기서 직접 구독하지 않는다.
-    static let observedTables = ["documents", "folders"]
+    /// publication 전체를 하나의 postgres_changes callback으로 받는다.
+    /// 테이블마다 callback을 추가하면 join 응답의 callback id 하나가
+    /// 어긋났을 때 같은 채널의 정상 알림까지 함께 사라질 수 있다.
+    /// 작품 필터는 event row의 project_id로 로컬에서 적용한다.
+    static let postgresScope = SyncV2RealtimePostgresScope(
+        schema: "public",
+        table: nil
+    )
 
     private let client: SupabaseClient
     private let subscriptionGate: SyncV2RealtimeConnectGate
     private var channel: RealtimeChannelV2?
-    private var changeSubscriptions: [RealtimeSubscription] = []
+    private var changeSubscription: RealtimeSubscription?
     private var statusSubscription: RealtimeSubscription?
     private var channelGeneration: UUID?
     private var hasObservedSubscribing = false
@@ -186,34 +193,20 @@ actor LiveSyncV2RealtimeTrigger: SyncV2RealtimeTriggering {
                 "writerpad-documents-\($0.uuidString.lowercased())"
             } ?? "writerpad-documents-all"
         )
-        changeSubscriptions = Self.observedTables.map { table in
-            if let projectID {
-                return channel.onPostgresChange(
-                    AnyAction.self,
-                    schema: "public",
-                    table: table,
-                    filter:
-                        "project_id=eq.\(projectID.uuidString.lowercased())"
-                ) { _ in
-                    Task {
-                        await self.receivedChange(
-                            generation: generation,
-                            callback: onChange
-                        )
-                    }
-                }
-            }
-            return channel.onPostgresChange(
-                AnyAction.self,
-                schema: "public",
-                table: table
-            ) { _ in
-                Task {
-                    await self.receivedChange(
-                        generation: generation,
-                        callback: onChange
-                    )
-                }
+        let scope = Self.postgresScope
+        changeSubscription = channel.onPostgresChange(
+            AnyAction.self,
+            schema: scope.schema,
+            table: scope.table
+        ) { action in
+            let eventProjectID = Self.eventProjectID(from: action)
+            Task {
+                await self.receivedChange(
+                    eventProjectID: eventProjectID,
+                    expectedProjectID: projectID,
+                    generation: generation,
+                    callback: onChange
+                )
             }
         }
         statusSubscription = channel.onStatusChange {
@@ -263,9 +256,9 @@ actor LiveSyncV2RealtimeTrigger: SyncV2RealtimeTriggering {
     }
 
     func stop() async {
-        changeSubscriptions.forEach { $0.cancel() }
+        changeSubscription?.cancel()
         statusSubscription?.cancel()
-        changeSubscriptions.removeAll()
+        changeSubscription = nil
         statusSubscription = nil
         if let channel {
             // Supabase 2.46.0의 removeChannel은 이미 subscribed인 채널만
@@ -300,11 +293,44 @@ actor LiveSyncV2RealtimeTrigger: SyncV2RealtimeTriggering {
     }
 
     private func receivedChange(
+        eventProjectID: String?,
+        expectedProjectID: UUID?,
         generation: UUID,
         callback: @escaping @Sendable () -> Void
     ) {
-        guard channelGeneration == generation else { return }
+        guard channelGeneration == generation,
+              Self.shouldForward(
+                eventProjectID: eventProjectID,
+                expectedProjectID: expectedProjectID
+              )
+        else { return }
         callback()
+    }
+
+    static func shouldForward(
+        eventProjectID: String?,
+        expectedProjectID: UUID?
+    ) -> Bool {
+        guard let expectedProjectID else { return true }
+        // DELETE payload가 primary key만 포함하거나 새 publication 테이블에
+        // project_id가 없다면 누락시키지 않고 보수적으로 snapshot을 확인한다.
+        guard let eventProjectID,
+              let observedProjectID = UUID(uuidString: eventProjectID)
+        else { return true }
+        return observedProjectID == expectedProjectID
+    }
+
+    private static func eventProjectID(from action: AnyAction) -> String? {
+        let row: JSONObject
+        switch action {
+        case let .insert(insert):
+            row = insert.record
+        case let .update(update):
+            row = update.record
+        case let .delete(delete):
+            row = delete.oldRecord
+        }
+        return row["project_id"]?.stringValue
     }
 
     private func receivedStatus(

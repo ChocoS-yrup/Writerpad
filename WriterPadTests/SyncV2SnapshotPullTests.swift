@@ -3689,7 +3689,17 @@ final class SyncV2SnapshotPullTests: XCTestCase {
             sceneIsActive: false,
             editingGuards: { [:] }
         ) { _ in }
-        XCTAssertEqual(model.state, SyncV2WorkspaceState())
+        XCTAssertEqual(
+            model.state,
+            SyncV2WorkspaceState(connection: .unknown)
+        )
+        let initialPresentation = WorkspaceSyncStatusReducer.presentation(
+            saveState: .idle,
+            handoffState: .idle,
+            workspaceState: model.state,
+            leaseState: .localOnly
+        )
+        XCTAssertEqual(initialPresentation.label, "서버 연결 확인 중")
         var pullCount = await puller.count()
         XCTAssertEqual(pullCount, 0)
 
@@ -5726,7 +5736,10 @@ final class SyncV2SnapshotPullTests: XCTestCase {
         await model.updateSceneActivity(false)
         await puller.finishFirst()
         for _ in 0..<100 { await Task.yield() }
-        XCTAssertEqual(model.state, SyncV2WorkspaceState())
+        XCTAssertEqual(
+            model.state,
+            SyncV2WorkspaceState(connection: .unknown)
+        )
         await model.updateSceneActivity(true)
         for _ in 0..<500 where await puller.count() < 2 {
             await Task.yield()
@@ -7468,10 +7481,40 @@ private actor BackgroundPullerStub: SyncV2SnapshotPulling {
 /// 폴더에 공유 UUID가 없는 채로 서버 폴더와 짝을 맞추게 되어, 모든 원격 폴더가
 /// "이 기기가 모르는 폴더"로 보이고 옮기는 대신 새로 만들어진다.
 final class SyncV2PullFolderWiringTests: XCTestCase {
-    func testRealtimeObservesOnlyPublicationBackedSnapshotTables() {
+    func testRealtimeUsesOnePublicationWildcardInsteadOfTableFilters() {
         XCTAssertEqual(
-            LiveSyncV2RealtimeTrigger.observedTables,
-            ["documents", "folders"]
+            LiveSyncV2RealtimeTrigger.postgresScope.schema,
+            "public"
+        )
+        XCTAssertNil(LiveSyncV2RealtimeTrigger.postgresScope.table)
+    }
+
+    func testRealtimeRoutesKnownProjectsLocallyAndKeepsUnknownDeletes() {
+        let projectID = UUID()
+        XCTAssertTrue(
+            LiveSyncV2RealtimeTrigger.shouldForward(
+                eventProjectID: projectID.uuidString,
+                expectedProjectID: projectID
+            )
+        )
+        XCTAssertFalse(
+            LiveSyncV2RealtimeTrigger.shouldForward(
+                eventProjectID: UUID().uuidString,
+                expectedProjectID: projectID
+            )
+        )
+        XCTAssertTrue(
+            LiveSyncV2RealtimeTrigger.shouldForward(
+                eventProjectID: nil,
+                expectedProjectID: projectID
+            ),
+            "DELETE payload에 project_id가 없으면 누락보다 보수적인 pull이 안전합니다."
+        )
+        XCTAssertTrue(
+            LiveSyncV2RealtimeTrigger.shouldForward(
+                eventProjectID: UUID().uuidString,
+                expectedProjectID: nil
+            )
         )
     }
 
