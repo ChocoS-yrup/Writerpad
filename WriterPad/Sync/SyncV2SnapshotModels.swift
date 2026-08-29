@@ -305,6 +305,10 @@ struct SyncV2SnapshotPullReport: Equatable, Sendable {
     /// value라 값을 담을 수 없어 보고서로 따로 올린다. 이것이 없으면 사용자는
     /// 무엇을 고쳐야 할지 알 수 없어 상태에서 빠져나올 수 없다.
     var rejectedStructureNames: [SyncV2RejectedStructureName] = []
+    /// 원격 폴더 tombstone은 왔지만 자식의 live/tombstone 세대가
+    /// 아직 완료되지 않아 다음 Realtime snapshot을 기다리는 건수다.
+    /// 로컬 자료 위험과는 다르므로 rejectedStructureNames에 섞지 않는다.
+    var pendingChildTombstoneFolderCount: Int = 0
 }
 
 /// 거부를 사용자에게 어떻게 말해야 하는지 가른다.

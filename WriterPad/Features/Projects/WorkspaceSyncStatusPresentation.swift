@@ -101,6 +101,7 @@ enum WorkspaceSyncStatusReducer {
         ) {
         case (_, .conflictRequired), (_, .structuralConflict),
              (_, .notApplied), (_, .notPublished), (_, .waiting),
+             (_, .reconcilingStructure),
              (_, .uploadPending), (_, .retryWaiting),
              (_, .actualConflict), (_, .blocked),
              (_, .automaticallyMerged):
@@ -240,6 +241,12 @@ enum WorkspaceSyncStatusReducer {
                 "편집 또는 조합 중인 문서는 덮어쓰지 않고 다음 snapshot 확인을 기다립니다.",
                 severity: .warning,
                 retry: true
+            )
+        case let .reconcilingStructure(count):
+            return value(
+                "동기화 정리 중",
+                "folder.badge.clock",
+                "폴더 \(count)개의 자식 삭제 세대를 기다리고 있습니다. 로컬 TXT는 지우지 않습니다."
             )
         case .authenticationRequired:
             return value(

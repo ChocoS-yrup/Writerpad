@@ -4,6 +4,12 @@ struct SyncV2RemoteFolderApplyReport: Equatable, Sendable {
     var movedFolderIDs: [DocumentID] = []
     var createdFolderIDs: [DocumentID] = []
     var deletedFolderIDs: [DocumentID] = []
+    /// 문서 tombstone을 먼저 적용한 뒤 같은 pull에서 다시
+    /// 확인할 폴더다. 아직 거부가 아니므로 사용자 경고에 싣지 않는다.
+    var deferredFolderIDs: Set<DocumentID> = []
+    /// 원격에도 아직 live이거나 tombstone 적용이 열린 문서로
+    /// 막힌 자식만 남았다. 다음 Realtime 세대를 기다릴 일시 상태다.
+    var pendingChildTombstoneFolderIDs: Set<DocumentID> = []
     var rejectedFolderIDs: Set<DocumentID> = []
     /// 반영하지 못한 것들이다. 사용자가 무엇을 고쳐야 하는지 알 수 있게 이름을
     /// 함께 싣는다.
@@ -13,6 +19,8 @@ struct SyncV2RemoteFolderApplyReport: Equatable, Sendable {
         movedFolderIDs.isEmpty
             && createdFolderIDs.isEmpty
             && deletedFolderIDs.isEmpty
+            && deferredFolderIDs.isEmpty
+            && pendingChildTombstoneFolderIDs.isEmpty
             && rejectedFolderIDs.isEmpty
             && rejectedNames.isEmpty
     }
@@ -24,6 +32,54 @@ protocol SyncV2RemoteFolderApplying: Sendable {
         remote: [SyncV2RemoteFolder],
         blockedFolderIDs: Set<DocumentID>
     ) async -> SyncV2RemoteFolderApplyReport
+
+    func stageRemoteFoldersDeferringNonEmptyDeletions(
+        localProjectID: ProjectID,
+        remote: [SyncV2RemoteFolder],
+        blockedFolderIDs: Set<DocumentID>
+    ) async -> SyncV2RemoteFolderApplyReport
+
+    func finalizeDeferredFolderDeletions(
+        localProjectID: ProjectID,
+        remote: [SyncV2RemoteFolder],
+        deferredFolderIDs: Set<DocumentID>,
+        blockedFolderIDs: Set<DocumentID>,
+        waitingForRemoteChildrenFolderIDs: Set<DocumentID>
+    ) async -> SyncV2RemoteFolderApplyReport
+}
+
+extension SyncV2RemoteFolderApplying {
+    func stageRemoteFoldersDeferringNonEmptyDeletions(
+        localProjectID: ProjectID,
+        remote: [SyncV2RemoteFolder],
+        blockedFolderIDs: Set<DocumentID>
+    ) async -> SyncV2RemoteFolderApplyReport {
+        await applyRemoteFolders(
+            localProjectID: localProjectID,
+            remote: remote,
+            blockedFolderIDs: blockedFolderIDs
+        )
+    }
+
+    func finalizeDeferredFolderDeletions(
+        localProjectID: ProjectID,
+        remote: [SyncV2RemoteFolder],
+        deferredFolderIDs: Set<DocumentID>,
+        blockedFolderIDs: Set<DocumentID>,
+        waitingForRemoteChildrenFolderIDs: Set<DocumentID>
+    ) async -> SyncV2RemoteFolderApplyReport {
+        _ = waitingForRemoteChildrenFolderIDs
+        return await applyRemoteFolders(
+            localProjectID: localProjectID,
+            remote: remote.filter {
+                $0.isDeleted
+                    && deferredFolderIDs.contains(
+                        DocumentID(rawValue: $0.folderID)
+                    )
+            },
+            blockedFolderIDs: blockedFolderIDs
+        )
+    }
 }
 
 /// 계획대로 폴더를 옮기고 만들고 지운다.
@@ -31,6 +87,12 @@ protocol SyncV2RemoteFolderApplying: Sendable {
 /// 이름 변경도 이동으로 처리한다. 지우고 새로 만들면 받는 기기에 옛 이름과 새
 /// 이름의 폴더가 함께 남는데, 그것이 이번 전환이 없애려는 증상이다.
 actor SyncV2RemoteFolderApplier: SyncV2RemoteFolderApplying {
+    private enum NonEmptyDeletionMode {
+        case reject
+        case deferUntilDocumentsApply
+        case finalize(waitingFolderIDs: Set<DocumentID>)
+    }
+
     private let documentRepository: any DocumentRepository
     private let workspaceLocator: any ProjectWorkspaceLocating
     private let fileManager: FileManager
@@ -50,6 +112,55 @@ actor SyncV2RemoteFolderApplier: SyncV2RemoteFolderApplying {
         localProjectID: ProjectID,
         remote: [SyncV2RemoteFolder],
         blockedFolderIDs: Set<DocumentID> = []
+    ) async -> SyncV2RemoteFolderApplyReport {
+        await applyRemoteFolders(
+            localProjectID: localProjectID,
+            remote: remote,
+            blockedFolderIDs: blockedFolderIDs,
+            deletionMode: .reject
+        )
+    }
+
+    func stageRemoteFoldersDeferringNonEmptyDeletions(
+        localProjectID: ProjectID,
+        remote: [SyncV2RemoteFolder],
+        blockedFolderIDs: Set<DocumentID>
+    ) async -> SyncV2RemoteFolderApplyReport {
+        await applyRemoteFolders(
+            localProjectID: localProjectID,
+            remote: remote,
+            blockedFolderIDs: blockedFolderIDs,
+            deletionMode: .deferUntilDocumentsApply
+        )
+    }
+
+    func finalizeDeferredFolderDeletions(
+        localProjectID: ProjectID,
+        remote: [SyncV2RemoteFolder],
+        deferredFolderIDs: Set<DocumentID>,
+        blockedFolderIDs: Set<DocumentID>,
+        waitingForRemoteChildrenFolderIDs: Set<DocumentID>
+    ) async -> SyncV2RemoteFolderApplyReport {
+        await applyRemoteFolders(
+            localProjectID: localProjectID,
+            remote: remote.filter {
+                $0.isDeleted
+                    && deferredFolderIDs.contains(
+                        DocumentID(rawValue: $0.folderID)
+                    )
+            },
+            blockedFolderIDs: blockedFolderIDs,
+            deletionMode: .finalize(
+                waitingFolderIDs: waitingForRemoteChildrenFolderIDs
+            )
+        )
+    }
+
+    private func applyRemoteFolders(
+        localProjectID: ProjectID,
+        remote: [SyncV2RemoteFolder],
+        blockedFolderIDs: Set<DocumentID>,
+        deletionMode: NonEmptyDeletionMode
     ) async -> SyncV2RemoteFolderApplyReport {
         var report = SyncV2RemoteFolderApplyReport()
         guard !remote.isEmpty else { return report }
@@ -97,6 +208,7 @@ actor SyncV2RemoteFolderApplier: SyncV2RemoteFolderApplying {
                     path: path,
                     documents: documents,
                     root: root,
+                    deletionMode: deletionMode,
                     report: &report
                 )
             case let .conflict(folderID, path, reason):
@@ -292,6 +404,7 @@ actor SyncV2RemoteFolderApplier: SyncV2RemoteFolderApplying {
         path: RelativeDocumentPath,
         documents: [DocumentNode],
         root: URL,
+        deletionMode: NonEmptyDeletionMode,
         report: inout SyncV2RemoteFolderApplyReport
     ) async -> [DocumentNode] {
         // 휴지통 안의 폴더는 이 기기에서 삭제를 이미 표현한 보존본이다.
@@ -311,15 +424,25 @@ actor SyncV2RemoteFolderApplier: SyncV2RemoteFolderApplying {
                 && canonical($0.relativePath.rawValue).hasPrefix(prefix)
         }
         guard !hasLocalContent else {
-            report.rejectedFolderIDs.insert(folderID)
-            report.rejectedNames.append(
-                rejection(
+            switch deletionMode {
+            case .deferUntilDocumentsApply:
+                report.deferredFolderIDs.insert(folderID)
+            case let .finalize(waitingFolderIDs)
+                where waitingFolderIDs.contains(folderID)
+                    && !hasUnexpectedDiskContent(
+                        path: path,
+                        documents: documents,
+                        root: root
+                    ):
+                report.pendingChildTombstoneFolderIDs.insert(folderID)
+                report.rejectedFolderIDs.insert(folderID)
+            case .reject, .finalize:
+                rejectNonEmptyFolder(
+                    folderID: folderID,
                     path: path,
-                    reason: nil,
-                    detail: "아직 내용이 남아 있어 지우지 않음",
-                    kind: .notApplied
+                    report: &report
                 )
-            )
+            }
             return documents
         }
 
@@ -331,18 +454,29 @@ actor SyncV2RemoteFolderApplier: SyncV2RemoteFolderApplying {
                 ),
                 contents.isEmpty
             else {
+                // metadata에 없는 파일이나 하위 폴더다. 자식 tombstone
+                // 대기로 위장하지 않고 항상 로컬 자료로 간주한다.
+                rejectNonEmptyFolder(
+                    folderID: folderID,
+                    path: path,
+                    report: &report
+                )
+                return documents
+            }
+            do {
+                try fileManager.removeItem(at: target)
+            } catch {
                 report.rejectedFolderIDs.insert(folderID)
                 report.rejectedNames.append(
                     rejection(
                         path: path,
                         reason: nil,
-                        detail: "아직 내용이 남아 있어 지우지 않음",
+                        detail: "지울 수 없음",
                         kind: .notApplied
                     )
                 )
                 return documents
             }
-            try? fileManager.removeItem(at: target)
         }
         guard
             (try? await documentRepository.removeMetadata(id: folderID))
@@ -353,6 +487,54 @@ actor SyncV2RemoteFolderApplier: SyncV2RemoteFolderApplying {
         }
         report.deletedFolderIDs.append(folderID)
         return documents.filter { $0.id != folderID }
+    }
+
+    private func rejectNonEmptyFolder(
+        folderID: DocumentID,
+        path: RelativeDocumentPath,
+        report: inout SyncV2RemoteFolderApplyReport
+    ) {
+        report.rejectedFolderIDs.insert(folderID)
+        report.rejectedNames.append(
+            rejection(
+                path: path,
+                reason: nil,
+                detail: "아직 내용이 남아 있어 지우지 않음",
+                kind: .notApplied
+            )
+        )
+    }
+
+    private func hasUnexpectedDiskContent(
+        path: RelativeDocumentPath,
+        documents: [DocumentNode],
+        root: URL
+    ) -> Bool {
+        let target = url(root: root, path: path)
+        guard fileManager.fileExists(atPath: target.path) else { return false }
+        let prefix = canonical(path.rawValue) + "/"
+        let knownPaths = Set(documents.compactMap { document -> String? in
+            let value = canonical(document.relativePath.rawValue)
+            return value.hasPrefix(prefix) ? value : nil
+        })
+        guard let enumerator = fileManager.enumerator(
+            at: target,
+            includingPropertiesForKeys: nil,
+            options: [],
+            errorHandler: { _, _ in false }
+        ) else {
+            return true
+        }
+        for case let item as URL in enumerator {
+            let rootPath = root.standardizedFileURL.path
+            let itemPath = item.standardizedFileURL.path
+            guard itemPath.hasPrefix(rootPath + "/") else { return true }
+            let relative = canonical(String(itemPath.dropFirst(rootPath.count + 1)))
+            let isKnown = knownPaths.contains(relative)
+                || knownPaths.contains { $0.hasPrefix(relative + "/") }
+            if !isKnown { return true }
+        }
+        return false
     }
 
     private func isNameAllowed(_ path: RelativeDocumentPath) -> Bool {

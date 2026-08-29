@@ -896,6 +896,7 @@ struct SyncV2WorkspaceState: Equatable, Sendable {
         case localOnly
         case synced(at: Date)
         case waiting
+        case reconcilingStructure(count: Int)
         case uploadPending(count: Int)
         case retryWaiting(count: Int)
         case actualConflict(count: Int)
@@ -2435,6 +2436,10 @@ final class SyncV2WorkspaceSyncModel: ObservableObject {
                 적용하지 않았습니다. \(skipped.reason).\(tail) \
                 로컬 TXT는 그대로입니다.
                 """
+            )
+        } else if report.pendingChildTombstoneFolderCount > 0 {
+            lastResult = .reconcilingStructure(
+                count: report.pendingChildTombstoneFolderCount
             )
         } else if !mergeOutcomes.isEmpty {
             lastResult = .waiting

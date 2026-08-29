@@ -4521,6 +4521,42 @@ final class SyncV2SnapshotPullTests: XCTestCase {
         await model.stop()
     }
 
+    @MainActor
+    func testPendingChildTombstoneShowsQuietReconciliationInsteadOfWarning()
+        async throws {
+        let model = try await folderRejectionModel(
+            outcomes: [],
+            rejectedStructureNames: [],
+            pendingChildTombstoneFolderCount: 2
+        )
+
+        guard case let .reconcilingStructure(count) = model.state.lastResult
+        else {
+            return XCTFail(
+                "자식 tombstone 대기는 미적용 경고가 아니어야 한다: "
+                    + "\(model.state.lastResult)"
+            )
+        }
+        XCTAssertEqual(count, 2)
+        let presentation = WorkspaceSyncStatusReducer.presentation(
+            saveState: .saved(
+                generation: 1,
+                savedAt: Date(timeIntervalSince1970: 1),
+                contentHash: ContentHash(
+                    rawValue: String(repeating: "a", count: 64)
+                )!
+            ),
+            handoffState: .idle,
+            workspaceState: model.state,
+            leaseState: .localOnly
+        )
+        XCTAssertEqual(presentation.label, "동기화 정리 중")
+        XCTAssertEqual(presentation.severity, .neutral)
+        XCTAssertFalse(presentation.allowsRetry)
+        XCTAssertTrue(presentation.detail.contains("폴더 2개"))
+        await model.stop()
+    }
+
     /// 이 기기가 한 폴더 변경이 서버에 올라가지 못했는데 화면이 "동기화됨"이라고
     /// 하면 그것도 거짓이다. pull 보고서에는 나가는 쪽 굳음이 들어 있지 않다.
     @MainActor
@@ -4634,7 +4670,8 @@ final class SyncV2SnapshotPullTests: XCTestCase {
     private func folderRejectionModel(
         outcomes: [SyncV2SnapshotPullOutcome],
         rejectedStructureNames: [SyncV2RejectedStructureName],
-        stalled: [SyncV2StalledFolderChange] = []
+        stalled: [SyncV2StalledFolderChange] = [],
+        pendingChildTombstoneFolderCount: Int = 0
     ) async throws -> SyncV2WorkspaceSyncModel {
         let previous = GlobalSyncPreference.isEnabled()
         GlobalSyncPreference.setEnabled(true)
@@ -4644,7 +4681,9 @@ final class SyncV2SnapshotPullTests: XCTestCase {
             report: SyncV2SnapshotPullReport(
                 outcomes: outcomes,
                 appliedSnapshots: [],
-                rejectedStructureNames: rejectedStructureNames
+                rejectedStructureNames: rejectedStructureNames,
+                pendingChildTombstoneFolderCount:
+                    pendingChildTombstoneFolderCount
             )
         )
         let model = SyncV2WorkspaceSyncModel(
@@ -6238,6 +6277,86 @@ final class SyncV2SnapshotPullTests: XCTestCase {
         })
     }
 
+    func testFolderAndChildTombstonesConvergeWithinOneSnapshotPull()
+        async throws {
+        let fixture = try FolderTombstonePullFixture()
+        defer { fixture.removeWorkspace() }
+
+        let report = try await fixture.pull(childIsDeleted: true)
+
+        XCTAssertEqual(report.pendingChildTombstoneFolderCount, 0)
+        XCTAssertTrue(report.rejectedStructureNames.isEmpty)
+        XCTAssertFalse(fixture.exists(fixture.folderPath))
+        let documents = try await fixture.repository.documents(
+            in: fixture.projectID
+        )
+        XCTAssertNil(documents.first { $0.id == fixture.folderID })
+        let trashedChild = try XCTUnwrap(
+            documents.first { $0.id == fixture.childID }
+        )
+        guard case .trashed = trashedChild.deletionStatus else {
+            return XCTFail("자식 TXT는 지우지 않고 휴지통 사본으로 보존해야 합니다.")
+        }
+        XCTAssertTrue(fixture.exists(trashedChild.relativePath.rawValue))
+    }
+
+    func testDelayedChildTombstoneWaitsWithoutWarningThenResumesAfterRestart()
+        async throws {
+        let fixture = try FolderTombstonePullFixture()
+        defer { fixture.removeWorkspace() }
+
+        let waiting = try await fixture.pull(childIsDeleted: false)
+
+        XCTAssertEqual(waiting.pendingChildTombstoneFolderCount, 1)
+        XCTAssertTrue(waiting.rejectedStructureNames.isEmpty)
+        XCTAssertTrue(fixture.exists(fixture.childPath))
+
+        // 새 service를 만드는 pull()은 앱 재시작 뒤 재구성되는 경로와 같다.
+        let resumed = try await fixture.pull(childIsDeleted: true)
+
+        XCTAssertEqual(resumed.pendingChildTombstoneFolderCount, 0)
+        XCTAssertTrue(resumed.rejectedStructureNames.isEmpty)
+        XCTAssertFalse(fixture.exists(fixture.folderPath))
+    }
+
+    func testPendingLocalChildIsNotMisclassifiedAsTombstoneWaiting()
+        async throws {
+        let fixture = try FolderTombstonePullFixture()
+        defer { fixture.removeWorkspace() }
+
+        let report = try await fixture.pull(
+            childIsDeleted: true,
+            childHasPendingOperation: true
+        )
+
+        XCTAssertEqual(report.pendingChildTombstoneFolderCount, 0)
+        XCTAssertEqual(report.rejectedStructureNames.count, 1)
+        XCTAssertTrue(fixture.exists(fixture.childPath))
+        let documents = try await fixture.repository.documents(
+            in: fixture.projectID
+        )
+        XCTAssertEqual(
+            documents.first { $0.id == fixture.childID }?.relativePath.rawValue,
+            fixture.childPath
+        )
+    }
+
+    func testNewLocalChildBetweenDocumentApplyAndFolderFinalizeBlocksDeletion()
+        async throws {
+        let fixture = try FolderTombstonePullFixture()
+        defer { fixture.removeWorkspace() }
+
+        let report = try await fixture.pull(
+            childIsDeleted: true,
+            injectNewChildAfterApply: true
+        )
+
+        XCTAssertEqual(report.pendingChildTombstoneFolderCount, 0)
+        XCTAssertEqual(report.rejectedStructureNames.count, 1)
+        XCTAssertTrue(fixture.exists(fixture.folderPath + "/새 로컬.txt"))
+        XCTAssertTrue(fixture.exists(fixture.folderPath))
+    }
+
     @MainActor
     private func makeLifecycleModel(
         puller: any SyncV2SnapshotPulling,
@@ -6294,6 +6413,249 @@ final class SyncV2SnapshotPullTests: XCTestCase {
             realtimeTimeoutSleep: realtimeTimeoutSleep,
             pullTimeoutSleep: pullTimeoutSleep,
             recoverySleep: recoverySleep
+        )
+    }
+}
+
+private final class FolderTombstonePullFixture {
+    let projectID = ProjectID(rawValue: UUID())
+    let rootID = DocumentID(rawValue: UUID())
+    let trashID = DocumentID(rawValue: UUID())
+    let folderID = DocumentID(rawValue: UUID())
+    let childID = DocumentID(rawValue: UUID())
+    let folderPath = "메인/든폴더"
+    let childPath = "메인/든폴더/문서.txt"
+    let root: URL
+    let repository: SnapshotDocumentRepository
+
+    init() throws {
+        root = FileManager.default.temporaryDirectory
+            .appendingPathComponent(
+                "WriterPad-folder-tombstone-pull-\(UUID().uuidString)",
+                isDirectory: true
+            )
+        try FileManager.default.createDirectory(
+            at: root.appendingPathComponent("메인/휴지통"),
+            withIntermediateDirectories: true
+        )
+        try FileManager.default.createDirectory(
+            at: root.appendingPathComponent(folderPath),
+            withIntermediateDirectories: true
+        )
+        try Data("본문".utf8).write(
+            to: root.appendingPathComponent(childPath)
+        )
+        repository = SnapshotDocumentRepository(
+            documents: [
+                Self.node(
+                    projectID: projectID,
+                    id: rootID,
+                    kind: .folder,
+                    parentID: nil,
+                    path: "메인",
+                    order: -1
+                ),
+                Self.node(
+                    projectID: projectID,
+                    id: trashID,
+                    kind: .folder,
+                    parentID: rootID,
+                    path: "메인/휴지통",
+                    order: BinderFixedCategory.trash.fixedOrder
+                ),
+                Self.node(
+                    projectID: projectID,
+                    id: folderID,
+                    kind: .folder,
+                    parentID: rootID,
+                    path: folderPath,
+                    order: 0
+                ),
+                Self.node(
+                    projectID: projectID,
+                    id: childID,
+                    kind: .text,
+                    parentID: folderID,
+                    path: childPath,
+                    order: 0
+                ),
+            ]
+        )
+    }
+
+    func pull(
+        childIsDeleted: Bool,
+        childHasPendingOperation: Bool = false,
+        injectNewChildAfterApply: Bool = false
+    ) async throws -> SyncV2SnapshotPullReport {
+        let workspace = SnapshotWorkspaceLocator(root: root)
+        let states: [UUID: SyncV2SnapshotLocalState] =
+            childHasPendingOperation
+            ? [
+                childID.rawValue: localState(
+                    revision: 0,
+                    active: true
+                ),
+            ]
+            : [:]
+        let baseApplier = LocalSyncV2SnapshotApplier(
+            documentRepository: repository,
+            workspaceLocator: workspace
+        )
+        let localApplier: any SyncV2LocalSnapshotApplying =
+            injectNewChildAfterApply
+            ? RacingFolderSnapshotApplier(
+                base: baseApplier,
+                repository: repository,
+                root: root,
+                folderID: folderID
+            )
+            : baseApplier
+        let service = SyncV2SnapshotPullService(
+            client: SnapshotClientStub(
+                snapshots: [
+                    makeSnapshot(
+                        id: childID.rawValue,
+                        path: childPath,
+                        content: childIsDeleted ? "" : "본문",
+                        revision: childIsDeleted ? 2 : 1,
+                        isDeleted: childIsDeleted
+                    ),
+                ],
+                folders: [
+                    remoteFolder(
+                        id: rootID,
+                        parentID: nil,
+                        name: "메인",
+                        isDeleted: false
+                    ),
+                    remoteFolder(
+                        id: trashID,
+                        parentID: rootID,
+                        name: "휴지통",
+                        isDeleted: false
+                    ),
+                    remoteFolder(
+                        id: folderID,
+                        parentID: rootID,
+                        name: "든폴더",
+                        isDeleted: true
+                    ),
+                ]
+            ),
+            stateStore: SnapshotStateStoreStub(states: states),
+            localApplier: localApplier,
+            mergeStore: SnapshotMergeStoreSpy(),
+            folderApplier: SyncV2RemoteFolderApplier(
+                documentRepository: repository,
+                workspaceLocator: workspace
+            ),
+            folderDocuments: repository
+        )
+        return try await service.pull(
+            localProjectID: projectID,
+            serverProjectID: projectID.rawValue
+        )
+    }
+
+    func exists(_ path: String) -> Bool {
+        FileManager.default.fileExists(
+            atPath: root.appendingPathComponent(path).path
+        )
+    }
+
+    func removeWorkspace() {
+        try? FileManager.default.removeItem(at: root)
+    }
+
+    private static func node(
+        projectID: ProjectID,
+        id: DocumentID,
+        kind: DocumentKind,
+        parentID: DocumentID?,
+        path: String,
+        order: Int
+    ) -> DocumentNode {
+        DocumentNode(
+            id: id,
+            projectID: projectID,
+            kind: kind,
+            parentID: parentID,
+            relativePath: RelativeDocumentPath(rawValue: path),
+            userOrder: order,
+            modifiedAt: .distantPast,
+            contentHash: nil
+        )
+    }
+
+    private func remoteFolder(
+        id: DocumentID,
+        parentID: DocumentID?,
+        name: String,
+        isDeleted: Bool
+    ) -> SyncV2RemoteFolder {
+        SyncV2RemoteFolder(
+            folderID: id.rawValue,
+            parentFolderID: parentID?.rawValue,
+            name: name,
+            revision: 1,
+            isDeleted: isDeleted,
+            updatedAt: Date(timeIntervalSince1970: 20)
+        )
+    }
+}
+
+private actor RacingFolderSnapshotApplier: SyncV2LocalSnapshotApplying {
+    private let base: LocalSyncV2SnapshotApplier
+    private let repository: SnapshotDocumentRepository
+    private let root: URL
+    private let folderID: DocumentID
+    private var injected = false
+
+    init(
+        base: LocalSyncV2SnapshotApplier,
+        repository: SnapshotDocumentRepository,
+        root: URL,
+        folderID: DocumentID
+    ) {
+        self.base = base
+        self.repository = repository
+        self.root = root
+        self.folderID = folderID
+    }
+
+    func apply(
+        localProjectID: ProjectID,
+        snapshot: SyncV2RemoteDocumentSnapshot
+    ) async throws {
+        try await base.apply(
+            localProjectID: localProjectID,
+            snapshot: snapshot
+        )
+        guard snapshot.isDeleted, !injected else { return }
+        injected = true
+        let path = "메인/든폴더/새 로컬.txt"
+        try Data("미전송".utf8).write(
+            to: root.appendingPathComponent(path)
+        )
+        try await repository.save(
+            DocumentNode(
+                id: DocumentID(rawValue: UUID()),
+                projectID: localProjectID,
+                kind: .text,
+                parentID: folderID,
+                relativePath: RelativeDocumentPath(rawValue: path),
+                userOrder: 1,
+                modifiedAt: Date(),
+                contentHash: nil
+            )
+        )
+    }
+
+    func finish(localProjectID: ProjectID, documentID: UUID) async {
+        await base.finish(
+            localProjectID: localProjectID,
+            documentID: documentID
         )
     }
 }

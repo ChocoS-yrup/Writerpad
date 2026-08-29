@@ -150,7 +150,9 @@ actor SyncV2SnapshotPullService: SyncV2SnapshotPulling {
         // 폴더를 문서보다 먼저 제자리에 놓는다. 이름이 바뀐 폴더에 문서가 먼저
         // 도착하면 옛 경로에 자리를 잡아, 뒤이은 폴더 이동이 목적지 충돌로
         // 막힌다.
-        var folderRejections: [SyncV2RejectedStructureName] = []
+        var folderReport = SyncV2RemoteFolderApplyReport()
+        var fetchedRemoteFolders: [SyncV2RemoteFolder]?
+        var permanentFolderBaselineExclusions: Set<UUID> = []
         folderStage: if let folderApplier {
             // fetch는 Gate 밖에서 한다. 네트워크를 기다리는 동안
             // 사용자의 폴더 작업을 막지 않고, 디스크·메타데이터를
@@ -176,7 +178,8 @@ actor SyncV2SnapshotPullService: SyncV2SnapshotPulling {
                 )
                 break folderStage
             }
-            folderRejections = try await mutationGate.withCriticalSection(
+            fetchedRemoteFolders = folders
+            let stage = try await mutationGate.withCriticalSection(
                 documentID: syncV2ProjectStructureMutationID(localProjectID)
             ) { [self] in
                 let folderDocuments =
@@ -209,7 +212,8 @@ actor SyncV2SnapshotPullService: SyncV2SnapshotPulling {
                 let blockedFolderIDs = Set(
                     blockedServerFolderIDs.map(DocumentID.init(rawValue:))
                 )
-                let report = await folderApplier.applyRemoteFolders(
+                let report = await folderApplier
+                    .stageRemoteFoldersDeferringNonEmptyDeletions(
                     localProjectID: localProjectID,
                     remote: folders,
                     blockedFolderIDs: blockedFolderIDs
@@ -220,10 +224,16 @@ actor SyncV2SnapshotPullService: SyncV2SnapshotPulling {
                     folders: folders,
                     excluding: blockedServerFolderIDs.union(
                         report.rejectedFolderIDs.map(\.rawValue)
+                    ).union(
+                        report.deferredFolderIDs.map(\.rawValue)
                     )
                 )
-                return report.rejectedNames
+                return (report, blockedServerFolderIDs)
             }
+            folderReport = stage.0
+            permanentFolderBaselineExclusions = stage.1.union(
+                folderReport.rejectedFolderIDs.map(\.rawValue)
+            )
         } else {
             // 이 작품에는 폴더 모형이 없다. 보류가 아니라 "없음"이므로 옛
             // tree_order 이름 추측을 그대로 쓴다. 보류로 두면 폴더 동기화가
@@ -257,7 +267,7 @@ actor SyncV2SnapshotPullService: SyncV2SnapshotPulling {
         }
         var outcomes: [SyncV2SnapshotPullOutcome] = []
         var appliedSnapshots: [SyncV2RemoteDocumentSnapshot] = []
-        var rejectedStructureNames = folderRejections
+        var rejectedStructureNames = folderReport.rejectedNames
         outcomes.reserveCapacity(snapshots.count)
 
         var effectivePurgeState = await localApplier.trashPurgeState(
@@ -346,11 +356,141 @@ actor SyncV2SnapshotPullService: SyncV2SnapshotPulling {
                 }
             }
         }
+
+        if let folderApplier,
+           let folders = fetchedRemoteFolders,
+           !folderReport.deferredFolderIDs.isEmpty {
+            let deferredFolderIDs = folderReport.deferredFolderIDs
+            let baselineExclusions = permanentFolderBaselineExclusions
+            let completedOutcomes = outcomes
+            let finalReport = try await mutationGate.withCriticalSection(
+                documentID: syncV2ProjectStructureMutationID(localProjectID)
+            ) { [self] in
+                let latestDocuments = try await folderDocuments?.documents(
+                    in: localProjectID
+                ) ?? []
+                let latestBlockedServerFolderIDs: Set<UUID>
+                if let folderMarker {
+                    latestBlockedServerFolderIDs = try await folderMarker
+                        .foldersWithPendingOperations(
+                            localProjectID: localProjectID
+                        )
+                } else {
+                    latestBlockedServerFolderIDs = []
+                }
+                let latestBlockedFolderIDs = Set(
+                    latestBlockedServerFolderIDs.map(
+                        DocumentID.init(rawValue:)
+                    )
+                )
+                let waitingFolderIDs = Self
+                    .foldersWaitingForRemoteChildren(
+                        folderIDs: deferredFolderIDs,
+                        documents: latestDocuments,
+                        snapshots: ordinarySnapshots,
+                        outcomes: completedOutcomes,
+                        remoteFolders: folders,
+                        blockedFolderIDs: latestBlockedFolderIDs
+                    )
+                let report = await folderApplier
+                    .finalizeDeferredFolderDeletions(
+                        localProjectID: localProjectID,
+                        remote: folders,
+                        deferredFolderIDs: deferredFolderIDs,
+                        blockedFolderIDs: latestBlockedFolderIDs,
+                        waitingForRemoteChildrenFolderIDs: waitingFolderIDs
+                    )
+                let finalExclusions = baselineExclusions
+                    .union(latestBlockedServerFolderIDs)
+                    .union(report.rejectedFolderIDs.map(\.rawValue))
+                try await stateStore.applyFolderSnapshotBaselines(
+                    localProjectID: localProjectID,
+                    serverProjectID: serverProjectID,
+                    folders: folders,
+                    excluding: finalExclusions
+                )
+                return report
+            }
+            folderReport.deletedFolderIDs.append(
+                contentsOf: finalReport.deletedFolderIDs
+            )
+            folderReport.pendingChildTombstoneFolderIDs.formUnion(
+                finalReport.pendingChildTombstoneFolderIDs
+            )
+            folderReport.rejectedFolderIDs.formUnion(
+                finalReport.rejectedFolderIDs
+            )
+            rejectedStructureNames.append(
+                contentsOf: finalReport.rejectedNames
+            )
+            folderReport.deferredFolderIDs.removeAll()
+        }
         return SyncV2SnapshotPullReport(
             outcomes: outcomes,
             appliedSnapshots: appliedSnapshots,
-            rejectedStructureNames: rejectedStructureNames
+            rejectedStructureNames: rejectedStructureNames,
+            pendingChildTombstoneFolderCount:
+                folderReport.pendingChildTombstoneFolderIDs.count
         )
+    }
+
+    /// 로컬에 남은 모든 자식이 완전한 원격 projection에도
+    /// 같은 UUID로 있을 때만 "자식 tombstone 대기"로 분류한다.
+    /// 원격에 없는 로컬 자식이나 pending 폴더가 하나라도 있으면
+    /// 진짜 로컬 자료 위험이므로 대기 집합에 넣지 않는다.
+    private static func foldersWaitingForRemoteChildren(
+        folderIDs: Set<DocumentID>,
+        documents: [DocumentNode],
+        snapshots: [SyncV2RemoteDocumentSnapshot],
+        outcomes: [SyncV2SnapshotPullOutcome],
+        remoteFolders: [SyncV2RemoteFolder],
+        blockedFolderIDs: Set<DocumentID>
+    ) -> Set<DocumentID> {
+        let snapshotsByID = Dictionary(
+            snapshots.map { ($0.documentID, $0) },
+            uniquingKeysWith: { first, _ in first }
+        )
+        let remoteFolderIDs = Set(remoteFolders.map(\.folderID))
+        let safelyProcessedDocumentIDs = Set(outcomes.compactMap { outcome in
+            switch outcome {
+            case let .applied(documentID, _, _),
+                 let .upToDate(documentID, _):
+                documentID
+            case .mergeRequired:
+                nil
+            }
+        })
+        var waiting: Set<DocumentID> = []
+        for folderID in folderIDs {
+            guard !blockedFolderIDs.contains(folderID),
+                  let folder = documents.first(where: {
+                      $0.id == folderID && $0.kind == .folder
+                  })
+            else { continue }
+            let prefix = SyncV2FolderIdentity.canonicalPath(
+                folder.relativePath.rawValue
+            ) + "/"
+            let descendants = documents.filter {
+                $0.id != folderID
+                    && SyncV2FolderIdentity.canonicalPath(
+                        $0.relativePath.rawValue
+                    ).hasPrefix(prefix)
+            }
+            guard !descendants.isEmpty else { continue }
+            let allChildrenBelongToRemoteProjection = descendants.allSatisfy {
+                child in
+                if child.kind == .folder {
+                    return !blockedFolderIDs.contains(child.id)
+                        && remoteFolderIDs.contains(child.id.rawValue)
+                }
+                return snapshotsByID[child.id.rawValue] != nil
+                    && safelyProcessedDocumentIDs.contains(child.id.rawValue)
+            }
+            if allChildrenBelongToRemoteProjection {
+                waiting.insert(folderID)
+            }
+        }
+        return waiting
     }
 
     private func process(

@@ -150,6 +150,7 @@ private extension SyncV2WorkspaceState.Result {
         case .conflictRequired: "conflictRequired"
         case .structuralConflict: "structuralConflict"
         case .notApplied: "notApplied"
+        case .reconcilingStructure: "reconcilingStructure"
         case .notPublished: "notPublished"
         case .failed: "failed"
         }
