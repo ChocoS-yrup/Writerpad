@@ -5,6 +5,28 @@ import XCTest
 @testable import WriterPad
 
 final class AppEnvironmentTests: XCTestCase {
+    @MainActor
+    func testWriterPadCommandActionsUpdatesInPlaceWithoutReplacingFocusedIdentity() {
+        let actions = WriterPadCommandActions()
+        let identity = ObjectIdentifier(actions)
+        var receivedCommands: [WriterPadEditorCommand] = []
+
+        actions.update(
+            perform: { receivedCommands.append($0) },
+            canToggleEditorPane: false
+        )
+        actions.perform(.save)
+        actions.update(
+            perform: { receivedCommands.append($0) },
+            canToggleEditorPane: true
+        )
+        actions.perform(.nextChapter)
+
+        XCTAssertEqual(ObjectIdentifier(actions), identity)
+        XCTAssertEqual(receivedCommands, [.save, .nextChapter])
+        XCTAssertTrue(actions.canToggleEditorPane)
+    }
+
     func testCloudStartupDoesNotRestoreAuthenticationWhenSyncIsDisabled()
         async {
         let authentication = CloudStartupAuthenticationSpy()

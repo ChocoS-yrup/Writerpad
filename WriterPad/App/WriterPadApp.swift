@@ -1,5 +1,6 @@
 import SwiftUI
 import SwiftData
+import Observation
 
 enum WriterPadEditorCommand: String, CaseIterable, Sendable {
     case save
@@ -15,9 +16,23 @@ enum WriterPadEditorCommand: String, CaseIterable, Sendable {
     case nextChapter
 }
 
-struct WriterPadCommandActions {
-    let perform: (WriterPadEditorCommand) -> Void
-    let canToggleEditorPane: Bool
+@Observable
+final class WriterPadCommandActions {
+    private(set) var canToggleEditorPane = false
+    @ObservationIgnored
+    private var performAction: (WriterPadEditorCommand) -> Void = { _ in }
+
+    func update(
+        perform: @escaping (WriterPadEditorCommand) -> Void,
+        canToggleEditorPane: Bool
+    ) {
+        performAction = perform
+        self.canToggleEditorPane = canToggleEditorPane
+    }
+
+    func perform(_ command: WriterPadEditorCommand) {
+        performAction(command)
+    }
 }
 
 enum WriterPadCloudStartup {
@@ -45,19 +60,8 @@ enum WriterPadCloudStartup {
     }
 }
 
-private struct WriterPadCommandActionsKey: FocusedValueKey {
-    typealias Value = WriterPadCommandActions
-}
-
-extension FocusedValues {
-    var writerPadCommandActions: WriterPadCommandActions? {
-        get { self[WriterPadCommandActionsKey.self] }
-        set { self[WriterPadCommandActionsKey.self] = newValue }
-    }
-}
-
 struct WriterPadCommands: Commands {
-    @FocusedValue(\.writerPadCommandActions) private var actions
+    @FocusedValue(WriterPadCommandActions.self) private var actions
 
     private func send(_ command: WriterPadEditorCommand) {
         actions?.perform(command)

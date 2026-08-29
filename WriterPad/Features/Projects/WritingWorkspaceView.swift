@@ -133,6 +133,7 @@ struct WritingWorkspaceShell: View {
     @State private var workspaceSceneActivityGate =
         WorkspaceSceneActivityGate()
     @State private var workspaceLifecycleTask: Task<Void, Never>?
+    @State private var writerPadCommandActions = WriterPadCommandActions()
 
     init(
         project: ManagedProject,
@@ -371,14 +372,9 @@ struct WritingWorkspaceShell: View {
         .toolbarBackground(appBackground, for: .navigationBar)
         .toolbarBackground(.visible, for: .navigationBar)
         .navigationBarTitleDisplayMode(.inline)
-        .focusedSceneValue(
-            \.writerPadCommandActions,
-            WriterPadCommandActions(
-                perform: handleEditorCommand,
-                canToggleEditorPane: shouldPresentSplit && !usesCompactLayout
-            )
-        )
+        .focusedSceneValue(writerPadCommandActions)
         .onAppear {
+            updateWriterPadCommandActions()
             applyAutosaveDelaySetting(autosaveDelayMilliseconds)
             guard let appearanceID =
                 workspaceSceneActivityGate.beginAppearance()
@@ -402,6 +398,12 @@ struct WritingWorkspaceShell: View {
         }
         .onChange(of: autosaveDelayMilliseconds) { _, milliseconds in
             applyAutosaveDelaySetting(milliseconds)
+        }
+        .onChange(of: isSplitPreferred) { _, _ in
+            updateWriterPadCommandActions()
+        }
+        .onChange(of: usesCompactLayout) { _, _ in
+            updateWriterPadCommandActions()
         }
         .task(id: scenePhase) {
             if let active = workspaceSceneActivityGate.observe(
@@ -1473,6 +1475,13 @@ struct WritingWorkspaceShell: View {
         case .nextChapter:
             Task { await selectAdjacentChapter(offset: 1) }
         }
+    }
+
+    private func updateWriterPadCommandActions() {
+        writerPadCommandActions.update(
+            perform: handleEditorCommand,
+            canToggleEditorPane: isSplitPreferred && !usesCompactLayout
+        )
     }
 
     private func presentDocumentSearch() {
