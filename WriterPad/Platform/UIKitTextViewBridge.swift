@@ -872,6 +872,7 @@ struct iPadTextEditor: UIViewRepresentable {
     var undoRequest: UInt64 = 0
     var redoRequest: UInt64 = 0
     var isActive: Bool = true
+    var isReadOnly: Bool = false
     var appearance: EditorAppearanceSettings = .default
     var placeholder: String = "빈 문서입니다. 바로 입력을 시작하세요."
     var searchHighlightRanges: [NSRange] = []
@@ -955,6 +956,12 @@ struct iPadTextEditor: UIViewRepresentable {
         func applyExternalState(to textView: SmartTextView) {
             textView.textStorage.delegate = self
             textView.placeholderText = parent.placeholder
+            textView.isEditable = !parent.isReadOnly
+            textView.isSelectable = !parent.isReadOnly
+            textView.isScrollEnabled = true
+            textView.accessibilityValue = parent.isReadOnly
+                ? "읽기 전용"
+                : nil
             let incoming = EditorExternalSnapshot(
                 documentID: parent.documentID,
                 version: parent.externalVersion
@@ -1047,6 +1054,10 @@ struct iPadTextEditor: UIViewRepresentable {
             }
             scheduleTypewriterPaddingUpdate(for: textView)
             commitCompositionIfRequested(in: textView)
+            if parent.isReadOnly {
+                requestResponderResignationIfNeeded(for: textView)
+                return
+            }
             if !parent.isActive {
                 requestResponderResignationIfNeeded(for: textView)
                 return

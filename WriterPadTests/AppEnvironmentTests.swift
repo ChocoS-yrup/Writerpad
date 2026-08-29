@@ -3607,6 +3607,147 @@ final class AppEnvironmentTests: XCTestCase {
     }
 
     @MainActor
+    func testTrashedDocumentOpensReadOnlyWithoutSavingMutations()
+        async throws {
+        let environment = try AppEnvironment.testing()
+        let project = try await environment.projectManager.createProject(
+            named: "휴지통 읽기 전용"
+        )
+        let roots = try await environment.binderRepository.rootNodes(in: project.id)
+        let notes = try XCTUnwrap(
+            roots.first { $0.fixedCategory == .notes }
+        )
+        let created = try await environment.binderCommands.create(
+            kind: .text,
+            named: "버려진 문서",
+            in: notes.id,
+            projectID: project.id
+        )
+        let loadedActiveDocument = try await environment.documentRepository
+            .document(id: created.affectedDocumentID)
+        let activeDocument = try XCTUnwrap(
+            loadedActiveDocument
+        )
+        _ = try await environment.localDocumentStore.save(
+            DocumentSaveRequest(
+                projectID: project.id,
+                documentID: activeDocument.id,
+                relativePath: activeDocument.relativePath,
+                text: "읽기만 할 본문\n두 번째 줄",
+                generation: 1
+            )
+        )
+        _ = try await environment.binderCommands.moveToTrash(
+            documentID: activeDocument.id,
+            projectID: project.id
+        )
+        let loadedTrashedDocument = try await environment.documentRepository
+            .document(id: activeDocument.id)
+        let trashedDocument = try XCTUnwrap(
+            loadedTrashedDocument
+        )
+        let node = BinderNode(
+            id: trashedDocument.id,
+            projectID: project.id,
+            kind: .text,
+            relativePath: trashedDocument.relativePath,
+            displayName: "버려진 문서",
+            fixedCategory: nil,
+            userOrder: trashedDocument.userOrder,
+            contentState: .written,
+            isExpanded: false
+        )
+        let model = EditorSessionModel(
+            documentRepository: environment.documentRepository,
+            documentStore: environment.localDocumentStore,
+            workspaceStateRepository: environment.workspaceStateRepository
+        )
+
+        await model.select(node)
+
+        XCTAssertTrue(model.isReadOnly)
+        XCTAssertEqual(model.currentText, "읽기만 할 본문\n두 번째 줄")
+        XCTAssertEqual(model.focusRequest, 0)
+        model.updateText("바꾸면 안 됨")
+        XCTAssertEqual(model.currentText, "읽기만 할 본문\n두 번째 줄")
+        XCTAssertFalse(model.hasUnsavedChanges)
+        XCTAssertNil(
+            model.automaticRebaseSnapshot(
+                documentID: trashedDocument.id
+            )
+        )
+        let didSave = await model.saveNow()
+        XCTAssertTrue(didSave)
+        let storedText = try await environment.localDocumentStore.loadText(
+            for: trashedDocument
+        )
+        XCTAssertEqual(
+            storedText,
+            "읽기만 할 본문\n두 번째 줄"
+        )
+
+        _ = try await environment.binderCommands.restoreFromTrash(
+            documentID: trashedDocument.id,
+            toFolderID: nil,
+            projectID: project.id
+        )
+        let loadedRestoredDocument = try await environment.documentRepository
+            .document(id: trashedDocument.id)
+        let restoredDocument = try XCTUnwrap(loadedRestoredDocument)
+        let restoredNode = BinderNode(
+            id: restoredDocument.id,
+            projectID: project.id,
+            kind: .text,
+            relativePath: restoredDocument.relativePath,
+            displayName: "버려진 문서",
+            fixedCategory: nil,
+            userOrder: restoredDocument.userOrder,
+            contentState: .written,
+            isExpanded: false
+        )
+
+        await model.select(restoredNode)
+
+        XCTAssertFalse(model.isReadOnly)
+        model.updateText("복원 후에는 편집 가능")
+        XCTAssertTrue(model.hasUnsavedChanges)
+        let didSaveRestoredDocument = await model.saveNow()
+        XCTAssertTrue(didSaveRestoredDocument)
+        let restoredText = try await environment.localDocumentStore.loadText(
+            for: restoredDocument
+        )
+        XCTAssertEqual(
+            restoredText,
+            "복원 후에는 편집 가능"
+        )
+    }
+
+    @MainActor
+    func testReadOnlyNativeEditorDisablesEditingButKeepsScrolling() {
+        let textView = SmartTextView()
+        let editor = iPadTextEditor(
+            text: .constant("읽기 전용 본문"),
+            documentID: DocumentID(rawValue: UUID()),
+            externalVersion: 1,
+            selection: .constant(.start),
+            focusRequest: 1,
+            isActive: true,
+            isReadOnly: true
+        )
+        let coordinator = editor.makeCoordinator()
+        textView.delegate = coordinator
+
+        coordinator.applyExternalState(to: textView)
+
+        XCTAssertFalse(textView.isEditable)
+        XCTAssertFalse(textView.isSelectable)
+        XCTAssertTrue(textView.isScrollEnabled)
+        XCTAssertTrue(textView.isUserInteractionEnabled)
+        XCTAssertEqual(textView.text, "읽기 전용 본문")
+        XCTAssertEqual(textView.accessibilityValue, "읽기 전용")
+    }
+
+    @MainActor
     func testEditorSessionManualSaveAtomicallyWritesCurrentUTF8Text() async throws {
         let environment = try AppEnvironment.testing()
         let project = try await environment.projectManager.createProject(named: "명령 저장")

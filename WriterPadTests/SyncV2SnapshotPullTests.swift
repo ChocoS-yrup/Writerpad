@@ -1334,6 +1334,209 @@ final class SyncV2SnapshotPullTests: XCTestCase {
         )
     }
 
+    /// 폴더 복원이 문서 복원보다 먼저 보이는 실기기 경합을 재현한다.
+    /// 폴더를 통째로 옮기면 tombstone 문서의 TXT도 live 경로에
+    /// 잠시 물질화된다. 이때 낡은 tombstone은 같은 본문을 휴지통으로
+    /// 재배치하고, 뒤이은 live snapshot이 그 보존본을 소비해야 한다.
+    func testFolderRestoreRaceConsumesRecoveredTombstoneCopy()
+        async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("WriterPad-FolderRestoreRace-\(UUID())")
+        defer { try? FileManager.default.removeItem(at: root) }
+        let liveFolderURL = root.appendingPathComponent("메인/아이패드-든폴더")
+        let trashURL = root.appendingPathComponent("메인/휴지통")
+        try FileManager.default.createDirectory(
+            at: liveFolderURL,
+            withIntermediateDirectories: true
+        )
+        try FileManager.default.createDirectory(
+            at: trashURL,
+            withIntermediateDirectories: true
+        )
+        let projectID = ProjectID(rawValue: UUID())
+        let rootID = DocumentID(rawValue: UUID())
+        let trashID = DocumentID(rawValue: UUID())
+        let folderID = DocumentID(rawValue: UUID())
+        let documentID = DocumentID(rawValue: UUID())
+        let livePath = RelativeDocumentPath(
+            rawValue: "메인/아이패드-든폴더/문문서서.txt"
+        )
+        let liveURL = root.appendingPathComponent(livePath.rawValue)
+        try Data("아이패드 본문".utf8).write(to: liveURL)
+        let repository = SnapshotDocumentRepository(
+            documents: [
+                DocumentNode(
+                    id: rootID,
+                    projectID: projectID,
+                    kind: .folder,
+                    parentID: nil,
+                    relativePath: RelativeDocumentPath(rawValue: "메인"),
+                    userOrder: 0,
+                    modifiedAt: .distantPast,
+                    contentHash: nil
+                ),
+                DocumentNode(
+                    id: trashID,
+                    projectID: projectID,
+                    kind: .folder,
+                    parentID: rootID,
+                    relativePath: BinderFixedCategory.trash.relativePath,
+                    userOrder: 1,
+                    modifiedAt: .distantPast,
+                    contentHash: nil
+                ),
+                DocumentNode(
+                    id: folderID,
+                    projectID: projectID,
+                    kind: .folder,
+                    parentID: rootID,
+                    relativePath: RelativeDocumentPath(
+                        rawValue: "메인/아이패드-든폴더"
+                    ),
+                    userOrder: 2,
+                    modifiedAt: .distantPast,
+                    contentHash: nil
+                ),
+                DocumentNode(
+                    id: documentID,
+                    projectID: projectID,
+                    kind: .text,
+                    parentID: folderID,
+                    relativePath: livePath,
+                    userOrder: 0,
+                    modifiedAt: .distantPast,
+                    contentHash: nil,
+                    deletionStatus: .trashed(
+                        originalPath: livePath,
+                        deletedAt: .distantPast
+                    )
+                ),
+            ]
+        )
+        let applier = LocalSyncV2SnapshotApplier(
+            documentRepository: repository,
+            workspaceLocator: SnapshotWorkspaceLocator(root: root)
+        )
+
+        let staleTombstone = makeSnapshot(
+            id: documentID.rawValue,
+            path: livePath.rawValue,
+            content: "아이패드 본문",
+            revision: 2,
+            isDeleted: true
+        )
+        await repository.failNextSave()
+        do {
+            try await applier.apply(
+                localProjectID: projectID,
+                snapshot: staleTombstone
+            )
+            XCTFail("중간 재배치의 metadata 실패가 전파되어야 합니다.")
+        } catch SnapshotTestError.injectedMetadataFailure {}
+        await applier.rollback(
+            localProjectID: projectID,
+            documentID: documentID.rawValue
+        )
+        let rolledBackDocument = try await repository.document(id: documentID)
+        let rolledBack = try XCTUnwrap(rolledBackDocument)
+        XCTAssertEqual(rolledBack.relativePath, livePath)
+        guard case .trashed = rolledBack.deletionStatus else {
+            return XCTFail("rollback은 기존 tombstone metadata를 복원해야 합니다.")
+        }
+        XCTAssertTrue(FileManager.default.fileExists(atPath: liveURL.path))
+        XCTAssertEqual(
+            try FileManager.default.contentsOfDirectory(atPath: trashURL.path),
+            []
+        )
+
+        try await applier.apply(
+            localProjectID: projectID,
+            snapshot: staleTombstone
+        )
+        await applier.finish(
+            localProjectID: projectID,
+            documentID: documentID.rawValue
+        )
+        let repairedDocument = try await repository.document(id: documentID)
+        let repaired = try XCTUnwrap(repairedDocument)
+        let repairedURL = root.appendingPathComponent(
+            repaired.relativePath.rawValue
+        )
+        XCTAssertFalse(FileManager.default.fileExists(atPath: liveURL.path))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: repairedURL.path))
+
+        try await applier.apply(
+            localProjectID: projectID,
+            snapshot: makeSnapshot(
+                id: documentID.rawValue,
+                path: livePath.rawValue,
+                content: "아이패드 본문",
+                revision: 3
+            )
+        )
+        await applier.finish(
+            localProjectID: projectID,
+            documentID: documentID.rawValue
+        )
+
+        let restoredDocument = try await repository.document(id: documentID)
+        let restored = try XCTUnwrap(restoredDocument)
+        XCTAssertEqual(restored.relativePath, livePath)
+        XCTAssertEqual(restored.deletionStatus, .active)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: liveURL.path))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: repairedURL.path))
+
+        // 이전 빌드가 이미 live TXT와 __UUID 휴지통 사본을 둘 다
+        // 남긴 실기기 상태도 다음 live snapshot 하나로 수렴해야 한다.
+        let legacyTrashPath = RelativeDocumentPath(
+            rawValue: BinderFixedCategory.trash.relativePath.rawValue
+                + "/문문서서__"
+                + documentID.rawValue.uuidString.lowercased()
+                + ".txt"
+        )
+        let legacyTrashURL = root.appendingPathComponent(
+            legacyTrashPath.rawValue
+        )
+        try Data("아이패드 본문".utf8).write(to: legacyTrashURL)
+        try await repository.save(
+            DocumentNode(
+                id: documentID,
+                projectID: projectID,
+                kind: .text,
+                parentID: trashID,
+                relativePath: legacyTrashPath,
+                userOrder: 0,
+                modifiedAt: .distantPast,
+                contentHash: nil,
+                deletionStatus: .trashed(
+                    originalPath: livePath,
+                    deletedAt: .distantPast
+                )
+            )
+        )
+
+        try await applier.apply(
+            localProjectID: projectID,
+            snapshot: makeSnapshot(
+                id: documentID.rawValue,
+                path: livePath.rawValue,
+                content: "아이패드 본문",
+                revision: 4
+            )
+        )
+        await applier.finish(
+            localProjectID: projectID,
+            documentID: documentID.rawValue
+        )
+        let convergedDocument = try await repository.document(id: documentID)
+        let converged = try XCTUnwrap(convergedDocument)
+        XCTAssertEqual(converged.relativePath, livePath)
+        XCTAssertEqual(converged.deletionStatus, .active)
+        XCTAssertFalse(
+            FileManager.default.fileExists(atPath: legacyTrashURL.path)
+        )
+    }
+
     func testTreeOrderAppliesAfterDocumentsAndNeverCreatesHiddenFile()
         async throws {
         let root = FileManager.default.temporaryDirectory

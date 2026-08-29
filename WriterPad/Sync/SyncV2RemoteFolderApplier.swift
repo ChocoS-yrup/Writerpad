@@ -140,7 +140,10 @@ actor SyncV2RemoteFolderApplier: SyncV2RemoteFolderApplying {
 
         let sourceURL = url(root: root, path: from)
         let destinationURL = url(root: root, path: to)
-        guard !fileManager.fileExists(atPath: destinationURL.path) else {
+        let reactivatesInPlace = from == to
+        guard reactivatesInPlace
+                || !fileManager.fileExists(atPath: destinationURL.path)
+        else {
             report.rejectedFolderIDs.insert(folderID)
             // 계획을 세운 뒤에 누군가 그 자리를 차지했다. 덮어쓰지 않는다.
             report.rejectedNames.append(
@@ -153,19 +156,28 @@ actor SyncV2RemoteFolderApplier: SyncV2RemoteFolderApplying {
             return documents
         }
         do {
-            try fileManager.createDirectory(
-                at: destinationURL.deletingLastPathComponent(),
-                withIntermediateDirectories: true
-            )
-            if fileManager.fileExists(atPath: sourceURL.path) {
-                try fileManager.moveItem(at: sourceURL, to: destinationURL)
+            if reactivatesInPlace {
+                guard fileManager.fileExists(atPath: sourceURL.path) else {
+                    throw CocoaError(.fileNoSuchFile)
+                }
             } else {
-                // 빈 폴더는 디스크에 없을 수 있다. 그래도 메타데이터는 옮겨야
-                // 화면에서 폴더가 둘로 보이지 않는다.
                 try fileManager.createDirectory(
-                    at: destinationURL,
+                    at: destinationURL.deletingLastPathComponent(),
                     withIntermediateDirectories: true
                 )
+                if fileManager.fileExists(atPath: sourceURL.path) {
+                    try fileManager.moveItem(
+                        at: sourceURL,
+                        to: destinationURL
+                    )
+                } else {
+                    // 빈 폴더는 디스크에 없을 수 있다. 그래도 메타데이터는
+                    // 옮겨야 화면에서 폴더가 둘로 보이지 않는다.
+                    try fileManager.createDirectory(
+                        at: destinationURL,
+                        withIntermediateDirectories: true
+                    )
+                }
             }
         } catch {
             report.rejectedFolderIDs.insert(folderID)
@@ -201,7 +213,11 @@ actor SyncV2RemoteFolderApplier: SyncV2RemoteFolderApplying {
                 userOrder: document.userOrder,
                 modifiedAt: document.modifiedAt,
                 contentHash: document.contentHash,
-                deletionStatus: document.deletionStatus,
+                // 서버에서 live로 돌아온 폴더 자체는 활성화한다.
+                // 단, 폴더 이동에 물리적으로 따라온 자식은 각자의
+                // document/folder snapshot이 live를 확정할 때까지 tombstone을
+                // 유지해야 중간 상태에서 자료를 부활시키지 않는다.
+                deletionStatus: isSelf ? .active : document.deletionStatus,
                 cursor: document.cursor,
                 isExpanded: document.isExpanded
             )

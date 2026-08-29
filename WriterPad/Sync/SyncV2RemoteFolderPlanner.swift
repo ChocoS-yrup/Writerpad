@@ -145,6 +145,21 @@ enum SyncV2RemoteFolderPlanner {
 
             if let local, canonical(local.relativePath.rawValue)
                 == canonical(path) {
+                if case .trashed = local.deletionStatus {
+                    // 이전 버전이 휴지통 폴더를 물리적으로만 복원하고
+                    // metadata를 trashed로 남긴 중간 상태다. 경로 이동 없이
+                    // 같은 move 경계로 다시 넘겨 live로 수렴시킨다.
+                    moves.append(
+                        .move(
+                            folderID: folderID,
+                            parentID: folder.parentFolderID.map(
+                                DocumentID.init(rawValue:)
+                            ),
+                            from: local.relativePath,
+                            to: RelativeDocumentPath(rawValue: path)
+                        )
+                    )
+                }
                 continue
             }
 

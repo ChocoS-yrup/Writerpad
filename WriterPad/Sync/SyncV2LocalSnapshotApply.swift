@@ -606,15 +606,31 @@ actor LocalSyncV2SnapshotApplier: SyncV2LocalSnapshotApplying {
             throw SyncV2LocalSnapshotApplyError
                 .pathOccupiedByDifferentDocument
         }
+        let data = Data(snapshot.content.utf8)
+        let reclaimsMaterializedRestore: Bool
+        if let current,
+           case let .trashed(originalPath, _) = current.deletionStatus,
+           current.relativePath != path,
+           normalized(originalPath.rawValue) == normalized(path.rawValue) {
+            let currentURL = root.appendingPathComponent(
+                current.relativePath.rawValue
+            ).standardizedFileURL
+            reclaimsMaterializedRestore =
+                currentURL.path.hasPrefix(rootPrefix)
+                && (try? Data(contentsOf: currentURL)) == data
+                && (try? Data(contentsOf: destination)) == data
+        } else {
+            reclaimsMaterializedRestore = false
+        }
         if current?.relativePath != path,
            fileManager.fileExists(atPath: destination.path),
            !recoveringSameSnapshot,
-           placeholderFolder == nil {
+           placeholderFolder == nil,
+           !reclaimsMaterializedRestore {
             throw SyncV2LocalSnapshotApplyError
                 .pathOccupiedByDifferentDocument
         }
 
-        let data = Data(snapshot.content.utf8)
         if !recoveringSameSnapshot {
             let previousContent: Data?
             if let current {
@@ -2280,11 +2296,34 @@ actor LocalSyncV2SnapshotApplier: SyncV2LocalSnapshotApplying {
             destinationPath.rawValue
         ).standardizedFileURL
         let data = Data(snapshot.content.utf8)
+        let currentURL = root.appendingPathComponent(
+            current.relativePath.rawValue
+        ).standardizedFileURL
+        let relocatesMaterializedTombstone: Bool
+        if normalized(current.relativePath.rawValue)
+                == normalized(originalPath.rawValue),
+           !isInTrash(current.relativePath),
+           currentURL != destinationURL,
+           (try? Data(contentsOf: currentURL)) == data {
+            // 폴더 복원이 문서 복원보다 먼저 보이면 tombstone TXT도
+            // 폴더를 따라 live 경로로 잠시 옮겨진다. 서버 tombstone과
+            // 본문이 완전히 같은 경우에만 그 사본을 휴지통 보존본으로
+            // 재배치한다. 다르면 기존 fail-closed 복사 정책을 유지한다.
+            relocatesMaterializedTombstone = true
+        } else {
+            relocatesMaterializedTombstone = false
+        }
         if fileManager.fileExists(atPath: destinationURL.path) {
             guard (try? Data(contentsOf: destinationURL)) == data else {
                 throw SyncV2LocalSnapshotApplyError
                     .pathOccupiedByDifferentDocument
             }
+            if relocatesMaterializedTombstone,
+               fileManager.fileExists(atPath: currentURL.path) {
+                try fileManager.removeItem(at: currentURL)
+            }
+        } else if relocatesMaterializedTombstone {
+            try fileManager.moveItem(at: currentURL, to: destinationURL)
         } else {
             let temporary = destinationURL.deletingLastPathComponent()
                 .appendingPathComponent(
@@ -2709,6 +2748,33 @@ actor LocalSyncV2SnapshotApplier: SyncV2LocalSnapshotApplying {
             return
         }
         do {
+            if let previousContent = marker.previousContent {
+                let previousURL = root.appendingPathComponent(
+                    previous.relativePath.rawValue
+                ).standardizedFileURL
+                if fileManager.fileExists(atPath: previousURL.path) {
+                    guard (try? Data(contentsOf: previousURL))
+                            == previousContent
+                    else { return }
+                } else {
+                    let temporary = previousURL.deletingLastPathComponent()
+                        .appendingPathComponent(
+                            LocalDocumentStore.temporaryPrefix
+                                + previous.id.rawValue.uuidString.lowercased()
+                                + "-tombstone-repair-rollback-"
+                                + UUID().uuidString.lowercased()
+                                + LocalDocumentStore.temporarySuffix
+                        )
+                    try writer.writeTemporaryFile(
+                        data: previousContent,
+                        at: temporary
+                    )
+                    try writer.replaceItem(
+                        at: previousURL,
+                        with: temporary
+                    )
+                }
+            }
             try await documentRepository.save(previous)
             try fileManager.removeItem(at: destinationURL)
             if marker.tombstoneRepairHadTrashRecord != true {

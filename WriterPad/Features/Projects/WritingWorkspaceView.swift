@@ -562,6 +562,15 @@ struct WritingWorkspaceShell: View {
                     .accessibilityLabel(pane == .left ? "왼쪽 편집기" : "오른쪽 편집기")
                     .accessibilityValue(pane == activePane ? "활성" : "비활성")
                 Spacer(minLength: 8)
+                if model.isReadOnly {
+                    Label("읽기 전용", systemImage: "lock.fill")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: true, vertical: false)
+                        .accessibilityIdentifier(
+                            "writerpad.editor-read-only-\(pane.rawValue)"
+                        )
+                }
                 if let leaseStatus = leaseStatus(for: model.editLeaseState) {
                     Label(leaseStatus.text, systemImage: leaseStatus.symbol)
                         .font(.caption)
@@ -628,6 +637,7 @@ struct WritingWorkspaceShell: View {
                     undoRequest: model.undoRequest,
                     redoRequest: model.redoRequest,
                     isActive: pane == activePane,
+                    isReadOnly: model.isReadOnly,
                     appearance: editorAppearance,
                     searchHighlightRanges: searchHighlightRanges(for: model, pane: pane),
                     currentSearchHighlightRange: currentSearchHighlightRange(
@@ -842,6 +852,7 @@ struct WritingWorkspaceShell: View {
                 .accessibilityIdentifier("writerpad.manuscript-export")
                 Button("백업") { Task { await presentBackupHistory() } }
                     .accessibilityIdentifier("writerpad.backup-history")
+                    .disabled(activeEditorModel.isReadOnly)
                 if conflictRecoveryStore != nil {
                     Button {
                         isShowingConflictRecovery = true
@@ -1135,6 +1146,7 @@ struct WritingWorkspaceShell: View {
     }
 
     private func presentBackupHistory() async {
+        guard !activeEditorModel.isReadOnly else { return }
         guard let documentID = activeEditorModel.currentDocumentID else {
             notice = .backupRequiresDocument
             return
