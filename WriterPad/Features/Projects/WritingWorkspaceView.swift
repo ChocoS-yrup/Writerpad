@@ -639,6 +639,9 @@ struct WritingWorkspaceShell: View {
                     isActive: pane == activePane,
                     isReadOnly: model.isReadOnly,
                     appearance: editorAppearance,
+                    placeholder: model.isReadOnly
+                        ? "휴지통 문서는 수정 할 수 없습니다."
+                        : "빈 문서입니다. 바로 입력을 시작하세요.",
                     searchHighlightRanges: searchHighlightRanges(for: model, pane: pane),
                     currentSearchHighlightRange: currentSearchHighlightRange(
                         for: model,

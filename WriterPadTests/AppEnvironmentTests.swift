@@ -3726,13 +3726,14 @@ final class AppEnvironmentTests: XCTestCase {
     func testReadOnlyNativeEditorDisablesEditingButKeepsScrolling() {
         let textView = SmartTextView()
         let editor = iPadTextEditor(
-            text: .constant("읽기 전용 본문"),
+            text: .constant(""),
             documentID: DocumentID(rawValue: UUID()),
             externalVersion: 1,
             selection: .constant(.start),
             focusRequest: 1,
             isActive: true,
-            isReadOnly: true
+            isReadOnly: true,
+            placeholder: "휴지통 문서는 수정 할 수 없습니다."
         )
         let coordinator = editor.makeCoordinator()
         textView.delegate = coordinator
@@ -3743,7 +3744,11 @@ final class AppEnvironmentTests: XCTestCase {
         XCTAssertFalse(textView.isSelectable)
         XCTAssertTrue(textView.isScrollEnabled)
         XCTAssertTrue(textView.isUserInteractionEnabled)
-        XCTAssertEqual(textView.text, "읽기 전용 본문")
+        XCTAssertEqual(textView.text, "")
+        XCTAssertEqual(
+            textView.placeholderText,
+            "휴지통 문서는 수정 할 수 없습니다."
+        )
         XCTAssertEqual(textView.accessibilityValue, "읽기 전용")
     }
 
