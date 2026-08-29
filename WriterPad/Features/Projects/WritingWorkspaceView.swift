@@ -8,11 +8,13 @@ struct WorkspaceSceneActivityGate: Equatable, Sendable {
     private var latestActivity: Bool?
     private var hasStarted = false
 
-    mutating func beginAppearance() -> UInt64? {
+    mutating func beginAppearance(
+        initialActivity: Bool
+    ) -> UInt64? {
         guard activeAppearanceID == nil else { return nil }
         nextAppearanceID &+= 1
         activeAppearanceID = nextAppearanceID
-        latestActivity = nil
+        latestActivity = initialActivity
         hasStarted = false
         return nextAppearanceID
     }
@@ -28,12 +30,11 @@ struct WorkspaceSceneActivityGate: Equatable, Sendable {
     }
 
     mutating func finishStarting(
-        appearanceID: UInt64,
-        fallbackActivity: Bool
+        appearanceID: UInt64
     ) -> Bool? {
         guard activeAppearanceID == appearanceID else { return nil }
         hasStarted = true
-        return latestActivity ?? fallbackActivity
+        return latestActivity
     }
 
     mutating func endAppearance() {
@@ -377,7 +378,9 @@ struct WritingWorkspaceShell: View {
             updateWriterPadCommandActions()
             applyAutosaveDelaySetting(autosaveDelayMilliseconds)
             guard let appearanceID =
-                workspaceSceneActivityGate.beginAppearance()
+                workspaceSceneActivityGate.beginAppearance(
+                    initialActivity: scenePhase == .active
+                )
             else { return }
             enqueueWorkspaceLifecycleOperation {
                 await restoreWorkspaceIfNeeded()
@@ -390,8 +393,7 @@ struct WritingWorkspaceShell: View {
                     applyOpenSnapshots: applyOpenServerSnapshots
                 )
                 guard let active = workspaceSceneActivityGate.finishStarting(
-                    appearanceID: appearanceID,
-                    fallbackActivity: scenePhase == .active
+                    appearanceID: appearanceID
                 ) else { return }
                 await updateSceneActivity(active)
             }

@@ -125,9 +125,18 @@ actor SyncV2SnapshotPullService: SyncV2SnapshotPulling {
         serverProjectID: UUID,
         editingGuards: [UUID: SyncV2EditingGuard] = [:]
     ) async throws -> SyncV2SnapshotPullReport {
-        let snapshots = try await client.fetchDocuments(
+        let shouldFetchFolders = folderApplier != nil
+        async let snapshotsRequest = client.fetchDocuments(
             projectID: serverProjectID
         )
+        async let foldersRequest: [SyncV2RemoteFolder]? =
+            shouldFetchFolders
+            ? (try? await client.fetchFolders(projectID: serverProjectID))
+            : nil
+        async let treeOrdersRequest = client.fetchTreeOrders(
+            projectID: serverProjectID
+        )
+        let snapshots = try await snapshotsRequest
         // 실제 TXT 경로에서 폴더 메타데이터를 먼저 재구성한 뒤 순서를
         // 적용해야 새 Windows 폴더의 첫 pull에도 userOrder가 반영된다.
         let ordinarySnapshots = snapshots.filter {
@@ -163,14 +172,7 @@ actor SyncV2SnapshotPullService: SyncV2SnapshotPulling {
             // 던지지도 않는다. 폴더 하나 때문에 문서 pull까지 막을 이유가
             // 없고, 폴더가 없던 시절 작품이 통째로 막힌다.
             // 실패는 값으로 남겨 폴더 판정만 보류시킨다.
-            let fetchedFolders: [SyncV2RemoteFolder]?
-            do {
-                fetchedFolders = try await client.fetchFolders(
-                    projectID: serverProjectID
-                )
-            } catch {
-                fetchedFolders = nil
-            }
+            let fetchedFolders = await foldersRequest
             guard let folders = fetchedFolders else {
                 await localApplier.prepareRemoteFolders(
                     localProjectID: localProjectID,
@@ -246,9 +248,7 @@ actor SyncV2SnapshotPullService: SyncV2SnapshotPulling {
 
         // 폴더가 제자리에 놓인 뒤에 순서를 받는다. 순서는 folder_id를 가리키므로
         // 폴더가 먼저 있어야 가리킬 대상이 있다.
-        let treeOrders = try await client.fetchTreeOrders(
-            projectID: serverProjectID
-        )
+        let treeOrders = try await treeOrdersRequest
         if !treeOrders.isEmpty {
             try await stateStore.applyTreeOrderSnapshotBaselines(
                 localProjectID: localProjectID,

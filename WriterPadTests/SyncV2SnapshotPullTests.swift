@@ -4,16 +4,205 @@ import XCTest
 @testable import WriterPad
 
 final class SyncV2SnapshotPullTests: XCTestCase {
+    func testSnapshotNetworkReadsStartConcurrently() async throws {
+        let client = ConcurrentSnapshotClientProbe()
+        let service = SyncV2SnapshotPullService(
+            client: client,
+            stateStore: SnapshotStateStoreStub(states: [:]),
+            localApplier: SnapshotApplierSpy(),
+            mergeStore: SnapshotMergeStoreSpy(),
+            folderApplier: FolderWiringApplierSpy(
+                order: FolderWiringOrderRecorder()
+            )
+        )
+        let pull = Task {
+            try await service.pull(
+                localProjectID: ProjectID(rawValue: UUID()),
+                serverProjectID: UUID()
+            )
+        }
+
+        for _ in 0..<500 where await client.startedCount() < 3 {
+            await Task.yield()
+        }
+        let started = await client.startedStages()
+        XCTAssertEqual(
+            started,
+            Set(ConcurrentSnapshotClientProbe.Stage.allCases),
+            "서로 독립적인 snapshot 네트워크 읽기는 한 왕복 구간에 시작해야 합니다."
+        )
+
+        await client.releaseAll()
+        _ = try await pull.value
+    }
+
+    func testFolderFetchFailureKeepsProjectionUnavailable() async throws {
+        let projectionApplier = FolderProjectionApplierSpy()
+        let order = FolderWiringOrderRecorder()
+        let service = SyncV2SnapshotPullService(
+            client: SelectiveFailureSnapshotClient(
+                failure: .folders
+            ),
+            stateStore: SnapshotStateStoreStub(states: [:]),
+            localApplier: projectionApplier,
+            mergeStore: SnapshotMergeStoreSpy(),
+            folderApplier: FolderWiringApplierSpy(order: order)
+        )
+
+        _ = try await service.pull(
+            localProjectID: ProjectID(rawValue: UUID()),
+            serverProjectID: UUID()
+        )
+
+        let projections = await projectionApplier.projections()
+        XCTAssertEqual(
+            projections,
+            [.unavailable(code: "FOLDER_FETCH_FAILED")]
+        )
+        let folderApplySteps = await order.steps()
+        XCTAssertTrue(folderApplySteps.isEmpty)
+    }
+
+    func testTreeOrderFetchFailureStopsBeforeDocumentApply() async {
+        let documentID = UUID()
+        let applier = SnapshotApplierSpy()
+        let service = SyncV2SnapshotPullService(
+            client: SelectiveFailureSnapshotClient(
+                failure: .treeOrders,
+                snapshots: [
+                    makeSnapshot(
+                        id: documentID,
+                        path: "메인/메모장/본문.txt",
+                        revision: 1
+                    ),
+                ]
+            ),
+            stateStore: SnapshotStateStoreStub(states: [:]),
+            localApplier: applier,
+            mergeStore: SnapshotMergeStoreSpy(),
+            folderApplier: FolderWiringApplierSpy(
+                order: FolderWiringOrderRecorder()
+            )
+        )
+
+        do {
+            _ = try await service.pull(
+                localProjectID: ProjectID(rawValue: UUID()),
+                serverProjectID: UUID()
+            )
+            XCTFail("tree-order 조회 실패는 pull을 중단해야 합니다.")
+        } catch SnapshotTestError.injectedNetworkFailure {
+            // expected
+        } catch {
+            XCTFail("예상하지 못한 오류: \(error)")
+        }
+
+        let appliedIDs = await applier.appliedIDs()
+        XCTAssertTrue(appliedIDs.isEmpty)
+    }
+
+    func testOutOfOrderNetworkResponsesKeepLocalApplyOrder()
+        async throws {
+        let recorder = SnapshotMutationSequence()
+        let documentID = UUID()
+        let folderID = UUID()
+        let client = OutOfOrderSnapshotClient(
+            snapshots: [
+                makeSnapshot(
+                    id: documentID,
+                    path: "메인/메모장/본문.txt",
+                    revision: 1
+                ),
+            ],
+            folders: [
+                SyncV2RemoteFolder(
+                    folderID: folderID,
+                    parentFolderID: nil,
+                    name: "메인",
+                    revision: 1,
+                    isDeleted: false,
+                    updatedAt: Date(timeIntervalSince1970: 1)
+                ),
+            ],
+            treeOrders: [
+                SyncV2RemoteTreeOrder(
+                    treeOrderID: UUID(),
+                    parentFolderID: folderID,
+                    children: [documentID],
+                    revision: 1,
+                    updatedAt: Date(timeIntervalSince1970: 1)
+                ),
+            ]
+        )
+        let service = SyncV2SnapshotPullService(
+            client: client,
+            stateStore: OrderedSnapshotStateStore(recorder: recorder),
+            localApplier: OrderedSnapshotApplier(recorder: recorder),
+            mergeStore: SnapshotMergeStoreSpy(),
+            folderApplier: OrderedFolderApplier(recorder: recorder)
+        )
+        let pull = Task {
+            try await service.pull(
+                localProjectID: ProjectID(rawValue: UUID()),
+                serverProjectID: UUID()
+            )
+        }
+
+        for _ in 0..<500 where await client.startedCount() < 3 {
+            await Task.yield()
+        }
+        await client.release(.treeOrders)
+        await client.release(.folders)
+        for _ in 0..<100 { await Task.yield() }
+        let beforeDocuments = await recorder.events()
+        XCTAssertTrue(beforeDocuments.isEmpty)
+        await client.release(.documents)
+        _ = try await pull.value
+
+        let events = await recorder.events()
+        XCTAssertEqual(
+            events,
+            [
+                "prepare-pull",
+                "folder-projection",
+                "folders",
+                "tree-order-baseline",
+                "document",
+            ]
+        )
+    }
+
+    func testWorkspaceSceneGateDoesNotLoseActiveBeforeFirstAppearance()
+        throws {
+        var gate = WorkspaceSceneActivityGate()
+
+        // SwiftUI가 scene task를 onAppear보다 먼저 실행하고, onAppear의
+        // escaping 시작 작업에는 이전 inactive 값이 남은 순서를 재현한다.
+        XCTAssertNil(gate.observe(true))
+        let appearanceID = try XCTUnwrap(
+            gate.beginAppearance(initialActivity: true)
+        )
+
+        XCTAssertEqual(
+            gate.finishStarting(
+                appearanceID: appearanceID
+            ),
+            true,
+            "첫 appearance 전 active 사건을 잃으면 workspace sync가 시작되지 않는다."
+        )
+    }
+
     func testWorkspaceSceneGateReplaysActivePhaseObservedWhileStarting()
         throws {
         var gate = WorkspaceSceneActivityGate()
-        let appearanceID = try XCTUnwrap(gate.beginAppearance())
+        let appearanceID = try XCTUnwrap(
+            gate.beginAppearance(initialActivity: false)
+        )
 
         XCTAssertNil(gate.observe(true))
         XCTAssertEqual(
             gate.finishStarting(
-                appearanceID: appearanceID,
-                fallbackActivity: false
+                appearanceID: appearanceID
             ),
             true
         )
@@ -23,12 +212,13 @@ final class SyncV2SnapshotPullTests: XCTestCase {
     func testWorkspaceSceneGateUsesCurrentPhaseWithoutEarlyObservation()
         throws {
         var gate = WorkspaceSceneActivityGate()
-        let appearanceID = try XCTUnwrap(gate.beginAppearance())
+        let appearanceID = try XCTUnwrap(
+            gate.beginAppearance(initialActivity: true)
+        )
 
         XCTAssertEqual(
             gate.finishStarting(
-                appearanceID: appearanceID,
-                fallbackActivity: true
+                appearanceID: appearanceID
             ),
             true
         )
@@ -36,29 +226,54 @@ final class SyncV2SnapshotPullTests: XCTestCase {
 
     func testWorkspaceSceneGateRejectsLateStartAfterDisappear() throws {
         var gate = WorkspaceSceneActivityGate()
-        let appearanceID = try XCTUnwrap(gate.beginAppearance())
+        let appearanceID = try XCTUnwrap(
+            gate.beginAppearance(initialActivity: false)
+        )
         XCTAssertNil(gate.observe(true))
 
         gate.endAppearance()
 
         XCTAssertNil(
             gate.finishStarting(
-                appearanceID: appearanceID,
-                fallbackActivity: true
+                appearanceID: appearanceID
             )
+        )
+    }
+
+    func testWorkspaceSceneGateDoesNotLeakActivityIntoNextAppearance()
+        throws {
+        var gate = WorkspaceSceneActivityGate()
+        let firstAppearanceID = try XCTUnwrap(
+            gate.beginAppearance(initialActivity: false)
+        )
+        XCTAssertNil(gate.observe(true))
+        XCTAssertEqual(
+            gate.finishStarting(appearanceID: firstAppearanceID),
+            true
+        )
+
+        gate.endAppearance()
+
+        let secondAppearanceID = try XCTUnwrap(
+            gate.beginAppearance(initialActivity: false)
+        )
+        XCTAssertEqual(
+            gate.finishStarting(appearanceID: secondAppearanceID),
+            false
         )
     }
 
     func testWorkspaceSceneGateCoalescesDuplicateAppearance() throws {
         var gate = WorkspaceSceneActivityGate()
-        let appearanceID = try XCTUnwrap(gate.beginAppearance())
+        let appearanceID = try XCTUnwrap(
+            gate.beginAppearance(initialActivity: false)
+        )
 
-        XCTAssertNil(gate.beginAppearance())
+        XCTAssertNil(gate.beginAppearance(initialActivity: true))
         XCTAssertNil(gate.observe(true))
         XCTAssertEqual(
             gate.finishStarting(
-                appearanceID: appearanceID,
-                fallbackActivity: false
+                appearanceID: appearanceID
             ),
             true
         )
@@ -6857,6 +7072,262 @@ private actor SnapshotClientStub: SyncV2SnapshotClienting {
     }
 }
 
+private actor ConcurrentSnapshotClientProbe: SyncV2SnapshotClienting {
+    enum Stage: CaseIterable, Hashable, Sendable {
+        case documents
+        case folders
+        case treeOrders
+    }
+
+    private var started = Set<Stage>()
+    private var isReleased = false
+    private var waiters: [CheckedContinuation<Void, Never>] = []
+
+    func fetchDocuments(
+        projectID: UUID
+    ) async throws -> [SyncV2RemoteDocumentSnapshot] {
+        await arrive(.documents)
+        return []
+    }
+
+    func fetchFolders(
+        projectID: UUID
+    ) async throws -> [SyncV2RemoteFolder] {
+        await arrive(.folders)
+        return []
+    }
+
+    func fetchTreeOrders(
+        projectID: UUID
+    ) async throws -> [SyncV2RemoteTreeOrder] {
+        await arrive(.treeOrders)
+        return []
+    }
+
+    func startedCount() -> Int { started.count }
+
+    func startedStages() -> Set<Stage> { started }
+
+    func releaseAll() {
+        isReleased = true
+        let pending = waiters
+        waiters.removeAll()
+        pending.forEach { $0.resume() }
+    }
+
+    private func arrive(_ stage: Stage) async {
+        started.insert(stage)
+        guard !isReleased else { return }
+        await withCheckedContinuation { continuation in
+            waiters.append(continuation)
+        }
+    }
+}
+
+private actor SelectiveFailureSnapshotClient:
+    SyncV2SnapshotClienting {
+    enum Stage: Equatable, Sendable {
+        case folders
+        case treeOrders
+    }
+
+    private let failure: Stage
+    private let snapshots: [SyncV2RemoteDocumentSnapshot]
+
+    init(
+        failure: Stage,
+        snapshots: [SyncV2RemoteDocumentSnapshot] = []
+    ) {
+        self.failure = failure
+        self.snapshots = snapshots
+    }
+
+    func fetchDocuments(
+        projectID: UUID
+    ) async throws -> [SyncV2RemoteDocumentSnapshot] {
+        snapshots
+    }
+
+    func fetchFolders(
+        projectID: UUID
+    ) async throws -> [SyncV2RemoteFolder] {
+        guard failure != .folders else {
+            throw SnapshotTestError.injectedNetworkFailure
+        }
+        return []
+    }
+
+    func fetchTreeOrders(
+        projectID: UUID
+    ) async throws -> [SyncV2RemoteTreeOrder] {
+        guard failure != .treeOrders else {
+            throw SnapshotTestError.injectedNetworkFailure
+        }
+        return []
+    }
+}
+
+private actor FolderProjectionApplierSpy:
+    SyncV2LocalSnapshotApplying {
+    private var values: [SyncV2RemoteFolderProjection] = []
+
+    func prepareRemoteFolders(
+        localProjectID: ProjectID,
+        projection: SyncV2RemoteFolderProjection
+    ) {
+        values.append(projection)
+    }
+
+    func apply(
+        localProjectID: ProjectID,
+        snapshot: SyncV2RemoteDocumentSnapshot
+    ) async throws {}
+
+    func projections() -> [SyncV2RemoteFolderProjection] { values }
+}
+
+private actor OutOfOrderSnapshotClient: SyncV2SnapshotClienting {
+    enum Stage: CaseIterable, Hashable, Sendable {
+        case documents
+        case folders
+        case treeOrders
+    }
+
+    private let snapshots: [SyncV2RemoteDocumentSnapshot]
+    private let folders: [SyncV2RemoteFolder]
+    private let treeOrders: [SyncV2RemoteTreeOrder]
+    private var started = Set<Stage>()
+    private var released = Set<Stage>()
+    private var waiters: [Stage: CheckedContinuation<Void, Never>] = [:]
+
+    init(
+        snapshots: [SyncV2RemoteDocumentSnapshot],
+        folders: [SyncV2RemoteFolder],
+        treeOrders: [SyncV2RemoteTreeOrder]
+    ) {
+        self.snapshots = snapshots
+        self.folders = folders
+        self.treeOrders = treeOrders
+    }
+
+    func fetchDocuments(
+        projectID: UUID
+    ) async throws -> [SyncV2RemoteDocumentSnapshot] {
+        await wait(for: .documents)
+        return snapshots
+    }
+
+    func fetchFolders(
+        projectID: UUID
+    ) async throws -> [SyncV2RemoteFolder] {
+        await wait(for: .folders)
+        return folders
+    }
+
+    func fetchTreeOrders(
+        projectID: UUID
+    ) async throws -> [SyncV2RemoteTreeOrder] {
+        await wait(for: .treeOrders)
+        return treeOrders
+    }
+
+    func startedCount() -> Int { started.count }
+
+    func release(_ stage: Stage) {
+        released.insert(stage)
+        waiters.removeValue(forKey: stage)?.resume()
+    }
+
+    private func wait(for stage: Stage) async {
+        started.insert(stage)
+        guard !released.contains(stage) else { return }
+        await withCheckedContinuation { continuation in
+            waiters[stage] = continuation
+        }
+    }
+}
+
+private actor OrderedSnapshotStateStore:
+    SyncV2SnapshotStateStoring {
+    private let recorder: SnapshotMutationSequence
+
+    init(recorder: SnapshotMutationSequence) {
+        self.recorder = recorder
+    }
+
+    func snapshotState(
+        localProjectID: ProjectID,
+        serverProjectID: UUID,
+        documentID: UUID
+    ) async throws -> SyncV2SnapshotLocalState? {
+        nil
+    }
+
+    func applySnapshotBaseline(
+        localProjectID: ProjectID,
+        serverProjectID: UUID,
+        snapshot: SyncV2RemoteDocumentSnapshot,
+        expectedRevision: Int64?
+    ) async throws -> Bool {
+        true
+    }
+
+    func applyTreeOrderSnapshotBaselines(
+        localProjectID: ProjectID,
+        serverProjectID: UUID,
+        treeOrders: [SyncV2RemoteTreeOrder]
+    ) async throws {
+        await recorder.append("tree-order-baseline")
+    }
+}
+
+private actor OrderedSnapshotApplier:
+    SyncV2LocalSnapshotApplying {
+    private let recorder: SnapshotMutationSequence
+
+    init(recorder: SnapshotMutationSequence) {
+        self.recorder = recorder
+    }
+
+    func preparePull(
+        localProjectID: ProjectID,
+        remoteLiveDocumentPaths: Set<String>
+    ) async {
+        await recorder.append("prepare-pull")
+    }
+
+    func prepareRemoteFolders(
+        localProjectID: ProjectID,
+        projection: SyncV2RemoteFolderProjection
+    ) async {
+        await recorder.append("folder-projection")
+    }
+
+    func apply(
+        localProjectID: ProjectID,
+        snapshot: SyncV2RemoteDocumentSnapshot
+    ) async throws {
+        await recorder.append("document")
+    }
+}
+
+private actor OrderedFolderApplier: SyncV2RemoteFolderApplying {
+    private let recorder: SnapshotMutationSequence
+
+    init(recorder: SnapshotMutationSequence) {
+        self.recorder = recorder
+    }
+
+    func applyRemoteFolders(
+        localProjectID: ProjectID,
+        remote: [SyncV2RemoteFolder],
+        blockedFolderIDs: Set<DocumentID>
+    ) async -> SyncV2RemoteFolderApplyReport {
+        await recorder.append("folders")
+        return SyncV2RemoteFolderApplyReport()
+    }
+}
+
 private actor SnapshotStateStoreStub: SyncV2SnapshotStateStoring {
     private let states: [UUID: SyncV2SnapshotLocalState]
     private let commitResult: Bool
@@ -7210,6 +7681,7 @@ private actor SnapshotDocumentRepository:
 
 private enum SnapshotTestError: Error {
     case injectedMetadataFailure
+    case injectedNetworkFailure
 }
 
 private actor SnapshotWorkspaceLocator: ProjectWorkspaceLocating {
