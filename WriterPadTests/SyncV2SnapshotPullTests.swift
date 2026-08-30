@@ -293,7 +293,7 @@ final class SyncV2SnapshotPullTests: XCTestCase {
         // escaping 시작 작업에는 이전 inactive 값이 남은 순서를 재현한다.
         XCTAssertNil(gate.observe(true))
         let appearanceID = try XCTUnwrap(
-            gate.beginAppearance(initialActivity: true)
+            gate.beginAppearance(initialActivity: false)
         )
 
         XCTAssertEqual(
@@ -325,6 +325,7 @@ final class SyncV2SnapshotPullTests: XCTestCase {
     func testWorkspaceSceneGateUsesCurrentPhaseWithoutEarlyObservation()
         throws {
         var gate = WorkspaceSceneActivityGate()
+        XCTAssertNil(gate.observe(false))
         let appearanceID = try XCTUnwrap(
             gate.beginAppearance(initialActivity: true)
         )
@@ -366,6 +367,7 @@ final class SyncV2SnapshotPullTests: XCTestCase {
         )
 
         gate.endAppearance()
+        XCTAssertNil(gate.observe(true))
 
         let secondAppearanceID = try XCTUnwrap(
             gate.beginAppearance(initialActivity: false)

@@ -12,9 +12,12 @@ struct WorkspaceSceneActivityGate: Equatable, Sendable {
         initialActivity: Bool
     ) -> UInt64? {
         guard activeAppearanceID == nil else { return nil }
+        let observedActiveBeforeFirstAppearance =
+            nextAppearanceID == 0 && latestActivity == true
         nextAppearanceID &+= 1
         activeAppearanceID = nextAppearanceID
-        latestActivity = initialActivity
+        latestActivity =
+            observedActiveBeforeFirstAppearance || initialActivity
         hasStarted = false
         return nextAppearanceID
     }
@@ -24,7 +27,15 @@ struct WorkspaceSceneActivityGate: Equatable, Sendable {
     }
 
     mutating func observe(_ active: Bool) -> Bool? {
-        guard activeAppearanceID != nil else { return nil }
+        guard activeAppearanceID != nil else {
+            // 첫 화면 구성에서는 SwiftUI의 scene task가 onAppear보다
+            // 먼저 active를 전달할 수 있다. 이 한 번만 보존하되, 이전
+            // appearance의 늦은 통지를 다음 진입에 넘기지는 않는다.
+            if nextAppearanceID == 0, active {
+                latestActivity = true
+            }
+            return nil
+        }
         latestActivity = active
         return hasStarted ? active : nil
     }
