@@ -3924,6 +3924,82 @@ final class SyncV2StoreTests: XCTestCase {
         await store.close()
     }
 
+    func testBatchSnapshotStatesMatchSingleReadsAndOmitUnknownIDs()
+        async throws {
+        let url = try databaseURL()
+        let context = QueueAPIContext()
+        let store = try await connectedStore(at: url, context: context)
+        let otherDocumentID = UUID()
+        let snapshots = [
+            SyncV2RemoteDocumentSnapshot(
+                documentID: context.documentID,
+                relativePath: "메인/원고/1권/001화.txt",
+                content: "첫 번째",
+                revision: 3,
+                isDeleted: false,
+                deletedAt: nil,
+                updatedAt: Date(timeIntervalSince1970: 30)
+            ),
+            SyncV2RemoteDocumentSnapshot(
+                documentID: otherDocumentID,
+                relativePath: "메인/원고/1권/002화.txt",
+                content: "두 번째",
+                revision: 5,
+                isDeleted: false,
+                deletedAt: nil,
+                updatedAt: Date(timeIntervalSince1970: 50)
+            ),
+        ]
+        for snapshot in snapshots {
+            let applied = try await store.applySnapshotBaseline(
+                localProjectID: context.localProjectID,
+                serverProjectID: context.serverProjectID,
+                snapshot: snapshot,
+                expectedRevision: nil
+            )
+            XCTAssertTrue(applied)
+        }
+        _ = try await store.enqueue(
+            context.batch(
+                mutations: [
+                    context.documentMutation(
+                        operationID: UUID(),
+                        relativePath: snapshots[0].relativePath,
+                        content: "로컬 수정"
+                    ),
+                ]
+            )
+        )
+
+        let unknownID = UUID()
+        let optionalBatch = try await store.snapshotStates(
+            localProjectID: context.localProjectID,
+            serverProjectID: context.serverProjectID,
+            documentIDs: [
+                context.documentID,
+                otherDocumentID,
+                unknownID,
+            ]
+        )
+        let batch = try XCTUnwrap(optionalBatch)
+        let first = try await store.snapshotState(
+            localProjectID: context.localProjectID,
+            serverProjectID: context.serverProjectID,
+            documentID: context.documentID
+        )
+        let second = try await store.snapshotState(
+            localProjectID: context.localProjectID,
+            serverProjectID: context.serverProjectID,
+            documentID: otherDocumentID
+        )
+
+        XCTAssertEqual(batch[context.documentID], first)
+        XCTAssertEqual(batch[otherDocumentID], second)
+        XCTAssertNil(batch[unknownID])
+        XCTAssertEqual(batch.count, 2)
+        await store.close()
+    }
+
     func testSnapshotBaselineUsesRevisionCASAndRejectsOccupiedPath()
         async throws {
         let url = try databaseURL()

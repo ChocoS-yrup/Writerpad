@@ -1,6 +1,10 @@
 import Foundation
 
 struct SyncV2RemoteFolderApplyReport: Equatable, Sendable {
+    /// 로컬 workspace와 metadata를 실제로 읽고 remote projection을
+    /// 평가했는지를 나타낸다. 변경 목록이 비어 있어도 읽기
+    /// 실패로 계획을 만들지 못한 것이면 안정된 projection이 아니다.
+    var projectionWasEvaluated = false
     var movedFolderIDs: [DocumentID] = []
     var createdFolderIDs: [DocumentID] = []
     var deletedFolderIDs: [DocumentID] = []
@@ -174,6 +178,7 @@ actor SyncV2RemoteFolderApplier: SyncV2RemoteFolderApplying {
         else {
             return report
         }
+        report.projectionWasEvaluated = true
 
         let plan = SyncV2RemoteFolderPlanner.plan(
             remote: remote,

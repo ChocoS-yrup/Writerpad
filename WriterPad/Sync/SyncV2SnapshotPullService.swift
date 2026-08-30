@@ -9,6 +9,15 @@ protocol SyncV2SnapshotPulling: Sendable {
 }
 
 protocol SyncV2SnapshotStateStoring: Sendable {
+    /// 변경 없는 pull의 SQLite 반복 조회를 줄이기 위한 선택적
+    /// fast path다. `nil`은 batch 미지원을 뜻하고, 빈 Dictionary는
+    /// 요청한 ID들의 로컬 기준선이 모두 없음을 뜻한다.
+    func snapshotStates(
+        localProjectID: ProjectID,
+        serverProjectID: UUID,
+        documentIDs: Set<UUID>
+    ) async throws -> [UUID: SyncV2SnapshotLocalState]?
+
     func snapshotState(
         localProjectID: ProjectID,
         serverProjectID: UUID,
@@ -54,6 +63,15 @@ protocol SyncV2SnapshotStateStoring: Sendable {
 }
 
 extension SyncV2SnapshotStateStoring {
+    func snapshotStates(
+        localProjectID: ProjectID,
+        serverProjectID: UUID,
+        documentIDs: Set<UUID>
+    ) async throws -> [UUID: SyncV2SnapshotLocalState]? {
+        _ = (localProjectID, serverProjectID, documentIDs)
+        return nil
+    }
+
     func applyFolderSnapshotBaselines(
         localProjectID: ProjectID,
         serverProjectID: UUID,
@@ -80,11 +98,38 @@ extension SyncV2SnapshotStateStoring {
 }
 
 actor SyncV2SnapshotPullService: SyncV2SnapshotPulling {
+    private enum PrefetchedSnapshotState: Sendable {
+        case unavailable
+        case loaded(SyncV2SnapshotLocalState?)
+    }
+
+    private final class ProcessMeasurement: @unchecked Sendable {
+        private let lock = NSLock()
+        private var storedStateLookupNanoseconds: UInt64 = 0
+
+        func recordStateLookup(nanoseconds: UInt64) {
+            lock.withLock {
+                storedStateLookupNanoseconds = nanoseconds
+            }
+        }
+
+        func stateLookupNanoseconds() -> UInt64 {
+            lock.withLock { storedStateLookupNanoseconds }
+        }
+    }
+
     private struct ProcessedSnapshot: Sendable {
         let outcome: SyncV2SnapshotPullOutcome
         let appliedSnapshot: SyncV2RemoteDocumentSnapshot?
         /// 구조를 막은 이름. 화면 문구로 올라간다.
         var rejectedName: SyncV2RejectedStructureName? = nil
+    }
+
+    private struct TimedProcessedSnapshot: Sendable {
+        let processed: ProcessedSnapshot
+        let gateWaitNanoseconds: UInt64
+        let processNanoseconds: UInt64
+        let stateLookupNanoseconds: UInt64
     }
 
     private let client: any SyncV2SnapshotClienting
@@ -179,6 +224,10 @@ actor SyncV2SnapshotPullService: SyncV2SnapshotPulling {
         var folderReport = SyncV2RemoteFolderApplyReport()
         var fetchedRemoteFolders: [SyncV2RemoteFolder]?
         var permanentFolderBaselineExclusions: Set<UUID> = []
+        // 성공적으로 평가한 folder projection이 실제로 변하지 않았음이
+        // 입증되기 전까지는 같은 revision의 LEGACY tree_order를 재적용한다.
+        // fetch/read/migration/pending 중 하나라도 불확실하면 fail-closed다.
+        var folderProjectionIsStable = false
         let folderApplyStartedAt = DispatchTime.now().uptimeNanoseconds
         folderStage: if let folderApplier {
             // fetch는 Gate 밖에서 한다. 네트워크를 기다리는 동안
@@ -217,18 +266,35 @@ actor SyncV2SnapshotPullService: SyncV2SnapshotPulling {
                 )
                 // 이관을 먼저 돌린다. 기존 폴더에 공유 UUID가 붙어 있어야
                 // 서버가 보낸 폴더와 짝이 맞는다.
+                var migrationRequiresTreeOrderRecovery = false
                 if let folderMigration {
-                    _ = await folderMigration.migrateIfNeeded(
+                    let migrationResult = await folderMigration.migrateIfNeeded(
                         localProjectID: localProjectID,
                         serverProjectID: serverProjectID,
                         serverFolderIDsByPath: serverFolderIDsByPath
                     )
+                    switch migrationResult {
+                    case .alreadyCompleted, .nothingToMigrate:
+                        break
+                    case .migrated, .postponed:
+                        migrationRequiresTreeOrderRecovery = true
+                    }
                 }
-                let blockedServerFolderIDs = Set(
-                    (try? await folderMarker?.foldersWithPendingOperations(
-                        localProjectID: localProjectID
-                    )) ?? []
-                )
+                let blockedServerFolderIDs: Set<UUID>
+                var pendingOperationLookupSucceeded = true
+                if let folderMarker {
+                    do {
+                        blockedServerFolderIDs = try await folderMarker
+                            .foldersWithPendingOperations(
+                                localProjectID: localProjectID
+                            )
+                    } catch {
+                        blockedServerFolderIDs = []
+                        pendingOperationLookupSucceeded = false
+                    }
+                } else {
+                    blockedServerFolderIDs = []
+                }
                 let blockedFolderIDs = Set(
                     blockedServerFolderIDs.map(DocumentID.init(rawValue:))
                 )
@@ -248,9 +314,19 @@ actor SyncV2SnapshotPullService: SyncV2SnapshotPulling {
                         report.deferredFolderIDs.map(\.rawValue)
                     )
                 )
-                return (report, blockedServerFolderIDs)
+                let projectionIsStable = report.projectionWasEvaluated
+                    && report.isEmpty
+                    && blockedServerFolderIDs.isEmpty
+                    && pendingOperationLookupSucceeded
+                    && !migrationRequiresTreeOrderRecovery
+                return (
+                    report,
+                    blockedServerFolderIDs,
+                    projectionIsStable
+                )
             }
             folderReport = stage.0
+            folderProjectionIsStable = stage.2
             permanentFolderBaselineExclusions = stage.1.union(
                 folderReport.rejectedFolderIDs.map(\.rawValue)
             )
@@ -307,14 +383,53 @@ actor SyncV2SnapshotPullService: SyncV2SnapshotPulling {
         )
         let documentLoopStartedAt =
             DispatchTime.now().uptimeNanoseconds
+        var identityLookupNanoseconds: UInt64 = 0
+        var gateWaitNanoseconds: UInt64 = 0
+        var processNanoseconds: UInt64 = 0
+        var stateLookupNanoseconds: UInt64 = 0
+        var equivalentIdentityCount = 0
+        let sameRevisionTreeOrderRequiresRecovery =
+            !folderProjectionIsStable
+        let batchStateLookupStartedAt =
+            DispatchTime.now().uptimeNanoseconds
+        let prefetchedStates: [UUID: SyncV2SnapshotLocalState]?
+        do {
+            prefetchedStates = try await stateStore.snapshotStates(
+                localProjectID: localProjectID,
+                serverProjectID: serverProjectID,
+                documentIDs: Set(orderedSnapshots.map(\.documentID))
+            )
+        } catch {
+            // batch는 최적화일 뿐이다. 실패하면 각 문서 gate 안의
+            // 기존 단건 조회로 돌아가 안전 판정을 유지한다.
+            prefetchedStates = nil
+        }
+        SyncV2PullDiagnostics.record(
+            stage: "snapshot-state-batch",
+            phase: prefetchedStates == nil ? "fallback" : "finished",
+            startedAtNanoseconds: batchStateLookupStartedAt,
+            rowCount: orderedSnapshots.count,
+            changedCount: prefetchedStates?.count
+        )
         for snapshot in orderedSnapshots {
             try Task.checkCancellation()
             let editing = editingGuards[snapshot.documentID] ?? .closed
+            let identityLookupStartedAt =
+                DispatchTime.now().uptimeNanoseconds
             let equivalentLocalDocumentID =
                 await localApplier.equivalentLocalDocumentID(
                     localProjectID: localProjectID,
                     snapshot: snapshot
                 )
+            let identityLookupFinishedAt =
+                DispatchTime.now().uptimeNanoseconds
+            identityLookupNanoseconds += Self.elapsedNanoseconds(
+                from: identityLookupStartedAt,
+                to: identityLookupFinishedAt
+            )
+            if equivalentLocalDocumentID != nil {
+                equivalentIdentityCount += 1
+            }
             let equivalentLocalEditing = equivalentLocalDocumentID.map {
                 editingGuards[$0] ?? .closed
             } ?? .closed
@@ -362,10 +477,23 @@ actor SyncV2SnapshotPullService: SyncV2SnapshotPulling {
             }
             let purgeStateForSnapshot = effectivePurgeState
             let eligibleIDsForSnapshot = eligibleDocumentIDs
-            let processed = try await mutationGate.withCriticalSections(
+            let gateWaitStartedAt =
+                DispatchTime.now().uptimeNanoseconds
+            let measurement = ProcessMeasurement()
+            let prefetchedState: PrefetchedSnapshotState
+            if let prefetchedStates {
+                prefetchedState = .loaded(
+                    prefetchedStates[snapshot.documentID]
+                )
+            } else {
+                prefetchedState = .unavailable
+            }
+            let timed = try await mutationGate.withCriticalSections(
                 documentIDs: lockedDocumentIDs
             ) { [self] in
-                try await process(
+                let processStartedAt =
+                    DispatchTime.now().uptimeNanoseconds
+                let processed = try await process(
                     snapshot,
                     localProjectID: localProjectID,
                     serverProjectID: serverProjectID,
@@ -374,9 +502,32 @@ actor SyncV2SnapshotPullService: SyncV2SnapshotPulling {
                         equivalentLocalDocumentID,
                     equivalentLocalEditing: equivalentLocalEditing,
                     effectivePurgeState: purgeStateForSnapshot,
-                    eligibleDocumentIDs: eligibleIDsForSnapshot
+                    eligibleDocumentIDs: eligibleIDsForSnapshot,
+                    sameRevisionTreeOrderRequiresRecovery:
+                        sameRevisionTreeOrderRequiresRecovery,
+                    prefetchedState: prefetchedState,
+                    measurement: measurement
+                )
+                let processFinishedAt =
+                    DispatchTime.now().uptimeNanoseconds
+                return TimedProcessedSnapshot(
+                    processed: processed,
+                    gateWaitNanoseconds: Self.elapsedNanoseconds(
+                        from: gateWaitStartedAt,
+                        to: processStartedAt
+                    ),
+                    processNanoseconds: Self.elapsedNanoseconds(
+                        from: processStartedAt,
+                        to: processFinishedAt
+                    ),
+                    stateLookupNanoseconds:
+                        measurement.stateLookupNanoseconds()
                 )
             }
+            gateWaitNanoseconds += timed.gateWaitNanoseconds
+            processNanoseconds += timed.processNanoseconds
+            stateLookupNanoseconds += timed.stateLookupNanoseconds
+            let processed = timed.processed
             outcomes.append(processed.outcome)
             if let rejectedName = processed.rejectedName {
                 rejectedStructureNames.append(rejectedName)
@@ -390,6 +541,43 @@ actor SyncV2SnapshotPullService: SyncV2SnapshotPulling {
                 }
             }
         }
+        let processRemainderNanoseconds = processNanoseconds
+            >= stateLookupNanoseconds
+            ? processNanoseconds - stateLookupNanoseconds
+            : 0
+        SyncV2PullDiagnostics.record(
+            stage: "document-loop-breakdown",
+            phase: "identity-lookup",
+            rowCount: orderedSnapshots.count,
+            changedCount: equivalentIdentityCount,
+            valueMilliseconds: Self.milliseconds(
+                identityLookupNanoseconds
+            )
+        )
+        SyncV2PullDiagnostics.record(
+            stage: "document-loop-breakdown",
+            phase: "mutation-gate-wait",
+            rowCount: orderedSnapshots.count,
+            valueMilliseconds: Self.milliseconds(
+                gateWaitNanoseconds
+            )
+        )
+        SyncV2PullDiagnostics.record(
+            stage: "document-loop-breakdown",
+            phase: "state-store-lookup",
+            rowCount: orderedSnapshots.count,
+            valueMilliseconds: Self.milliseconds(
+                stateLookupNanoseconds
+            )
+        )
+        SyncV2PullDiagnostics.record(
+            stage: "document-loop-breakdown",
+            phase: "process-after-state-lookup",
+            rowCount: orderedSnapshots.count,
+            valueMilliseconds: Self.milliseconds(
+                processRemainderNanoseconds
+            )
+        )
         SyncV2PullDiagnostics.record(
             stage: "document-local-compare-apply",
             phase: "finished",
@@ -560,7 +748,10 @@ actor SyncV2SnapshotPullService: SyncV2SnapshotPulling {
         equivalentLocalDocumentID: UUID?,
         equivalentLocalEditing: SyncV2EditingGuard,
         effectivePurgeState: SyncV2TrashPurgePayload,
-        eligibleDocumentIDs: Set<UUID>
+        eligibleDocumentIDs: Set<UUID>,
+        sameRevisionTreeOrderRequiresRecovery: Bool,
+        prefetchedState: PrefetchedSnapshotState,
+        measurement: ProcessMeasurement
     ) async throws -> ProcessedSnapshot {
         try Task.checkCancellation()
         let hiddenPath: String? = switch snapshot.relativePath {
@@ -633,10 +824,35 @@ actor SyncV2SnapshotPullService: SyncV2SnapshotPulling {
                 documentID: snapshot.documentID
             )
         }
+        if equivalentLocalDocumentID == nil,
+           case let .loaded(state) = prefetchedState,
+           let outcome = await prefetchedReadOnlyOutcome(
+               snapshot: snapshot,
+               state: state,
+               localProjectID: localProjectID,
+               effectivePurgeState: effectivePurgeState,
+               sameRevisionTreeOrderRequiresRecovery:
+                   sameRevisionTreeOrderRequiresRecovery
+           ) {
+            return ProcessedSnapshot(
+                outcome: outcome,
+                appliedSnapshot: nil
+            )
+        }
+        let stateLookupStartedAt =
+            DispatchTime.now().uptimeNanoseconds
         let state = try await stateStore.snapshotState(
             localProjectID: localProjectID,
             serverProjectID: serverProjectID,
             documentID: snapshot.documentID
+        )
+        let stateLookupFinishedAt =
+            DispatchTime.now().uptimeNanoseconds
+        measurement.recordStateLookup(
+            nanoseconds: Self.elapsedNanoseconds(
+                from: stateLookupStartedAt,
+                to: stateLookupFinishedAt
+            )
         )
         if let state, snapshot.revision <= state.serverRevision {
             let outcome: SyncV2SnapshotPullOutcome
@@ -683,7 +899,8 @@ actor SyncV2SnapshotPullService: SyncV2SnapshotPulling {
                         // 다시 실행해 새 이름으로 복구하고 folder commit을
                         // 올려야 한다. 숨은 문서라고 무조건 up-to-date로 넘기면
                         // Windows에서 바꾼 빈 폴더 이름이 옛 이름으로 회귀한다.
-                        requiresRecovery = true
+                        requiresRecovery =
+                            sameRevisionTreeOrderRequiresRecovery
                     } else if hiddenPath == nil {
                         requiresRecovery = await localApplier.requiresCopyRecovery(
                             localProjectID: localProjectID,
@@ -936,6 +1153,94 @@ actor SyncV2SnapshotPullService: SyncV2SnapshotPulling {
             ),
             appliedSnapshot: snapshot
         )
+    }
+
+    /// Batch 결과는 각 문서 gate를 잡기 전의 snapshot이다.
+    /// 그 값으로 로컬을 바꾸지 않고 종료할 수 있는 경우만 사용한다.
+    /// 복구나 새 revision 적용이 필요하면 `nil`로 단건 재조회를
+    /// 강제해 enqueue·conflict와의 경합을 닫는다.
+    private func prefetchedReadOnlyOutcome(
+        snapshot: SyncV2RemoteDocumentSnapshot,
+        state: SyncV2SnapshotLocalState?,
+        localProjectID: ProjectID,
+        effectivePurgeState: SyncV2TrashPurgePayload,
+        sameRevisionTreeOrderRequiresRecovery: Bool
+    ) async -> SyncV2SnapshotPullOutcome? {
+        guard let state,
+              snapshot.revision <= state.serverRevision
+        else { return nil }
+
+        if state.hasUnresolvedConflict {
+            return .mergeRequired(
+                documentID: snapshot.documentID,
+                revision: state.serverRevision,
+                reason: .unresolvedConflict
+            )
+        }
+        if state.blockingErrorCode != nil {
+            return .mergeRequired(
+                documentID: snapshot.documentID,
+                revision: state.serverRevision,
+                reason: .blockedOperation
+            )
+        }
+        if state.hasPathCollision {
+            return .mergeRequired(
+                documentID: snapshot.documentID,
+                revision: state.serverRevision,
+                reason: .pathOccupiedByDifferentDocument
+            )
+        }
+        if state.hasActiveOperation {
+            return .mergeRequired(
+                documentID: snapshot.documentID,
+                revision: state.serverRevision,
+                reason: .pendingOperation
+            )
+        }
+
+        // purge payload는 같은 revision이어도 휴지통 상태를
+        // 멱등하게 합치는 부수 작업이 있으므로 단건 경로를 유지한다.
+        guard snapshot.relativePath != syncV2TrashPurgePath else {
+            return nil
+        }
+
+        let isPurgedTombstone = snapshot.isDeleted
+            && effectivePurgeState.purgedRevisions[
+                snapshot.documentID
+            ].map { $0 >= snapshot.revision } == true
+        if snapshot.revision == state.serverRevision,
+           snapshot.relativePath == state.serverPath,
+           !isPurgedTombstone {
+            if snapshot.relativePath == syncV2TreeOrderPath {
+                guard !sameRevisionTreeOrderRequiresRecovery else {
+                    return nil
+                }
+            } else {
+                let requiresRecovery = await localApplier
+                    .requiresCopyRecovery(
+                        localProjectID: localProjectID,
+                        snapshot: snapshot
+                    )
+                guard !requiresRecovery else { return nil }
+            }
+        }
+
+        return .upToDate(
+            documentID: snapshot.documentID,
+            revision: state.serverRevision
+        )
+    }
+
+    private static func elapsedNanoseconds(
+        from start: UInt64,
+        to end: UInt64
+    ) -> UInt64 {
+        end >= start ? end - start : 0
+    }
+
+    private static func milliseconds(_ nanoseconds: UInt64) -> Double {
+        Double(nanoseconds) / 1_000_000
     }
 
     private static func mergeReason(

@@ -42,7 +42,61 @@ final class SyncV2SnapshotPullTests: XCTestCase {
         XCTAssertTrue(stages.contains("folder-local-apply"))
         XCTAssertTrue(stages.contains("tree-order-local-apply"))
         XCTAssertTrue(stages.contains("document-local-compare-apply"))
+        XCTAssertTrue(stages.contains("document-loop-breakdown"))
         XCTAssertTrue(stages.contains("snapshot-service"))
+        XCTAssertEqual(
+            Set(
+                events
+                    .filter { $0.stage == "document-loop-breakdown" }
+                    .map(\.phase)
+            ),
+            [
+                "identity-lookup",
+                "mutation-gate-wait",
+                "state-store-lookup",
+                "process-after-state-lookup",
+            ]
+        )
+    }
+
+    func testPullDiagnosticsMeasuresOneDocumentLoopWithoutChangingOutcome()
+        async throws {
+        let documentID = UUID()
+        let recorder = SyncV2PullDiagnosticRecorder()
+        let context = SyncV2PullDiagnosticContext(
+            origin: "test",
+            recorder: recorder
+        )
+        let service = SyncV2SnapshotPullService(
+            client: SnapshotClientStub(
+                snapshots: [makeSnapshot(id: documentID, revision: 1)]
+            ),
+            stateStore: SnapshotStateStoreStub(states: [:]),
+            localApplier: SnapshotApplierSpy(),
+            mergeStore: SnapshotMergeStoreSpy()
+        )
+
+        let report = try await SyncV2PullDiagnostics.withContext(context) {
+            try await service.pull(
+                localProjectID: ProjectID(rawValue: UUID()),
+                serverProjectID: UUID()
+            )
+        }
+
+        XCTAssertEqual(
+            report.appliedSnapshots.map { $0.documentID },
+            [documentID]
+        )
+        let breakdown = recorder.events().filter {
+            $0.stage == "document-loop-breakdown"
+        }
+        XCTAssertEqual(breakdown.count, 4)
+        XCTAssertTrue(breakdown.allSatisfy { $0.rowCount == 1 })
+        XCTAssertTrue(
+            breakdown.allSatisfy {
+                ($0.valueMilliseconds ?? -1) >= 0
+            }
+        )
     }
 
     func testPullDiagnosticsDistinguishesFirstEntryFromReentry() throws {
@@ -975,6 +1029,7 @@ final class SyncV2SnapshotPullTests: XCTestCase {
     func testSameRevisionTreeOrderIsReappliedAfterStaleFolderProjection()
         async throws {
         let serverProjectID = UUID()
+        let folderID = DocumentID(rawValue: UUID())
         let treeOrderID = syncV2UUIDv5(
             namespace: serverProjectID,
             name: syncV2TreeOrderPath
@@ -994,13 +1049,31 @@ final class SyncV2SnapshotPullTests: XCTestCase {
             blockingErrorCode: nil
         )
         let applier = SnapshotApplierSpy()
+        var folderReport = SyncV2RemoteFolderApplyReport()
+        folderReport.movedFolderIDs = [folderID]
         let service = SyncV2SnapshotPullService(
-            client: SnapshotClientStub(snapshots: [snapshot]),
+            client: SnapshotClientStub(
+                snapshots: [snapshot],
+                folders: [
+                    SyncV2RemoteFolder(
+                        folderID: folderID.rawValue,
+                        parentFolderID: nil,
+                        name: "메인",
+                        revision: 7,
+                        isDeleted: false,
+                        updatedAt: Date(timeIntervalSince1970: 7)
+                    ),
+                ]
+            ),
             stateStore: SnapshotStateStoreStub(
                 states: [treeOrderID: state]
             ),
             localApplier: applier,
-            mergeStore: SnapshotMergeStoreSpy()
+            mergeStore: SnapshotMergeStoreSpy(),
+            folderApplier: OrderedFolderApplier(
+                recorder: SnapshotMutationSequence(),
+                report: folderReport
+            )
         )
 
         let report = try await service.pull(
@@ -1019,6 +1092,286 @@ final class SyncV2SnapshotPullTests: XCTestCase {
                     wasOpen: false
                 ),
             ]
+        )
+    }
+
+    /// 폴더 projection이 아무것도 바꾸지 않았다면 이미 같은
+    /// revision을 적용한 LEGACY tree_order를 다시 실행할 이유가 없다.
+    /// 이 경로는 변경 없는 pull을 `changed=1`로 만들고 불필요한
+    /// 디스크·SQLite·UI 갱신을 유발한다.
+    func testSameRevisionTreeOrderIsUpToDateWhenFolderProjectionStayedStable()
+        async throws {
+        let serverProjectID = UUID()
+        let treeOrderID = syncV2UUIDv5(
+            namespace: serverProjectID,
+            name: syncV2TreeOrderPath
+        )
+        let snapshot = makeSnapshot(
+            id: treeOrderID,
+            path: syncV2TreeOrderPath,
+            content:
+                "{\"tree_order\":{\"메인/메모장\":[]},\"version\":1}",
+            revision: 7
+        )
+        let state = SyncV2SnapshotLocalState(
+            serverRevision: 7,
+            serverPath: syncV2TreeOrderPath,
+            hasActiveOperation: false,
+            hasUnresolvedConflict: false,
+            blockingErrorCode: nil
+        )
+        let applier = SnapshotApplierSpy()
+        let service = SyncV2SnapshotPullService(
+            client: SnapshotClientStub(snapshots: [snapshot]),
+            stateStore: SnapshotStateStoreStub(
+                states: [treeOrderID: state]
+            ),
+            localApplier: applier,
+            mergeStore: SnapshotMergeStoreSpy(),
+            folderApplier: OrderedFolderApplier(
+                recorder: SnapshotMutationSequence()
+            )
+        )
+
+        let report = try await service.pull(
+            localProjectID: ProjectID(rawValue: UUID()),
+            serverProjectID: serverProjectID
+        )
+
+        let appliedIDs = await applier.appliedIDs()
+        XCTAssertTrue(
+            appliedIDs.isEmpty,
+            "안정된 폴더 projection에서 같은 revision tree_order를 "
+                + "다시 적용하면 안 됩니다."
+        )
+        XCTAssertEqual(
+            report.outcomes,
+            [.upToDate(documentID: treeOrderID, revision: 7)]
+        )
+    }
+
+    func testSameRevisionTreeOrderIsReappliedWhenFolderFetchFails()
+        async throws {
+        let serverProjectID = UUID()
+        let treeOrderID = syncV2UUIDv5(
+            namespace: serverProjectID,
+            name: syncV2TreeOrderPath
+        )
+        let snapshot = makeSnapshot(
+            id: treeOrderID,
+            path: syncV2TreeOrderPath,
+            content: "{\"tree_order\":{},\"version\":1}",
+            revision: 7
+        )
+        let applier = SnapshotApplierSpy()
+        let service = SyncV2SnapshotPullService(
+            client: SelectiveFailureSnapshotClient(
+                failure: .folders,
+                snapshots: [snapshot]
+            ),
+            stateStore: SnapshotStateStoreStub(
+                states: [
+                    treeOrderID: SyncV2SnapshotLocalState(
+                        serverRevision: 7,
+                        serverPath: syncV2TreeOrderPath,
+                        hasActiveOperation: false,
+                        hasUnresolvedConflict: false,
+                        blockingErrorCode: nil
+                    ),
+                ]
+            ),
+            localApplier: applier,
+            mergeStore: SnapshotMergeStoreSpy(),
+            folderApplier: OrderedFolderApplier(
+                recorder: SnapshotMutationSequence()
+            )
+        )
+
+        _ = try await service.pull(
+            localProjectID: ProjectID(rawValue: UUID()),
+            serverProjectID: serverProjectID
+        )
+
+        let appliedIDs = await applier.appliedIDs()
+        XCTAssertEqual(appliedIDs, [treeOrderID])
+    }
+
+    func testSameRevisionTreeOrderIsReappliedWhenFolderProjectionWasNotEvaluated()
+        async throws {
+        let serverProjectID = UUID()
+        let treeOrderID = syncV2UUIDv5(
+            namespace: serverProjectID,
+            name: syncV2TreeOrderPath
+        )
+        let snapshot = makeSnapshot(
+            id: treeOrderID,
+            path: syncV2TreeOrderPath,
+            content: "{\"tree_order\":{},\"version\":1}",
+            revision: 7
+        )
+        let applier = SnapshotApplierSpy()
+        let service = SyncV2SnapshotPullService(
+            client: SnapshotClientStub(snapshots: [snapshot]),
+            stateStore: SnapshotStateStoreStub(
+                states: [
+                    treeOrderID: SyncV2SnapshotLocalState(
+                        serverRevision: 7,
+                        serverPath: syncV2TreeOrderPath,
+                        hasActiveOperation: false,
+                        hasUnresolvedConflict: false,
+                        blockingErrorCode: nil
+                    ),
+                ]
+            ),
+            localApplier: applier,
+            mergeStore: SnapshotMergeStoreSpy(),
+            folderApplier: OrderedFolderApplier(
+                recorder: SnapshotMutationSequence(),
+                projectionWasEvaluated: false
+            )
+        )
+
+        _ = try await service.pull(
+            localProjectID: ProjectID(rawValue: UUID()),
+            serverProjectID: serverProjectID
+        )
+
+        let appliedIDs = await applier.appliedIDs()
+        XCTAssertEqual(appliedIDs, [treeOrderID])
+    }
+
+    func testUnchangedDocumentsUseOneBatchStateReadWithoutSingleReads()
+        async throws {
+        let serverProjectID = UUID()
+        let snapshots = (0..<50).map { index in
+            makeSnapshot(
+                id: UUID(),
+                path: "메인/메모장/\(index).txt",
+                revision: 7
+            )
+        }
+        let states = Dictionary(
+            uniqueKeysWithValues: snapshots.map {
+                (
+                    $0.documentID,
+                    SyncV2SnapshotLocalState(
+                        serverRevision: 7,
+                        serverPath: $0.relativePath,
+                        hasActiveOperation: false,
+                        hasUnresolvedConflict: false,
+                        blockingErrorCode: nil
+                    )
+                )
+            }
+        )
+        let stateStore = BatchSnapshotStateStoreSpy(
+            batchStates: states,
+            singleStates: states
+        )
+        let service = SyncV2SnapshotPullService(
+            client: SnapshotClientStub(snapshots: snapshots),
+            stateStore: stateStore,
+            localApplier: SnapshotApplierSpy(),
+            mergeStore: SnapshotMergeStoreSpy()
+        )
+
+        let report = try await service.pull(
+            localProjectID: ProjectID(rawValue: UUID()),
+            serverProjectID: serverProjectID
+        )
+
+        let reads = await stateStore.readCounts()
+        XCTAssertEqual(reads.batch, 1)
+        XCTAssertEqual(reads.single, 0)
+        XCTAssertEqual(report.outcomes.count, 50)
+        XCTAssertTrue(report.appliedSnapshots.isEmpty)
+    }
+
+    func testChangedDocumentRefreshesBatchStateInsideDocumentGate()
+        async throws {
+        let documentID = UUID()
+        let snapshot = makeSnapshot(id: documentID, revision: 2)
+        let clean = SyncV2SnapshotLocalState(
+            serverRevision: 1,
+            serverPath: snapshot.relativePath,
+            hasActiveOperation: false,
+            hasUnresolvedConflict: false,
+            blockingErrorCode: nil
+        )
+        let pending = SyncV2SnapshotLocalState(
+            serverRevision: 1,
+            serverPath: snapshot.relativePath,
+            hasActiveOperation: true,
+            hasUnresolvedConflict: false,
+            blockingErrorCode: nil
+        )
+        let stateStore = BatchSnapshotStateStoreSpy(
+            batchStates: [documentID: clean],
+            singleStates: [documentID: pending]
+        )
+        let applier = SnapshotApplierSpy()
+        let service = SyncV2SnapshotPullService(
+            client: SnapshotClientStub(snapshots: [snapshot]),
+            stateStore: stateStore,
+            localApplier: applier,
+            mergeStore: SnapshotMergeStoreSpy()
+        )
+
+        let report = try await service.pull(
+            localProjectID: ProjectID(rawValue: UUID()),
+            serverProjectID: UUID()
+        )
+
+        let reads = await stateStore.readCounts()
+        XCTAssertEqual(reads.batch, 1)
+        XCTAssertEqual(reads.single, 1)
+        let appliedIDs = await applier.appliedIDs()
+        XCTAssertTrue(appliedIDs.isEmpty)
+        XCTAssertEqual(
+            report.outcomes,
+            [
+                .mergeRequired(
+                    documentID: documentID,
+                    revision: 2,
+                    reason: .pendingOperation
+                ),
+            ]
+        )
+    }
+
+    func testBatchStateReadFailureFallsBackToSingleRead() async throws {
+        let documentID = UUID()
+        let snapshot = makeSnapshot(id: documentID, revision: 7)
+        let state = SyncV2SnapshotLocalState(
+            serverRevision: 7,
+            serverPath: snapshot.relativePath,
+            hasActiveOperation: false,
+            hasUnresolvedConflict: false,
+            blockingErrorCode: nil
+        )
+        let stateStore = BatchSnapshotStateStoreSpy(
+            batchStates: [documentID: state],
+            singleStates: [documentID: state],
+            batchReadFails: true
+        )
+        let service = SyncV2SnapshotPullService(
+            client: SnapshotClientStub(snapshots: [snapshot]),
+            stateStore: stateStore,
+            localApplier: SnapshotApplierSpy(),
+            mergeStore: SnapshotMergeStoreSpy()
+        )
+
+        let report = try await service.pull(
+            localProjectID: ProjectID(rawValue: UUID()),
+            serverProjectID: UUID()
+        )
+
+        let reads = await stateStore.readCounts()
+        XCTAssertEqual(reads.batch, 1)
+        XCTAssertEqual(reads.single, 1)
+        XCTAssertEqual(
+            report.outcomes,
+            [.upToDate(documentID: documentID, revision: 7)]
         )
     }
 
@@ -3896,6 +4249,10 @@ final class SyncV2SnapshotPullTests: XCTestCase {
             timing.realtimeSubscriptionTimeout,
             .seconds(12)
         )
+        XCTAssertEqual(
+            timing.initialRealtimeSubscriptionGrace,
+            .seconds(1)
+        )
         XCTAssertEqual(timing.pullTimeout, .seconds(15))
         XCTAssertEqual(
             timing.workspaceAuthenticationTimeout,
@@ -3931,6 +4288,10 @@ final class SyncV2SnapshotPullTests: XCTestCase {
         XCTAssertLessThan(
             timing.realtimeSubscriptionTimeout,
             timing.pullTimeout
+        )
+        XCTAssertLessThan(
+            timing.initialRealtimeSubscriptionGrace,
+            timing.realtimeSubscriptionTimeout
         )
         XCTAssertLessThan(timing.maximumBackoff, timing.periodicDelay)
         XCTAssertLessThan(
@@ -5916,6 +6277,77 @@ final class SyncV2SnapshotPullTests: XCTestCase {
     }
 
     @MainActor
+    func testInitialRealtimeSubscriptionBeforeSnapshotCoalescesIntoInitialPull()
+        async throws {
+        let previous = GlobalSyncPreference.isEnabled()
+        GlobalSyncPreference.setEnabled(true)
+        defer { GlobalSyncPreference.setEnabled(previous) }
+        let puller = WorkspacePullerStub()
+        let model = makeLifecycleModel(
+            puller: puller,
+            realtime: ImmediateSubscribedWorkspaceRealtimeStub(),
+            periodicDelay: .seconds(600),
+            initialRealtimeSubscriptionGrace: .milliseconds(100)
+        )
+
+        await model.start(editingGuards: { [:] }) { _ in }
+        for _ in 0..<100 where await puller.count() < 1 {
+            await Task.yield()
+        }
+        try await Task.sleep(for: .milliseconds(30))
+
+        let pullCount = await puller.count()
+        XCTAssertEqual(
+            pullCount,
+            1,
+            "구독 경계 뒤에 시작한 초기 pull은 재구독 확인을 "
+                + "별도 전체 pull로 쌓으면 안 됩니다."
+        )
+        await model.stop()
+    }
+
+    @MainActor
+    func testSubscriptionAfterInitialSnapshotStartsStillQueuesSafetyPull()
+        async throws {
+        let previous = GlobalSyncPreference.isEnabled()
+        GlobalSyncPreference.setEnabled(true)
+        defer { GlobalSyncPreference.setEnabled(previous) }
+        let puller = ControlledFirstWorkspacePuller()
+        let realtime = WorkspaceRealtimeStub()
+        let model = makeLifecycleModel(
+            puller: puller,
+            realtime: realtime,
+            periodicDelay: .seconds(600),
+            initialRealtimeSubscriptionGrace: .zero
+        )
+
+        await model.start(editingGuards: { [:] }) { _ in }
+        await puller.waitUntilFirstStarted()
+        for _ in 0..<100 where await realtime.startCount() < 1 {
+            await Task.yield()
+        }
+
+        await realtime.emitStatus(.subscribed)
+        for _ in 0..<100 where model.state.connection != .healthy {
+            await Task.yield()
+        }
+        for _ in 0..<20 { await Task.yield() }
+        await puller.finishFirst()
+        for _ in 0..<100 where await puller.count() < 2 {
+            await Task.yield()
+        }
+
+        let pullCount = await puller.count()
+        XCTAssertEqual(
+            pullCount,
+            2,
+            "snapshot 시작 뒤에 열린 구독은 사이 변경을 위한 "
+                + "후속 확인을 유지해야 합니다."
+        )
+        await model.stop()
+    }
+
+    @MainActor
     func testPeriodicSafetyPullRecoversMissedRealtimeEvent()
         async throws {
         let previous = GlobalSyncPreference.isEnabled()
@@ -6647,6 +7079,7 @@ final class SyncV2SnapshotPullTests: XCTestCase {
         debounceDelay: Duration = .milliseconds(5),
         periodicDelay: Duration = .seconds(600),
         realtimeSubscriptionTimeout: Duration = .seconds(12),
+        initialRealtimeSubscriptionGrace: Duration = .zero,
         pullTimeout: Duration = .seconds(15),
         retryDelays: [Duration] = [.seconds(1), .seconds(2)],
         realtimeHardResetAttemptThreshold: Int = 3,
@@ -6680,6 +7113,8 @@ final class SyncV2SnapshotPullTests: XCTestCase {
             debounceDelay: debounceDelay,
             periodicDelay: periodicDelay,
             realtimeSubscriptionTimeout: realtimeSubscriptionTimeout,
+            initialRealtimeSubscriptionGrace:
+                initialRealtimeSubscriptionGrace,
             pullTimeout: pullTimeout,
             retryDelays: retryDelays,
             realtimeHardResetAttemptThreshold:
@@ -7372,9 +7807,17 @@ private actor OrderedSnapshotApplier:
 
 private actor OrderedFolderApplier: SyncV2RemoteFolderApplying {
     private let recorder: SnapshotMutationSequence
+    private var report: SyncV2RemoteFolderApplyReport
 
-    init(recorder: SnapshotMutationSequence) {
+    init(
+        recorder: SnapshotMutationSequence,
+        report: SyncV2RemoteFolderApplyReport = SyncV2RemoteFolderApplyReport(),
+        projectionWasEvaluated: Bool = true
+    ) {
         self.recorder = recorder
+        var evaluatedReport = report
+        evaluatedReport.projectionWasEvaluated = projectionWasEvaluated
+        self.report = evaluatedReport
     }
 
     func applyRemoteFolders(
@@ -7383,7 +7826,7 @@ private actor OrderedFolderApplier: SyncV2RemoteFolderApplying {
         blockedFolderIDs: Set<DocumentID>
     ) async -> SyncV2RemoteFolderApplyReport {
         await recorder.append("folders")
-        return SyncV2RemoteFolderApplyReport()
+        return report
     }
 }
 
@@ -7427,6 +7870,69 @@ private actor SnapshotStateStoreStub: SyncV2SnapshotStateStoring {
         treeOrders: [SyncV2RemoteTreeOrder]
     ) async throws {
         _ = (localProjectID, serverProjectID, treeOrders)
+    }
+}
+
+private actor BatchSnapshotStateStoreSpy: SyncV2SnapshotStateStoring {
+    private let batchStates: [UUID: SyncV2SnapshotLocalState]
+    private let singleStates: [UUID: SyncV2SnapshotLocalState]
+    private let batchReadFails: Bool
+    private var batchReadCount = 0
+    private var singleReadCount = 0
+
+    init(
+        batchStates: [UUID: SyncV2SnapshotLocalState],
+        singleStates: [UUID: SyncV2SnapshotLocalState],
+        batchReadFails: Bool = false
+    ) {
+        self.batchStates = batchStates
+        self.singleStates = singleStates
+        self.batchReadFails = batchReadFails
+    }
+
+    func snapshotStates(
+        localProjectID: ProjectID,
+        serverProjectID: UUID,
+        documentIDs: Set<UUID>
+    ) throws -> [UUID: SyncV2SnapshotLocalState]? {
+        _ = (localProjectID, serverProjectID)
+        batchReadCount += 1
+        if batchReadFails {
+            throw SnapshotTestError.injectedNetworkFailure
+        }
+        return batchStates.filter { documentIDs.contains($0.key) }
+    }
+
+    func snapshotState(
+        localProjectID: ProjectID,
+        serverProjectID: UUID,
+        documentID: UUID
+    ) -> SyncV2SnapshotLocalState? {
+        _ = (localProjectID, serverProjectID)
+        singleReadCount += 1
+        return singleStates[documentID]
+    }
+
+    func applySnapshotBaseline(
+        localProjectID: ProjectID,
+        serverProjectID: UUID,
+        snapshot: SyncV2RemoteDocumentSnapshot,
+        expectedRevision: Int64?
+    ) -> Bool {
+        _ = (localProjectID, serverProjectID, snapshot, expectedRevision)
+        return false
+    }
+
+    func applyTreeOrderSnapshotBaselines(
+        localProjectID: ProjectID,
+        serverProjectID: UUID,
+        treeOrders: [SyncV2RemoteTreeOrder]
+    ) {
+        _ = (localProjectID, serverProjectID, treeOrders)
+    }
+
+    func readCounts() -> (batch: Int, single: Int) {
+        (batchReadCount, singleReadCount)
     }
 }
 
@@ -8005,6 +8511,20 @@ private actor WorkspaceRealtimeStub: SyncV2RealtimeTriggering {
     func stopCount() -> Int { stops }
     func resetCount() -> Int { resets }
     func startCount() -> Int { statuses.count }
+}
+
+private actor ImmediateSubscribedWorkspaceRealtimeStub:
+    SyncV2RealtimeTriggering {
+    func start(
+        projectID: UUID,
+        onChange: @escaping @Sendable () -> Void,
+        onSubscribed: @escaping @Sendable () -> Void
+    ) async throws {
+        _ = (projectID, onChange)
+        onSubscribed()
+    }
+
+    func stop() async {}
 }
 
 private actor HangingWorkspaceRealtimeStub:

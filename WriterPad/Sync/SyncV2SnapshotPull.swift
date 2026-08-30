@@ -1010,6 +1010,8 @@ final class SyncV2WorkspaceSyncModel: ObservableObject {
     private let authenticationRetryDelay: Duration
     private let authenticationSleep: SyncV2WorkspaceSleep
     private let realtimeSubscriptionTimeout: Duration
+    private let initialRealtimeSubscriptionGrace: Duration
+    private let initialRealtimeSubscriptionSleep: SyncV2WorkspaceSleep
     private let realtimeTimeoutSleep: SyncV2WorkspaceSleep
     private let pullTimeout: Duration
     private let pullTimeoutSleep: SyncV2WorkspaceSleep
@@ -1033,6 +1035,7 @@ final class SyncV2WorkspaceSyncModel: ObservableObject {
     private var serverProjectID: UUID?
     private var isActive = false
     private var generation: UInt64 = 0
+    private var activationRequestID: UInt64 = 0
     private var realtimeGeneration: UInt64 = 0
     private var pullRequestID: UInt64 = 0
     private var authenticationCheckGeneration: UInt64 = 0
@@ -1045,6 +1048,9 @@ final class SyncV2WorkspaceSyncModel: ObservableObject {
     private var lastSubscribedAt: ContinuousClock.Instant?
     private var realtimeHealthy = false
     private var hasRealtimeSubscribed = false
+    private var initialSubscriptionBoundaryGeneration: UInt64?
+    private var initialSubscriptionBoundaryRace:
+        SyncV2OneShotRace<Bool>?
     private let coordinatorHandlerID = UUID()
     private var activeCoordinatorPullPermit:
         SyncV2ProjectUploadPullCoordinator.PullPermit?
@@ -1091,6 +1097,12 @@ final class SyncV2WorkspaceSyncModel: ObservableObject {
             SyncV2Timing.standard.authenticationRetryDelay,
         realtimeSubscriptionTimeout: Duration =
             SyncV2Timing.standard.realtimeSubscriptionTimeout,
+        initialRealtimeSubscriptionGrace: Duration =
+            SyncV2Timing.standard.initialRealtimeSubscriptionGrace,
+        initialRealtimeSubscriptionSleep:
+            @escaping SyncV2WorkspaceSleep = { duration in
+                try await ContinuousClock().sleep(for: duration)
+            },
         pullTimeout: Duration = SyncV2Timing.standard.pullTimeout,
         retryDelays: [Duration] = SyncV2Timing.standard.backoff,
         realtimeHardResetAttemptThreshold: Int = 3,
@@ -1132,6 +1144,10 @@ final class SyncV2WorkspaceSyncModel: ObservableObject {
         self.authenticationRetryDelay = authenticationRetryDelay
         self.authenticationSleep = authenticationSleep
         self.realtimeSubscriptionTimeout = realtimeSubscriptionTimeout
+        self.initialRealtimeSubscriptionGrace =
+            initialRealtimeSubscriptionGrace
+        self.initialRealtimeSubscriptionSleep =
+            initialRealtimeSubscriptionSleep
         self.realtimeTimeoutSleep = realtimeTimeoutSleep
         self.pullTimeout = pullTimeout
         self.pullTimeoutSleep = pullTimeoutSleep
@@ -1194,6 +1210,7 @@ final class SyncV2WorkspaceSyncModel: ObservableObject {
             startBindingObservation()
             await activate()
         } else {
+            await cancelInitialSubscriptionBoundary()
             await releaseCoordinatorPullPermit()
             realtimeGeneration &+= 1
             SyncV2Diagnostics.generation(
@@ -1238,6 +1255,8 @@ final class SyncV2WorkspaceSyncModel: ObservableObject {
     }
 
     func stop() async {
+        activationRequestID &+= 1
+        await cancelInitialSubscriptionBoundary()
         await releaseCoordinatorPullPermit()
         generation &+= 1
         SyncV2Diagnostics.generation(
@@ -1293,6 +1312,7 @@ final class SyncV2WorkspaceSyncModel: ObservableObject {
 
     func networkRecovered() async {
         guard isActive else { return }
+        activationRequestID &+= 1
         // NWPath가 반복해서 흔들려도 사용자에게 보이는 12초 제한을
         // 초기화하지 않는다. 진행 중인 확인이 없을 때만 조용히 재시도한다.
         if !authenticationCheckTask.isScheduled {
@@ -1305,6 +1325,7 @@ final class SyncV2WorkspaceSyncModel: ObservableObject {
             realtimeHealthy = false
             state.connection = .reconnecting
             await realtime?.stop()
+            await cancelInitialSubscriptionBoundary()
             startRealtime(reconnecting: true)
         }
         await pullNow(forceVisibleProgress: true)
@@ -1316,6 +1337,8 @@ final class SyncV2WorkspaceSyncModel: ObservableObject {
             state = SyncV2WorkspaceState(lastResult: .localOnly)
             return
         }
+        activationRequestID &+= 1
+        let requestActivationID = activationRequestID
         let authenticationStartedAt =
             DispatchTime.now().uptimeNanoseconds
         let authentication = await authenticationService.currentState()
@@ -1324,7 +1347,9 @@ final class SyncV2WorkspaceSyncModel: ObservableObject {
             phase: "finished",
             startedAtNanoseconds: authenticationStartedAt
         )
-        guard isActive else { return }
+        guard isActive,
+              activationRequestID == requestActivationID
+        else { return }
         switch authentication {
         case .authenticated:
             cancelAuthenticationCheck()
@@ -1363,7 +1388,9 @@ final class SyncV2WorkspaceSyncModel: ObservableObject {
             phase: "finished",
             startedAtNanoseconds: bindingStartedAt
         )
-        guard isActive else { return }
+        guard isActive,
+              activationRequestID == requestActivationID
+        else { return }
         self.serverProjectID = serverProjectID
         if state.lastResult == .localOnly
             || state.lastResult == .authenticationRequired
@@ -1374,6 +1401,9 @@ final class SyncV2WorkspaceSyncModel: ObservableObject {
         // waiting이 아니라 자동 rebase/conflict 결과를 관찰할 수 있다.
         let dispatchStartedAt = DispatchTime.now().uptimeNanoseconds
         await requestDispatchRetry?()
+        guard isActive,
+              activationRequestID == requestActivationID
+        else { return }
         SyncV2PullDiagnostics.record(
             stage: "dispatcher-wakeup",
             phase: "finished",
@@ -1381,9 +1411,70 @@ final class SyncV2WorkspaceSyncModel: ObservableObject {
         )
         realtimeHealthy = realtime == nil
         hasRealtimeSubscribed = false
-        startRealtime(reconnecting: false)
+        await cancelInitialSubscriptionBoundary()
+        let initialRealtimeGeneration = startRealtime(
+            reconnecting: false
+        )
+        if let initialRealtimeGeneration {
+            let race = SyncV2OneShotRace<Bool>()
+            initialSubscriptionBoundaryGeneration =
+                initialRealtimeGeneration
+            initialSubscriptionBoundaryRace = race
+            await waitForInitialSubscriptionBoundary(
+                race,
+                generation: initialRealtimeGeneration
+            )
+            guard isActive,
+                  activationRequestID == requestActivationID,
+                  realtimeGeneration == initialRealtimeGeneration
+            else { return }
+        }
         startPeriodicPull()
         await pullNow(forceVisibleProgress: true)
+        if initialSubscriptionBoundaryGeneration
+            == initialRealtimeGeneration {
+            initialSubscriptionBoundaryGeneration = nil
+            initialSubscriptionBoundaryRace = nil
+        }
+    }
+
+    /// Realtime이 빨리 열리면 구독 경계 뒤에 최초 snapshot을
+    /// 읽어 누락 구간 없이 pull 하나로 합친다. 구독이 느리거나
+    /// 고장 나도 bootstrap pull이 막히지 않도록 짧은 상한만 두고
+    /// 예전 경로로 진행한다.
+    private func waitForInitialSubscriptionBoundary(
+        _ race: SyncV2OneShotRace<Bool>,
+        generation requestGeneration: UInt64
+    ) async {
+        let grace = initialRealtimeSubscriptionGrace
+        guard grace > .zero else {
+            initialSubscriptionBoundaryRace = nil
+            return
+        }
+        let sleep = initialRealtimeSubscriptionSleep
+        let timeout = Task {
+            do {
+                try await sleep(grace)
+                await race.resolve(false)
+            } catch {
+                // 구독 완료나 scene 종료가 먼저 일어났다.
+            }
+        }
+        _ = await race.value()
+        timeout.cancel()
+        if initialSubscriptionBoundaryGeneration == requestGeneration {
+            // generation marker는 pullNow가 실제로 시작될 때까지
+            // 남긴다. timeout과 pull 시작 사이에 subscribed가 도착해도
+            // 이제 시작할 초기 pull이 그 경계를 안전하게 덮는다.
+            initialSubscriptionBoundaryRace = nil
+        }
+    }
+
+    private func cancelInitialSubscriptionBoundary() async {
+        let race = initialSubscriptionBoundaryRace
+        initialSubscriptionBoundaryRace = nil
+        initialSubscriptionBoundaryGeneration = nil
+        await race?.resolve(false)
     }
 
     private func startAuthenticationObservation() async {
@@ -1441,6 +1532,8 @@ final class SyncV2WorkspaceSyncModel: ObservableObject {
         connection: SyncV2WorkspaceState.Connection,
         lastResult: SyncV2WorkspaceState.Result
     ) async {
+        activationRequestID &+= 1
+        await cancelInitialSubscriptionBoundary()
         generation &+= 1
         SyncV2Diagnostics.generation(
             scope: "workspace",
@@ -1756,11 +1849,12 @@ final class SyncV2WorkspaceSyncModel: ObservableObject {
         await activate()
     }
 
-    private func startRealtime(reconnecting: Bool) {
+    @discardableResult
+    private func startRealtime(reconnecting: Bool) -> UInt64? {
         guard isActive,
               let realtime,
               let serverProjectID
-        else { return }
+        else { return nil }
         logTask(
             "realtimeStartTask",
             action: "cancel",
@@ -1805,7 +1899,7 @@ final class SyncV2WorkspaceSyncModel: ObservableObject {
                         },
                         onStatus: { [weak self] status in
                             Task { @MainActor in
-                                self?.receivedRealtimeStatus(
+                                await self?.receivedRealtimeStatus(
                                     status,
                                     generation: requestGeneration
                                 )
@@ -1846,7 +1940,7 @@ final class SyncV2WorkspaceSyncModel: ObservableObject {
             case .completed:
                 break
             case .failed:
-                receivedRealtimeStatus(
+                await receivedRealtimeStatus(
                     .channelError,
                     generation: requestGeneration
                 )
@@ -1857,18 +1951,19 @@ final class SyncV2WorkspaceSyncModel: ObservableObject {
                 guard isActive,
                       realtimeGeneration == requestGeneration
                 else { return }
-                receivedRealtimeStatus(
+                await receivedRealtimeStatus(
                     .timedOut,
                     generation: requestGeneration
                 )
             }
         }
+        return requestGeneration
     }
 
     private func receivedRealtimeStatus(
         _ status: SyncV2RealtimeConnectionStatus,
         generation requestGeneration: UInt64
-    ) {
+    ) async {
         guard isActive,
               realtimeGeneration == requestGeneration
         else { return }
@@ -1877,6 +1972,12 @@ final class SyncV2WorkspaceSyncModel: ObservableObject {
             realtimeHealthy = false
             state.connection = realtimeProgressConnection
         case .subscribed:
+            let satisfiesInitialBoundary =
+                initialSubscriptionBoundaryGeneration
+                    == requestGeneration
+            if satisfiesInitialBoundary {
+                await initialSubscriptionBoundaryRace?.resolve(true)
+            }
             realtimeHealthy = true
             hasRealtimeSubscribed = true
             lastSubscribedAt = ContinuousClock().now
@@ -1892,11 +1993,16 @@ final class SyncV2WorkspaceSyncModel: ObservableObject {
                 reason: "realtime-subscribed"
             )
             state.connection = .healthy
+            guard !satisfiesInitialBoundary else { return }
             Task { @MainActor [weak self] in
                 // 재구독 직후 이벤트를 기다리지 않고 누락 snapshot을 확인한다.
                 await self?.pullNow(forceVisibleProgress: true)
             }
         case .closed, .channelError, .timedOut:
+            if initialSubscriptionBoundaryGeneration
+                == requestGeneration {
+                await initialSubscriptionBoundaryRace?.resolve(false)
+            }
             let terminalReason: String
             switch status {
             case .closed:
@@ -1988,6 +2094,7 @@ final class SyncV2WorkspaceSyncModel: ObservableObject {
                 await self.realtime?.resetConnection()
                 self.reconnectAttempt = 0
             }
+            await self.cancelInitialSubscriptionBoundary()
             self.startRealtime(reconnecting: true)
         }
     }

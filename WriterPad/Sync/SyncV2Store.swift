@@ -1117,6 +1117,84 @@ actor SyncV2Store:
         }
     }
 
+    func snapshotStates(
+        localProjectID: ProjectID,
+        serverProjectID: UUID,
+        documentIDs: Set<UUID>
+    ) async throws -> [UUID: SyncV2SnapshotLocalState]? {
+        guard !documentIDs.isEmpty else { return [:] }
+        return try withStatement(
+            """
+            SELECT d.document_id, d.server_revision, d.server_path,
+                   EXISTS(
+                       SELECT 1
+                       FROM sync_operations o
+                       WHERE o.document_id = d.document_id
+                         AND o.status NOT IN ('completed', 'cancelled')
+                   ),
+                   EXISTS(
+                       SELECT 1
+                       FROM sync_conflicts c
+                       WHERE c.document_id = d.document_id
+                         AND c.resolved_at IS NULL
+                   ),
+                   (
+                       SELECT o.last_error_code
+                       FROM sync_operations o
+                       WHERE o.document_id = d.document_id
+                         AND o.status = 'blocked'
+                       ORDER BY o.document_sequence, o.queue_id
+                       LIMIT 1
+                   ),
+                   EXISTS(
+                       SELECT 1
+                       FROM sync_operations o
+                       WHERE o.document_id = d.document_id
+                         AND o.status = 'conflict'
+                         AND o.last_error_code = 'PATH_CONFLICT'
+                   )
+            FROM sync_documents d
+            WHERE d.local_project_id = ?
+              AND d.project_id = ?;
+            """
+        ) { statement in
+            try bind(
+                localProjectID.rawValue.uuidString.lowercased(),
+                at: 1,
+                to: statement
+            )
+            try bind(
+                serverProjectID.uuidString.lowercased(),
+                at: 2,
+                to: statement
+            )
+            var states: [UUID: SyncV2SnapshotLocalState] = [:]
+            while true {
+                let status = sqlite3_step(statement)
+                if status == SQLITE_DONE { return states }
+                guard status == SQLITE_ROW,
+                      let documentIDText = columnText(statement, at: 0),
+                      let documentID = UUID(uuidString: documentIDText),
+                      let path = columnText(statement, at: 2)
+                else {
+                    throw SyncV2StoreError.invalidStoredData
+                }
+                guard documentIDs.contains(documentID) else { continue }
+                states[documentID] = SyncV2SnapshotLocalState(
+                    serverRevision: sqlite3_column_int64(statement, 1),
+                    serverPath: path,
+                    hasActiveOperation:
+                        sqlite3_column_int(statement, 3) == 1,
+                    hasUnresolvedConflict:
+                        sqlite3_column_int(statement, 4) == 1,
+                    blockingErrorCode: columnText(statement, at: 5),
+                    hasPathCollision:
+                        sqlite3_column_int(statement, 6) == 1
+                )
+            }
+        }
+    }
+
     func applySnapshotBaseline(
         localProjectID: ProjectID,
         serverProjectID: UUID,
@@ -11175,6 +11253,21 @@ actor LazySyncV2ProjectBindingStore:
             localProjectID: localProjectID,
             serverProjectID: serverProjectID,
             documentID: documentID
+        )
+    }
+
+    func snapshotStates(
+        localProjectID: ProjectID,
+        serverProjectID: UUID,
+        documentIDs: Set<UUID>
+    ) async throws -> [UUID: SyncV2SnapshotLocalState]? {
+        guard let store = await resolvedStore() else {
+            throw SyncV2DispatchStoreError.unavailable
+        }
+        return try await store.snapshotStates(
+            localProjectID: localProjectID,
+            serverProjectID: serverProjectID,
+            documentIDs: documentIDs
         )
     }
 
