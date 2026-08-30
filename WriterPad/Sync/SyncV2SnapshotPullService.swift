@@ -125,6 +125,11 @@ actor SyncV2SnapshotPullService: SyncV2SnapshotPulling {
         serverProjectID: UUID,
         editingGuards: [UUID: SyncV2EditingGuard] = [:]
     ) async throws -> SyncV2SnapshotPullReport {
+        let pullStartedAt = DispatchTime.now().uptimeNanoseconds
+        SyncV2PullDiagnostics.record(
+            stage: "snapshot-service",
+            phase: "started"
+        )
         let shouldFetchFolders = folderApplier != nil
         async let snapshotsRequest = client.fetchDocuments(
             projectID: serverProjectID
@@ -137,6 +142,11 @@ actor SyncV2SnapshotPullService: SyncV2SnapshotPulling {
             projectID: serverProjectID
         )
         let snapshots = try await snapshotsRequest
+        SyncV2PullDiagnostics.record(
+            stage: "documents",
+            phase: "available-to-service",
+            rowCount: snapshots.count
+        )
         // 실제 TXT 경로에서 폴더 메타데이터를 먼저 재구성한 뒤 순서를
         // 적용해야 새 Windows 폴더의 첫 pull에도 userOrder가 반영된다.
         let ordinarySnapshots = snapshots.filter {
@@ -148,6 +158,7 @@ actor SyncV2SnapshotPullService: SyncV2SnapshotPulling {
                 .filter { !$0.isDeleted }
                 .map(\.relativePath)
         )
+        let preparePullStartedAt = DispatchTime.now().uptimeNanoseconds
         try await mutationGate.withCriticalSection(
             documentID: syncV2ProjectStructureMutationID(localProjectID)
         ) { [self] in
@@ -156,12 +167,19 @@ actor SyncV2SnapshotPullService: SyncV2SnapshotPulling {
                 remoteLiveDocumentPaths: remoteLiveDocumentPaths
             )
         }
+        SyncV2PullDiagnostics.record(
+            stage: "identity-audit",
+            phase: "finished",
+            startedAtNanoseconds: preparePullStartedAt,
+            rowCount: ordinarySnapshots.count
+        )
         // 폴더를 문서보다 먼저 제자리에 놓는다. 이름이 바뀐 폴더에 문서가 먼저
         // 도착하면 옛 경로에 자리를 잡아, 뒤이은 폴더 이동이 목적지 충돌로
         // 막힌다.
         var folderReport = SyncV2RemoteFolderApplyReport()
         var fetchedRemoteFolders: [SyncV2RemoteFolder]?
         var permanentFolderBaselineExclusions: Set<UUID> = []
+        let folderApplyStartedAt = DispatchTime.now().uptimeNanoseconds
         folderStage: if let folderApplier {
             // fetch는 Gate 밖에서 한다. 네트워크를 기다리는 동안
             // 사용자의 폴더 작업을 막지 않고, 디스크·메타데이터를
@@ -245,10 +263,18 @@ actor SyncV2SnapshotPullService: SyncV2SnapshotPulling {
                 projection: .unsupported
             )
         }
+        SyncV2PullDiagnostics.record(
+            stage: "folder-local-apply",
+            phase: "finished",
+            startedAtNanoseconds: folderApplyStartedAt,
+            rowCount: fetchedRemoteFolders?.count
+        )
 
         // 폴더가 제자리에 놓인 뒤에 순서를 받는다. 순서는 folder_id를 가리키므로
         // 폴더가 먼저 있어야 가리킬 대상이 있다.
         let treeOrders = try await treeOrdersRequest
+        let treeOrderApplyStartedAt =
+            DispatchTime.now().uptimeNanoseconds
         if !treeOrders.isEmpty {
             try await stateStore.applyTreeOrderSnapshotBaselines(
                 localProjectID: localProjectID,
@@ -256,6 +282,12 @@ actor SyncV2SnapshotPullService: SyncV2SnapshotPulling {
                 treeOrders: treeOrders
             )
         }
+        SyncV2PullDiagnostics.record(
+            stage: "tree-order-local-apply",
+            phase: "finished",
+            startedAtNanoseconds: treeOrderApplyStartedAt,
+            rowCount: treeOrders.count
+        )
 
         let orderedSnapshots = snapshots.filter {
             $0.relativePath == syncV2TrashPurgePath
@@ -273,6 +305,8 @@ actor SyncV2SnapshotPullService: SyncV2SnapshotPulling {
         var effectivePurgeState = await localApplier.trashPurgeState(
             localProjectID: localProjectID
         )
+        let documentLoopStartedAt =
+            DispatchTime.now().uptimeNanoseconds
         for snapshot in orderedSnapshots {
             try Task.checkCancellation()
             let editing = editingGuards[snapshot.documentID] ?? .closed
@@ -356,7 +390,17 @@ actor SyncV2SnapshotPullService: SyncV2SnapshotPulling {
                 }
             }
         }
+        SyncV2PullDiagnostics.record(
+            stage: "document-local-compare-apply",
+            phase: "finished",
+            startedAtNanoseconds: documentLoopStartedAt,
+            rowCount: orderedSnapshots.count,
+            changedCount: appliedSnapshots.count
+        )
 
+        let deferredFolderCount = folderReport.deferredFolderIDs.count
+        let folderFinalizeStartedAt =
+            DispatchTime.now().uptimeNanoseconds
         if let folderApplier,
            let folders = fetchedRemoteFolders,
            !folderReport.deferredFolderIDs.isEmpty {
@@ -425,13 +469,28 @@ actor SyncV2SnapshotPullService: SyncV2SnapshotPulling {
             )
             folderReport.deferredFolderIDs.removeAll()
         }
-        return SyncV2SnapshotPullReport(
+        SyncV2PullDiagnostics.record(
+            stage: "folder-tombstone-finalize",
+            phase: "finished",
+            startedAtNanoseconds: folderFinalizeStartedAt,
+            rowCount: deferredFolderCount,
+            changedCount: folderReport.deletedFolderIDs.count
+        )
+        let report = SyncV2SnapshotPullReport(
             outcomes: outcomes,
             appliedSnapshots: appliedSnapshots,
             rejectedStructureNames: rejectedStructureNames,
             pendingChildTombstoneFolderCount:
                 folderReport.pendingChildTombstoneFolderIDs.count
         )
+        SyncV2PullDiagnostics.record(
+            stage: "snapshot-service",
+            phase: "finished",
+            startedAtNanoseconds: pullStartedAt,
+            rowCount: snapshots.count,
+            changedCount: appliedSnapshots.count
+        )
+        return report
     }
 
     /// 로컬에 남은 모든 자식이 완전한 원격 projection에도

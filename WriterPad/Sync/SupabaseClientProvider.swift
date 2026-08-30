@@ -47,6 +47,74 @@ final class EphemeralAuthLocalStorage: AuthLocalStorage, @unchecked Sendable {
     }
 }
 
+#if DEBUG
+final class SyncV2URLSessionMetricsDelegate:
+    NSObject,
+    URLSessionTaskDelegate,
+    @unchecked Sendable {
+    func urlSession(
+        _ session: URLSession,
+        task: URLSessionTask,
+        didFinishCollecting metrics: URLSessionTaskMetrics
+    ) {
+        _ = session
+        guard
+            let request = task.originalRequest ?? task.currentRequest,
+            let rawPullID = request.value(
+                forHTTPHeaderField: SyncV2PullDiagnostics.pullIDHeader
+            ),
+            let pullID = UUID(uuidString: rawPullID),
+            let origin = request.value(
+                forHTTPHeaderField: SyncV2PullDiagnostics.pullOriginHeader
+            ),
+            let stage = request.value(
+                forHTTPHeaderField: SyncV2PullDiagnostics.pullStageHeader
+            ),
+            let rawStartedAt = request.value(
+                forHTTPHeaderField: SyncV2PullDiagnostics.pullStartHeader
+            ),
+            let pullStartedAt = UInt64(rawStartedAt)
+        else { return }
+
+        let transactions = metrics.transactionMetrics
+        let firstFetch = transactions.compactMap(\.fetchStartDate).min()
+        let firstResponse = transactions.compactMap(\.responseStartDate).min()
+        let lastResponse = transactions.compactMap(\.responseEndDate).max()
+        let ttfb = Self.milliseconds(from: firstFetch, to: firstResponse)
+        let receive = Self.milliseconds(
+            from: firstResponse,
+            to: lastResponse
+        )
+        let networkBytes = transactions.reduce(Int64(0)) {
+            $0 + $1.countOfResponseBodyBytesReceived
+        }
+        let decodedBytes = transactions.reduce(Int64(0)) {
+            $0 + $1.countOfResponseBodyBytesAfterDecoding
+        }
+        SyncV2PullDiagnostics.recordNetworkMetrics(
+            pullID: pullID,
+            origin: origin,
+            stage: stage,
+            pullStartedAtNanoseconds: pullStartedAt,
+            taskMilliseconds: metrics.taskInterval.duration * 1_000,
+            ttfbMilliseconds: ttfb,
+            receiveMilliseconds: receive,
+            networkBytes: networkBytes,
+            decodedBytes: decodedBytes,
+            transactionCount: transactions.count
+        )
+    }
+
+    private static func milliseconds(
+        from start: Date?,
+        to end: Date?
+    ) -> Double {
+        guard let start, let end else { return -1 }
+        return max(0, end.timeIntervalSince(start) * 1_000)
+    }
+}
+#endif
+
 final class SupabaseClientProvider: SupabaseClientProviding {
     let configurationState: SupabaseConfigurationState
     private let client: SupabaseClient?
@@ -127,6 +195,18 @@ final class SupabaseClientProvider: SupabaseClientProviding {
         switch configuration {
         case .success(let value):
             configurationState = .configured(value)
+#if DEBUG
+            let session = URLSession(
+                configuration: .default,
+                delegate: SyncV2URLSessionMetricsDelegate(),
+                delegateQueue: nil
+            )
+            let globalOptions = SupabaseClientOptions.GlobalOptions(
+                session: session
+            )
+#else
+            let globalOptions = SupabaseClientOptions.GlobalOptions()
+#endif
             client = SupabaseClient(
                 supabaseURL: value.url,
                 supabaseKey: value.publishableKey,
@@ -135,7 +215,8 @@ final class SupabaseClientProvider: SupabaseClientProviding {
                         storage: EphemeralAuthLocalStorage(),
                         autoRefreshToken: false,
                         emitLocalSessionAsInitialSession: true
-                    )
+                    ),
+                    global: globalOptions
                 )
             )
         case .failure(let error):

@@ -79,13 +79,64 @@ actor LiveSyncV2SnapshotTransport: SyncV2SnapshotTransporting {
         self.client = client
     }
 
+    private func executeRows<Row: Decodable>(
+        _ builder: PostgrestFilterBuilder,
+        stage: String,
+        as type: Row.Type
+    ) async throws -> [Row] {
+        _ = type
+        if let context = SyncV2PullDiagnostics.current {
+            builder
+                .setHeader(
+                    name: SyncV2PullDiagnostics.pullIDHeader,
+                    value: context.pullID.uuidString
+                )
+                .setHeader(
+                    name: SyncV2PullDiagnostics.pullOriginHeader,
+                    value: context.origin
+                )
+                .setHeader(
+                    name: SyncV2PullDiagnostics.pullStageHeader,
+                    value: stage
+                )
+                .setHeader(
+                    name: SyncV2PullDiagnostics.pullStartHeader,
+                    value: String(context.startedAtNanoseconds)
+                )
+        }
+        let requestStartedAt = DispatchTime.now().uptimeNanoseconds
+        SyncV2PullDiagnostics.record(
+            stage: stage,
+            phase: "request-start"
+        )
+        let response: PostgrestResponse<Void> = try await builder.execute()
+        SyncV2PullDiagnostics.record(
+            stage: stage,
+            phase: "response-received",
+            startedAtNanoseconds: requestStartedAt,
+            payloadBytes: response.data.count
+        )
+        let decodeStartedAt = DispatchTime.now().uptimeNanoseconds
+        let rows = try PostgrestClient.Configuration.jsonDecoder.decode(
+            [Row].self,
+            from: response.data
+        )
+        SyncV2PullDiagnostics.record(
+            stage: stage,
+            phase: "decode-finished",
+            startedAtNanoseconds: decodeStartedAt,
+            rowCount: rows.count,
+            payloadBytes: response.data.count
+        )
+        return rows
+    }
+
     func fetchDocuments(
         projectID: UUID
     ) async throws -> [SyncV2RemoteDocumentSnapshot] {
         do {
-            let response: PostgrestResponse<
-                [SyncV2RemoteDocumentSnapshot]
-            > = try await client
+            return try await executeRows(
+                client
                 .from("documents")
                 .select(
                     """
@@ -93,9 +144,10 @@ actor LiveSyncV2SnapshotTransport: SyncV2SnapshotTransporting {
                     deleted_at,updated_at
                     """
                 )
-                .eq("project_id", value: projectID.uuidString.lowercased())
-                .execute()
-            return response.value
+                .eq("project_id", value: projectID.uuidString.lowercased()),
+                stage: "documents",
+                as: SyncV2RemoteDocumentSnapshot.self
+            )
         } catch let error as PostgrestError {
             throw SyncV2SnapshotTransportError.postgrest(
                 message: error.message,
@@ -128,8 +180,8 @@ actor LiveSyncV2SnapshotTransport: SyncV2SnapshotTransporting {
         projectID: UUID
     ) async throws -> [SyncV2RemoteTreeOrder] {
         do {
-            let response: PostgrestResponse<[SyncV2RemoteTreeOrder]> =
-                try await client
+            return try await executeRows(
+                client
                     .from("tree_orders")
                     .select(
                         "tree_order_id,parent_folder_id,children,revision,updated_at"
@@ -137,9 +189,10 @@ actor LiveSyncV2SnapshotTransport: SyncV2SnapshotTransporting {
                     .eq(
                         "project_id",
                         value: projectID.uuidString.lowercased()
-                    )
-                    .execute()
-            return response.value
+                    ),
+                stage: "tree-orders",
+                as: SyncV2RemoteTreeOrder.self
+            )
         } catch let error as PostgrestError {
             throw SyncV2SnapshotTransportError.postgrest(
                 message: error.message,
@@ -167,8 +220,8 @@ actor LiveSyncV2SnapshotTransport: SyncV2SnapshotTransporting {
         projectID: UUID
     ) async throws -> [SyncV2RemoteFolder] {
         do {
-            let response: PostgrestResponse<[SyncV2RemoteFolder]> =
-                try await client
+            return try await executeRows(
+                client
                     .from("folders")
                     .select(
                         """
@@ -179,9 +232,10 @@ actor LiveSyncV2SnapshotTransport: SyncV2SnapshotTransporting {
                     .eq(
                         "project_id",
                         value: projectID.uuidString.lowercased()
-                    )
-                    .execute()
-            return response.value
+                    ),
+                stage: "folders",
+                as: SyncV2RemoteFolder.self
+            )
         } catch let error as PostgrestError {
             throw SyncV2SnapshotTransportError.postgrest(
                 message: error.message,

@@ -4,6 +4,65 @@ import XCTest
 @testable import WriterPad
 
 final class SyncV2SnapshotPullTests: XCTestCase {
+    func testPullDiagnosticsKeepsOneIDAndReportsAggregateStages()
+        async throws {
+        let recorder = SyncV2PullDiagnosticRecorder()
+        let context = SyncV2PullDiagnosticContext(
+            pullID: UUID(),
+            origin: "test",
+            recorder: recorder
+        )
+        let service = SyncV2SnapshotPullService(
+            client: SnapshotClientStub(snapshots: []),
+            stateStore: SnapshotStateStoreStub(states: [:]),
+            localApplier: SnapshotApplierSpy(),
+            mergeStore: SnapshotMergeStoreSpy(),
+            folderApplier: FolderWiringApplierSpy(
+                order: FolderWiringOrderRecorder()
+            )
+        )
+
+        _ = try await SyncV2PullDiagnostics.withContext(context) {
+            try await service.pull(
+                localProjectID: ProjectID(rawValue: UUID()),
+                serverProjectID: UUID()
+            )
+        }
+
+        let events = recorder.events()
+        XCTAssertFalse(events.isEmpty)
+        XCTAssertEqual(Set(events.map(\.pullID)), [context.pullID])
+        XCTAssertTrue(events.allSatisfy { $0.elapsedMilliseconds >= 0 })
+        XCTAssertEqual(
+            events.map(\.elapsedMilliseconds),
+            events.map(\.elapsedMilliseconds).sorted()
+        )
+        let stages = Set(events.map(\.stage))
+        XCTAssertTrue(stages.contains("identity-audit"))
+        XCTAssertTrue(stages.contains("folder-local-apply"))
+        XCTAssertTrue(stages.contains("tree-order-local-apply"))
+        XCTAssertTrue(stages.contains("document-local-compare-apply"))
+        XCTAssertTrue(stages.contains("snapshot-service"))
+    }
+
+    func testPullDiagnosticsDistinguishesFirstEntryFromReentry() throws {
+        let projectID = ProjectID(rawValue: UUID())
+        let first = try XCTUnwrap(
+            SyncV2PullDiagnostics.makeWorkspaceEntryContext(
+                localProjectID: projectID
+            )
+        )
+        let second = try XCTUnwrap(
+            SyncV2PullDiagnostics.makeWorkspaceEntryContext(
+                localProjectID: projectID
+            )
+        )
+
+        XCTAssertEqual(first.origin, "first-entry")
+        XCTAssertEqual(second.origin, "reentry")
+        XCTAssertNotEqual(first.pullID, second.pullID)
+    }
+
     func testSnapshotNetworkReadsStartConcurrently() async throws {
         let client = ConcurrentSnapshotClientProbe()
         let service = SyncV2SnapshotPullService(

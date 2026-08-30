@@ -382,20 +382,47 @@ struct WritingWorkspaceShell: View {
                     initialActivity: scenePhase == .active
                 )
             else { return }
-            enqueueWorkspaceLifecycleOperation {
-                await restoreWorkspaceIfNeeded()
-                guard workspaceSceneActivityGate.isCurrentAppearance(
-                    appearanceID
-                ) else { return }
-                await workspaceSyncModel.start(
-                    sceneIsActive: false,
-                    editingGuards: currentSyncEditingGuards,
-                    applyOpenSnapshots: applyOpenServerSnapshots
+            let diagnosticsContext =
+                SyncV2PullDiagnostics.makeWorkspaceEntryContext(
+                    localProjectID: project.id
                 )
-                guard let active = workspaceSceneActivityGate.finishStarting(
-                    appearanceID: appearanceID
-                ) else { return }
-                await updateSceneActivity(active)
+            enqueueWorkspaceLifecycleOperation {
+                await SyncV2PullDiagnostics.withContext(
+                    diagnosticsContext
+                ) {
+                    SyncV2PullDiagnostics.record(
+                        stage: "workspace-entry",
+                        phase: "started"
+                    )
+                    let restoreStartedAt =
+                        DispatchTime.now().uptimeNanoseconds
+                    await restoreWorkspaceIfNeeded()
+                    SyncV2PullDiagnostics.record(
+                        stage: "workspace-restore",
+                        phase: "finished",
+                        startedAtNanoseconds: restoreStartedAt
+                    )
+                    guard workspaceSceneActivityGate.isCurrentAppearance(
+                        appearanceID
+                    ) else { return }
+                    let syncStartAt =
+                        DispatchTime.now().uptimeNanoseconds
+                    await workspaceSyncModel.start(
+                        sceneIsActive: false,
+                        editingGuards: currentSyncEditingGuards,
+                        applyOpenSnapshots: applyOpenServerSnapshots
+                    )
+                    SyncV2PullDiagnostics.record(
+                        stage: "workspace-sync-start",
+                        phase: "finished",
+                        startedAtNanoseconds: syncStartAt
+                    )
+                    guard let active = workspaceSceneActivityGate
+                        .finishStarting(
+                            appearanceID: appearanceID
+                        ) else { return }
+                    await updateSceneActivity(active)
+                }
             }
         }
         .onChange(of: autosaveDelayMilliseconds) { _, milliseconds in

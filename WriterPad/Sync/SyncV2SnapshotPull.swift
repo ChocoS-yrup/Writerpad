@@ -1048,6 +1048,9 @@ final class SyncV2WorkspaceSyncModel: ObservableObject {
     private let coordinatorHandlerID = UUID()
     private var activeCoordinatorPullPermit:
         SyncV2ProjectUploadPullCoordinator.PullPermit?
+    private var pendingDiagnosticsContext:
+        SyncV2PullDiagnosticContext?
+    private let diagnosticLagProbe = SyncV2MainActorLagProbe()
 
     private func logTask(
         _ name: String,
@@ -1151,6 +1154,13 @@ final class SyncV2WorkspaceSyncModel: ObservableObject {
             @escaping @MainActor @Sendable
             ([SyncV2RemoteDocumentSnapshot]) -> Void
     ) async {
+        if pendingDiagnosticsContext == nil {
+            pendingDiagnosticsContext = SyncV2PullDiagnostics.current
+        }
+        SyncV2PullDiagnostics.record(
+            stage: "workspace-model",
+            phase: "start"
+        )
         self.editingGuards = editingGuards
         self.applyOpenSnapshots = applyOpenSnapshots
         await uploadPullCoordinator?.installPullReadyHandler(
@@ -1199,6 +1209,7 @@ final class SyncV2WorkspaceSyncModel: ObservableObject {
             periodicTask.cancel()
             logTask("pullTask", action: "cancel", reason: "scene-inactive")
             pullTask.cancel()
+            await diagnosticLagProbe.finish()
             logTask("realtimeStartTask", action: "cancel", reason: "scene-inactive")
             realtimeStartTask.cancel()
             logTask("reconnectTask", action: "cancel", reason: "scene-inactive")
@@ -1251,6 +1262,7 @@ final class SyncV2WorkspaceSyncModel: ObservableObject {
         periodicTask.cancel()
         logTask("pullTask", action: "cancel", reason: "stop")
         pullTask.cancel()
+        await diagnosticLagProbe.finish()
         logTask("realtimeStartTask", action: "cancel", reason: "stop")
         realtimeStartTask.cancel()
         logTask("reconnectTask", action: "cancel", reason: "stop")
@@ -1304,7 +1316,14 @@ final class SyncV2WorkspaceSyncModel: ObservableObject {
             state = SyncV2WorkspaceState(lastResult: .localOnly)
             return
         }
+        let authenticationStartedAt =
+            DispatchTime.now().uptimeNanoseconds
         let authentication = await authenticationService.currentState()
+        SyncV2PullDiagnostics.record(
+            stage: "authentication-current-state",
+            phase: "finished",
+            startedAtNanoseconds: authenticationStartedAt
+        )
         guard isActive else { return }
         switch authentication {
         case .authenticated:
@@ -1327,12 +1346,23 @@ final class SyncV2WorkspaceSyncModel: ObservableObject {
             )
             return
         }
+        let bindingStartedAt = DispatchTime.now().uptimeNanoseconds
         guard let binding = await projectBindingService.currentBinding(
             for: localProjectID
         ), let serverProjectID = binding.serverProjectID else {
+            SyncV2PullDiagnostics.record(
+                stage: "project-binding",
+                phase: "missing",
+                startedAtNanoseconds: bindingStartedAt
+            )
             state = SyncV2WorkspaceState(lastResult: .localOnly)
             return
         }
+        SyncV2PullDiagnostics.record(
+            stage: "project-binding",
+            phase: "finished",
+            startedAtNanoseconds: bindingStartedAt
+        )
         guard isActive else { return }
         self.serverProjectID = serverProjectID
         if state.lastResult == .localOnly
@@ -1342,7 +1372,13 @@ final class SyncV2WorkspaceSyncModel: ObservableObject {
         }
         // 기존 pending operation을 먼저 dispatch해야 첫 pull이 단순
         // waiting이 아니라 자동 rebase/conflict 결과를 관찰할 수 있다.
+        let dispatchStartedAt = DispatchTime.now().uptimeNanoseconds
         await requestDispatchRetry?()
+        SyncV2PullDiagnostics.record(
+            stage: "dispatcher-wakeup",
+            phase: "finished",
+            startedAtNanoseconds: dispatchStartedAt
+        )
         realtimeHealthy = realtime == nil
         hasRealtimeSubscribed = false
         startRealtime(reconnecting: false)
@@ -1439,6 +1475,7 @@ final class SyncV2WorkspaceSyncModel: ObservableObject {
             reason: "authentication-state-change"
         )
         pullTask.cancel()
+        await diagnosticLagProbe.finish()
         logTask(
             "realtimeStartTask",
             action: "cancel",
@@ -1527,7 +1564,14 @@ final class SyncV2WorkspaceSyncModel: ObservableObject {
             guard let self else { return }
             let outcome = SyncV2WorkspaceAuthenticationOutcome()
             let restoreTask = Task {
+                let restoreStartedAt =
+                    DispatchTime.now().uptimeNanoseconds
                 let state = await authenticationService.restoreSession()
+                SyncV2PullDiagnostics.record(
+                    stage: "authentication-restore",
+                    phase: "finished",
+                    startedAtNanoseconds: restoreStartedAt
+                )
                 await outcome.resolve(state)
             }
             let timeoutTask = Task {
@@ -1662,6 +1706,7 @@ final class SyncV2WorkspaceSyncModel: ObservableObject {
             periodicTask.cancel()
             logTask("pullTask", action: "cancel", reason: "bindingRemoved")
             pullTask.cancel()
+            await diagnosticLagProbe.finish()
             logTask("realtimeStartTask", action: "cancel", reason: "bindingRemoved")
             realtimeStartTask.cancel()
             logTask("reconnectTask", action: "cancel", reason: "bindingRemoved")
@@ -1689,6 +1734,7 @@ final class SyncV2WorkspaceSyncModel: ObservableObject {
         self.serverProjectID = nil
         logTask("pullTask", action: "cancel", reason: "bindingChanged")
         pullTask.cancel()
+        await diagnosticLagProbe.finish()
         logTask("realtimeStartTask", action: "cancel", reason: "bindingChanged")
         realtimeStartTask.cancel()
         logTask("reconnectTask", action: "cancel", reason: "bindingChanged")
@@ -2003,10 +2049,34 @@ final class SyncV2WorkspaceSyncModel: ObservableObject {
         forceVisibleProgress: Bool = false,
         recordsServerObservation: Bool = true
     ) async {
+        let diagnosticsContext = pendingDiagnosticsContext
+            ?? SyncV2PullDiagnostics.makeContext(origin: "follow-up")
+        await SyncV2PullDiagnostics.withContext(
+            diagnosticsContext
+        ) {
+            await performPullNow(
+                forceVisibleProgress: forceVisibleProgress,
+                recordsServerObservation: recordsServerObservation,
+                diagnosticsContext: diagnosticsContext
+            )
+        }
+    }
+
+    private func performPullNow(
+        forceVisibleProgress: Bool,
+        recordsServerObservation: Bool,
+        diagnosticsContext: SyncV2PullDiagnosticContext?
+    ) async {
         guard isActive, let puller, let serverProjectID else { return }
+        SyncV2PullDiagnostics.record(
+            stage: "pull",
+            phase: "requested"
+        )
         let coordinatorPermit:
             SyncV2ProjectUploadPullCoordinator.PullPermit?
         if let uploadPullCoordinator {
+            let coordinatorStartedAt =
+                DispatchTime.now().uptimeNanoseconds
             let queue = await readUploadQueueSnapshot?(localProjectID)
                 ?? SyncV2UploadQueueSnapshot(retryWaitingCount: 1)
             let bootstrapAllowed = await isBootstrapPullAllowed?(
@@ -2024,12 +2094,22 @@ final class SyncV2WorkspaceSyncModel: ObservableObject {
                     bootstrapAllowed: bootstrapAllowed
                 )
             guard coordinatorPermit != nil else {
+                SyncV2PullDiagnostics.record(
+                    stage: "upload-pull-gate",
+                    phase: "deferred",
+                    startedAtNanoseconds: coordinatorStartedAt
+                )
                 let snapshot = await uploadPullCoordinator.snapshot(
                     localProjectID: localProjectID
                 )
                 applyGateResult(snapshot)
                 return
             }
+            SyncV2PullDiagnostics.record(
+                stage: "upload-pull-gate",
+                phase: "granted",
+                startedAtNanoseconds: coordinatorStartedAt
+            )
         } else {
             coordinatorPermit = nil
         }
@@ -2071,27 +2151,46 @@ final class SyncV2WorkspaceSyncModel: ObservableObject {
             reason: "pullNow"
         )
         let requestID = pullRequestID
+        if pendingDiagnosticsContext?.pullID
+            == diagnosticsContext?.pullID {
+            pendingDiagnosticsContext = nil
+        }
         activeCoordinatorPullPermit = coordinatorPermit
         logTask(
             "pullTask",
             action: "create",
             reason: "pullNow-start"
         )
+        diagnosticLagProbe.start(context: diagnosticsContext)
         pullTask.schedule { [weak self] finish in
             guard let self else { return }
-            let outcome = await self.performPullWithAuthenticationRetry(
-                puller: puller,
-                localProjectID: localProjectID,
-                serverProjectID: serverProjectID,
-                editingGuards: guards
-            )
-            await self.finishPull(
-                outcome,
-                requestID: requestID,
-                generation: generation,
-                coordinatorPermit: coordinatorPermit,
-                finish: finish
-            )
+            await SyncV2PullDiagnostics.withContext(
+                diagnosticsContext
+            ) {
+                SyncV2PullDiagnostics.record(
+                    stage: "pull",
+                    phase: "started"
+                )
+                let outcome = await self
+                    .performPullWithAuthenticationRetry(
+                        puller: puller,
+                        localProjectID: localProjectID,
+                        serverProjectID: serverProjectID,
+                        editingGuards: guards
+                    )
+                await self.finishPull(
+                    outcome,
+                    requestID: requestID,
+                    generation: generation,
+                    coordinatorPermit: coordinatorPermit,
+                    finish: finish
+                )
+                await self.diagnosticLagProbe.finish()
+                SyncV2PullDiagnostics.record(
+                    stage: "pull",
+                    phase: "finished"
+                )
+            }
         }
     }
 
@@ -2123,6 +2222,11 @@ final class SyncV2WorkspaceSyncModel: ObservableObject {
     }
 
     private func refreshWithTimeout() async -> AuthenticationState {
+        let refreshStartedAt = DispatchTime.now().uptimeNanoseconds
+        SyncV2PullDiagnostics.record(
+            stage: "authentication-refresh",
+            phase: "started"
+        )
         let outcome = SyncV2WorkspaceAuthenticationOutcome()
         let authenticationService = self.authenticationService
         let refreshTask = Task {
@@ -2146,6 +2250,11 @@ final class SyncV2WorkspaceSyncModel: ObservableObject {
         let state = await outcome.value()
         refreshTask.cancel()
         timeoutTask.cancel()
+        SyncV2PullDiagnostics.record(
+            stage: "authentication-refresh",
+            phase: "finished",
+            startedAtNanoseconds: refreshStartedAt
+        )
         return state
     }
 
@@ -2369,7 +2478,16 @@ final class SyncV2WorkspaceSyncModel: ObservableObject {
         stalled: [SyncV2StalledFolderChange] = []
     ) {
         if !report.appliedSnapshots.isEmpty {
+            let uiRefreshStartedAt =
+                DispatchTime.now().uptimeNanoseconds
             applyOpenSnapshots?(report.appliedSnapshots)
+            SyncV2PullDiagnostics.record(
+                stage: "ui-snapshot-refresh",
+                phase: "finished",
+                startedAtNanoseconds: uiRefreshStartedAt,
+                rowCount: report.appliedSnapshots.count,
+                changedCount: report.appliedSnapshots.count
+            )
         }
         let mergeOutcomes = report.outcomes.compactMap {
             if case let .mergeRequired(_, _, reason) = $0 {
