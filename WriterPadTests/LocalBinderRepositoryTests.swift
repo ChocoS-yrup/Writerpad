@@ -237,6 +237,141 @@ final class LocalBinderRepositoryTests: XCTestCase {
     }
 
     @MainActor
+    func testOpenDocumentCommandDescriptorsRefreshWithoutReloadingBinder() async throws {
+        let harness = try await makeHarness(projectName: "열린 문서 명령 갱신")
+        let volume = try await harness.commands.addNewVolume(
+            projectID: harness.project.id
+        )
+        let roots = try await harness.binder.rootNodes(in: harness.project.id)
+        let manuscript = try XCTUnwrap(
+            roots.first { $0.fixedCategory == .manuscript }
+        )
+        let volumes = try await harness.binder.children(
+            of: manuscript.id,
+            in: harness.project.id
+        )
+        let firstVolume = try XCTUnwrap(volumes.first)
+        try await harness.binder.setExpanded(true, for: manuscript.id)
+        try await harness.binder.setExpanded(true, for: firstVolume.id)
+        let chapters = try await harness.binder.children(
+            of: firstVolume.id,
+            in: harness.project.id
+        )
+        let firstChapter = try XCTUnwrap(
+            chapters.first { $0.id == volume.firstChapterID }
+        )
+        let fourthChapter = try XCTUnwrap(
+            chapters.first { $0.displayName == "004화" }
+        )
+        try await harness.repository.saveEditorState(
+            EditorWorkspaceState(
+                projectID: harness.project.id,
+                left: EditorPaneState(
+                    documentID: firstChapter.id,
+                    cursor: .start
+                ),
+                right: nil,
+                activePane: .left
+            )
+        )
+        let model = BinderViewModel(
+            repository: harness.binder,
+            commands: harness.commands
+        )
+        await model.load(projectID: harness.project.id)
+
+        XCTAssertFalse(model.descriptor(.rename, for: firstChapter).isEnabled)
+        XCTAssertTrue(model.descriptor(.rename, for: fourthChapter).isEnabled)
+
+        try await harness.repository.saveEditorState(
+            EditorWorkspaceState(
+                projectID: harness.project.id,
+                left: EditorPaneState(
+                    documentID: fourthChapter.id,
+                    cursor: .start
+                ),
+                right: nil,
+                activePane: .left
+            )
+        )
+        await model.refreshCommandDescriptors(
+            forDocumentIDs: [firstChapter.id, fourthChapter.id]
+        )
+
+        XCTAssertTrue(model.descriptor(.rename, for: firstChapter).isEnabled)
+        XCTAssertFalse(model.descriptor(.rename, for: fourthChapter).isEnabled)
+    }
+
+    @MainActor
+    func testClosingSplitRefreshesOnlyDocumentThatIsNoLongerOpen() async throws {
+        let harness = try await makeHarness(projectName: "분할 편집기 명령 갱신")
+        _ = try await harness.commands.addNewVolume(
+            projectID: harness.project.id
+        )
+        let roots = try await harness.binder.rootNodes(in: harness.project.id)
+        let manuscript = try XCTUnwrap(
+            roots.first { $0.fixedCategory == .manuscript }
+        )
+        let volumes = try await harness.binder.children(
+            of: manuscript.id,
+            in: harness.project.id
+        )
+        let firstVolume = try XCTUnwrap(volumes.first)
+        try await harness.binder.setExpanded(true, for: manuscript.id)
+        try await harness.binder.setExpanded(true, for: firstVolume.id)
+        let chapters = try await harness.binder.children(
+            of: firstVolume.id,
+            in: harness.project.id
+        )
+        let firstChapter = try XCTUnwrap(
+            chapters.first { $0.displayName == "001화" }
+        )
+        let fourthChapter = try XCTUnwrap(
+            chapters.first { $0.displayName == "004화" }
+        )
+        try await harness.repository.saveEditorState(
+            EditorWorkspaceState(
+                projectID: harness.project.id,
+                left: EditorPaneState(
+                    documentID: firstChapter.id,
+                    cursor: .start
+                ),
+                right: EditorPaneState(
+                    documentID: fourthChapter.id,
+                    cursor: .start
+                ),
+                activePane: .right
+            )
+        )
+        let model = BinderViewModel(
+            repository: harness.binder,
+            commands: harness.commands
+        )
+        await model.load(projectID: harness.project.id)
+
+        XCTAssertFalse(model.descriptor(.rename, for: firstChapter).isEnabled)
+        XCTAssertFalse(model.descriptor(.rename, for: fourthChapter).isEnabled)
+
+        try await harness.repository.saveEditorState(
+            EditorWorkspaceState(
+                projectID: harness.project.id,
+                left: EditorPaneState(
+                    documentID: fourthChapter.id,
+                    cursor: .start
+                ),
+                right: nil,
+                activePane: .left
+            )
+        )
+        await model.refreshCommandDescriptors(
+            forDocumentIDs: [firstChapter.id]
+        )
+
+        XCTAssertTrue(model.descriptor(.rename, for: firstChapter).isEnabled)
+        XCTAssertFalse(model.descriptor(.rename, for: fourthChapter).isEnabled)
+    }
+
+    @MainActor
     func testBackgroundReloadKeepsVisibleRowsAndSelectionUntilReplacementIsReady()
         async throws {
         let harness = try await makeHarness(projectName: "무깜빡임 갱신")

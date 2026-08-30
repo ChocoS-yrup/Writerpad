@@ -65,6 +65,7 @@ struct BinderPanel: View {
     let projectID: ProjectID
     let allowsKeyboardFocus: Bool
     let refreshGeneration: UInt64
+    let openDocumentIDs: Set<DocumentID>
     let contentStateOverrides: [DocumentID: BinderTextContentState]
     let onSelection: (BinderNode) -> Void
     let onErrorChange: (String?) -> Void
@@ -98,6 +99,7 @@ struct BinderPanel: View {
         editOperation: Binding<BinderEditOperation>,
         allowsKeyboardFocus: Bool = true,
         refreshGeneration: UInt64 = 0,
+        openDocumentIDs: Set<DocumentID> = [],
         contentStateOverrides: [DocumentID: BinderTextContentState] = [:],
         onSelection: @escaping (BinderNode) -> Void = { _ in },
         onErrorChange: @escaping (String?) -> Void = { _ in },
@@ -107,6 +109,7 @@ struct BinderPanel: View {
         self.projectID = projectID
         self.allowsKeyboardFocus = allowsKeyboardFocus
         self.refreshGeneration = refreshGeneration
+        self.openDocumentIDs = openDocumentIDs
         self.contentStateOverrides = contentStateOverrides
         self.onSelection = onSelection
         self.onErrorChange = onErrorChange
@@ -169,6 +172,14 @@ struct BinderPanel: View {
             id: "\(projectID.rawValue.uuidString)-\(refreshGeneration)"
         ) {
             await model.load(projectID: projectID)
+        }
+        .onChange(of: openDocumentIDs) { previous, current in
+            let affectedDocumentIDs = previous.symmetricDifference(current)
+            Task {
+                await model.refreshCommandDescriptors(
+                    forDocumentIDs: affectedDocumentIDs
+                )
+            }
         }
         .alert(
             namePrompt?.title ?? "이름 입력",
@@ -925,6 +936,13 @@ struct BinderPanel: View {
         } else if isManuscriptDescendant(node) {
             commandButton(.rename, node: node, systemImage: "pencil") {
                 beginPrompt(.rename(node))
+            }
+            let descriptor = model.descriptor(.rename, for: node)
+            if !descriptor.isEnabled, let reason = descriptor.denialReason {
+                Divider()
+                Label(reason, systemImage: "info.circle")
+                    .font(.caption)
+                    .disabled(true)
             }
         } else {
             regularBinderContextMenu(for: node)

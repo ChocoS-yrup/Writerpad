@@ -22,6 +22,8 @@ final class BinderViewModel: ObservableObject {
     private let commands: any BinderCommanding
     private var loadedProjectID: ProjectID?
     private var loadGeneration: UInt64 = 0
+    private var pendingCommandDescriptorDocumentIDs: Set<DocumentID> = []
+    private var isRefreshingCommandDescriptors = false
 
     init(repository: any BinderRepository, commands: any BinderCommanding) {
         self.repository = repository
@@ -113,6 +115,45 @@ final class BinderViewModel: ObservableObject {
 
     func select(_ node: BinderNode) {
         selectedNodeID = node.id
+    }
+
+    func refreshCommandDescriptors(forDocumentIDs documentIDs: Set<DocumentID>) async {
+        pendingCommandDescriptorDocumentIDs.formUnion(documentIDs)
+        guard !isRefreshingCommandDescriptors else { return }
+
+        isRefreshingCommandDescriptors = true
+        defer { isRefreshingCommandDescriptors = false }
+
+        while !pendingCommandDescriptorDocumentIDs.isEmpty {
+            guard let projectID = loadedProjectID else {
+                pendingCommandDescriptorDocumentIDs.removeAll()
+                return
+            }
+            let generation = loadGeneration
+            let loadedIDs = Set(
+                (roots + childrenByParent.values.flatMap { $0 }).map(\.id)
+            )
+            let pendingIDs = pendingCommandDescriptorDocumentIDs
+            pendingCommandDescriptorDocumentIDs.removeAll()
+            let requestedIDs = pendingIDs.intersection(loadedIDs)
+            guard !requestedIDs.isEmpty else { continue }
+
+            do {
+                let refreshed = try await commands.commandDescriptors(
+                    for: Array(requestedIDs),
+                    in: projectID
+                )
+                guard loadedProjectID == projectID,
+                      loadGeneration == generation
+                else { continue }
+                commandDescriptorsByDocument.merge(refreshed) { _, new in new }
+            } catch {
+                guard loadedProjectID == projectID,
+                      loadGeneration == generation
+                else { continue }
+                errorMessage = error.localizedDescription
+            }
+        }
     }
 
     func prepareDisclosureState(for node: BinderNode) async {

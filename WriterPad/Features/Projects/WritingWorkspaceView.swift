@@ -108,6 +108,7 @@ struct WritingWorkspaceShell: View {
     @State private var liveBinderWidth: CGFloat?
     @State private var binderContentStateOverrides: [DocumentID: BinderTextContentState] = [:]
     @State private var binderSnapshotRefreshGeneration: UInt64 = 0
+    @State private var binderOpenDocumentIDs: Set<DocumentID> = []
     /// 방향 관찰자가 첫 값을 전달하기 전에는 분할을 노출하지 않는 안전한 기본값을 사용한다.
     @State private var usesCompactLayout = true
     /// 사용자가 선택한 분할 선호다. 세로·좁은 창에서는 표시만 숨기고 이 값은 보존한다.
@@ -274,6 +275,7 @@ struct WritingWorkspaceShell: View {
                                     || usesCompactLayoutForCurrentSize,
                                 refreshGeneration:
                                     binderSnapshotRefreshGeneration,
+                                openDocumentIDs: binderOpenDocumentIDs,
                                 contentStateOverrides: binderContentStateOverrides,
                                 onSelection: { node in
                                     Task { await handleBinderSelection(node) }
@@ -2045,6 +2047,7 @@ struct WritingWorkspaceShell: View {
             if state != savedState {
                 try await storageCoordinator.saveWorkspaceState(state)
             }
+            binderOpenDocumentIDs = openDocumentIDs(in: state)
         } catch {
             notice = .workspaceStateFailure
         }
@@ -2289,6 +2292,13 @@ struct WritingWorkspaceShell: View {
             )
         }
         try await storageCoordinator.saveWorkspaceState(state)
+        binderOpenDocumentIDs = openDocumentIDs(in: state)
+    }
+
+    private func openDocumentIDs(
+        in state: EditorWorkspaceState
+    ) -> Set<DocumentID> {
+        Set([state.left.documentID, state.right?.documentID].compactMap { $0 })
     }
 
     private var editorAppearance: EditorAppearanceSettings {
