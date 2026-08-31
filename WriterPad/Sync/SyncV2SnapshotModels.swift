@@ -309,6 +309,14 @@ struct SyncV2SnapshotPullReport: Equatable, Sendable {
     /// 아직 완료되지 않아 다음 Realtime snapshot을 기다리는 건수다.
     /// 로컬 자료 위험과는 다르므로 rejectedStructureNames에 섞지 않는다.
     var pendingChildTombstoneFolderCount: Int = 0
+    /// 서버 snapshot은 받았지만 열린 clean 문서를 보호하느라 tombstone을
+    /// 로컬에 아직 적용하지 못한 항목 수다. coordinator가 서버 세대 수신과
+    /// 로컬 적용 완료를 구분하는 데 사용한다.
+    var deferredLocalApplicationCount: Int = 0
+
+    var hasDeferredLocalApplication: Bool {
+        deferredLocalApplicationCount > 0
+    }
 }
 
 /// 거부를 사용자에게 어떻게 말해야 하는지 가른다.

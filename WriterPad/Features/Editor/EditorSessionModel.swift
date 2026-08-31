@@ -692,7 +692,7 @@ final class EditorSessionModel: ObservableObject {
                 compositionCommitRequest &+= 1
             }
             await completePendingSelectionIfPossible()
-            if !isReadOnly, hasUnsavedChanges {
+            if !isReadOnly {
                 await synchronizeEditLease(to: currentDocumentID)
             }
         }
@@ -1102,8 +1102,10 @@ final class EditorSessionModel: ObservableObject {
         if isUnsavedDraft, !isReadOnly {
             markDirtyAndScheduleAutosave()
         }
-        if shouldReleasePreviousLease {
-            await synchronizeEditLease(to: nil)
+        if shouldReleasePreviousLease || leaseTrackedDocumentID != documentID {
+            await synchronizeEditLease(
+                to: isSceneActive && !isReadOnly ? documentID : nil
+            )
         }
     }
 
@@ -1112,7 +1114,7 @@ final class EditorSessionModel: ObservableObject {
     }
 
     func resumeEditLease() async {
-        guard isSceneActive, !isReadOnly, hasUnsavedChanges else { return }
+        guard isSceneActive, !isReadOnly else { return }
         await synchronizeEditLease(to: currentDocumentID)
     }
 

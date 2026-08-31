@@ -509,6 +509,40 @@ final class AppEnvironmentTests: XCTestCase {
         }
     }
 
+    func testHiddenSplitPaneIsExcludedFromSyncEditingGuards() {
+        let leftID = DocumentID(rawValue: UUID())
+        let hiddenRightID = DocumentID(rawValue: UUID())
+        let left = SyncEditingPaneState(
+            documentID: leftID,
+            isDirty: false,
+            isComposing: false
+        )
+        let right = SyncEditingPaneState(
+            documentID: hiddenRightID,
+            isDirty: false,
+            isComposing: false
+        )
+
+        let singlePane = SyncEditingGuardCollector.collect(
+            left: left,
+            right: right,
+            showsSplit: false,
+            activePaneIsLeft: true
+        )
+        XCTAssertEqual(Set(singlePane.keys), [leftID.rawValue])
+
+        let visibleSplit = SyncEditingGuardCollector.collect(
+            left: left,
+            right: right,
+            showsSplit: true,
+            activePaneIsLeft: true
+        )
+        XCTAssertEqual(
+            Set(visibleSplit.keys),
+            [leftID.rawValue, hiddenRightID.rawValue]
+        )
+    }
+
     func testLandscapeDevicePresentsSplitOnlyAtSufficientWidth() {
         XCTAssertFalse(
             DualEditorLayoutPolicy.usesCompactLayout(

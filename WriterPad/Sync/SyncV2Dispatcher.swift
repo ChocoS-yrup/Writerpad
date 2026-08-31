@@ -651,6 +651,7 @@ actor SyncV2ProjectUploadPullCoordinator {
         let runningUploadCount: Int
         let runningPullCount: Int
         let lastPullSucceeded: Bool
+        let deferredApplicationGeneration: UInt64?
 
         var pendingServerGenerationCount: UInt64 {
             observedGeneration >= pulledGeneration
@@ -664,6 +665,7 @@ actor SyncV2ProjectUploadPullCoordinator {
                 && runningUploadCount == 0
                 && runningPullCount == 0
                 && pendingServerGenerationCount == 0
+                && deferredApplicationGeneration == nil
                 && phase == .idle
                 && lastPullSucceeded
         }
@@ -695,6 +697,7 @@ actor SyncV2ProjectUploadPullCoordinator {
         var uploadPermitID: UUID?
         var pullPermitID: UUID?
         var pullGeneration: UInt64?
+        var deferredApplicationGeneration: UInt64?
         var lastPullSucceeded = false
     }
 
@@ -834,10 +837,25 @@ actor SyncV2ProjectUploadPullCoordinator {
         return permit
     }
 
+    /// 열린 편집기 guard가 바뀐 경우에만 같은 서버 세대의 로컬 적용을 다시
+    /// 허가한다. 여러 pane 통지가 겹쳐도 첫 통지만 보류 표식을 소비한다.
+    @discardableResult
+    func resumeDeferredApplication(localProjectID: ProjectID) -> Bool {
+        var entry = entries[localProjectID] ?? Entry()
+        guard entry.deferredApplicationGeneration != nil else {
+            return false
+        }
+        entry.deferredApplicationGeneration = nil
+        entries[localProjectID] = entry
+        signalStateChanged()
+        return true
+    }
+
     @discardableResult
     func finishPull(
         _ permit: PullPermit,
         succeeded: Bool,
+        localApplicationDeferred: Bool = false,
         queue: SyncV2UploadQueueSnapshot
     ) -> Snapshot {
         var entry = entries[permit.localProjectID] ?? Entry()
@@ -848,7 +866,10 @@ actor SyncV2ProjectUploadPullCoordinator {
         entry.pullGeneration = nil
         entry.queue = queue
         entry.lastPullSucceeded = succeeded
-        if succeeded {
+        if succeeded && localApplicationDeferred {
+            entry.deferredApplicationGeneration = permit.generation
+        } else if succeeded {
+            entry.deferredApplicationGeneration = nil
             entry.pulledGeneration = max(
                 entry.pulledGeneration,
                 permit.generation
@@ -859,7 +880,13 @@ actor SyncV2ProjectUploadPullCoordinator {
         if queue.pendingCount > 0 {
             signalUploadReady()
         }
-        signalStateChanged()
+        // 열린 문서 때문에 같은 세대의 로컬 적용이 보류된 동안에는 handler를
+        // 깨우지 않는다. 여기서 깨우면 permit은 거절되지만 화면 결과가
+        // `reconcilingStructure`에서 일반 waiting으로 덮이고, 불필요한 pull
+        // 시도도 한 번 생긴다. guard 변경이 resume을 소비할 때만 깨운다.
+        if entry.deferredApplicationGeneration == nil {
+            signalStateChanged()
+        }
         return makeSnapshot(entry)
     }
 
@@ -873,6 +900,7 @@ actor SyncV2ProjectUploadPullCoordinator {
         bootstrapAllowed: Bool
     ) -> PullPermit? {
         guard entry.observedGeneration > entry.pulledGeneration,
+              entry.deferredApplicationGeneration == nil,
               entry.pullPermitID == nil,
               entry.uploadPermitID == nil,
               entry.enqueueReservations.isEmpty
@@ -938,7 +966,9 @@ actor SyncV2ProjectUploadPullCoordinator {
             enqueueReservationCount: entry.enqueueReservations.count,
             runningUploadCount: entry.uploadPermitID == nil ? 0 : 1,
             runningPullCount: entry.pullPermitID == nil ? 0 : 1,
-            lastPullSucceeded: entry.lastPullSucceeded
+            lastPullSucceeded: entry.lastPullSucceeded,
+            deferredApplicationGeneration:
+                entry.deferredApplicationGeneration
         )
     }
 }

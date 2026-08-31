@@ -140,6 +140,7 @@ actor SyncV2SnapshotPullService: SyncV2SnapshotPulling {
     private let folderMarker: (any SyncV2FolderMigrationMarking)?
     private let folderDocuments: (any DocumentRepository)?
     private let mergeStore: any SyncV2SnapshotMergeStoring
+    private let leaseManager: (any EditLeaseManaging)?
     private let mutationGate: SyncV2DocumentMutationGate
 
     init(
@@ -151,6 +152,7 @@ actor SyncV2SnapshotPullService: SyncV2SnapshotPulling {
         folderMigration: SyncV2FolderMigration? = nil,
         folderMarker: (any SyncV2FolderMigrationMarking)? = nil,
         folderDocuments: (any DocumentRepository)? = nil,
+        leaseManager: (any EditLeaseManaging)? = nil,
         mutationGate: SyncV2DocumentMutationGate =
             SyncV2DocumentMutationGate()
     ) {
@@ -162,6 +164,7 @@ actor SyncV2SnapshotPullService: SyncV2SnapshotPulling {
         self.folderMarker = folderMarker
         self.folderDocuments = folderDocuments
         self.mergeStore = mergeStore
+        self.leaseManager = leaseManager
         self.mutationGate = mutationGate
     }
 
@@ -197,6 +200,20 @@ actor SyncV2SnapshotPullService: SyncV2SnapshotPulling {
         let ordinarySnapshots = snapshots.filter {
             $0.relativePath != syncV2TreeOrderPath
                 && $0.relativePath != syncV2TrashPurgePath
+        }
+        if let leaseManager {
+            for snapshot in ordinarySnapshots {
+                if snapshot.isDeleted {
+                    await leaseManager.documentBecameTombstone(
+                        documentID: snapshot.documentID
+                    )
+                } else {
+                    await leaseManager.ensureLeaseForActiveLiveDocument(
+                        documentID: snapshot.documentID,
+                        serverRevision: snapshot.revision
+                    )
+                }
+            }
         }
         let remoteLiveDocumentPaths = Set(
             ordinarySnapshots
@@ -669,7 +686,13 @@ actor SyncV2SnapshotPullService: SyncV2SnapshotPulling {
             appliedSnapshots: appliedSnapshots,
             rejectedStructureNames: rejectedStructureNames,
             pendingChildTombstoneFolderCount:
-                folderReport.pendingChildTombstoneFolderIDs.count
+                folderReport.pendingChildTombstoneFolderIDs.count,
+            deferredLocalApplicationCount: outcomes.reduce(into: 0) {
+                count, outcome in
+                if case .mergeRequired(_, _, .remoteDeletion) = outcome {
+                    count += 1
+                }
+            }
         )
         SyncV2PullDiagnostics.record(
             stage: "snapshot-service",
@@ -698,13 +721,19 @@ actor SyncV2SnapshotPullService: SyncV2SnapshotPulling {
             uniquingKeysWith: { first, _ in first }
         )
         let remoteFolderIDs = Set(remoteFolders.map(\.folderID))
-        let safelyProcessedDocumentIDs = Set(outcomes.compactMap { outcome in
+        let safelyProcessedDocumentIDs: Set<UUID> = Set(
+            outcomes.compactMap { outcome -> UUID? in
             switch outcome {
             case let .applied(documentID, _, _),
                  let .upToDate(documentID, _):
-                documentID
-            case .mergeRequired:
-                nil
+                return documentID
+            case let .mergeRequired(documentID, revision, reason):
+                guard reason == .remoteDeletion,
+                      let snapshot = snapshotsByID[documentID],
+                      snapshot.isDeleted,
+                      snapshot.revision == revision
+                else { return nil }
+                return documentID
             }
         })
         var waiting: Set<DocumentID> = []

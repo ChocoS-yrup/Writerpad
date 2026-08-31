@@ -363,6 +363,7 @@ final class AppEnvironment: ObservableObject {
                 },
                 folderMarker: folderMigrationMarker,
                 folderDocuments: repository,
+                leaseManager: editLeaseManager,
                 mutationGate: syncMutationGate
             )
         } else {

@@ -4687,7 +4687,9 @@ final class SyncV2SnapshotPullTests: XCTestCase {
         XCTAssertGreaterThanOrEqual(stopCount, 1)
 
         await model.updateSceneActivity(true)
-        try await Task.sleep(for: .milliseconds(80))
+        for _ in 0..<100 where await puller.count() < 4 {
+            try await Task.sleep(for: .milliseconds(10))
+        }
         pullCount = await puller.count()
         XCTAssertEqual(pullCount, 4)
         await model.stop()
@@ -7027,6 +7029,26 @@ final class SyncV2SnapshotPullTests: XCTestCase {
         XCTAssertFalse(fixture.exists(fixture.folderPath))
     }
 
+    func testCleanOpenChildTombstoneIsPendingWithoutFolderWarning()
+        async throws {
+        let fixture = try FolderTombstonePullFixture()
+        defer { fixture.removeWorkspace() }
+
+        let report = try await fixture.pull(
+            childIsDeleted: true,
+            childEditingGuard: SyncV2EditingGuard(
+                isOpen: true,
+                isDirty: false,
+                isComposing: false
+            )
+        )
+
+        XCTAssertEqual(report.pendingChildTombstoneFolderCount, 1)
+        XCTAssertTrue(report.rejectedStructureNames.isEmpty)
+        XCTAssertTrue(fixture.exists(fixture.childPath))
+        XCTAssertTrue(fixture.exists(fixture.folderPath))
+    }
+
     func testPendingLocalChildIsNotMisclassifiedAsTombstoneWaiting()
         async throws {
         let fixture = try FolderTombstonePullFixture()
@@ -7063,6 +7085,104 @@ final class SyncV2SnapshotPullTests: XCTestCase {
         XCTAssertEqual(report.rejectedStructureNames.count, 1)
         XCTAssertTrue(fixture.exists(fixture.folderPath + "/새 로컬.txt"))
         XCTAssertTrue(fixture.exists(fixture.folderPath))
+    }
+
+    @MainActor
+    func testClosingDeferredOpenDocumentTriggersOneImmediateSameGenerationPull()
+        async throws {
+        let previous = GlobalSyncPreference.isEnabled()
+        GlobalSyncPreference.setEnabled(true)
+        defer { GlobalSyncPreference.setEnabled(previous) }
+        let localProjectID = ProjectID(rawValue: UUID())
+        let deferredDocumentID = UUID()
+        let deferredReport = SyncV2SnapshotPullReport(
+            outcomes: [
+                .mergeRequired(
+                    documentID: deferredDocumentID,
+                    revision: 5,
+                    reason: .remoteDeletion
+                ),
+            ],
+            appliedSnapshots: [],
+            pendingChildTombstoneFolderCount: 1,
+            deferredLocalApplicationCount: 1
+        )
+        let puller = SequencedWorkspacePuller(
+            outcomes: [
+                .success(deferredReport),
+                .success(
+                    SyncV2SnapshotPullReport(
+                        outcomes: [
+                            .applied(
+                                documentID: deferredDocumentID,
+                                revision: 5,
+                                wasOpen: false
+                            ),
+                        ],
+                        appliedSnapshots: []
+                    )
+                ),
+            ]
+        )
+        let coordinator = SyncV2ProjectUploadPullCoordinator()
+        let model = SyncV2WorkspaceSyncModel(
+            localProjectID: localProjectID,
+            puller: puller,
+            realtime: nil,
+            authenticationService: WorkspaceAuthenticationStub(
+                state: .authenticated(
+                    AuthenticatedAccount(userID: UUID(), maskedEmail: nil)
+                )
+            ),
+            projectBindingService: WorkspaceBindingStub(
+                binding: .connected(
+                    localProjectID: localProjectID,
+                    serverProjectID: UUID(),
+                    kind: .existingServerProject,
+                    projectName: "deferred application",
+                    ownerSubject: UUID()
+                )
+            ),
+            uploadPullCoordinator: coordinator,
+            readUploadQueueSnapshot: { _ in .idle },
+            isBootstrapPullAllowed: { _ in false },
+            periodicDelay: .seconds(600)
+        )
+
+        await model.start(editingGuards: {
+            [
+                deferredDocumentID: SyncV2EditingGuard(
+                    isOpen: true,
+                    isDirty: false,
+                    isComposing: false
+                ),
+            ]
+        }) { _ in }
+        for _ in 0..<500 where await puller.count() < 1 {
+            await Task.yield()
+        }
+        guard case .reconcilingStructure(count: 1) = model.state.lastResult
+        else {
+            await model.stop()
+            return XCTFail("보류 중에는 동기화 정리 중이어야 합니다.")
+        }
+
+        await model.editingGuardsDidChange()
+        await model.editingGuardsDidChange()
+        await model.editingGuardsDidChange()
+        for _ in 0..<500 where await puller.count() < 2 {
+            await Task.yield()
+        }
+        try await Task.sleep(for: .milliseconds(20))
+
+        let pullCount = await puller.count()
+        XCTAssertEqual(pullCount, 2)
+        if case .synced = model.state.lastResult {
+            // expected
+        } else {
+            XCTFail("guard 해제 재적용 뒤 synced여야 합니다: \(model.state)")
+        }
+        await model.stop()
     }
 
     @MainActor
@@ -7197,7 +7317,8 @@ private final class FolderTombstonePullFixture {
     func pull(
         childIsDeleted: Bool,
         childHasPendingOperation: Bool = false,
-        injectNewChildAfterApply: Bool = false
+        injectNewChildAfterApply: Bool = false,
+        childEditingGuard: SyncV2EditingGuard? = nil
     ) async throws -> SyncV2SnapshotPullReport {
         let workspace = SnapshotWorkspaceLocator(root: root)
         let states: [UUID: SyncV2SnapshotLocalState] =
@@ -7265,7 +7386,10 @@ private final class FolderTombstonePullFixture {
         )
         return try await service.pull(
             localProjectID: projectID,
-            serverProjectID: projectID.rawValue
+            serverProjectID: projectID.rawValue,
+            editingGuards: childEditingGuard.map {
+                [childID.rawValue: $0]
+            } ?? [:]
         )
     }
 
@@ -9794,6 +9918,62 @@ private actor FolderIdentityPublisherSpy: SyncV2FolderIdentityPublishing {
 }
 
 final class SyncV2ProjectUploadPullCoordinatorTests: XCTestCase {
+    func testDeferredLocalApplicationRetriesSameGenerationExactlyOnce()
+        async throws {
+        let coordinator = SyncV2ProjectUploadPullCoordinator()
+        let projectID = ProjectID(rawValue: UUID())
+        let firstCandidate = await coordinator.observeServerChange(
+            localProjectID: projectID,
+            queue: .idle,
+            bootstrapAllowed: false
+        )
+        let first = try XCTUnwrap(firstCandidate)
+
+        var snapshot = await coordinator.finishPull(
+            first,
+            succeeded: true,
+            localApplicationDeferred: true,
+            queue: .idle
+        )
+        XCTAssertEqual(snapshot.pulledGeneration, 0)
+        XCTAssertEqual(snapshot.deferredApplicationGeneration, 1)
+        XCTAssertFalse(snapshot.isServerSynced)
+        let blockedRetry = await coordinator.beginDeferredPull(
+            localProjectID: projectID,
+            queue: .idle,
+            bootstrapAllowed: false
+        )
+        XCTAssertNil(blockedRetry)
+
+        let firstResume = await coordinator.resumeDeferredApplication(
+            localProjectID: projectID
+        )
+        let duplicateResume = await coordinator.resumeDeferredApplication(
+            localProjectID: projectID
+        )
+        XCTAssertTrue(firstResume)
+        XCTAssertFalse(duplicateResume)
+        let retryCandidate = await coordinator.beginDeferredPull(
+            localProjectID: projectID,
+            queue: .idle,
+            bootstrapAllowed: false
+        )
+        let retry = try XCTUnwrap(retryCandidate)
+        XCTAssertEqual(retry.generation, first.generation)
+        snapshot = await coordinator.finishPull(
+            retry,
+            succeeded: true,
+            queue: .idle
+        )
+        XCTAssertTrue(snapshot.isServerSynced)
+        let third = await coordinator.beginDeferredPull(
+            localProjectID: projectID,
+            queue: .idle,
+            bootstrapAllowed: false
+        )
+        XCTAssertNil(third)
+    }
+
     @MainActor
     func testWorkspaceRealtimeDoesNotPullUntilUploadLaneFinishes()
         async throws {

@@ -1017,7 +1017,7 @@ actor SyncV2Store:
             """
             SELECT server_revision
             FROM sync_documents
-            WHERE document_id = ?
+            WHERE document_id = ? AND is_deleted = 0
             LIMIT 1;
             """
         ) { statement in

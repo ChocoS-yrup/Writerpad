@@ -469,7 +469,7 @@ final class EditLeaseManagerTests: XCTestCase {
     }
 
     @MainActor
-    func testViewingDocumentAcquiresLeaseOnlyAfterFirstMutation()
+    func testViewingServerLiveDocumentAcquiresLeaseBeforeFirstMutation()
         async throws {
         let environment = try AppEnvironment.testing()
         let project = try await environment.projectManager.createProject(
@@ -513,9 +513,14 @@ final class EditLeaseManagerTests: XCTestCase {
         )
 
         await model.select(node)
-        XCTAssertEqual(model.editLeaseState, .localOnly)
+        await waitUntil {
+            if case .held = model.editLeaseState {
+                return true
+            }
+            return false
+        }
         var acquireCount = await client.acquireCount()
-        XCTAssertEqual(acquireCount, 0)
+        XCTAssertEqual(acquireCount, 1)
 
         model.updateText("첫 수정")
         await waitUntil {
@@ -787,6 +792,116 @@ final class EditLeaseManagerTests: XCTestCase {
         XCTAssertEqual(finalReleaseCount, 1)
     }
 
+    func testLocalOnlyActiveReferencePromotesToLiveWithoutReferenceLeak()
+        async {
+        let documentID = UUID()
+        let deviceID = UUID()
+        let client = EditLeaseClientStub()
+        let manager = EditLeaseManager(
+            client: client,
+            revisionProvider: FixedRevisionProvider(revision: 0),
+            deviceIdentityProvider: FixedDeviceIdentityProvider(
+                identifier: DeviceIdentifier(uuid: deviceID)
+            )
+        )
+
+        _ = await manager.beginEditing(documentID: documentID)
+        await manager.ensureLeaseForActiveLiveDocument(
+            documentID: documentID,
+            serverRevision: 4
+        )
+        await manager.ensureLeaseForActiveLiveDocument(
+            documentID: documentID,
+            serverRevision: 4
+        )
+        let acquireCount = await client.acquireCount()
+        XCTAssertEqual(acquireCount, 1)
+
+        await manager.endEditing(documentID: documentID)
+        await waitForRelease(1, client: client)
+        let releaseCount = await client.releaseCount()
+        XCTAssertEqual(releaseCount, 1)
+    }
+
+    func testTombstoneInvalidatesLeaseAndLiveRestoreReacquiresOnce()
+        async {
+        let documentID = UUID()
+        let deviceID = UUID()
+        let client = EditLeaseClientStub()
+        let manager = EditLeaseManager(
+            client: client,
+            revisionProvider: FixedRevisionProvider(revision: 3),
+            deviceIdentityProvider: FixedDeviceIdentityProvider(
+                identifier: DeviceIdentifier(uuid: deviceID)
+            )
+        )
+
+        _ = await manager.beginEditing(documentID: documentID)
+        await manager.documentBecameTombstone(documentID: documentID)
+        await manager.ensureLeaseForActiveLiveDocument(
+            documentID: documentID,
+            serverRevision: 4
+        )
+        await manager.ensureLeaseForActiveLiveDocument(
+            documentID: documentID,
+            serverRevision: 4
+        )
+
+        let acquireCount = await client.acquireCount()
+        XCTAssertEqual(acquireCount, 2)
+        await manager.endEditing(documentID: documentID)
+        await waitForRelease(1, client: client)
+        let releaseCount = await client.releaseCount()
+        XCTAssertEqual(releaseCount, 1)
+    }
+
+    func testStaleAcquireResponseCannotOverwriteRestoredLiveLease()
+        async {
+        let documentID = UUID()
+        let deviceID = UUID()
+        let client = ControlledAcquireLeaseClient()
+        let manager = EditLeaseManager(
+            client: client,
+            revisionProvider: FixedRevisionProvider(revision: 3),
+            deviceIdentityProvider: FixedDeviceIdentityProvider(
+                identifier: DeviceIdentifier(uuid: deviceID)
+            )
+        )
+
+        let initial = Task {
+            await manager.beginEditing(documentID: documentID)
+        }
+        await client.waitForAcquireCount(1)
+        await manager.documentBecameTombstone(documentID: documentID)
+        let restored = Task {
+            await manager.ensureLeaseForActiveLiveDocument(
+                documentID: documentID,
+                serverRevision: 4
+            )
+        }
+        await client.waitForAcquireCount(2)
+
+        await client.completeAcquire(2)
+        await restored.value
+        await client.completeAcquire(1)
+        _ = await initial.value
+
+        let state = await manager.state(
+            documentID: documentID,
+            deviceID: deviceID
+        )
+        if case .held = state {
+            // expected
+        } else {
+            XCTFail("낡은 acquire 응답이 복원 lease를 덮었습니다: \(String(describing: state))")
+        }
+        await waitForControlledRelease(1, client: client)
+        let staleReleaseCount = await client.releaseCount()
+        XCTAssertEqual(staleReleaseCount, 1)
+        await manager.endEditing(documentID: documentID)
+        await waitForControlledRelease(2, client: client)
+    }
+
     func testDocumentTransitionDoesNotWaitForLeaseReleaseNetwork()
         async {
         let documentID = UUID()
@@ -937,7 +1052,7 @@ final class EditLeaseManagerTests: XCTestCase {
         await manager.endEditing(documentID: documentID)
     }
 
-    func testMissingServerDocumentUsesRecoveringStateAndReacquiresAfterCreate()
+    func testMissingServerDocumentWaitsForLiveRestoreBeforeReacquiring()
         async {
         let documentID = UUID()
         let deviceID = UUID()
@@ -959,10 +1074,9 @@ final class EditLeaseManagerTests: XCTestCase {
             documentID: documentID
         )
         await client.setAcquireError(nil)
-        await manager.commitSucceeded(
+        await manager.ensureLeaseForActiveLiveDocument(
             documentID: documentID,
-            deviceID: deviceID,
-            isDeleted: false
+            serverRevision: 2
         )
         let recoveredState = await manager.state(
             documentID: documentID,
@@ -971,7 +1085,7 @@ final class EditLeaseManagerTests: XCTestCase {
         let acquireCount = await client.acquireCount()
         await manager.endEditing(documentID: documentID)
 
-        XCTAssertEqual(missingState, .offlineEditing)
+        XCTAssertEqual(missingState, .unavailable)
         if case .held = recoveredState {
             // expected
         } else {
@@ -984,7 +1098,7 @@ final class EditLeaseManagerTests: XCTestCase {
     }
 
     @MainActor
-    func testEditorRefreshesOfflineLeaseAfterServerDocumentRecovery()
+    func testEditorRefreshesLeaseAfterServerDocumentLiveRestore()
         async throws {
         let environment = try AppEnvironment.testing()
         let project = try await environment.projectManager.createProject(
@@ -1035,20 +1149,18 @@ final class EditLeaseManagerTests: XCTestCase {
         )
 
         await model.select(node)
-        model.updateText("복구 후 동기화")
         for _ in 0..<100 {
-            if model.editLeaseState == .offlineEditing {
+            if model.editLeaseState == .unavailable {
                 break
             }
             try await Task.sleep(for: .milliseconds(2))
         }
-        XCTAssertEqual(model.editLeaseState, .offlineEditing)
+        XCTAssertEqual(model.editLeaseState, .unavailable)
 
         await client.setAcquireError(nil)
-        await manager.commitSucceeded(
+        await manager.ensureLeaseForActiveLiveDocument(
             documentID: document.id.rawValue,
-            deviceID: deviceID,
-            isDeleted: false
+            serverRevision: 2
         )
         for _ in 0..<100 {
             if case .held = model.editLeaseState {
@@ -1087,6 +1199,121 @@ final class EditLeaseManagerTests: XCTestCase {
         await manager.endEditing(documentID: documentID)
 
         XCTAssertEqual(renewCount, 1)
+    }
+
+    func testHeartbeatLeaseExpiredReacquiresExactlyOnce() async {
+        let documentID = UUID()
+        let deviceID = UUID()
+        let client = EditLeaseClientStub(
+            renewalErrors: [
+                .remote(code: .leaseExpired, detail: nil),
+            ]
+        )
+        let sleeper = OneShotLeaseSleeper()
+        let manager = EditLeaseManager(
+            client: client,
+            revisionProvider: FixedRevisionProvider(revision: 2),
+            deviceIdentityProvider: FixedDeviceIdentityProvider(
+                identifier: DeviceIdentifier(uuid: deviceID)
+            ),
+            sleep: { duration in
+                try await sleeper.sleep(duration)
+            }
+        )
+
+        _ = await manager.beginEditing(documentID: documentID)
+        await sleeper.waitUntilSleeping()
+        await sleeper.wake()
+        await waitForAcquire(2, client: client)
+
+        let acquireCount = await client.acquireCount()
+        let state = await manager.state(
+            documentID: documentID,
+            deviceID: deviceID
+        )
+        XCTAssertEqual(acquireCount, 2)
+        if case .held = state {
+            // expected
+        } else {
+            XCTFail("leaseExpired 뒤 한 번 재획득해야 합니다: \(String(describing: state))")
+        }
+        await manager.endEditing(documentID: documentID)
+    }
+
+    func testHeartbeatLeaseConflictWaitsUntilExpiryBeforeSingleRetry()
+        async {
+        let documentID = UUID()
+        let deviceID = UUID()
+        let client = EditLeaseClientStub(
+            renewalErrors: [
+                .remote(
+                    code: .leaseConflict,
+                    detail: #"{"expires_at":"1970-01-01T00:16:50Z"}"#
+                ),
+            ]
+        )
+        let sleeper = ManualLeaseSleeper()
+        let manager = EditLeaseManager(
+            client: client,
+            revisionProvider: FixedRevisionProvider(revision: 2),
+            deviceIdentityProvider: FixedDeviceIdentityProvider(
+                identifier: DeviceIdentifier(uuid: deviceID)
+            ),
+            now: { Date(timeIntervalSince1970: 1_000) },
+            sleep: { duration in
+                try await sleeper.sleep(duration)
+            }
+        )
+
+        _ = await manager.beginEditing(documentID: documentID)
+        await sleeper.waitForCallCount(1)
+        await sleeper.wakeNext()
+        await sleeper.waitForCallCount(2)
+        let beforeExpiry = await client.acquireCount()
+        let delays = await sleeper.recordedDurations()
+        XCTAssertEqual(beforeExpiry, 1)
+        XCTAssertEqual(delays.last, .seconds(10))
+
+        await sleeper.wakeNext()
+        await waitForAcquire(2, client: client)
+        let afterExpiry = await client.acquireCount()
+        XCTAssertEqual(afterExpiry, 2)
+        await manager.endEditing(documentID: documentID)
+    }
+
+    func testHeartbeatNetworkFailureRecoversWithoutConnectivityTransition()
+        async {
+        let documentID = UUID()
+        let deviceID = UUID()
+        let client = EditLeaseClientStub(
+            renewalErrors: [.networkUnavailable]
+        )
+        let sleeper = ManualLeaseSleeper()
+        let manager = EditLeaseManager(
+            client: client,
+            revisionProvider: FixedRevisionProvider(revision: 2),
+            deviceIdentityProvider: FixedDeviceIdentityProvider(
+                identifier: DeviceIdentifier(uuid: deviceID)
+            ),
+            sleep: { duration in
+                try await sleeper.sleep(duration)
+            }
+        )
+
+        _ = await manager.beginEditing(documentID: documentID)
+        await sleeper.waitForCallCount(1)
+        await sleeper.wakeNext()
+        await sleeper.waitForCallCount(2)
+        let delays = await sleeper.recordedDurations()
+        XCTAssertEqual(delays.last, .seconds(1))
+        let beforeRetry = await client.acquireCount()
+        XCTAssertEqual(beforeRetry, 1)
+
+        await sleeper.wakeNext()
+        await waitForAcquire(2, client: client)
+        let afterRetry = await client.acquireCount()
+        XCTAssertEqual(afterRetry, 2)
+        await manager.endEditing(documentID: documentID)
     }
 
     @MainActor
@@ -1212,9 +1439,7 @@ final class EditLeaseManagerTests: XCTestCase {
         XCTAssertEqual(model.editLeaseState, .localOnly)
 
         connectivity.send(isConnected: false)
-        await waitUntil {
-            model.editLeaseState == .offlineEditing
-        }
+        await waitForLeaseState(model) { $0 == .offlineEditing }
 
         XCTAssertEqual(model.editLeaseState, .offlineEditing)
     }
@@ -1250,6 +1475,30 @@ final class EditLeaseManagerTests: XCTestCase {
         client: EditLeaseClientStub
     ) async {
         for _ in 0..<100 {
+            if await client.releaseCount() >= expectedCount {
+                return
+            }
+            await Task.yield()
+        }
+    }
+
+    private func waitForAcquire(
+        _ expectedCount: Int,
+        client: EditLeaseClientStub
+    ) async {
+        for _ in 0..<200 {
+            if await client.acquireCount() >= expectedCount {
+                return
+            }
+            await Task.yield()
+        }
+    }
+
+    private func waitForControlledRelease(
+        _ expectedCount: Int,
+        client: ControlledAcquireLeaseClient
+    ) async {
+        for _ in 0..<200 {
             if await client.releaseCount() >= expectedCount {
                 return
             }
@@ -3911,6 +4160,104 @@ private struct FixedDeviceIdentityProvider: DeviceIdentityProviding {
     func prepareIdentity() async {}
 }
 
+private actor ControlledAcquireLeaseClient: EditLeaseClienting {
+    private var acquisitions = 0
+    private var releases = 0
+    private var acquireContinuations: [
+        Int: CheckedContinuation<EditLeaseMutationResult, Never>
+    ] = [:]
+    private var countWaiters: [
+        (count: Int, continuation: CheckedContinuation<Void, Never>)
+    ] = []
+    private var requests: [Int: (documentID: UUID, deviceID: UUID)] = [:]
+
+    func acquire(
+        documentID: UUID,
+        deviceID: UUID,
+        ttlSeconds: Int
+    ) async throws -> EditLeaseMutationResult {
+        _ = ttlSeconds
+        acquisitions += 1
+        let index = acquisitions
+        requests[index] = (documentID, deviceID)
+        let ready = countWaiters.filter { acquisitions >= $0.count }
+        countWaiters.removeAll { acquisitions >= $0.count }
+        ready.forEach { $0.continuation.resume() }
+        return await withCheckedContinuation { continuation in
+            acquireContinuations[index] = continuation
+        }
+    }
+
+    func renew(
+        documentID: UUID,
+        deviceID: UUID,
+        leaseToken: UUID,
+        ttlSeconds: Int
+    ) -> EditLeaseMutationResult {
+        _ = (leaseToken, ttlSeconds)
+        return result(documentID: documentID, deviceID: deviceID, index: 99)
+    }
+
+    func release(
+        documentID: UUID,
+        deviceID: UUID,
+        leaseToken: UUID
+    ) -> Bool {
+        _ = (documentID, deviceID, leaseToken)
+        releases += 1
+        return true
+    }
+
+    func inspect(
+        documentID: UUID,
+        deviceID: UUID
+    ) -> EditLeaseInspectionResult {
+        EditLeaseInspectionResult(
+            documentID: documentID,
+            state: .available,
+            expiresAt: nil
+        )
+    }
+
+    func waitForAcquireCount(_ count: Int) async {
+        guard acquisitions < count else { return }
+        await withCheckedContinuation { continuation in
+            countWaiters.append((count, continuation))
+        }
+    }
+
+    func completeAcquire(_ index: Int) {
+        guard let request = requests[index] else { return }
+        acquireContinuations.removeValue(forKey: index)?.resume(
+            returning: result(
+                documentID: request.documentID,
+                deviceID: request.deviceID,
+                index: index
+            )
+        )
+    }
+
+    func releaseCount() -> Int { releases }
+
+    private func result(
+        documentID: UUID,
+        deviceID: UUID,
+        index: Int
+    ) -> EditLeaseMutationResult {
+        EditLeaseMutationResult(
+            documentID: documentID,
+            leaseToken: UUID(
+                uuidString: String(
+                    format: "00000000-0000-0000-0000-%012d",
+                    index
+                )
+            )!,
+            deviceID: deviceID,
+            expiresAt: Date().addingTimeInterval(90)
+        )
+    }
+}
+
 private actor EditLeaseClientStub: EditLeaseClienting {
     private let token = UUID()
     private var acquireError: SyncV2ClientError?
@@ -3918,13 +4265,16 @@ private actor EditLeaseClientStub: EditLeaseClienting {
     private var releases = 0
     private var renewals = 0
     private var renewalWaiters: [CheckedContinuation<Void, Never>] = []
+    private var renewalErrors: [SyncV2ClientError]
     private let releaseGate: LeaseReleaseGate?
 
     init(
         acquireError: SyncV2ClientError? = nil,
+        renewalErrors: [SyncV2ClientError] = [],
         releaseGate: LeaseReleaseGate? = nil
     ) {
         self.acquireError = acquireError
+        self.renewalErrors = renewalErrors
         self.releaseGate = releaseGate
     }
 
@@ -3946,12 +4296,15 @@ private actor EditLeaseClientStub: EditLeaseClienting {
         deviceID: UUID,
         leaseToken: UUID,
         ttlSeconds: Int
-    ) -> EditLeaseMutationResult {
+    ) throws -> EditLeaseMutationResult {
         _ = (leaseToken, ttlSeconds)
         renewals += 1
         let waiters = renewalWaiters
         renewalWaiters.removeAll()
         waiters.forEach { $0.resume() }
+        if !renewalErrors.isEmpty {
+            throw renewalErrors.removeFirst()
+        }
         return result(documentID: documentID, deviceID: deviceID)
     }
 
@@ -4195,6 +4548,41 @@ private actor OneShotLeaseSleeper {
     func wake() {
         sleepContinuation?.resume()
         sleepContinuation = nil
+    }
+}
+
+private actor ManualLeaseSleeper {
+    private var durations: [Duration] = []
+    private var sleepContinuations:
+        [CheckedContinuation<Void, any Error>] = []
+    private var callCountWaiters: [
+        (count: Int, continuation: CheckedContinuation<Void, Never>)
+    ] = []
+
+    func sleep(_ duration: Duration) async throws {
+        durations.append(duration)
+        let ready = callCountWaiters.filter { durations.count >= $0.count }
+        callCountWaiters.removeAll { durations.count >= $0.count }
+        ready.forEach { $0.continuation.resume() }
+        try await withCheckedThrowingContinuation { continuation in
+            sleepContinuations.append(continuation)
+        }
+    }
+
+    func waitForCallCount(_ count: Int) async {
+        guard durations.count < count else { return }
+        await withCheckedContinuation { continuation in
+            callCountWaiters.append((count, continuation))
+        }
+    }
+
+    func wakeNext() {
+        guard !sleepContinuations.isEmpty else { return }
+        sleepContinuations.removeFirst().resume()
+    }
+
+    func recordedDurations() -> [Duration] {
+        durations
     }
 }
 

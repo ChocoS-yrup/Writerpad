@@ -860,6 +860,12 @@ actor SyncV2BackgroundSyncCoordinator {
             await uploadPullCoordinator.finishPull(
                 coordinatorPermit,
                 succeeded: succeeded,
+                localApplicationDeferred: {
+                    if case let .success(report) = outcome {
+                        return report.hasDeferredLocalApplication
+                    }
+                    return false
+                }(),
                 queue: queue
             )
             guard isStarted else { return }
@@ -1247,6 +1253,15 @@ final class SyncV2WorkspaceSyncModel: ObservableObject {
             networkMonitor.cancel()
             await realtime?.stop()
         }
+    }
+
+    /// 편집기 open/dirty/composition 집합이 바뀌었을 때 보류 중인 같은 서버
+    /// 세대를 한 번만 다시 적용한다. 보류가 없으면 아무 pull도 만들지 않는다.
+    func editingGuardsDidChange() async {
+        guard isActive, let uploadPullCoordinator else { return }
+        _ = await uploadPullCoordinator.resumeDeferredApplication(
+            localProjectID: localProjectID
+        )
     }
 
     func retry() async {
@@ -2428,6 +2443,12 @@ final class SyncV2WorkspaceSyncModel: ObservableObject {
             gateSnapshot = await uploadPullCoordinator.finishPull(
                 coordinatorPermit,
                 succeeded: succeeded,
+                localApplicationDeferred: {
+                    if case let .success(report) = outcome {
+                        return report.hasDeferredLocalApplication
+                    }
+                    return false
+                }(),
                 queue: queue
             )
             if activeCoordinatorPullPermit == coordinatorPermit {
@@ -2455,7 +2476,9 @@ final class SyncV2WorkspaceSyncModel: ObservableObject {
         case .success(let report):
             pullRetryAttempt = 0
             complete(report, stalled: stalled)
-            if let gateSnapshot, !gateSnapshot.isServerSynced {
+            if let gateSnapshot,
+               !gateSnapshot.isServerSynced,
+               !report.hasDeferredLocalApplication {
                 applyGateResult(gateSnapshot)
             }
         case .clientError(let error):

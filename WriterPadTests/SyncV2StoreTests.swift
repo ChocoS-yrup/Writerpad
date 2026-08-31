@@ -1502,6 +1502,7 @@ final class SyncV2StoreTests: XCTestCase {
 
         var claimedRevisions: [Int64] = []
         var claimedDeleted: [Bool] = []
+        var liveServerRevisions: [Int64?] = []
         for index in operationIDs.indices {
             let claims = try await store.claimReadyOperations(
                 limit: 1,
@@ -1516,14 +1517,18 @@ final class SyncV2StoreTests: XCTestCase {
                 operation,
                 result: commitResult(for: operation)
             )
+            liveServerRevisions.append(
+                try await store.serverRevision(for: context.documentID)
+            )
         }
 
         XCTAssertEqual(claimedRevisions, [0, 1, 2, 3])
         XCTAssertEqual(claimedDeleted, deleted)
+        XCTAssertEqual(liveServerRevisions, [1, nil, 3, nil])
         let serverRevision = try await store.serverRevision(
             for: context.documentID
         )
-        XCTAssertEqual(serverRevision, 4)
+        XCTAssertNil(serverRevision)
         await store.close()
     }
 

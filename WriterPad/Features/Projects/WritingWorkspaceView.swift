@@ -447,6 +447,9 @@ struct WritingWorkspaceShell: View {
         .onChange(of: usesCompactLayout) { _, _ in
             updateWriterPadCommandActions()
         }
+        .onChange(of: syncEditingGuardSignature) { _, _ in
+            notifySyncEditingGuardsChanged()
+        }
         .task(id: scenePhase) {
             if let active = workspaceSceneActivityGate.observe(
                 scenePhase == .active
@@ -2074,20 +2077,39 @@ struct WritingWorkspaceShell: View {
 
     private func currentSyncEditingGuards()
         -> [UUID: SyncV2EditingGuard] {
-        var result: [UUID: SyncV2EditingGuard] = [:]
-        for model in [leftEditorModel, rightEditorModel] {
-            guard let documentID = model.currentDocumentID?.rawValue else {
-                continue
-            }
-            let previous = result[documentID] ?? .closed
-            result[documentID] = SyncV2EditingGuard(
-                isOpen: true,
-                isDirty: previous.isDirty || model.hasUnsavedChanges,
-                isComposing:
-                    previous.isComposing || model.isComposing
-            )
+        SyncEditingGuardCollector.collect(
+            left: SyncEditingPaneState(
+                documentID: leftEditorModel.currentDocumentID,
+                isDirty: leftEditorModel.hasUnsavedChanges,
+                isComposing: leftEditorModel.isComposing
+            ),
+            right: SyncEditingPaneState(
+                documentID: rightEditorModel.currentDocumentID,
+                isDirty: rightEditorModel.hasUnsavedChanges,
+                isComposing: rightEditorModel.isComposing
+            ),
+            showsSplit: shouldPresentSplit,
+            activePaneIsLeft: activePane == .left
+        )
+    }
+
+    private var syncEditingGuardSignature: SyncEditingGuardSignature {
+        SyncEditingGuardSignature(
+            leftDocumentID: leftEditorModel.currentDocumentID,
+            rightDocumentID: rightEditorModel.currentDocumentID,
+            leftDirty: leftEditorModel.hasUnsavedChanges,
+            rightDirty: rightEditorModel.hasUnsavedChanges,
+            leftComposing: leftEditorModel.isComposing,
+            rightComposing: rightEditorModel.isComposing,
+            showsSplit: shouldPresentSplit,
+            activePaneIsLeft: activePane == .left
+        )
+    }
+
+    private func notifySyncEditingGuardsChanged() {
+        Task {
+            await workspaceSyncModel.editingGuardsDidChange()
         }
-        return result
     }
 
     private func applyOpenServerSnapshots(
@@ -2313,6 +2335,47 @@ struct WritingWorkspaceShell: View {
             isBold: editorBold,
             typewriterScrolling: editorTypewriterScrolling
         )
+    }
+}
+
+private struct SyncEditingGuardSignature: Equatable {
+    let leftDocumentID: DocumentID?
+    let rightDocumentID: DocumentID?
+    let leftDirty: Bool
+    let rightDirty: Bool
+    let leftComposing: Bool
+    let rightComposing: Bool
+    let showsSplit: Bool
+    let activePaneIsLeft: Bool
+}
+
+struct SyncEditingPaneState: Equatable {
+    let documentID: DocumentID?
+    let isDirty: Bool
+    let isComposing: Bool
+}
+
+enum SyncEditingGuardCollector {
+    static func collect(
+        left: SyncEditingPaneState,
+        right: SyncEditingPaneState,
+        showsSplit: Bool,
+        activePaneIsLeft: Bool
+    ) -> [UUID: SyncV2EditingGuard] {
+        let panes = showsSplit
+            ? [left, right]
+            : [activePaneIsLeft ? left : right]
+        var result: [UUID: SyncV2EditingGuard] = [:]
+        for pane in panes {
+            guard let documentID = pane.documentID?.rawValue else { continue }
+            let previous = result[documentID] ?? .closed
+            result[documentID] = SyncV2EditingGuard(
+                isOpen: true,
+                isDirty: previous.isDirty || pane.isDirty,
+                isComposing: previous.isComposing || pane.isComposing
+            )
+        }
+        return result
     }
 }
 
