@@ -12,6 +12,13 @@ protocol SyncV2SnapshotTransporting: Sendable {
     func fetchDocuments(
         projectID: UUID
     ) async throws -> [SyncV2RemoteDocumentSnapshot]
+    func fetchDocumentManifest(
+        projectID: UUID
+    ) async throws -> [SyncV2RemoteDocumentManifestEntry]
+    func fetchDocumentContents(
+        projectID: UUID,
+        documentIDs: [UUID]
+    ) async throws -> [SyncV2RemoteDocumentSnapshot]
     func fetchDocument(
         projectID: UUID,
         documentID: UUID
@@ -32,6 +39,24 @@ extension SyncV2SnapshotTransporting {
         }
     }
 
+    /// 두 단계를 나누지 않는 구현은 한 번에 받은 결과에서 표만 뽑는다.
+    func fetchDocumentManifest(
+        projectID: UUID
+    ) async throws -> [SyncV2RemoteDocumentManifestEntry] {
+        try await fetchDocuments(projectID: projectID).map(\.manifestEntry)
+    }
+
+    func fetchDocumentContents(
+        projectID: UUID,
+        documentIDs: [UUID]
+    ) async throws -> [SyncV2RemoteDocumentSnapshot] {
+        let wanted = Set(documentIDs)
+        guard !wanted.isEmpty else { return [] }
+        return try await fetchDocuments(projectID: projectID).filter {
+            wanted.contains($0.documentID)
+        }
+    }
+
     /// 폴더 표를 아직 읽지 않는 구현은 빈 목록을 준다. 서버에 없는 폴더라는
     /// 이유만으로 로컬 폴더를 지우지 않으므로 빈 목록은 아무 일도 하지 않는다.
     func fetchFolders(projectID: UUID) async throws -> [SyncV2RemoteFolder] {
@@ -44,6 +69,13 @@ extension SyncV2SnapshotTransporting {
 protocol SyncV2SnapshotClienting: Sendable {
     func fetchDocuments(
         projectID: UUID
+    ) async throws -> [SyncV2RemoteDocumentSnapshot]
+    func fetchDocumentManifest(
+        projectID: UUID
+    ) async throws -> [SyncV2RemoteDocumentManifestEntry]
+    func fetchDocumentContents(
+        projectID: UUID,
+        documentIDs: [UUID]
     ) async throws -> [SyncV2RemoteDocumentSnapshot]
     func fetchDocument(
         projectID: UUID,
@@ -62,6 +94,23 @@ extension SyncV2SnapshotClienting {
     ) async throws -> SyncV2RemoteDocumentSnapshot? {
         try await fetchDocuments(projectID: projectID).first {
             $0.documentID == documentID
+        }
+    }
+
+    func fetchDocumentManifest(
+        projectID: UUID
+    ) async throws -> [SyncV2RemoteDocumentManifestEntry] {
+        try await fetchDocuments(projectID: projectID).map(\.manifestEntry)
+    }
+
+    func fetchDocumentContents(
+        projectID: UUID,
+        documentIDs: [UUID]
+    ) async throws -> [SyncV2RemoteDocumentSnapshot] {
+        let wanted = Set(documentIDs)
+        guard !wanted.isEmpty else { return [] }
+        return try await fetchDocuments(projectID: projectID).filter {
+            wanted.contains($0.documentID)
         }
     }
 
@@ -169,6 +218,113 @@ actor LiveSyncV2SnapshotTransport: SyncV2SnapshotTransporting {
                 message: error.localizedDescription
             )
         }
+    }
+
+    /// 본문을 뺀 문서 표를 받는다. 변경 판정에 필요한 필드만 담긴다.
+    func fetchDocumentManifest(
+        projectID: UUID
+    ) async throws -> [SyncV2RemoteDocumentManifestEntry] {
+        do {
+            return try await executeRows(
+                client
+                .from("documents")
+                .select(
+                    """
+                    document_id,relative_path,revision,is_deleted,\
+                    deleted_at,updated_at
+                    """
+                )
+                .eq("project_id", value: projectID.uuidString.lowercased()),
+                stage: "document-manifest",
+                as: SyncV2RemoteDocumentManifestEntry.self
+            )
+        } catch let error as PostgrestError {
+            throw SyncV2SnapshotTransportError.postgrest(
+                message: error.message,
+                postgresCode: error.code,
+                detail: error.detail
+            )
+        } catch let error as URLError {
+            throw SyncV2SnapshotTransportError.url(code: error.code)
+        } catch is DecodingError {
+            throw SyncV2SnapshotTransportError.invalidResponse
+        } catch {
+            let nsError = error as NSError
+            if nsError.domain == NSURLErrorDomain {
+                throw SyncV2SnapshotTransportError.url(
+                    code: URLError.Code(rawValue: nsError.code)
+                )
+            }
+            throw SyncV2SnapshotTransportError.unknown(
+                message: error.localizedDescription
+            )
+        }
+    }
+
+    /// UUID 목록은 질의 문자열에 그대로 들어간다. 한 요청에 다 넣으면 URL이
+    /// 서버·중간 장비의 상한을 넘길 수 있으므로 나눠 보낸다.
+    static let contentFetchChunkSize = 80
+
+    func fetchDocumentContents(
+        projectID: UUID,
+        documentIDs: [UUID]
+    ) async throws -> [SyncV2RemoteDocumentSnapshot] {
+        let identifiers = Array(Set(documentIDs))
+        guard !identifiers.isEmpty else { return [] }
+        var collected: [SyncV2RemoteDocumentSnapshot] = []
+        collected.reserveCapacity(identifiers.count)
+        var index = 0
+        while index < identifiers.count {
+            let end = min(
+                index + Self.contentFetchChunkSize,
+                identifiers.count
+            )
+            let chunk = identifiers[index..<end].map {
+                $0.uuidString.lowercased()
+            }
+            index = end
+            do {
+                let rows = try await executeRows(
+                    client
+                    .from("documents")
+                    .select(
+                        """
+                        document_id,relative_path,content,revision,\
+                        is_deleted,deleted_at,updated_at
+                        """
+                    )
+                    .eq(
+                        "project_id",
+                        value: projectID.uuidString.lowercased()
+                    )
+                    .in("document_id", values: chunk),
+                    stage: "document-contents",
+                    as: SyncV2RemoteDocumentSnapshot.self
+                )
+                collected.append(contentsOf: rows)
+            } catch let error as PostgrestError {
+                throw SyncV2SnapshotTransportError.postgrest(
+                    message: error.message,
+                    postgresCode: error.code,
+                    detail: error.detail
+                )
+            } catch let error as URLError {
+                throw SyncV2SnapshotTransportError.url(code: error.code)
+            } catch is DecodingError {
+                throw SyncV2SnapshotTransportError.invalidResponse
+            } catch {
+                let nsError = error as NSError
+                if nsError.domain == NSURLErrorDomain {
+                    throw SyncV2SnapshotTransportError.url(
+                        code: URLError.Code(rawValue: nsError.code)
+                    )
+                }
+                throw SyncV2SnapshotTransportError.unknown(
+                    message: error.localizedDescription
+                )
+            }
+        }
+        return collected
     }
 
     /// 계약 tree_order를 서버가 말한 그대로 받아 온다.
@@ -346,6 +502,70 @@ actor SyncV2SnapshotClient: SyncV2SnapshotClienting {
         }
     }
 
+    func fetchDocumentManifest(
+        projectID: UUID
+    ) async throws -> [SyncV2RemoteDocumentManifestEntry] {
+        do {
+            let entries = try await transport.fetchDocumentManifest(
+                projectID: projectID
+            )
+            var identifiers = Set<UUID>()
+            for entry in entries {
+                guard identifiers.insert(entry.documentID).inserted,
+                      Self.isValid(entry)
+                else {
+                    throw SyncV2ClientError.invalidResponse
+                }
+            }
+            return entries.sorted {
+                $0.documentID.uuidString < $1.documentID.uuidString
+            }
+        } catch let error as SyncV2ClientError {
+            throw error
+        } catch let error as SyncV2SnapshotTransportError {
+            throw Self.classify(error)
+        } catch {
+            throw SyncV2ClientError.invalidResponse
+        }
+    }
+
+    /// 요청한 UUID가 하나라도 빠지거나 겹쳐 오면 표와 본문을 짝지을 수 없다.
+    /// 반쯤 맞는 결과로 진행하지 않고 실패로 돌린다.
+    func fetchDocumentContents(
+        projectID: UUID,
+        documentIDs: [UUID]
+    ) async throws -> [SyncV2RemoteDocumentSnapshot] {
+        let requested = Set(documentIDs)
+        guard !requested.isEmpty else { return [] }
+        do {
+            let rows = try await transport.fetchDocumentContents(
+                projectID: projectID,
+                documentIDs: Array(requested)
+            )
+            var identifiers = Set<UUID>()
+            for row in rows {
+                guard identifiers.insert(row.documentID).inserted,
+                      requested.contains(row.documentID),
+                      Self.isValid(row)
+                else {
+                    throw SyncV2ClientError.invalidResponse
+                }
+            }
+            guard identifiers == requested else {
+                throw SyncV2ClientError.invalidResponse
+            }
+            return rows.sorted {
+                $0.documentID.uuidString < $1.documentID.uuidString
+            }
+        } catch let error as SyncV2ClientError {
+            throw error
+        } catch let error as SyncV2SnapshotTransportError {
+            throw Self.classify(error)
+        } catch {
+            throw SyncV2ClientError.invalidResponse
+        }
+    }
+
     func fetchDocument(
         projectID: UUID,
         documentID: UUID
@@ -454,6 +674,17 @@ actor SyncV2SnapshotClient: SyncV2SnapshotClienting {
               SyncV2Client.isValidFolderName(folder.name)
         else { return false }
         return true
+    }
+
+    private static func isValid(
+        _ entry: SyncV2RemoteDocumentManifestEntry
+    ) -> Bool {
+        guard entry.revision > 0,
+              SyncV2Client.isValidServerPath(entry.relativePath)
+        else { return false }
+        return entry.isDeleted
+            ? entry.deletedAt != nil
+            : entry.deletedAt == nil
     }
 
     private static func isValid(

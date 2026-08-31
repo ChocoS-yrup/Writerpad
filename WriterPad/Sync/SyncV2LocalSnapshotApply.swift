@@ -62,6 +62,21 @@ protocol SyncV2LocalSnapshotApplying: Sendable {
         localProjectID: ProjectID,
         snapshot: SyncV2RemoteDocumentSnapshot
     ) async -> Bool
+
+    /// 본문 없이 복구 필요 여부를 판정한다. 어떤 문서의 본문을 받을지 정하는
+    /// 단계에서 쓰므로 표에 있는 값만 본다.
+    func requiresCopyRecovery(
+        localProjectID: ProjectID,
+        manifestEntry: SyncV2RemoteDocumentManifestEntry
+    ) async -> Bool
+
+    /// 서버 문서 UUID가 로컬에도 있는지만 확인한다. 없으면 같은 경로의 다른
+    /// UUID를 채택할지 따져야 하고, 그 판정에는 본문 비교가 필요하다.
+    func hasLocalDocument(
+        localProjectID: ProjectID,
+        documentID: UUID
+    ) async -> Bool
+
     func finish(
         localProjectID: ProjectID,
         documentID: UUID
@@ -132,6 +147,24 @@ extension SyncV2LocalSnapshotApplying {
         snapshot: SyncV2RemoteDocumentSnapshot
     ) async -> Bool {
         _ = (localProjectID, snapshot)
+        return false
+    }
+
+    // 아래 두 기본 구현은 본문 생략 여부를 모르는 쪽으로 답한다. 판정을
+    // 구현하지 않은 대역에서는 예전처럼 본문을 모두 받아 기존 경로로 간다.
+    func requiresCopyRecovery(
+        localProjectID: ProjectID,
+        manifestEntry: SyncV2RemoteDocumentManifestEntry
+    ) async -> Bool {
+        _ = (localProjectID, manifestEntry)
+        return true
+    }
+
+    func hasLocalDocument(
+        localProjectID: ProjectID,
+        documentID: UUID
+    ) async -> Bool {
+        _ = (localProjectID, documentID)
         return false
     }
 
@@ -819,8 +852,20 @@ actor LocalSyncV2SnapshotApplier: SyncV2LocalSnapshotApplying {
         localProjectID: ProjectID,
         snapshot: SyncV2RemoteDocumentSnapshot
     ) async -> Bool {
-        guard snapshot.relativePath != syncV2TreeOrderPath,
-              snapshot.relativePath != syncV2TrashPurgePath,
+        await requiresCopyRecovery(
+            localProjectID: localProjectID,
+            manifestEntry: snapshot.manifestEntry
+        )
+    }
+
+    /// 본문은 보지 않는다. 복구 판정에 필요한 것은 문서의 정체와 세대,
+    /// 그리고 로컬 파일이 실제로 있는지뿐이다.
+    func requiresCopyRecovery(
+        localProjectID: ProjectID,
+        manifestEntry: SyncV2RemoteDocumentManifestEntry
+    ) async -> Bool {
+        guard manifestEntry.relativePath != syncV2TreeOrderPath,
+              manifestEntry.relativePath != syncV2TrashPurgePath,
               let root = try? await workspaceLocator.workspaceRoot(
                   for: localProjectID
               )
@@ -828,12 +873,12 @@ actor LocalSyncV2SnapshotApplier: SyncV2LocalSnapshotApplying {
         if isSameRecovery(
             recoveryMarker(
                 at: recoveryMarkerURL(
-                    documentID: snapshot.documentID,
+                    documentID: manifestEntry.documentID,
                     root: root
                 )
             ),
             localProjectID: localProjectID,
-            snapshot: snapshot
+            manifestEntry: manifestEntry
         ) {
             return true
         }
@@ -841,7 +886,7 @@ actor LocalSyncV2SnapshotApplier: SyncV2LocalSnapshotApplying {
         // 읽으면 pull 한 번에 문서 수만큼 반복되어 비용이 제곱으로 자란다.
         // 프로젝트 범위 판정은 그대로 유지한다.
         let currentDocument = (try? await documentRepository.document(
-            id: DocumentID(rawValue: snapshot.documentID)
+            id: DocumentID(rawValue: manifestEntry.documentID)
         )) ?? nil
         guard
             let current = currentDocument,
@@ -851,15 +896,25 @@ actor LocalSyncV2SnapshotApplier: SyncV2LocalSnapshotApplying {
         let currentURL = root.appendingPathComponent(
             current.relativePath.rawValue
         ).standardizedFileURL
-        if snapshot.isDeleted {
+        if manifestEntry.isDeleted {
             guard isTrashed(current) else { return false }
             return !isInTrash(current.relativePath)
                 || !fileManager.fileExists(atPath: currentURL.path)
         }
         return isActive(current)
             && normalized(current.relativePath.rawValue)
-                == normalized(snapshot.relativePath)
+                == normalized(manifestEntry.relativePath)
             && !fileManager.fileExists(atPath: currentURL.path)
+    }
+
+    func hasLocalDocument(
+        localProjectID: ProjectID,
+        documentID: UUID
+    ) async -> Bool {
+        let document = (try? await documentRepository.document(
+            id: DocumentID(rawValue: documentID)
+        )) ?? nil
+        return document?.projectID == localProjectID
     }
 
     func trashPurgeState(
@@ -2820,12 +2875,24 @@ actor LocalSyncV2SnapshotApplier: SyncV2LocalSnapshotApplying {
         localProjectID: ProjectID,
         snapshot: SyncV2RemoteDocumentSnapshot
     ) -> Bool {
+        isSameRecovery(
+            marker,
+            localProjectID: localProjectID,
+            manifestEntry: snapshot.manifestEntry
+        )
+    }
+
+    private func isSameRecovery(
+        _ marker: RecoveryMarker?,
+        localProjectID: ProjectID,
+        manifestEntry: SyncV2RemoteDocumentManifestEntry
+    ) -> Bool {
         marker?.localProjectID == localProjectID
-            && marker?.snapshot.documentID == snapshot.documentID
-            && marker?.snapshot.revision == snapshot.revision
-            && marker?.snapshot.isDeleted == snapshot.isDeleted
+            && marker?.snapshot.documentID == manifestEntry.documentID
+            && marker?.snapshot.revision == manifestEntry.revision
+            && marker?.snapshot.isDeleted == manifestEntry.isDeleted
             && normalized(marker?.snapshot.relativePath ?? "")
-                == normalized(snapshot.relativePath)
+                == normalized(manifestEntry.relativePath)
     }
 
     private func writeRecoveryMarker(

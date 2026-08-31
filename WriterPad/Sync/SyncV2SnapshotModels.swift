@@ -1,5 +1,69 @@
 import Foundation
 
+/// 본문 없이 문서의 정체와 세대만 담는다.
+///
+/// 변경 없는 pull에서 본문은 읽히지 않고 버려진다. 그런데도 매번 작품의
+/// 모든 본문을 받으면 전송량이 작품 크기에 비례해 늘어난다. 먼저 이 표를
+/// 받아 본문이 실제로 필요한 문서를 가려낸 뒤 그 문서만 채운다.
+///
+/// 판정에 쓰는 필드는 전부 여기 있다. 본문을 보는 곳은 휴지통 비움 payload
+/// 해석과 로컬 적용뿐이다.
+struct SyncV2RemoteDocumentManifestEntry: Codable, Equatable, Sendable {
+    let documentID: UUID
+    let relativePath: String
+    let revision: Int64
+    let isDeleted: Bool
+    let deletedAt: Date?
+    let updatedAt: Date
+
+    enum CodingKeys: String, CodingKey {
+        case documentID = "document_id"
+        case relativePath = "relative_path"
+        case revision
+        case isDeleted = "is_deleted"
+        case deletedAt = "deleted_at"
+        case updatedAt = "updated_at"
+    }
+
+    init(
+        documentID: UUID,
+        relativePath: String,
+        revision: Int64,
+        isDeleted: Bool,
+        deletedAt: Date?,
+        updatedAt: Date
+    ) {
+        self.documentID = documentID
+        self.relativePath = relativePath
+        self.revision = revision
+        self.isDeleted = isDeleted
+        self.deletedAt = deletedAt
+        self.updatedAt = updatedAt
+    }
+
+    /// 본문을 받아 온 뒤 표와 같은 문서·같은 세대인지 확인한다. 표와 본문은
+    /// 서로 다른 요청이라 그 사이에 서버가 바뀔 수 있다.
+    func describesSameRow(as snapshot: SyncV2RemoteDocumentSnapshot) -> Bool {
+        documentID == snapshot.documentID
+            && revision == snapshot.revision
+            && relativePath == snapshot.relativePath
+            && isDeleted == snapshot.isDeleted
+    }
+}
+
+extension SyncV2RemoteDocumentSnapshot {
+    var manifestEntry: SyncV2RemoteDocumentManifestEntry {
+        SyncV2RemoteDocumentManifestEntry(
+            documentID: documentID,
+            relativePath: relativePath,
+            revision: revision,
+            isDeleted: isDeleted,
+            deletedAt: deletedAt,
+            updatedAt: updatedAt
+        )
+    }
+}
+
 struct SyncV2RemoteDocumentSnapshot: Codable, Equatable, Sendable {
     let documentID: UUID
     let relativePath: String

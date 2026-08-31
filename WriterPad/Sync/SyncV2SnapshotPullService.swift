@@ -179,7 +179,9 @@ actor SyncV2SnapshotPullService: SyncV2SnapshotPulling {
             phase: "started"
         )
         let shouldFetchFolders = folderApplier != nil
-        async let snapshotsRequest = client.fetchDocuments(
+        // 1단계: 본문 없는 표만 받는다. 어떤 문서의 본문이 실제로 필요한지는
+        // 이 표와 로컬 상태만으로 정할 수 있다.
+        async let manifestRequest = client.fetchDocumentManifest(
             projectID: serverProjectID
         )
         async let foldersRequest: [SyncV2RemoteFolder]? =
@@ -189,34 +191,34 @@ actor SyncV2SnapshotPullService: SyncV2SnapshotPulling {
         async let treeOrdersRequest = client.fetchTreeOrders(
             projectID: serverProjectID
         )
-        let snapshots = try await snapshotsRequest
+        let manifest = try await manifestRequest
         SyncV2PullDiagnostics.record(
-            stage: "documents",
+            stage: "document-manifest",
             phase: "available-to-service",
-            rowCount: snapshots.count
+            rowCount: manifest.count
         )
         // 실제 TXT 경로에서 폴더 메타데이터를 먼저 재구성한 뒤 순서를
         // 적용해야 새 Windows 폴더의 첫 pull에도 userOrder가 반영된다.
-        let ordinarySnapshots = snapshots.filter {
+        let ordinaryEntries = manifest.filter {
             $0.relativePath != syncV2TreeOrderPath
                 && $0.relativePath != syncV2TrashPurgePath
         }
         if let leaseManager {
-            for snapshot in ordinarySnapshots {
-                if snapshot.isDeleted {
+            for entry in ordinaryEntries {
+                if entry.isDeleted {
                     await leaseManager.documentBecameTombstone(
-                        documentID: snapshot.documentID
+                        documentID: entry.documentID
                     )
                 } else {
                     await leaseManager.ensureLeaseForActiveLiveDocument(
-                        documentID: snapshot.documentID,
-                        serverRevision: snapshot.revision
+                        documentID: entry.documentID,
+                        serverRevision: entry.revision
                     )
                 }
             }
         }
         let remoteLiveDocumentPaths = Set(
-            ordinarySnapshots
+            ordinaryEntries
                 .filter { !$0.isDeleted }
                 .map(\.relativePath)
         )
@@ -233,7 +235,7 @@ actor SyncV2SnapshotPullService: SyncV2SnapshotPulling {
             stage: "identity-audit",
             phase: "finished",
             startedAtNanoseconds: preparePullStartedAt,
-            rowCount: ordinarySnapshots.count
+            rowCount: ordinaryEntries.count
         )
         // 폴더를 문서보다 먼저 제자리에 놓는다. 이름이 바뀐 폴더에 문서가 먼저
         // 도착하면 옛 경로에 자리를 잡아, 뒤이은 폴더 이동이 목적지 충돌로
@@ -382,18 +384,18 @@ actor SyncV2SnapshotPullService: SyncV2SnapshotPulling {
             rowCount: treeOrders.count
         )
 
-        let orderedSnapshots = snapshots.filter {
+        let orderedEntries = manifest.filter {
             $0.relativePath == syncV2TrashPurgePath
         }
-            + ordinarySnapshots.filter(\.isDeleted)
-            + ordinarySnapshots.filter { !$0.isDeleted }
-            + snapshots.filter {
+            + ordinaryEntries.filter(\.isDeleted)
+            + ordinaryEntries.filter { !$0.isDeleted }
+            + manifest.filter {
             $0.relativePath == syncV2TreeOrderPath
         }
         var outcomes: [SyncV2SnapshotPullOutcome] = []
         var appliedSnapshots: [SyncV2RemoteDocumentSnapshot] = []
         var rejectedStructureNames = folderReport.rejectedNames
-        outcomes.reserveCapacity(snapshots.count)
+        outcomes.reserveCapacity(manifest.count)
 
         var effectivePurgeState = await localApplier.trashPurgeState(
             localProjectID: localProjectID
@@ -414,7 +416,7 @@ actor SyncV2SnapshotPullService: SyncV2SnapshotPulling {
             prefetchedStates = try await stateStore.snapshotStates(
                 localProjectID: localProjectID,
                 serverProjectID: serverProjectID,
-                documentIDs: Set(orderedSnapshots.map(\.documentID))
+                documentIDs: Set(orderedEntries.map(\.documentID))
             )
         } catch {
             // batch는 최적화일 뿐이다. 실패하면 각 문서 gate 안의
@@ -425,11 +427,100 @@ actor SyncV2SnapshotPullService: SyncV2SnapshotPulling {
             stage: "snapshot-state-batch",
             phase: prefetchedStates == nil ? "fallback" : "finished",
             startedAtNanoseconds: batchStateLookupStartedAt,
-            rowCount: orderedSnapshots.count,
+            rowCount: orderedEntries.count,
             changedCount: prefetchedStates?.count
         )
-        for snapshot in orderedSnapshots {
+
+        // 2단계: 본문이 실제로 필요한 문서만 고른다. batch 상태 조회가 실패한
+        // pull은 판정 근거가 없으므로 예전처럼 전부 받는다.
+        let hydrationDecisionStartedAt =
+            DispatchTime.now().uptimeNanoseconds
+        var resolvedOutcomes: [UUID: SyncV2SnapshotPullOutcome] = [:]
+        var hydrationTargets: [UUID] = []
+        for entry in orderedEntries {
             try Task.checkCancellation()
+            guard let prefetchedStates else {
+                hydrationTargets.append(entry.documentID)
+                continue
+            }
+            let decision = await hydrationDecision(
+                entry: entry,
+                localProjectID: localProjectID,
+                serverProjectID: serverProjectID,
+                state: prefetchedStates[entry.documentID],
+                editing: editingGuards[entry.documentID] ?? .closed,
+                effectivePurgeState: effectivePurgeState,
+                sameRevisionTreeOrderRequiresRecovery:
+                    sameRevisionTreeOrderRequiresRecovery
+            )
+            switch decision {
+            case let .resolved(outcome):
+                resolvedOutcomes[entry.documentID] = outcome
+            case .hydrate:
+                hydrationTargets.append(entry.documentID)
+            }
+        }
+        SyncV2PullDiagnostics.record(
+            stage: "hydration-decision",
+            phase: "finished",
+            startedAtNanoseconds: hydrationDecisionStartedAt,
+            rowCount: orderedEntries.count,
+            changedCount: hydrationTargets.count
+        )
+
+        let hydrationStartedAt = DispatchTime.now().uptimeNanoseconds
+        let hydratedByID: [UUID: SyncV2RemoteDocumentSnapshot]
+        if hydrationTargets.isEmpty {
+            hydratedByID = [:]
+        } else {
+            let hydrated = try await client.fetchDocumentContents(
+                projectID: serverProjectID,
+                documentIDs: hydrationTargets
+            )
+            hydratedByID = Dictionary(
+                hydrated.map { ($0.documentID, $0) },
+                uniquingKeysWith: { first, _ in first }
+            )
+        }
+        SyncV2PullDiagnostics.record(
+            stage: "document-contents",
+            phase: "available-to-service",
+            startedAtNanoseconds: hydrationStartedAt,
+            rowCount: hydrationTargets.count
+        )
+
+        // 표와 본문은 서로 다른 요청이다. 그 사이에 서버가 앞서갔다면 본문 쪽이
+        // 더 최신이므로 아래 루프가 본문을 정본으로 쓴다. 여기서는 표를 근거로
+        // 내린 사전 판정을 거두고, 얼마나 자주 어긋나는지를 남긴다.
+        var advancedRowCount = 0
+        for entry in orderedEntries {
+            guard let hydrated = hydratedByID[entry.documentID],
+                  !entry.describesSameRow(as: hydrated)
+            else { continue }
+            advancedRowCount += 1
+            resolvedOutcomes[entry.documentID] = nil
+        }
+        if advancedRowCount > 0 {
+            SyncV2PullDiagnostics.record(
+                stage: "document-contents",
+                phase: "row-advanced-during-hydration",
+                rowCount: hydrationTargets.count,
+                changedCount: advancedRowCount
+            )
+        }
+        for entry in orderedEntries {
+            try Task.checkCancellation()
+            // 본문 없이 결론이 난 문서는 여기서 끝난다. 판정은 본문을 한 번도
+            // 보지 않는 기존 경로와 같은 규칙을 쓴다.
+            if let resolved = resolvedOutcomes[entry.documentID] {
+                outcomes.append(resolved)
+                continue
+            }
+            guard let snapshot = hydratedByID[entry.documentID] else {
+                // 본문을 받기로 했는데 없다. 검증 계층이 막지 못한 경우이므로
+                // 조용히 건너뛰지 않고 이 pull을 실패로 돌린다.
+                throw SyncV2ClientError.invalidResponse
+            }
             let editing = editingGuards[snapshot.documentID] ?? .closed
             let identityLookupStartedAt =
                 DispatchTime.now().uptimeNanoseconds
@@ -470,7 +561,7 @@ actor SyncV2SnapshotPullService: SyncV2SnapshotPulling {
                ) {
                 let merged = effectivePurgeState.merging(remotePurge)
                 eligibleDocumentIDs = Set(
-                    snapshots.compactMap { candidate in
+                    manifest.compactMap { candidate in
                         guard
                             candidate.isDeleted,
                             let purgedRevision = merged.purgedRevisions[
@@ -565,7 +656,7 @@ actor SyncV2SnapshotPullService: SyncV2SnapshotPulling {
         SyncV2PullDiagnostics.record(
             stage: "document-loop-breakdown",
             phase: "identity-lookup",
-            rowCount: orderedSnapshots.count,
+            rowCount: orderedEntries.count,
             changedCount: equivalentIdentityCount,
             valueMilliseconds: Self.milliseconds(
                 identityLookupNanoseconds
@@ -574,7 +665,7 @@ actor SyncV2SnapshotPullService: SyncV2SnapshotPulling {
         SyncV2PullDiagnostics.record(
             stage: "document-loop-breakdown",
             phase: "mutation-gate-wait",
-            rowCount: orderedSnapshots.count,
+            rowCount: orderedEntries.count,
             valueMilliseconds: Self.milliseconds(
                 gateWaitNanoseconds
             )
@@ -582,7 +673,7 @@ actor SyncV2SnapshotPullService: SyncV2SnapshotPulling {
         SyncV2PullDiagnostics.record(
             stage: "document-loop-breakdown",
             phase: "state-store-lookup",
-            rowCount: orderedSnapshots.count,
+            rowCount: orderedEntries.count,
             valueMilliseconds: Self.milliseconds(
                 stateLookupNanoseconds
             )
@@ -590,7 +681,7 @@ actor SyncV2SnapshotPullService: SyncV2SnapshotPulling {
         SyncV2PullDiagnostics.record(
             stage: "document-loop-breakdown",
             phase: "process-after-state-lookup",
-            rowCount: orderedSnapshots.count,
+            rowCount: orderedEntries.count,
             valueMilliseconds: Self.milliseconds(
                 processRemainderNanoseconds
             )
@@ -599,7 +690,7 @@ actor SyncV2SnapshotPullService: SyncV2SnapshotPulling {
             stage: "document-local-compare-apply",
             phase: "finished",
             startedAtNanoseconds: documentLoopStartedAt,
-            rowCount: orderedSnapshots.count,
+            rowCount: orderedEntries.count,
             changedCount: appliedSnapshots.count
         )
 
@@ -636,7 +727,7 @@ actor SyncV2SnapshotPullService: SyncV2SnapshotPulling {
                     .foldersWaitingForRemoteChildren(
                         folderIDs: deferredFolderIDs,
                         documents: latestDocuments,
-                        snapshots: ordinarySnapshots,
+                        entries: ordinaryEntries,
                         outcomes: completedOutcomes,
                         remoteFolders: folders,
                         blockedFolderIDs: latestBlockedFolderIDs
@@ -698,7 +789,7 @@ actor SyncV2SnapshotPullService: SyncV2SnapshotPulling {
             stage: "snapshot-service",
             phase: "finished",
             startedAtNanoseconds: pullStartedAt,
-            rowCount: snapshots.count,
+            rowCount: manifest.count,
             changedCount: appliedSnapshots.count
         )
         return report
@@ -711,13 +802,13 @@ actor SyncV2SnapshotPullService: SyncV2SnapshotPulling {
     private static func foldersWaitingForRemoteChildren(
         folderIDs: Set<DocumentID>,
         documents: [DocumentNode],
-        snapshots: [SyncV2RemoteDocumentSnapshot],
+        entries: [SyncV2RemoteDocumentManifestEntry],
         outcomes: [SyncV2SnapshotPullOutcome],
         remoteFolders: [SyncV2RemoteFolder],
         blockedFolderIDs: Set<DocumentID>
     ) -> Set<DocumentID> {
         let snapshotsByID = Dictionary(
-            snapshots.map { ($0.documentID, $0) },
+            entries.map { ($0.documentID, $0) },
             uniquingKeysWith: { first, _ in first }
         )
         let remoteFolderIDs = Set(remoteFolders.map(\.folderID))
@@ -1188,6 +1279,129 @@ actor SyncV2SnapshotPullService: SyncV2SnapshotPulling {
     /// 그 값으로 로컬을 바꾸지 않고 종료할 수 있는 경우만 사용한다.
     /// 복구나 새 revision 적용이 필요하면 `nil`로 단건 재조회를
     /// 강제해 enqueue·conflict와의 경합을 닫는다.
+    /// 본문을 받아야 하는가, 아니면 표와 로컬 상태만으로 결론이 나는가.
+    ///
+    /// 본문을 생략해도 되는 경우는 `prefetchedReadOnlyOutcome`이 본문을 한 번도
+    /// 보지 않고 답을 내는 경우와 정확히 같아야 한다. 모르면 받는 쪽으로 답한다.
+    private enum HydrationDecision: Sendable {
+        /// 본문 없이 결론이 났다.
+        case resolved(SyncV2SnapshotPullOutcome)
+        /// 본문을 받아 기존 판정 경로로 내려간다.
+        case hydrate
+    }
+
+    private func hydrationDecision(
+        entry: SyncV2RemoteDocumentManifestEntry,
+        localProjectID: ProjectID,
+        serverProjectID: UUID,
+        state: SyncV2SnapshotLocalState?,
+        editing: SyncV2EditingGuard,
+        effectivePurgeState: SyncV2TrashPurgePayload,
+        sameRevisionTreeOrderRequiresRecovery: Bool
+    ) async -> HydrationDecision {
+        // ⑤ 숨은 문서가 계약과 다르면 원격 본문을 보존 대상으로 남긴다.
+        let hiddenPath: String? = switch entry.relativePath {
+        case syncV2TreeOrderPath: syncV2TreeOrderPath
+        case syncV2TrashPurgePath: syncV2TrashPurgePath
+        default: nil
+        }
+        if let hiddenPath,
+           entry.isDeleted
+               || entry.documentID != syncV2UUIDv5(
+                   namespace: serverProjectID,
+                   name: hiddenPath
+               ) {
+            return .hydrate
+        }
+
+        // ④ 휴지통 비움 payload는 같은 revision이어도 멱등 병합이 필요하다.
+        if entry.relativePath == syncV2TrashPurgePath {
+            return .hydrate
+        }
+
+        // ① 로컬 기준선이 없거나 서버가 앞서면 받아야 한다.
+        guard let state, entry.revision <= state.serverRevision else {
+            return .hydrate
+        }
+
+        // ⑥ 서버 UUID가 로컬에 없으면 같은 경로의 다른 UUID를 채택할지
+        // 따져야 하고, 그 판정은 본문 바이트 비교로만 끝난다.
+        if !editing.isOpen, !editing.isDirty, !editing.isComposing,
+           await !localApplier.hasLocalDocument(
+               localProjectID: localProjectID,
+               documentID: entry.documentID
+           ) {
+            return .hydrate
+        }
+
+        if state.hasUnresolvedConflict {
+            return .resolved(
+                .mergeRequired(
+                    documentID: entry.documentID,
+                    revision: state.serverRevision,
+                    reason: .unresolvedConflict
+                )
+            )
+        }
+        if state.blockingErrorCode != nil {
+            return .resolved(
+                .mergeRequired(
+                    documentID: entry.documentID,
+                    revision: state.serverRevision,
+                    reason: .blockedOperation
+                )
+            )
+        }
+        if state.hasPathCollision {
+            return .resolved(
+                .mergeRequired(
+                    documentID: entry.documentID,
+                    revision: state.serverRevision,
+                    reason: .pathOccupiedByDifferentDocument
+                )
+            )
+        }
+        if state.hasActiveOperation {
+            return .resolved(
+                .mergeRequired(
+                    documentID: entry.documentID,
+                    revision: state.serverRevision,
+                    reason: .pendingOperation
+                )
+            )
+        }
+
+        let isPurgedTombstone = entry.isDeleted
+            && effectivePurgeState.purgedRevisions[
+                entry.documentID
+            ].map { $0 >= entry.revision } == true
+        if entry.revision == state.serverRevision,
+           entry.relativePath == state.serverPath,
+           !isPurgedTombstone {
+            if entry.relativePath == syncV2TreeOrderPath {
+                // ③ 같은 revision의 순서를 다시 적용해야 하면 본문이 필요하다.
+                if sameRevisionTreeOrderRequiresRecovery {
+                    return .hydrate
+                }
+            } else {
+                // ② 로컬 TXT가 사라졌으면 서버 본문으로 되살려야 한다.
+                if await localApplier.requiresCopyRecovery(
+                    localProjectID: localProjectID,
+                    manifestEntry: entry
+                ) {
+                    return .hydrate
+                }
+            }
+        }
+
+        return .resolved(
+            .upToDate(
+                documentID: entry.documentID,
+                revision: state.serverRevision
+            )
+        )
+    }
+
     private func prefetchedReadOnlyOutcome(
         snapshot: SyncV2RemoteDocumentSnapshot,
         state: SyncV2SnapshotLocalState?,

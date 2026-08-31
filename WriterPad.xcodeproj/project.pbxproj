@@ -153,6 +153,7 @@
 		A90000000000000000000016 /* SyncV2SnapshotPullTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = B9000000000000000000001A /* SyncV2SnapshotPullTests.swift */; };
 		A90000000000000000000044 /* SyncV2PullLoopScalingMeasurementTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = B90000000000000000000044 /* SyncV2PullLoopScalingMeasurementTests.swift */; };
 		A90000000000000000000045 /* SyncV2LocalSnapshotApplyLookupTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = B90000000000000000000045 /* SyncV2LocalSnapshotApplyLookupTests.swift */; };
+		A90000000000000000000046 /* SyncV2SnapshotHydrationTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = B90000000000000000000046 /* SyncV2SnapshotHydrationTests.swift */; };
 		A93000000000000000000001 /* SyncV2Diagnostics.swift in Sources */ = {isa = PBXBuildFile; fileRef = B93000000000000000000001 /* SyncV2Diagnostics.swift */; };
 		A94000000000000000000001 /* SyncV2SnapshotTransport.swift in Sources */ = {isa = PBXBuildFile; fileRef = B94000000000000000000001 /* SyncV2SnapshotTransport.swift */; };
 		A94000000000000000000002 /* SyncV2SnapshotModels.swift in Sources */ = {isa = PBXBuildFile; fileRef = B94000000000000000000002 /* SyncV2SnapshotModels.swift */; };
@@ -340,6 +341,7 @@
 		B9000000000000000000001A /* SyncV2SnapshotPullTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SyncV2SnapshotPullTests.swift; sourceTree = "<group>"; };
 		B90000000000000000000044 /* SyncV2PullLoopScalingMeasurementTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SyncV2PullLoopScalingMeasurementTests.swift; sourceTree = "<group>"; };
 		B90000000000000000000045 /* SyncV2LocalSnapshotApplyLookupTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SyncV2LocalSnapshotApplyLookupTests.swift; sourceTree = "<group>"; };
+		B90000000000000000000046 /* SyncV2SnapshotHydrationTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SyncV2SnapshotHydrationTests.swift; sourceTree = "<group>"; };
 		B93000000000000000000001 /* SyncV2Diagnostics.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SyncV2Diagnostics.swift; sourceTree = "<group>"; };
 		B94000000000000000000001 /* SyncV2SnapshotTransport.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SyncV2SnapshotTransport.swift; sourceTree = "<group>"; };
 		B94000000000000000000002 /* SyncV2SnapshotModels.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SyncV2SnapshotModels.swift; sourceTree = "<group>"; };
@@ -573,6 +575,7 @@
 				B9000000000000000000001A /* SyncV2SnapshotPullTests.swift */,
 				B90000000000000000000044 /* SyncV2PullLoopScalingMeasurementTests.swift */,
 				B90000000000000000000045 /* SyncV2LocalSnapshotApplyLookupTests.swift */,
+				B90000000000000000000046 /* SyncV2SnapshotHydrationTests.swift */,
 				B92000000000000000000002 /* ThreeWayMergeTests.swift */,
 				B90000000000000000000017 /* SyncSettingsModelTests.swift */,
 				G92000000000000000000001 /* Fixtures */,
@@ -1073,6 +1076,7 @@
 				A90000000000000000000016 /* SyncV2SnapshotPullTests.swift in Sources */,
 				A90000000000000000000044 /* SyncV2PullLoopScalingMeasurementTests.swift in Sources */,
 				A90000000000000000000045 /* SyncV2LocalSnapshotApplyLookupTests.swift in Sources */,
+				A90000000000000000000046 /* SyncV2SnapshotHydrationTests.swift in Sources */,
 				A92000000000000000000002 /* ThreeWayMergeTests.swift in Sources */,
 				A90000000000000000000013 /* SyncSettingsModelTests.swift in Sources */,
 			);
