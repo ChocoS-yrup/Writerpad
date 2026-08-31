@@ -338,27 +338,14 @@ actor LocalBinderRepository: BinderRepository {
     }
 
     private func rootOrdering(_ lhs: BinderNode, _ rhs: BinderNode) -> Bool {
-        // 원고와 휴지통만 양 끝에 보호하고, 나머지 고정·사용자 루트는 사용자 순서를 따른다.
-        if lhs.fixedCategory == .manuscript { return true }
-        if rhs.fixedCategory == .manuscript { return false }
-        if lhs.fixedCategory == .trash { return false }
-        if rhs.fixedCategory == .trash { return true }
-        let leftCustomized = lhs.userOrder >= BinderOrderingPolicy.customizedRootOrderOffset
-        let rightCustomized = rhs.userOrder >= BinderOrderingPolicy.customizedRootOrderOffset
-        if leftCustomized || rightCustomized {
-            if leftCustomized != rightCustomized { return leftCustomized }
-            return childOrdering(lhs, rhs)
-        }
-        switch (lhs.fixedCategory, rhs.fixedCategory) {
-        case let (left?, right?):
-            return left.fixedOrder < right.fixedOrder
-        case (.some, .none):
-            return true
-        case (.none, .some):
-            return false
-        case (.none, .none):
-            return childOrdering(lhs, rhs)
-        }
+        BinderOrderingPolicy.rootItemPrecedes(
+            lhsUserOrder: lhs.userOrder,
+            lhsFixedCategory: lhs.fixedCategory,
+            lhsStableName: lhs.relativePath.rawValue.precomposedStringWithCanonicalMapping,
+            rhsUserOrder: rhs.userOrder,
+            rhsFixedCategory: rhs.fixedCategory,
+            rhsStableName: rhs.relativePath.rawValue.precomposedStringWithCanonicalMapping
+        )
     }
 
     private func childOrdering(_ lhs: BinderNode, _ rhs: BinderNode) -> Bool {

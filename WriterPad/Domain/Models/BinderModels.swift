@@ -3,6 +3,67 @@ import Foundation
 enum BinderOrderingPolicy {
     /// 기존 고정 바인더 순서를 유지하면서 사용자가 루트 순서를 처음 바꾼 시점을 구분한다.
     static let customizedRootOrderOffset = 1_000_000
+
+    /// 화면과 동기화 tree-order가 같은 루트 순서를 사용하게 한다.
+    ///
+    /// 원격에서 막 들어온 항목은 작은 userOrder를, 이미 사용자가 재정렬한 항목은
+    /// offset 이상의 값을 가질 수 있다. 이 전환 구간에서도 두 표현이 갈라지면
+    /// 한 기기에서 정상으로 보인 순서가 다른 기기에 잘못 저장된다.
+    static func rootItemPrecedes(
+        lhsUserOrder: Int,
+        lhsFixedCategory: BinderFixedCategory?,
+        lhsStableName: String,
+        rhsUserOrder: Int,
+        rhsFixedCategory: BinderFixedCategory?,
+        rhsStableName: String
+    ) -> Bool {
+        if lhsFixedCategory == .manuscript {
+            return rhsFixedCategory != .manuscript
+        }
+        if rhsFixedCategory == .manuscript { return false }
+        if lhsFixedCategory == .trash { return false }
+        if rhsFixedCategory == .trash { return true }
+
+        let lhsCustomized = lhsUserOrder >= customizedRootOrderOffset
+        let rhsCustomized = rhsUserOrder >= customizedRootOrderOffset
+        if lhsCustomized || rhsCustomized {
+            if lhsCustomized != rhsCustomized { return lhsCustomized }
+            return itemPrecedes(
+                lhsUserOrder: lhsUserOrder,
+                lhsStableName: lhsStableName,
+                rhsUserOrder: rhsUserOrder,
+                rhsStableName: rhsStableName
+            )
+        }
+
+        switch (lhsFixedCategory, rhsFixedCategory) {
+        case let (lhs?, rhs?):
+            return lhs.fixedOrder < rhs.fixedOrder
+        case (.some, .none):
+            return true
+        case (.none, .some):
+            return false
+        case (.none, .none):
+            return itemPrecedes(
+                lhsUserOrder: lhsUserOrder,
+                lhsStableName: lhsStableName,
+                rhsUserOrder: rhsUserOrder,
+                rhsStableName: rhsStableName
+            )
+        }
+    }
+
+    private static func itemPrecedes(
+        lhsUserOrder: Int,
+        lhsStableName: String,
+        rhsUserOrder: Int,
+        rhsStableName: String
+    ) -> Bool {
+        if lhsUserOrder != rhsUserOrder {
+            return lhsUserOrder < rhsUserOrder
+        }
+        return lhsStableName < rhsStableName
+    }
 }
 
 enum BinderFixedCategory: String, CaseIterable, Codable, Sendable {

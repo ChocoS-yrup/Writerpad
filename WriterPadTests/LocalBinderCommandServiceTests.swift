@@ -668,6 +668,126 @@ final class LocalBinderCommandServiceTests: XCTestCase {
         XCTAssertEqual(stored?.deletionStatus, .active)
     }
 
+    /// 루트 재정렬값은 offset 영역에 있다. 휴지통 복원이 이 값을 형제 수로
+    /// 줄이면 Windows에서 온 폴더가 캐릭터 앞으로 이동한 순서가 서버에 저장된다.
+    func testRootTrashRestorePreservesCustomizedOrderAndQueuedTreeOrder()
+        async throws {
+        let recorder = RecordingDurableChangeRecorder()
+        let harness = try await makeHarness(durableChangeRecorder: recorder)
+        let rootID = try await harness.binder.rootContainerID(in: harness.project.id)
+        let created = try await harness.commands.create(
+            kind: .folder,
+            named: "윈도우-빈폴더",
+            in: rootID,
+            projectID: harness.project.id
+        )
+
+        let initialRoots = try await harness.binder.rootNodes(in: harness.project.id)
+        let reorderableIDs = initialRoots.compactMap { node -> DocumentID? in
+            switch node.fixedCategory {
+            case .manuscript?, .trash?: nil
+            default: node.id
+            }
+        }
+        try await harness.commands.reorder(
+            childIDs: reorderableIDs,
+            in: rootID,
+            projectID: harness.project.id
+        )
+
+        let storedBeforeValue = try await harness.repository.document(
+            id: created.affectedDocumentID
+        )
+        let storedBefore = try XCTUnwrap(storedBeforeValue)
+        XCTAssertGreaterThanOrEqual(
+            storedBefore.userOrder,
+            BinderOrderingPolicy.customizedRootOrderOffset
+        )
+        let beforeContent = try await harness.commands.treeOrderContent(
+            documents: try await harness.repository.documents(in: harness.project.id)
+        )
+        let beforeRootOrder = try treeOrderChildren(
+            in: beforeContent,
+            parent: "<root>"
+        )
+
+        _ = try await harness.commands.moveToTrash(
+            documentID: created.affectedDocumentID,
+            projectID: harness.project.id
+        )
+        await recorder.clear()
+        _ = try await harness.commands.restoreFromTrash(
+            documentID: created.affectedDocumentID,
+            toFolderID: nil,
+            projectID: harness.project.id
+        )
+
+        let storedAfterValue = try await harness.repository.document(
+            id: created.affectedDocumentID
+        )
+        let storedAfter = try XCTUnwrap(storedAfterValue)
+        XCTAssertEqual(storedAfter.userOrder, storedBefore.userOrder)
+
+        let recorded = await recorder.recordedBatches()
+        let restoreBatch = try XCTUnwrap(recorded.last)
+        guard case let .treeOrder(_, queuedContent, _) = restoreBatch.mutations.last
+        else {
+            return XCTFail("복원 batch 마지막에 tree-order가 없습니다.")
+        }
+        XCTAssertEqual(
+            try treeOrderChildren(in: queuedContent, parent: "<root>"),
+            beforeRootOrder
+        )
+    }
+
+    /// 원격 폴더 반영 직후에는 기존 offset 순서와 작은 순서값이 잠시 섞일 수 있다.
+    /// 이때도 iPad 화면과 Windows로 보낼 tree-order가 반드시 같아야 한다.
+    func testRootTreeOrderUsesSameOrderingAsBinderDuringMixedOrderTransition()
+        async throws {
+        let harness = try await makeHarness()
+        let rootID = try await harness.binder.rootContainerID(in: harness.project.id)
+        let imported = try await harness.commands.create(
+            kind: .folder,
+            named: "윈도우-빈폴더",
+            in: rootID,
+            projectID: harness.project.id
+        )
+        let initialRoots = try await harness.binder.rootNodes(in: harness.project.id)
+        let reorderableIDs = initialRoots.compactMap { node -> DocumentID? in
+            switch node.fixedCategory {
+            case .manuscript?, .trash?: nil
+            default: node.id
+            }
+        }
+        try await harness.commands.reorder(
+            childIDs: reorderableIDs,
+            in: rootID,
+            projectID: harness.project.id
+        )
+
+        let storedValue = try await harness.repository.document(
+            id: imported.affectedDocumentID
+        )
+        let stored = try XCTUnwrap(storedValue)
+        try await harness.repository.reconcileBinderMetadata(
+            in: harness.project.id,
+            upserting: [copy(stored, userOrder: 0)],
+            removingSubtrees: []
+        )
+
+        let visibleRootOrder = try await harness.binder.rootNodes(in: harness.project.id)
+            .filter { $0.fixedCategory != .trash }
+            .map { storedName(of: $0.relativePath) }
+        let content = try await harness.commands.treeOrderContent(
+            documents: try await harness.repository.documents(in: harness.project.id)
+        )
+
+        XCTAssertEqual(
+            try treeOrderChildren(in: content, parent: "<root>"),
+            visibleRootOrder
+        )
+    }
+
     func testTrashRestoreCanUseChosenDestinationFolder() async throws {
         let harness = try await makeHarness()
         let notes = try await fixedRoot(.notes, harness: harness)
@@ -1760,6 +1880,25 @@ final class LocalBinderCommandServiceTests: XCTestCase {
         )
     }
 
+    private func copy(
+        _ document: DocumentNode,
+        userOrder: Int
+    ) -> DocumentNode {
+        DocumentNode(
+            id: document.id,
+            projectID: document.projectID,
+            kind: document.kind,
+            parentID: document.parentID,
+            relativePath: document.relativePath,
+            userOrder: userOrder,
+            modifiedAt: document.modifiedAt,
+            contentHash: document.contentHash,
+            deletionStatus: document.deletionStatus,
+            cursor: document.cursor,
+            isExpanded: document.isExpanded
+        )
+    }
+
     private struct Harness {
         let root: URL
         let repository: SwiftDataMetadataRepository
@@ -1861,6 +2000,24 @@ final class LocalBinderCommandServiceTests: XCTestCase {
     ) async throws -> BinderNode {
         let roots = try await harness.binder.rootNodes(in: harness.project.id)
         return try XCTUnwrap(roots.first { $0.fixedCategory == category })
+    }
+
+    private func treeOrderChildren(
+        in content: String,
+        parent: String
+    ) throws -> [String] {
+        let object = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: Data(content.utf8))
+                as? [String: Any]
+        )
+        let treeOrder = try XCTUnwrap(
+            object["tree_order"] as? [String: [String]]
+        )
+        return try XCTUnwrap(treeOrder[parent])
+    }
+
+    private func storedName(of path: RelativeDocumentPath) -> String {
+        path.rawValue.split(separator: "/").last.map(String.init) ?? ""
     }
 
     private func fileURL(_ path: String, harness: Harness) -> URL {

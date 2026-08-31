@@ -615,8 +615,10 @@ actor LocalBinderCommandService: BinderCommanding {
         let root = try await workspaceLocator.workspaceRoot(for: projectID)
         let record = try readTrashRecord(documentID, workspaceRoot: root)
         let destinationParent: DocumentNode
+        let restoresToOriginalParent: Bool
         if let toFolderID {
             destinationParent = try requireDocument(toFolderID, in: documents)
+            restoresToOriginalParent = false
             guard destinationParent.kind == .folder, !isInTrash(destinationParent.relativePath) else {
                 throw BinderCommandError.destinationIsNotFolder(toFolderID)
             }
@@ -626,11 +628,13 @@ actor LocalBinderCommandService: BinderCommanding {
                 && !isInTrash($0.relativePath)
         }) {
             destinationParent = originalParent
+            restoresToOriginalParent = true
         } else {
             guard let rootContainer = documents.first(where: hierarchyPolicy.isTopLevelContainer) else {
                 throw BinderCommandError.missingDocument(record.originalParentID)
             }
             destinationParent = rootContainer
+            restoresToOriginalParent = false
         }
         if hierarchyPolicy.placementViolation(
             for: source.kind,
@@ -659,8 +663,11 @@ actor LocalBinderCommandService: BinderCommanding {
         )
         try requireAllowed(decision, candidate: candidate, existingNames: existingNames)
         let siblings = documents.filter { $0.parentID == destinationParent.id && $0.id != source.id }
-        let order = toFolderID == nil
-            ? min(max(record.originalUserOrder, 0), siblings.count)
+        // 루트 사용자 정렬은 offset 이상의 값으로 정렬 영역을 구분한다.
+        // 형제 개수로 clamp하면 이 영역 정보가 사라져 복원 항목이 캐릭터 앞으로
+        // 이동하고, 그 잘못된 순서가 tree-order에도 기록된다.
+        let order = restoresToOriginalParent
+            ? max(record.originalUserOrder, 0)
             : (siblings.map(\.userOrder).max() ?? -1) + 1
         let restored = relocatedSubtree(
             subtree,

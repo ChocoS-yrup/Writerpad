@@ -863,15 +863,28 @@ extension LocalBinderCommandService {
         let folders = live.filter { $0.kind == .folder }
         var order: [String: [String]] = [:]
         for parent in folders {
+            let isRoot = hierarchyPolicy.isTopLevelContainer(parent)
             let children = live
                 .filter { $0.parentID == parent.id }
                 .sorted {
+                    if isRoot {
+                        return BinderOrderingPolicy.rootItemPrecedes(
+                            lhsUserOrder: $0.userOrder,
+                            lhsFixedCategory: fixedCategory(for: $0.relativePath),
+                            lhsStableName: $0.relativePath.rawValue
+                                .precomposedStringWithCanonicalMapping,
+                            rhsUserOrder: $1.userOrder,
+                            rhsFixedCategory: fixedCategory(for: $1.relativePath),
+                            rhsStableName: $1.relativePath.rawValue
+                                .precomposedStringWithCanonicalMapping
+                        )
+                    }
                     if $0.userOrder != $1.userOrder {
                         return $0.userOrder < $1.userOrder
                     }
                     return $0.relativePath.rawValue < $1.relativePath.rawValue
                 }
-            let rawKey = hierarchyPolicy.isTopLevelContainer(parent)
+            let rawKey = isRoot
                 ? "<root>"
                 : parent.relativePath.rawValue
             let key = rawKey == "<root>"
