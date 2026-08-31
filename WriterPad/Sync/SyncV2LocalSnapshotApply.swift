@@ -373,10 +373,22 @@ actor LocalSyncV2SnapshotApplier: SyncV2LocalSnapshotApplying {
               documentRepository is any DocumentIdentityReplacing
         else { return nil }
 
+        // 정상 상태에서는 서버 문서 UUID가 로컬에도 그대로 있다. 그때는 단건
+        // 조회만으로 답이 나오므로 작품 전체 목록을 읽지 않는다. 이 판정은
+        // pull 한 번에 문서 수만큼 반복된다.
+        let targetID = DocumentID(rawValue: snapshot.documentID)
+        let existing = (try? await documentRepository.document(
+            id: targetID
+        )) ?? nil
+        if let existing, existing.projectID == localProjectID {
+            return nil
+        }
+
+        // UUID가 없을 때만 같은 경로의 후보를 찾는다. 단건 조회가 실패로
+        // 비어 온 경우까지 덮도록 목록 쪽 판정도 남겨 둔다.
         guard let documents = try? await documentRepository.documents(
             in: localProjectID
         ) else { return nil }
-        let targetID = DocumentID(rawValue: snapshot.documentID)
         guard !documents.contains(where: { $0.id == targetID }) else {
             return nil
         }
@@ -825,13 +837,15 @@ actor LocalSyncV2SnapshotApplier: SyncV2LocalSnapshotApplying {
         ) {
             return true
         }
+        // 여기서 필요한 것은 이 UUID 하나의 현재 상태뿐이다. 작품 전체 목록을
+        // 읽으면 pull 한 번에 문서 수만큼 반복되어 비용이 제곱으로 자란다.
+        // 프로젝트 범위 판정은 그대로 유지한다.
+        let currentDocument = (try? await documentRepository.document(
+            id: DocumentID(rawValue: snapshot.documentID)
+        )) ?? nil
         guard
-            let documents = try? await documentRepository.documents(
-                in: localProjectID
-            ),
-            let current = documents.first(where: {
-                $0.id.rawValue == snapshot.documentID
-            }),
+            let current = currentDocument,
+            current.projectID == localProjectID,
             current.kind == .text
         else { return false }
         let currentURL = root.appendingPathComponent(
