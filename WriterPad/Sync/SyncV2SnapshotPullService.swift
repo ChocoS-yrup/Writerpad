@@ -440,6 +440,11 @@ actor SyncV2SnapshotPullService: SyncV2SnapshotPulling {
         for entry in orderedEntries {
             try Task.checkCancellation()
             guard let prefetchedStates else {
+                SyncV2Diagnostics.hydrationRequired(
+                    documentID: entry.documentID,
+                    reason: "state-batch-unavailable",
+                    sentinelPath: nil
+                )
                 hydrationTargets.append(entry.documentID)
                 continue
             }
@@ -456,7 +461,17 @@ actor SyncV2SnapshotPullService: SyncV2SnapshotPulling {
             switch decision {
             case let .resolved(outcome):
                 resolvedOutcomes[entry.documentID] = outcome
-            case .hydrate:
+            case let .hydrate(reason):
+                let sentinelPath: String? = switch entry.relativePath {
+                case syncV2TreeOrderPath: syncV2TreeOrderPath
+                case syncV2TrashPurgePath: syncV2TrashPurgePath
+                default: nil
+                }
+                SyncV2Diagnostics.hydrationRequired(
+                    documentID: entry.documentID,
+                    reason: reason,
+                    sentinelPath: sentinelPath
+                )
                 hydrationTargets.append(entry.documentID)
             }
         }
@@ -469,18 +484,15 @@ actor SyncV2SnapshotPullService: SyncV2SnapshotPulling {
         )
 
         let hydrationStartedAt = DispatchTime.now().uptimeNanoseconds
-        let hydratedByID: [UUID: SyncV2RemoteDocumentSnapshot]
-        if hydrationTargets.isEmpty {
-            hydratedByID = [:]
-        } else {
+        var hydratedByID: [UUID: SyncV2RemoteDocumentSnapshot] = [:]
+        if !hydrationTargets.isEmpty {
             let hydrated = try await client.fetchDocumentContents(
                 projectID: serverProjectID,
                 documentIDs: hydrationTargets
             )
-            hydratedByID = Dictionary(
-                hydrated.map { ($0.documentID, $0) },
-                uniquingKeysWith: { first, _ in first }
-            )
+            for snapshot in hydrated {
+                hydratedByID[snapshot.documentID] = snapshot
+            }
         }
         SyncV2PullDiagnostics.record(
             stage: "document-contents",
@@ -1283,14 +1295,14 @@ actor SyncV2SnapshotPullService: SyncV2SnapshotPulling {
     ///
     /// 본문을 생략해도 되는 경우는 `prefetchedReadOnlyOutcome`이 본문을 한 번도
     /// 보지 않고 답을 내는 경우와 정확히 같아야 한다. 모르면 받는 쪽으로 답한다.
-    private enum HydrationDecision: Sendable {
+    enum HydrationDecision: Sendable {
         /// 본문 없이 결론이 났다.
         case resolved(SyncV2SnapshotPullOutcome)
         /// 본문을 받아 기존 판정 경로로 내려간다.
-        case hydrate
+        case hydrate(reason: String)
     }
 
-    private func hydrationDecision(
+    func hydrationDecision(
         entry: SyncV2RemoteDocumentManifestEntry,
         localProjectID: ProjectID,
         serverProjectID: UUID,
@@ -1311,27 +1323,37 @@ actor SyncV2SnapshotPullService: SyncV2SnapshotPulling {
                    namespace: serverProjectID,
                    name: hiddenPath
                ) {
-            return .hydrate
+            return .hydrate(reason: "hidden-document-contract")
         }
 
         // ④ 휴지통 비움 payload는 같은 revision이어도 멱등 병합이 필요하다.
         if entry.relativePath == syncV2TrashPurgePath {
-            return .hydrate
+            return .hydrate(reason: "trash-purge")
         }
 
         // ① 로컬 기준선이 없거나 서버가 앞서면 받아야 한다.
-        guard let state, entry.revision <= state.serverRevision else {
-            return .hydrate
+        guard let state else {
+            return .hydrate(reason: "no-local-baseline")
+        }
+        guard entry.revision <= state.serverRevision else {
+            return .hydrate(reason: "server-revision-advanced")
         }
 
         // ⑥ 서버 UUID가 로컬에 없으면 같은 경로의 다른 UUID를 채택할지
         // 따져야 하고, 그 판정은 본문 바이트 비교로만 끝난다.
-        if !editing.isOpen, !editing.isDirty, !editing.isComposing,
+        //
+        // 채택 대상이 될 수 없는 문서는 확인하지 않는다. 숨은 계약 문서는
+        // 로컬에 짝이 없는 것이 정상이고, tombstone은 채택 대상이 아니다.
+        // 이 제외가 없으면 작품마다 tree-order 하나가 변경이 없는데도 매번
+        // 본문을 받아 두 단계로 나눈 뜻이 없어진다. 제외 조건은
+        // `equivalentLocalDocumentID`가 스스로 거르는 것과 같아야 한다.
+        if hiddenPath == nil, !entry.isDeleted,
+           !editing.isOpen, !editing.isDirty, !editing.isComposing,
            await !localApplier.hasLocalDocument(
                localProjectID: localProjectID,
                documentID: entry.documentID
            ) {
-            return .hydrate
+            return .hydrate(reason: "local-uuid-absent")
         }
 
         if state.hasUnresolvedConflict {
@@ -1381,7 +1403,7 @@ actor SyncV2SnapshotPullService: SyncV2SnapshotPulling {
             if entry.relativePath == syncV2TreeOrderPath {
                 // ③ 같은 revision의 순서를 다시 적용해야 하면 본문이 필요하다.
                 if sameRevisionTreeOrderRequiresRecovery {
-                    return .hydrate
+                    return .hydrate(reason: "tree-order-recovery")
                 }
             } else {
                 // ② 로컬 TXT가 사라졌으면 서버 본문으로 되살려야 한다.
@@ -1389,7 +1411,7 @@ actor SyncV2SnapshotPullService: SyncV2SnapshotPulling {
                     localProjectID: localProjectID,
                     manifestEntry: entry
                 ) {
-                    return .hydrate
+                    return .hydrate(reason: "copy-recovery")
                 }
             }
         }

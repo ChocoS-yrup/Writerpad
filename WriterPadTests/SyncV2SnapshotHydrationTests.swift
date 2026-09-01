@@ -93,33 +93,38 @@ final class SyncV2SnapshotHydrationTests: XCTestCase {
         )
     }
 
-    func testTrashPurgeIsAlwaysHydrated() async throws {
-        let workspace = try await HydrationWorkspace.make(documentCount: 3)
+    /// 어디서 받든, 휴지통 payload는 같은 revision이어도 본문이 있어야 한다.
+    /// 받아 오는 경로는 아래 병렬 사전 조회 시험이 따로 고정한다.
+    func testTrashPurgeAlwaysNeedsContent() async throws {
+        let workspace = try await HydrationWorkspace.make(documentCount: 1)
         addTeardownBlock { workspace.remove() }
 
         let purgeID = syncV2UUIDv5(
             namespace: workspace.serverProjectID,
             name: syncV2TrashPurgePath
         )
-        await workspace.client.addDocument(
-            documentID: purgeID,
-            path: syncV2TrashPurgePath,
-            content: "{}",
-            revision: 3
+        let decision = await workspace.decision(
+            entry: SyncV2RemoteDocumentManifestEntry(
+                documentID: purgeID,
+                relativePath: syncV2TrashPurgePath,
+                revision: 3,
+                isDeleted: false,
+                deletedAt: nil,
+                updatedAt: Date(timeIntervalSince1970: 1_800_000_000)
+            ),
+            state: SyncV2SnapshotLocalState(
+                serverRevision: 3,
+                serverPath: syncV2TrashPurgePath,
+                hasActiveOperation: false,
+                hasUnresolvedConflict: false,
+                blockingErrorCode: nil
+            ),
+            sameRevisionTreeOrderRequiresRecovery: false
         )
-        await workspace.setState(
-            documentID: purgeID,
-            path: syncV2TrashPurgePath,
-            revision: 3
-        )
-
-        _ = try await workspace.pull()
-
-        let requested = await workspace.client.requestedContentIDs()
-        XCTAssertTrue(
-            requested.contains(purgeID),
-            "휴지통 비움은 같은 revision이어도 멱등 병합이 필요하다."
-        )
+        guard case .hydrate = decision else {
+            XCTFail("휴지통 비움은 멱등 병합을 위해 본문이 필요하다.")
+            return
+        }
     }
 
     func testHiddenDocumentContractViolationIsHydrated() async throws {
@@ -180,6 +185,103 @@ final class SyncV2SnapshotHydrationTests: XCTestCase {
             Set(requested),
             Set(workspace.documentIDs.map(\.rawValue)),
             "판정 근거가 없으면 예전처럼 전부 받아야 한다."
+        )
+    }
+
+    /// 계약이 정한 숨은 문서는 로컬에 짝이 없는 것이 정상이다. 이것을
+    /// "로컬에 UUID가 없다"로 읽으면 작품마다 tree-order 하나가 변경이
+    /// 없는데도 매 pull마다 본문을 받는다.
+    func testCanonicalTreeOrderIsNotHydratedWhenUnchanged() async throws {
+        let workspace = try await HydrationWorkspace.make(documentCount: 1)
+        addTeardownBlock { workspace.remove() }
+
+        let treeOrderID = syncV2UUIDv5(
+            namespace: workspace.serverProjectID,
+            name: syncV2TreeOrderPath
+        )
+        let entry = SyncV2RemoteDocumentManifestEntry(
+            documentID: treeOrderID,
+            relativePath: syncV2TreeOrderPath,
+            revision: 3,
+            isDeleted: false,
+            deletedAt: nil,
+            updatedAt: Date(timeIntervalSince1970: 1_800_000_000)
+        )
+        // 순서 재적용이 필요 없는 안정 상태에서 판정한다. 이 조건에서도
+        // 본문을 받으면 작품마다 매 pull에 한 건이 고정으로 늘어난다.
+        let decision = await workspace.decision(
+            entry: entry,
+            state: SyncV2SnapshotLocalState(
+                serverRevision: 3,
+                serverPath: syncV2TreeOrderPath,
+                hasActiveOperation: false,
+                hasUnresolvedConflict: false,
+                blockingErrorCode: nil
+            ),
+            sameRevisionTreeOrderRequiresRecovery: false
+        )
+        guard case .resolved = decision else {
+            XCTFail("변경 없는 계약 tree-order는 본문 없이 결론이 나야 한다.")
+            return
+        }
+    }
+
+    /// 순서를 다시 적용해야 하는 상태에서는 여전히 본문을 받아야 한다.
+    func testTreeOrderRecoveryStillHydrates() async throws {
+        let workspace = try await HydrationWorkspace.make(documentCount: 1)
+        addTeardownBlock { workspace.remove() }
+
+        let treeOrderID = syncV2UUIDv5(
+            namespace: workspace.serverProjectID,
+            name: syncV2TreeOrderPath
+        )
+        let decision = await workspace.decision(
+            entry: SyncV2RemoteDocumentManifestEntry(
+                documentID: treeOrderID,
+                relativePath: syncV2TreeOrderPath,
+                revision: 3,
+                isDeleted: false,
+                deletedAt: nil,
+                updatedAt: Date(timeIntervalSince1970: 1_800_000_000)
+            ),
+            state: SyncV2SnapshotLocalState(
+                serverRevision: 3,
+                serverPath: syncV2TreeOrderPath,
+                hasActiveOperation: false,
+                hasUnresolvedConflict: false,
+                blockingErrorCode: nil
+            ),
+            sameRevisionTreeOrderRequiresRecovery: true
+        )
+        guard case .hydrate = decision else {
+            XCTFail("순서 재적용이 필요하면 본문을 받아야 한다.")
+            return
+        }
+    }
+
+    /// tombstone은 동일성 채택 대상이 아니다.
+    func testDeletedDocumentIsNotHydratedForIdentityAdoption() async throws {
+        let workspace = try await HydrationWorkspace.make(documentCount: 3)
+        addTeardownBlock { workspace.remove() }
+
+        let goneID = UUID()
+        await workspace.client.addTombstone(
+            documentID: goneID,
+            path: "메인/원고/1권/9999.txt",
+            revision: 3
+        )
+        await workspace.setState(
+            documentID: goneID,
+            path: "메인/원고/1권/9999.txt",
+            revision: 3
+        )
+
+        _ = try await workspace.pull()
+
+        let requested = await workspace.client.requestedContentIDs()
+        XCTAssertFalse(
+            requested.contains(goneID),
+            "삭제 표식은 동일성 채택 후보가 아니므로 본문이 필요 없다."
         )
     }
 
@@ -318,6 +420,23 @@ private struct HydrationWorkspace {
 
     func removeState(documentID: UUID) async {
         await stateStore.remove(documentID: documentID)
+    }
+
+    func decision(
+        entry: SyncV2RemoteDocumentManifestEntry,
+        state: SyncV2SnapshotLocalState?,
+        sameRevisionTreeOrderRequiresRecovery: Bool
+    ) async -> SyncV2SnapshotPullService.HydrationDecision {
+        await service.hydrationDecision(
+            entry: entry,
+            localProjectID: projectID,
+            serverProjectID: serverProjectID,
+            state: state,
+            editing: .closed,
+            effectivePurgeState: .empty,
+            sameRevisionTreeOrderRequiresRecovery:
+                sameRevisionTreeOrderRequiresRecovery
+        )
     }
 
     func remove() {
@@ -487,6 +606,22 @@ private actor HydrationRecordingClient: SyncV2SnapshotClienting {
             revision: revision,
             isDeleted: false,
             deletedAt: nil,
+            updatedAt: Date(timeIntervalSince1970: 1_800_000_000)
+        )
+    }
+
+    func addTombstone(
+        documentID: UUID,
+        path: String,
+        revision: Int64
+    ) {
+        snapshots[documentID] = SyncV2RemoteDocumentSnapshot(
+            documentID: documentID,
+            relativePath: path,
+            content: "",
+            revision: revision,
+            isDeleted: true,
+            deletedAt: Date(timeIntervalSince1970: 1_800_000_000),
             updatedAt: Date(timeIntervalSince1970: 1_800_000_000)
         )
     }

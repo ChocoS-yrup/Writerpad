@@ -75,6 +75,22 @@ enum SyncV2Diagnostics {
         )
     }
 
+    /// 어떤 문서의 본문을 왜 받았는지 남긴다.
+    ///
+    /// 변경 없는 pull에서도 본문을 받는 문서가 있으면 두 번째 왕복이 상시
+    /// 발생해 두 단계 조회의 이득이 깎인다. 그 원인을 사후에 찾을 수 있어야
+    /// 한다. 경로는 계약이 정한 숨은 문서일 때만 남기고, 원고 경로는 남기지
+    /// 않는다.
+    static func hydrationRequired(
+        documentID: UUID,
+        reason: String,
+        sentinelPath: String?
+    ) {
+        syncV2Logger.info(
+            "event=hydrationRequired documentID=\(documentID.uuidString, privacy: .public) reason=\(reason, privacy: .public) path=\(sentinelPath ?? "document", privacy: .public)"
+        )
+    }
+
     static func raceTimedOut(_ race: String) {
         syncV2Logger.warning(
             "event=raceTimedOut race=\(race, privacy: .public)"
