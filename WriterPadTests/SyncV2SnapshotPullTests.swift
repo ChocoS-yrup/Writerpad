@@ -394,6 +394,133 @@ final class SyncV2SnapshotPullTests: XCTestCase {
         )
     }
 
+    @MainActor
+    func testWorkspaceLifecycleKeepsSyncActiveAfterSlowInitialDeactivation()
+        async throws {
+        let previous = GlobalSyncPreference.isEnabled()
+        GlobalSyncPreference.setEnabled(true)
+        defer { GlobalSyncPreference.setEnabled(previous) }
+        let puller = WorkspacePullerStub()
+        let model = makeLifecycleModel(puller: puller, realtime: nil)
+        let lifecycle = WorkspaceLifecycleCoordinator()
+        let inactiveStarted = expectation(description: "초기 비활성화 시작")
+        let inactiveMayFinish = SyncV2OneShotRace<Bool>()
+        var events: [String] = []
+        let update: @MainActor (Bool) async -> Void = { active in
+            events.append(active ? "active-start" : "inactive-start")
+            if !active {
+                inactiveStarted.fulfill()
+                // 편집기의 저장 또는 편집 잠금 해제가 끝나기 전에
+                // scene이 active로 바뀌는 재실행 순서를 재현한다.
+                _ = await inactiveMayFinish.value()
+            }
+            await model.updateSceneActivity(active)
+            events.append(active ? "active-end" : "inactive-end")
+        }
+        let starting = try XCTUnwrap(lifecycle.appear(
+            initialActivity: false,
+            prepare: {
+                await model.start(sceneIsActive: false, editingGuards: { [:] }) { _ in }
+            },
+            updateActivity: update
+        ))
+        await fulfillment(of: [inactiveStarted], timeout: 2)
+        let activating = try XCTUnwrap(lifecycle.observeSceneActivity(
+            true,
+            updateActivity: update
+        ))
+        try await Task.sleep(for: .milliseconds(50))
+        XCTAssertEqual(events, ["inactive-start"])
+        await inactiveMayFinish.resolve(true)
+        await starting.value
+        await activating.value
+
+        XCTAssertEqual(events, [
+            "inactive-start", "inactive-end", "active-start", "active-end"
+        ])
+        for _ in 0..<500 where model.state.progress == .pulling {
+            await Task.yield()
+        }
+        await model.retry()
+        for _ in 0..<500 where model.state.progress == .pulling {
+            await Task.yield()
+        }
+        let pullCount = await puller.count()
+        XCTAssertEqual(pullCount, 2, "마지막 active 통지 뒤에도 동기화가 살아 있어야 한다.")
+        if case .synced = model.state.lastResult {
+            // expected
+        } else {
+            XCTFail("Expected synced, got \(model.state)")
+        }
+        await lifecycle.disappear { await model.stop() }.value
+    }
+
+    @MainActor
+    func testWorkspaceLifecycleStartsSyncAfterActiveArrivesDuringRestoration()
+        async throws {
+        let previous = GlobalSyncPreference.isEnabled()
+        GlobalSyncPreference.setEnabled(true)
+        defer { GlobalSyncPreference.setEnabled(previous) }
+        let puller = WorkspacePullerStub()
+        let model = makeLifecycleModel(puller: puller, realtime: nil)
+        let lifecycle = WorkspaceLifecycleCoordinator()
+        let restorationStarted = expectation(description: "작품 복원 시작")
+        let restorationMayFinish = SyncV2OneShotRace<Bool>()
+        let starting = try XCTUnwrap(lifecycle.appear(
+            initialActivity: false,
+            prepare: {
+                restorationStarted.fulfill()
+                _ = await restorationMayFinish.value()
+                await model.start(sceneIsActive: false, editingGuards: { [:] }) { _ in }
+            },
+            updateActivity: { await model.updateSceneActivity($0) }
+        ))
+        await fulfillment(of: [restorationStarted], timeout: 2)
+        XCTAssertNil(lifecycle.observeSceneActivity(
+            true,
+            updateActivity: { await model.updateSceneActivity($0) }
+        ))
+        await restorationMayFinish.resolve(true)
+        await starting.value
+        for _ in 0..<500 where model.state.progress == .pulling {
+            await Task.yield()
+        }
+        let pullCount = await puller.count()
+        XCTAssertEqual(pullCount, 1)
+        await lifecycle.disappear { await model.stop() }.value
+    }
+
+    @MainActor
+    func testWorkspaceLifecycleIgnoresOldRestorationAfterLeavingAndReentering()
+        async throws {
+        let lifecycle = WorkspaceLifecycleCoordinator()
+        let restorationStarted = expectation(description: "이전 작품 복원 시작")
+        let restorationMayFinish = SyncV2OneShotRace<Bool>()
+        var events: [String] = []
+        let oldStart = try XCTUnwrap(lifecycle.appear(
+            initialActivity: true,
+            prepare: {
+                restorationStarted.fulfill()
+                _ = await restorationMayFinish.value()
+                events.append("old-restore")
+            },
+            updateActivity: { _ in events.append("old-active") }
+        ))
+        await fulfillment(of: [restorationStarted], timeout: 2)
+        lifecycle.disappear { events.append("stop") }
+        let newStart = try XCTUnwrap(lifecycle.appear(
+            initialActivity: true,
+            prepare: { events.append("new-restore") },
+            updateActivity: { active in
+                events.append(active ? "new-active" : "new-inactive")
+            }
+        ))
+        await restorationMayFinish.resolve(true)
+        await oldStart.value
+        await newStart.value
+        XCTAssertEqual(events, ["old-restore", "stop", "new-restore", "new-active"])
+    }
+
     func testOneShotRaceResolvesOnceAndIntentionallyIgnoresCancellation()
         async {
         let race = SyncV2OneShotRace<Int>()

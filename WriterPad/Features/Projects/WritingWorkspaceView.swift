@@ -55,6 +55,65 @@ struct WorkspaceSceneActivityGate: Equatable, Sendable {
     }
 }
 
+@MainActor
+final class WorkspaceLifecycleCoordinator {
+    private var sceneActivityGate = WorkspaceSceneActivityGate()
+    private var lifecycleTask: Task<Void, Never>?
+
+    @discardableResult
+    func appear(
+        initialActivity: Bool,
+        prepare: @escaping @MainActor () async -> Void,
+        updateActivity: @escaping @MainActor (Bool) async -> Void
+    ) -> Task<Void, Never>? {
+        guard let appearanceID = sceneActivityGate.beginAppearance(
+            initialActivity: initialActivity
+        ) else { return nil }
+        return enqueue {
+            guard self.sceneActivityGate.isCurrentAppearance(appearanceID)
+            else { return }
+            await prepare()
+            guard let active = self.sceneActivityGate.finishStarting(
+                appearanceID: appearanceID
+            ) else { return }
+            await updateActivity(active)
+        }
+    }
+
+    @discardableResult
+    func observeSceneActivity(
+        _ active: Bool,
+        updateActivity: @escaping @MainActor (Bool) async -> Void
+    ) -> Task<Void, Never>? {
+        guard let active = sceneActivityGate.observe(active)
+        else { return nil }
+        // 저장이나 편집 잠금 해제로 이전 전환이 지연되어도, 뒤늦게
+        // 끝난 inactive가 최신 active의 동기화를 정지시키지 않게 한다.
+        // SwiftUI scene task의 취소와도 분리해 이미 받은 전환을 보존한다.
+        return enqueue { await updateActivity(active) }
+    }
+
+    @discardableResult
+    func disappear(
+        stop: @escaping @MainActor () async -> Void
+    ) -> Task<Void, Never> {
+        sceneActivityGate.endAppearance()
+        return enqueue(stop)
+    }
+
+    private func enqueue(
+        _ operation: @escaping @MainActor () async -> Void
+    ) -> Task<Void, Never> {
+        let predecessor = lifecycleTask
+        let task = Task { @MainActor in
+            _ = await predecessor?.value
+            await operation()
+        }
+        lifecycleTask = task
+        return task
+    }
+}
+
 struct WritingWorkspaceShell: View {
     @Environment(\.colorScheme) private var colorScheme
     @Environment(\.scenePhase) private var scenePhase
@@ -143,9 +202,7 @@ struct WritingWorkspaceShell: View {
     @State private var isProjectSearching = false
     @State private var projectSearchGeneration: UInt64 = 0
     @State private var projectSearchTask: Task<Void, Never>?
-    @State private var workspaceSceneActivityGate =
-        WorkspaceSceneActivityGate()
-    @State private var workspaceLifecycleTask: Task<Void, Never>?
+    @State private var workspaceLifecycle = WorkspaceLifecycleCoordinator()
     @State private var writerPadCommandActions = WriterPadCommandActions()
 
     init(
@@ -390,53 +447,44 @@ struct WritingWorkspaceShell: View {
         .onAppear {
             updateWriterPadCommandActions()
             applyAutosaveDelaySetting(autosaveDelayMilliseconds)
-            guard let appearanceID =
-                workspaceSceneActivityGate.beginAppearance(
-                    initialActivity: scenePhase == .active
-                )
-            else { return }
             let diagnosticsContext =
                 SyncV2PullDiagnostics.makeWorkspaceEntryContext(
                     localProjectID: project.id
                 )
-            enqueueWorkspaceLifecycleOperation {
-                await SyncV2PullDiagnostics.withContext(
-                    diagnosticsContext
-                ) {
-                    SyncV2PullDiagnostics.record(
-                        stage: "workspace-entry",
-                        phase: "started"
-                    )
-                    let restoreStartedAt =
-                        DispatchTime.now().uptimeNanoseconds
-                    await restoreWorkspaceIfNeeded()
-                    SyncV2PullDiagnostics.record(
-                        stage: "workspace-restore",
-                        phase: "finished",
-                        startedAtNanoseconds: restoreStartedAt
-                    )
-                    guard workspaceSceneActivityGate.isCurrentAppearance(
-                        appearanceID
-                    ) else { return }
-                    let syncStartAt =
-                        DispatchTime.now().uptimeNanoseconds
-                    await workspaceSyncModel.start(
-                        sceneIsActive: false,
-                        editingGuards: currentSyncEditingGuards,
-                        applyOpenSnapshots: applyOpenServerSnapshots
-                    )
-                    SyncV2PullDiagnostics.record(
-                        stage: "workspace-sync-start",
-                        phase: "finished",
-                        startedAtNanoseconds: syncStartAt
-                    )
-                    guard let active = workspaceSceneActivityGate
-                        .finishStarting(
-                            appearanceID: appearanceID
-                        ) else { return }
-                    await updateSceneActivity(active)
-                }
-            }
+            workspaceLifecycle.appear(
+                initialActivity: scenePhase == .active,
+                prepare: {
+                    await SyncV2PullDiagnostics.withContext(
+                        diagnosticsContext
+                    ) {
+                        SyncV2PullDiagnostics.record(
+                            stage: "workspace-entry",
+                            phase: "started"
+                        )
+                        let restoreStartedAt =
+                            DispatchTime.now().uptimeNanoseconds
+                        await restoreWorkspaceIfNeeded()
+                        SyncV2PullDiagnostics.record(
+                            stage: "workspace-restore",
+                            phase: "finished",
+                            startedAtNanoseconds: restoreStartedAt
+                        )
+                        let syncStartAt =
+                            DispatchTime.now().uptimeNanoseconds
+                        await workspaceSyncModel.start(
+                            sceneIsActive: false,
+                            editingGuards: currentSyncEditingGuards,
+                            applyOpenSnapshots: applyOpenServerSnapshots
+                        )
+                        SyncV2PullDiagnostics.record(
+                            stage: "workspace-sync-start",
+                            phase: "finished",
+                            startedAtNanoseconds: syncStartAt
+                        )
+                    }
+                },
+                updateActivity: updateSceneActivity
+            )
         }
         .onChange(of: autosaveDelayMilliseconds) { _, milliseconds in
             applyAutosaveDelaySetting(milliseconds)
@@ -451,16 +499,15 @@ struct WritingWorkspaceShell: View {
             notifySyncEditingGuardsChanged()
         }
         .task(id: scenePhase) {
-            if let active = workspaceSceneActivityGate.observe(
-                scenePhase == .active
-            ) {
-                await updateSceneActivity(active)
-            }
+            guard !Task.isCancelled else { return }
+            workspaceLifecycle.observeSceneActivity(
+                scenePhase == .active,
+                updateActivity: updateSceneActivity
+            )
         }
         .onDisappear {
             projectSearchTask?.cancel()
-            workspaceSceneActivityGate.endAppearance()
-            enqueueWorkspaceLifecycleOperation {
+            workspaceLifecycle.disappear {
                 await workspaceSyncModel.stop()
                 await leftEditorModel.releaseEditLease()
                 await rightEditorModel.releaseEditLease()
@@ -2062,16 +2109,6 @@ struct WritingWorkspaceShell: View {
         await workspaceSyncModel.updateSceneActivity(active)
         if !active {
             await persistWorkspaceState()
-        }
-    }
-
-    private func enqueueWorkspaceLifecycleOperation(
-        _ operation: @escaping @MainActor () async -> Void
-    ) {
-        let predecessor = workspaceLifecycleTask
-        workspaceLifecycleTask = Task { @MainActor in
-            _ = await predecessor?.value
-            await operation()
         }
     }
 
