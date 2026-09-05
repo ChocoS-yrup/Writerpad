@@ -61,6 +61,15 @@ enum WorkspaceSyncStatusReducer {
                 severity: .failure,
                 retry: true
             )
+        case let .serverSizeLimitExceeded(_, bytes, limit):
+            // 작품의 과거 동기화 성공이나 재연결 상태가 현재 문서의
+            // 전송 불가 사유를 가리면 다른 기기로 이동해도 된다고 오인한다.
+            return value(
+                "서버 크기 제한 초과",
+                "exclamationmark.icloud",
+                "로컬 TXT에는 저장됐지만 서버로 전송하지 못했습니다. \(bytes.formatted())바이트 문서가 서버 제한 \(limit.formatted())바이트를 초과했습니다.",
+                severity: .failure
+            )
         default:
             break
         }
@@ -254,18 +263,6 @@ enum WorkspaceSyncStatusReducer {
                 "person.crop.circle.badge.exclamationmark",
                 "서버 동기화를 계속하려면 설정에서 다시 로그인하세요.",
                 severity: .warning
-            )
-        default:
-            break
-        }
-
-        switch handoffState {
-        case let .serverSizeLimitExceeded(_, bytes, limit):
-            return value(
-                "서버 크기 제한 초과",
-                "exclamationmark.icloud",
-                "\(bytes.formatted())바이트 문서가 서버 제한 \(limit.formatted())바이트를 초과했습니다.",
-                severity: .failure
             )
         default:
             break

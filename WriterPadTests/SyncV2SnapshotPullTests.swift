@@ -4314,6 +4314,89 @@ final class SyncV2SnapshotPullTests: XCTestCase {
         )
     }
 
+    func testOversizedDocumentStatusSurvivesPastSyncAndConnectionChanges() throws {
+        let hash = try XCTUnwrap(ContentHash(rawValue: String(repeating: "a", count: 64)))
+        let savedAt = Date(timeIntervalSince1970: 20)
+        let saved = SaveState.saved(generation: 2, savedAt: savedAt, contentHash: hash)
+        let oversized = SyncHandoffState.serverSizeLimitExceeded(
+            generation: 2, byteCount: 101, limit: 100
+        )
+        let states: [SyncV2WorkspaceState] = [
+            .init(lastResult: .synced(at: Date(timeIntervalSince1970: 10))),
+            .init(lastResult: .synced(at: Date(timeIntervalSince1970: 30))),
+            .init(connection: .unknown),
+            .init(connection: .reconnecting),
+            .init(connection: .offline),
+            .init(progress: .pulling),
+            .init(progress: .checkingAuthentication),
+            .init(lastResult: .automaticallyMerged),
+        ]
+        for state in states {
+            // 문서를 다시 열어 저장 상태가 idle이 돼도 보존한 전송 실패를 표시한다.
+            for saveState in [SaveState.idle, saved] {
+                let presentation = WorkspaceSyncStatusReducer.presentation(
+                    saveState: saveState,
+                    handoffState: oversized,
+                    workspaceState: state,
+                    leaseState: .localOnly
+                )
+                XCTAssertEqual(presentation.label, "서버 크기 제한 초과", "\(state)")
+                XCTAssertEqual(presentation.severity, .failure)
+                XCTAssertFalse(presentation.allowsRetry)
+                XCTAssertTrue(presentation.detail.contains("로컬 TXT에는 저장됐지만"))
+                XCTAssertTrue(presentation.detail.contains("서버로 전송하지 못했습니다"))
+                XCTAssertTrue(presentation.detail.contains("101"))
+                XCTAssertTrue(presentation.detail.contains("100"))
+            }
+        }
+    }
+
+    func testOversizedDocumentStatusYieldsToLocalSaveAndClearsAfterValidSave() throws {
+        let hash = try XCTUnwrap(ContentHash(rawValue: String(repeating: "a", count: 64)))
+        let oversized = SyncHandoffState.serverSizeLimitExceeded(
+            generation: 2, byteCount: 101, limit: 100
+        )
+        let oldSync = SyncV2WorkspaceState(
+            lastResult: .synced(at: Date(timeIntervalSince1970: 10))
+        )
+        let localStates: [(SaveState, String)] = [
+            (.editing(generation: 3), "편집 중"),
+            (.saving(generation: 3), "로컬 저장 중"),
+            (.failed(generation: 3, message: "디스크 부족"), "로컬 저장 실패"),
+        ]
+        for (state, expectedLabel) in localStates {
+            let presentation = WorkspaceSyncStatusReducer.presentation(
+                saveState: state,
+                handoffState: oversized,
+                workspaceState: oldSync,
+                leaseState: .localOnly
+            )
+            XCTAssertEqual(presentation.label, expectedLabel)
+        }
+
+        let saved = SaveState.saved(
+            generation: 3,
+            savedAt: Date(timeIntervalSince1970: 20),
+            contentHash: hash
+        )
+        let queued = WorkspaceSyncStatusReducer.presentation(
+            saveState: saved,
+            handoffState: .queued(generation: 3, operationIDs: [UUID()]),
+            workspaceState: oldSync,
+            leaseState: .localOnly
+        )
+        XCTAssertEqual(queued.label, "동기화 대기")
+
+        let synced = WorkspaceSyncStatusReducer.presentation(
+            saveState: saved,
+            handoffState: .upToDate(generation: 3),
+            workspaceState: .init(lastResult: .synced(at: Date(timeIntervalSince1970: 30))),
+            leaseState: .localOnly
+        )
+        XCTAssertEqual(synced.label, "서버 동기화됨")
+        XCTAssertEqual(synced.severity, .success)
+    }
+
     func testWorkspaceStatusReducerUsesTextIconDetailAndStablePriority() {
         let hash = ContentHash(
             rawValue: String(repeating: "a", count: 64)

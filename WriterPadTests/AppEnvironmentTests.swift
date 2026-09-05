@@ -102,6 +102,53 @@ final class AppEnvironmentTests: XCTestCase {
     }
 
     @MainActor
+    func testChapterNavigationKeepsTitledChaptersInOrderAcrossVolumes() async throws {
+        let environment = try AppEnvironment.testing()
+        let project = try await environment.projectManager.createProject(
+            named: "제목 회차 이동"
+        )
+        _ = try await environment.binderRepository.rootNodes(in: project.id)
+        for _ in 0..<2 {
+            _ = try await environment.binderCommands.addNewVolume(
+                projectID: project.id
+            )
+        }
+        let coordinator = WorkspaceStorageCoordinator(
+            projectID: project.id,
+            binderRepository: environment.binderRepository,
+            documentRepository: environment.documentRepository,
+            workspaceStateRepository: environment.workspaceStateRepository
+        )
+        let original = try await coordinator.manuscriptTextNodes()
+        XCTAssertEqual(original.count, 50)
+        guard original.count == 50 else { return }
+
+        // 첫 화·연속 회차·권 경계·마지막 화에 제목을 붙여도
+        // 단축키가 소비하는 목록에서 빠지거나 순서가 바뀌면 안 된다.
+        for index in [0, 1, 24, 25, 49] {
+            _ = try await environment.binderCommands.renameChapter(
+                documentID: original[index].id,
+                titleSuffix: "이야기의 시작 🌙",
+                projectID: project.id
+            )
+        }
+
+        let renamed = try await coordinator.manuscriptTextNodes()
+        XCTAssertEqual(renamed.map(\.id), original.map(\.id))
+        let lastChapter = try await coordinator.lastManuscriptChapterNumber()
+        XCTAssertEqual(lastChapter, 50)
+
+        // 제목을 지운 뒤에도 일반 회차와 제목 회차가 섞인 순서를 유지한다.
+        _ = try await environment.binderCommands.renameChapter(
+            documentID: original[1].id,
+            titleSuffix: "",
+            projectID: project.id
+        )
+        let mixed = try await coordinator.manuscriptTextNodes()
+        XCTAssertEqual(mixed.map(\.id), original.map(\.id))
+    }
+
+    @MainActor
     func testProjectListModelRespectsLastProjectLaunchPreference() async throws {
         let environment = try AppEnvironment.testing()
         let first = try await environment.projectManager.createProject(named: "첫 작품")
