@@ -10541,3 +10541,27 @@ private actor UploadQueueSnapshotBox {
         self.snapshot = snapshot
     }
 }
+
+extension SyncV2SnapshotPullTests {
+    func testCancelledPhysicalPullKeepsProjectSlotUntilNetworkReturns() async throws {
+        let client = ConcurrentSnapshotClientProbe()
+        let service = SyncV2SnapshotPullService(client: client,
+            stateStore: SnapshotStateStoreStub(states: [:]), localApplier: SnapshotApplierSpy(),
+            mergeStore: SnapshotMergeStoreSpy())
+        let local = ProjectID(rawValue: UUID()), server = UUID()
+        let first = Task { try await service.pull(localProjectID: local, serverProjectID: server) }
+        for _ in 0..<200 {
+            if await client.startedCount() == 2 { break }
+            try await Task.sleep(for: .milliseconds(5))
+        }
+        first.cancel()
+        do {
+            _ = try await service.pull(localProjectID: local, serverProjectID: server)
+            XCTFail("실제 네트워크가 끝나기 전에 중복 pull이 시작됨")
+        } catch { XCTAssertEqual(error as? SyncV2SnapshotPullError, .alreadyRunning) }
+        await client.releaseAll()
+        do { _ = try await first.value; XCTFail("취소된 pull이 로컬 적용으로 진행됨") }
+        catch { XCTAssertTrue(error is CancellationError) }
+        _ = try await service.pull(localProjectID: local, serverProjectID: server)
+    }
+}

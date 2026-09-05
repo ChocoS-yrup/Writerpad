@@ -521,6 +521,7 @@ final class SupabaseAuthServiceTests: XCTestCase {
             var iterator = updates.makeAsyncIterator()
             return (
                 await iterator.next(),
+                await iterator.next(),
                 await iterator.next()
             )
         }
@@ -531,8 +532,9 @@ final class SupabaseAuthServiceTests: XCTestCase {
             password: "password"
         )
         _ = await service.signOut()
-        let (loggedIn, loggedOut) = await observedStates.value
+        let (restoring, loggedIn, loggedOut) = await observedStates.value
 
+        XCTAssertEqual(restoring, .restoring)
         XCTAssertEqual(
             loggedIn,
             .authenticated(
@@ -860,5 +862,48 @@ private actor AuthOperationCompletionGate {
     func open() {
         completionContinuation?.resume()
         completionContinuation = nil
+    }
+}
+
+extension SupabaseAuthServiceTests {
+    func testLateRestoreCannotOverlapNewLoginOrOverwriteItsTokens() async throws {
+        for shouldFail in [false, true] {
+            let gate = AuthRestoreGate()
+            let old = session(email: "old@example.com", accessToken: "old-returned-access", refreshToken: "old-returned-refresh")
+            let new = session(email: "new@example.com")
+            let transport = AuthTransportStub(signInResult: .success(new),
+                restoreResult: shouldFail ? .failure(.sessionExpired) : .success(old), restoreGate: gate)
+            let tokens = StoredSessionTokens(accessToken: "old-access", refreshToken: "old-refresh")
+            let store = SessionStoreStub(tokens: tokens)
+            let service = SupabaseAuthService(transport: transport, sessionStore: store)
+            let restore = Task { await service.restoreSession() }
+            for _ in 0..<200 {
+                if await transport.restoreCallCount() == 1 { break }
+                try await Task.sleep(for: .milliseconds(5))
+            }
+            let epoch = service.contractEpoch!.value
+            let login = Task { await service.signIn(email: "new@example.com", password: "test") }
+            try await Task.sleep(for: .milliseconds(30))
+            let before = await transport.signInCallCount()
+            XCTAssertEqual(before, 0, "취소된 복원이 실제 종료되기 전에 SDK 로그인을 겹치지 않는다")
+            XCTAssertGreaterThan(service.contractEpoch!.value, epoch)
+            await gate.open()
+            _ = await restore.value
+            let result = await login.value
+            XCTAssertTrue(result.isAuthenticated)
+            let saved = await store.storedTokens()
+            XCTAssertEqual(saved?.accessToken, new.accessToken)
+            XCTAssertEqual(saved?.refreshToken, new.refreshToken)
+        }
+    }
+
+    func testSameAccountReloginAdvancesAuthenticationEpoch() async {
+        let returned = session(email: "same@example.com")
+        let service = SupabaseAuthService(transport: AuthTransportStub(signInResult: .success(returned)),
+            sessionStore: SessionStoreStub())
+        _ = await service.signIn(email: "same@example.com", password: "test")
+        let first = service.contractEpoch!.value
+        _ = await service.signIn(email: "same@example.com", password: "test")
+        XCTAssertGreaterThan(service.contractEpoch!.value, first)
     }
 }

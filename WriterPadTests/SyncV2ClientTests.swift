@@ -1226,6 +1226,17 @@ final class EditLeaseManagerTests: XCTestCase {
         await sleeper.wake()
         await waitForAcquire(2, client: client)
 
+        // RPC 호출 수 증가는 응답을 반영한 held 상태의 완료 사건이 아니다.
+        let updates = await manager.stateUpdates(documentID: documentID)
+        let reacquired = XCTestExpectation(description: "편집권 재획득 완료")
+        let observation = Task {
+            for await state in updates {
+                if case .held = state { reacquired.fulfill(); return }
+            }
+        }
+        await fulfillment(of: [reacquired], timeout: 2)
+        observation.cancel()
+
         let acquireCount = await client.acquireCount()
         let state = await manager.state(
             documentID: documentID,

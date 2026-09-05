@@ -310,6 +310,7 @@ struct NoOpInitialProjectSyncRecorder: InitialProjectSyncRecording {
 }
 
 protocol ProjectBindingServicing: Sendable {
+    var contractEpoch: SyncV2ContractEpoch? { get }
     func bindingUpdates(
         for localProjectID: ProjectID
     ) async -> AsyncStream<ProjectSyncBinding?>
@@ -332,6 +333,7 @@ protocol ProjectBindingServicing: Sendable {
 }
 
 extension ProjectBindingServicing {
+    var contractEpoch: SyncV2ContractEpoch? { nil }
     func bindingUpdates(
         for localProjectID: ProjectID
     ) async -> AsyncStream<ProjectSyncBinding?> {
@@ -354,6 +356,8 @@ extension ProjectBindingServicing {
 }
 
 actor SupabaseProjectBindingService: ProjectBindingServicing {
+    nonisolated let contractEpoch: SyncV2ContractEpoch?
+    private let handshakeInvalidated: @Sendable () -> Void
     private let transport: (any EnsureProjectTransporting)?
     private let bindingStore: any ProjectBindingStoring
     private let projectRepository: any ProjectRepository
@@ -371,7 +375,9 @@ actor SupabaseProjectBindingService: ProjectBindingServicing {
         authenticationService: any AuthenticationServicing,
         initialSyncRecorder: any InitialProjectSyncRecording =
             NoOpInitialProjectSyncRecorder(),
-        snapshotClient: (any SyncV2SnapshotClienting)? = nil
+        snapshotClient: (any SyncV2SnapshotClienting)? = nil,
+        contractEpoch: SyncV2ContractEpoch = SyncV2ContractEpoch(),
+        handshakeInvalidated: @escaping @Sendable () -> Void = {}
     ) {
         self.transport = transport
         self.bindingStore = bindingStore
@@ -379,6 +385,8 @@ actor SupabaseProjectBindingService: ProjectBindingServicing {
         self.authenticationService = authenticationService
         self.initialSyncRecorder = initialSyncRecorder
         self.snapshotClient = snapshotClient
+        self.contractEpoch = contractEpoch
+        self.handshakeInvalidated = handshakeInvalidated
     }
 
     func currentBinding(
@@ -496,6 +504,8 @@ actor SupabaseProjectBindingService: ProjectBindingServicing {
     func disconnect(
         localProjectID: ProjectID
     ) async -> ProjectBindingResult {
+        contractEpoch?.beginTransition()
+        defer { contractEpoch?.endTransition(); handshakeInvalidated() }
         guard await bindingStore.availability() == .available else {
             return .failed(.bindingStoreUnavailable)
         }
@@ -558,6 +568,8 @@ actor SupabaseProjectBindingService: ProjectBindingServicing {
         serverProjectID: UUID,
         kind: ProjectBindingKind
     ) async -> ProjectBindingResult {
+        contractEpoch?.beginTransition()
+        defer { contractEpoch?.endTransition(); handshakeInvalidated() }
         guard let transport else {
             return .failed(.configurationUnavailable)
         }
@@ -699,6 +711,7 @@ actor SupabaseProjectBindingService: ProjectBindingServicing {
         _ binding: ProjectSyncBinding?,
         localProjectID: ProjectID
     ) {
+        contractEpoch?.advance()
         bindingObservers[localProjectID]?.values.forEach {
             $0.yield(binding)
         }

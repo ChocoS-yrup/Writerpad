@@ -186,6 +186,7 @@ final class AppEnvironment: ObservableObject {
             .map { SyncV2HandshakeService(transport: $0) }
         let projectBindingTransport =
             supabaseClientProvider.makeProjectBindingTransport()
+        let contractBindingEpoch = SyncV2ContractEpoch()
         let deviceIdentityStore: any DeviceIdentityStoring
         if isStoredInMemoryOnly {
             deviceIdentityStore = InMemoryDeviceIdentityStore()
@@ -241,7 +242,8 @@ final class AppEnvironment: ObservableObject {
             durableChangeRecorder = SyncV2ContractPathRecorder(
                 store: liveSyncV2Store,
                 handshakeService: handshakeService,
-                authenticationService: authenticationService
+                authenticationService: authenticationService,
+                bindingEpoch: contractBindingEpoch
             )
             conflictResolutionService = liveSyncV2Store
             snapshotStateStore = liveSyncV2Store
@@ -289,7 +291,9 @@ final class AppEnvironment: ObservableObject {
                     transport: transport,
                     handshakeService: handshakeService,
                     authenticationService: authenticationService,
-                    uploadPullCoordinator: uploadPullCoordinator
+                    uploadPullCoordinator: uploadPullCoordinator,
+                    bindingEpoch: contractBindingEpoch,
+                    deviceIdentityProvider: deviceIdentityService
                 )
             } else {
                 contractStructureSender = nil
@@ -331,7 +335,9 @@ final class AppEnvironment: ObservableObject {
             authenticationService: authenticationService,
             initialSyncRecorder: initialSyncRecorder,
             // 초기 snapshot을 올리기 전에 서버 작품이 비어 있는지 확인한다.
-            snapshotClient: supabaseClientProvider.makeSnapshotClient()
+            snapshotClient: supabaseClientProvider.makeSnapshotClient(),
+            contractEpoch: contractBindingEpoch,
+            handshakeInvalidated: { Task { await handshakeService?.projectChanged() } }
         )
         let localDocumentStore = LocalDocumentStore(
             workspaceLocator: workspaceLocator,

@@ -1,5 +1,9 @@
 import Foundation
 
+enum SyncV2SnapshotPullError: Error, Equatable {
+    case alreadyRunning
+}
+
 protocol SyncV2SnapshotPulling: Sendable {
     func pull(
         localProjectID: ProjectID,
@@ -142,6 +146,7 @@ actor SyncV2SnapshotPullService: SyncV2SnapshotPulling {
     private let mergeStore: any SyncV2SnapshotMergeStoring
     private let leaseManager: (any EditLeaseManaging)?
     private let mutationGate: SyncV2DocumentMutationGate
+    private var activeProjects: Set<ProjectID> = []
 
     init(
         client: any SyncV2SnapshotClienting,
@@ -173,6 +178,20 @@ actor SyncV2SnapshotPullService: SyncV2SnapshotPulling {
         serverProjectID: UUID,
         editingGuards: [UUID: SyncV2EditingGuard] = [:]
     ) async throws -> SyncV2SnapshotPullReport {
+        guard activeProjects.insert(localProjectID).inserted else {
+            throw SyncV2SnapshotPullError.alreadyRunning
+        }
+        defer { activeProjects.remove(localProjectID) }
+        try Task.checkCancellation()
+        // 내부 async let 네트워크 요청까지 실제로 종료한 다음에 슬롯을 돌려준다.
+        return try await performPull(localProjectID: localProjectID,
+                                     serverProjectID: serverProjectID, editingGuards: editingGuards)
+    }
+
+    private func performPull(
+        localProjectID: ProjectID, serverProjectID: UUID,
+        editingGuards: [UUID: SyncV2EditingGuard]
+    ) async throws -> SyncV2SnapshotPullReport {
         let pullStartedAt = DispatchTime.now().uptimeNanoseconds
         SyncV2PullDiagnostics.record(
             stage: "snapshot-service",
@@ -192,6 +211,7 @@ actor SyncV2SnapshotPullService: SyncV2SnapshotPulling {
             projectID: serverProjectID
         )
         let manifest = try await manifestRequest
+        try Task.checkCancellation()
         SyncV2PullDiagnostics.record(
             stage: "document-manifest",
             phase: "available-to-service",

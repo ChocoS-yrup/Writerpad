@@ -1,4 +1,5 @@
 import XCTest
+import Supabase
 @testable import WriterPad
 
 /// 핸드셰이크가 "서버가 뭐라 했는가"와 "우리가 계약 경로를 써도 되는가"를 끝까지
@@ -744,6 +745,516 @@ final class SyncV2HandshakeTests: XCTestCase {
             XCTAssertEqual(error, expected, file: file, line: line)
         } catch {
             XCTFail("예상 못 한 오류 \(error)", file: file, line: line)
+        }
+    }
+}
+
+extension SyncV2HandshakeTests {
+    private actor ControlledTransport: SyncV2HandshakeTransporting {
+        private var waiters: [CheckedContinuation<SyncV2HandshakeResponse, Error>] = []
+        private(set) var count = 0
+        func fetchHandshake(parameters: SyncV2HandshakeParameters) async throws -> SyncV2HandshakeResponse {
+            count += 1
+            return try await withCheckedThrowingContinuation { waiters.append($0) }
+        }
+        func finish(_ result: Result<SyncV2HandshakeResponse, Error>) {
+            guard !waiters.isEmpty else { return }
+            waiters.removeFirst().resume(with: result)
+        }
+    }
+
+    private actor LifecycleAuth: AuthenticationServicing {
+        nonisolated let contractEpoch: SyncV2ContractEpoch? = SyncV2ContractEpoch()
+        var state: AuthenticationState
+        var observers: [AsyncStream<AuthenticationState>.Continuation] = []
+        init(account: UUID) { state = .authenticated(.init(userID: account, maskedEmail: nil)) }
+        func currentState() -> AuthenticationState { state }
+        func stateUpdates() -> AsyncStream<AuthenticationState> {
+            AsyncStream { observers.append($0) }
+        }
+        func relogin() { contractEpoch?.advance(); observers.forEach { $0.yield(state) } }
+        func restoreSession() -> AuthenticationState { state }
+        func refreshSession(force: Bool) -> AuthenticationState { state }
+        func signIn(email: String, password: String) -> AuthenticationState { relogin(); return state }
+        func signOut() -> AuthenticationState {
+            contractEpoch?.advance(); state = .signedOut(.userInitiated)
+            observers.forEach { $0.yield(state) }; return state
+        }
+    }
+
+    private actor LifecycleBindings: ProjectBindingServicing {
+        nonisolated let contractEpoch: SyncV2ContractEpoch? = SyncV2ContractEpoch()
+        let bindings: [ProjectID: ProjectSyncBinding]
+        init(_ bindings: [ProjectSyncBinding]) { self.bindings = Dictionary(uniqueKeysWithValues: bindings.map { ($0.localProjectID, $0) }) }
+        func currentBinding(for id: ProjectID) -> ProjectSyncBinding? { bindings[id] }
+        func createServerProject(for id: ProjectID) -> ProjectBindingResult { .failed(.serverRejected) }
+        func connectExistingProject(localProjectID: ProjectID, confirmation: ConfirmedServerProjectID) -> ProjectBindingResult { .failed(.serverRejected) }
+        func connectWindowsProject(localProjectID: ProjectID, confirmation: ConfirmedServerProjectID) -> ProjectBindingResult { .failed(.serverRejected) }
+        func refreshServerName(for id: ProjectID) -> ProjectBindingResult { .failed(.serverRejected) }
+        func disconnect(localProjectID: ProjectID) -> ProjectBindingResult { .failed(.serverRejected) }
+    }
+
+    private func eventually(_ condition: () async -> Bool, file: StaticString = #filePath, line: UInt = #line) async {
+        for _ in 0..<600 {
+            if await condition() { return }
+            try? await Task.sleep(for: .milliseconds(5))
+        }
+        XCTFail("비동기 조건이 완료되지 않았습니다", file: file, line: line)
+    }
+
+    func testWrongContractVersionIsRejectedEvenWithCorrectDigest() async {
+        let id = UUID()
+        let service = SyncV2HandshakeService(transport: StubTransport(results: [
+            .success(supportedResponse(projectID: id, contractVersion: "0.3.0"))
+        ]))
+        await assertThrows(.incompatible(.contractDigestMismatch)) {
+            _ = try await service.refresh(context: context(serverProjectID: id))
+        }
+    }
+
+    func testCoalescedLateFailureCannotSurviveInvalidationOrFreePhysicalSlot() async throws {
+        let transport = ControlledTransport()
+        let service = SyncV2HandshakeService(transport: transport)
+        let ctx = context(serverProjectID: UUID())
+        let first = Task { try await service.refresh(context: ctx) }
+        await eventually { await transport.count == 1 }
+        let joined = Task { try await service.refresh(context: ctx) }
+        try await Task.sleep(for: .milliseconds(20))
+        await service.authenticationChanged()
+        await assertThrows(.superseded) { _ = try await service.refresh(context: ctx) }
+        let count = await transport.count
+        XCTAssertEqual(count, 1)
+        await transport.finish(.failure(SyncV2HandshakeTransportError.forbidden))
+        await assertThrows(.superseded) { _ = try await first.value }
+        await assertThrows(.superseded) { _ = try await joined.value }
+        let fresh = await service.isFresh(for: ctx)
+        XCTAssertFalse(fresh)
+    }
+
+    func testTimeoutDoesNotReleasePhysicalSlotAndLateSuccessIsDiscarded() async {
+        let transport = ControlledTransport()
+        let service = SyncV2HandshakeService(transport: transport, timeout: .milliseconds(30))
+        let ctx = context(serverProjectID: UUID())
+        await assertThrows(.timedOut) { _ = try await service.refresh(context: ctx) }
+        await service.projectChanged()
+        await assertThrows(.superseded) { _ = try await service.refresh(context: ctx) }
+        let count = await transport.count
+        XCTAssertEqual(count, 1)
+        await transport.finish(.success(supportedResponse(projectID: ctx.serverProjectID)))
+        try? await Task.sleep(for: .milliseconds(20))
+        let fresh = await service.isFresh(for: ctx)
+        XCTAssertFalse(fresh)
+    }
+
+    func testAutomaticRetryRecoversSameProjectWithoutOpeningGate() async throws {
+        let id = UUID(), account = UUID(), localID = ProjectID(rawValue: UUID())
+        let auth = LifecycleAuth(account: account)
+        let bindings = LifecycleBindings([.connected(localProjectID: localID, serverProjectID: id,
+            kind: .existingServerProject, projectName: "회귀 시험", ownerSubject: account)])
+        let transport = StubTransport(results: [.failure(SyncV2HandshakeTransportError.networkUnavailable),
+                                                .success(supportedResponse(projectID: id))])
+        let service = SyncV2HandshakeService(transport: transport, timeout: .seconds(120), sleep: { delay in
+            try await Task.sleep(for: delay == .seconds(120) ? delay : .milliseconds(5))
+        })
+        let defaults = makeDefaults()
+        await service.observeProject(localID, authentication: auth, bindings: bindings)
+        let ctx = SyncV2HandshakeContext(localProjectID: localID, serverProjectID: id, accountID: account)
+        await eventually { await service.isFresh(for: ctx) }
+        let count = await transport.callCount
+        XCTAssertEqual(count, 2)
+        XCTAssertFalse(ContractPathGate.isOpen(for: localID, in: defaults))
+        await service.networkRecovered()
+        try await Task.sleep(for: .milliseconds(30))
+        let afterRecovery = await transport.callCount
+        XCTAssertEqual(afterRecovery, 2, "유효한 답을 네트워크 사건만으로 다시 조회하지 않는다")
+        await service.stopObserving()
+    }
+
+    func testSameAccountReloginAndAToBToASelectFreshGenerations() async throws {
+        let a = UUID(), b = UUID(), account = UUID()
+        let localA = ProjectID(rawValue: UUID()), localB = ProjectID(rawValue: UUID())
+        let auth = LifecycleAuth(account: account)
+        let bindings = LifecycleBindings([
+            .connected(localProjectID: localA, serverProjectID: a, kind: .existingServerProject, projectName: "A", ownerSubject: account),
+            .connected(localProjectID: localB, serverProjectID: b, kind: .existingServerProject, projectName: "B", ownerSubject: account)
+        ])
+        let transport = StubTransport(results: [a, a, b, a].map { .success(supportedResponse(projectID: $0)) })
+        let service = SyncV2HandshakeService(transport: transport)
+        func ctx(_ local: ProjectID, _ server: UUID, _ epoch: UInt64) -> SyncV2HandshakeContext {
+            .init(localProjectID: local, serverProjectID: server, accountID: account, authenticationEpoch: epoch)
+        }
+        await service.observeProject(localA, authentication: auth, bindings: bindings)
+        await eventually { await service.isFresh(for: ctx(localA, a, 0)) }
+        await auth.relogin()
+        await eventually { await service.isFresh(for: ctx(localA, a, 1)) }
+        await service.observeProject(localB, authentication: auth, bindings: bindings)
+        await eventually { await service.isFresh(for: ctx(localB, b, 1)) }
+        await service.observeProject(localA, authentication: auth, bindings: bindings)
+        await eventually { await service.isFresh(for: ctx(localA, a, 1)) }
+        let count = await transport.callCount
+        XCTAssertEqual(count, 4)
+        await service.stopObserving()
+    }
+
+    func testTerminalHandshakeFailureDoesNotRetryOnNetworkEvents() async throws {
+        let id = UUID(), account = UUID(), local = ProjectID(rawValue: UUID())
+        let auth = LifecycleAuth(account: account)
+        let bindings = LifecycleBindings([.connected(localProjectID: local, serverProjectID: id,
+            kind: .existingServerProject, projectName: "시험", ownerSubject: account)])
+        let transport = StubTransport(results: [.failure(SyncV2HandshakeTransportError.forbidden)])
+        let service = SyncV2HandshakeService(transport: transport)
+        await service.observeProject(local, authentication: auth, bindings: bindings)
+        await eventually { await transport.callCount == 1 }
+        try await Task.sleep(for: .milliseconds(30))
+        await service.networkRecovered()
+        try await Task.sleep(for: .milliseconds(30))
+        let count = await transport.callCount
+        XCTAssertEqual(count, 1)
+        await service.stopObserving()
+    }
+
+    func testRetryBackoffIsCappedAndEpochsArePartOfContext() {
+        XCTAssertEqual((0..<9).map(SyncV2HandshakeService.retryDelay), [2,4,8,16,32,60,60,60,60].map { .seconds($0) })
+        let a = context(serverProjectID: UUID())
+        let b = SyncV2HandshakeContext(localProjectID: a.localProjectID, serverProjectID: a.serverProjectID,
+            accountID: a.accountID, authenticationEpoch: 1)
+        XCTAssertNotEqual(a, b)
+    }
+}
+
+extension SyncV2HandshakeTests {
+    private actor ContractQueueStub: SyncV2ContractQueue {
+        let savedBinding: ProjectSyncBinding
+        let pending: SyncV2PendingContractBatch
+        var beforeClaim: (@Sendable () async -> Void)?
+        private(set) var completed = false
+        private(set) var failures: [SyncV2ContractStructureError] = []
+        init(binding: ProjectSyncBinding, request: SyncV2ContractRequest) {
+            savedBinding = binding
+            pending = .init(localProjectID: binding.localProjectID, serverProjectID: binding.serverProjectID!, request: request)
+        }
+        func setBeforeClaim(_ hook: @escaping @Sendable () async -> Void) { beforeClaim = hook }
+        func binding(for projectID: ProjectID) -> ProjectSyncBinding? { savedBinding }
+        func uploadQueueSnapshot(localProjectID: ProjectID) -> SyncV2UploadQueueSnapshot { .init(pendingCount: completed ? 0 : 1) }
+        func claimNextContractStructure(localProjectID: ProjectID) async throws -> SyncV2PendingContractBatch {
+            if completed { throw SyncV2ContractStructureError.noReadyBatch }
+            await beforeClaim?()
+            return pending
+        }
+        func completeContractStructure(_ pending: SyncV2PendingContractBatch, response: SyncV2JSON) { completed = true }
+        func failContractStructure(_ pending: SyncV2PendingContractBatch, error: Error, response: SyncV2JSON?) {
+            if let error = error as? SyncV2ContractStructureError { failures.append(error) }
+        }
+    }
+
+    private actor ContractTransportStub: SyncV2AtomicStructureTransporting {
+        var beforeReservation: (@Sendable () async -> Void)?
+        var afterReservation: (@Sendable () async -> Void)?
+        private(set) var requests: [SyncV2JSON] = []
+        var reject = false
+        func configure(before: (@Sendable () async -> Void)? = nil,
+                       after: (@Sendable () async -> Void)? = nil, reject: Bool = false) {
+            beforeReservation = before; afterReservation = after; self.reject = reject
+        }
+        func commit(request: SyncV2JSON) async throws -> SyncV2JSON { throw SyncV2ContractStructureError.transmissionNotStarted }
+        func commit(request: SyncV2JSON, authorize: @escaping @Sendable () throws -> Void) async throws -> SyncV2JSON {
+            await beforeReservation?()
+            try authorize()
+            requests.append(request)
+            await afterReservation?()
+            if reject { throw SyncV2ContractStructureError.transportRejected }
+            let fields = request.objectValue!, batch = fields["batch"]!.objectValue!
+            let results = fields["ordered_intents"]!.arrayValue!.map { intent -> SyncV2JSON in
+                let f = intent.objectValue!
+                return .object(["sequence": f["sequence"]!, "operation_id": f["operation_id"]!,
+                    "entity_id": f["entity_id"]!, "result_revision": .int(1)])
+            }
+            return .object(["kind": .string("atomic_structure_commit_success"),
+                "batch_id": batch["batch_id"]!, "batch_payload_sha256": batch["batch_payload_sha256"]!,
+                "status": .string("committed"), "applied": .bool(true), "results": .array(results)])
+        }
+    }
+
+    private struct SenderFixture: @unchecked Sendable {
+        let sender: SyncV2ContractStructureSender
+        let service: SyncV2HandshakeService
+        let auth: LifecycleAuth
+        let bindingEpoch: SyncV2ContractEpoch
+        let queue: ContractQueueStub
+        let transport: ContractTransportStub
+        let localID: ProjectID
+        let defaults: UserDefaults
+        let request: SyncV2ContractRequest
+    }
+
+    private func senderFixture(deviceMismatch: Bool = false) async throws -> SenderFixture {
+        let local = ProjectID(rawValue: UUID()), server = UUID(), account = UUID(), device = UUID()
+        let defaults = makeDefaults(function: UUID().uuidString)
+        GlobalSyncPreference.setEnabled(true, in: defaults)
+        ContractPathGate.setOpen(true, for: local, in: defaults)
+        let auth = LifecycleAuth(account: account)
+        let bindingEpoch = SyncV2ContractEpoch()
+        let handshake = SyncV2HandshakeService(transport: StubTransport(results: [.success(supportedResponse(projectID: server))]))
+        _ = try await handshake.refresh(context: .init(localProjectID: local, serverProjectID: server, accountID: account))
+        let request = try SyncV2Contract.buildAtomicStructureRequest(projectID: server,
+            projectSyncMode: .legacy, migrationEpoch: 0, writerDeviceID: device,
+            orderedIntents: [.init(entityKind: .folder, entityID: UUID(), intentKind: .create,
+                                  payload: .object(["name": .string("전송 시험")]))])
+        let binding = ProjectSyncBinding.connected(localProjectID: local, serverProjectID: server,
+            kind: .existingServerProject, projectName: "전송 시험", ownerSubject: account)
+        let queue = ContractQueueStub(binding: binding, request: request)
+        let transport = ContractTransportStub()
+        let actualDevice = deviceMismatch ? UUID() : device
+        let sender = SyncV2ContractStructureSender(store: queue, transport: transport,
+            handshakeService: handshake, authenticationService: auth, defaults: defaults,
+            bindingEpoch: bindingEpoch, deviceIdentityProvider: DeviceIdentityService(
+                store: InMemoryDeviceIdentityStore(), generateUUID: { actualDevice }))
+        return SenderFixture(sender: sender, service: handshake, auth: auth, bindingEpoch: bindingEpoch,
+            queue: queue, transport: transport, localID: local, defaults: defaults, request: request)
+    }
+
+    func testSenderRechecksEveryAuthorityAfterClaimAndAtTransportReservation() async throws {
+        for boundary in 0..<2 {
+            for change in 0..<6 {
+                let f = try await senderFixture()
+                let mutation: @Sendable () async -> Void = {
+                    switch change {
+                    case 0: ContractPathGate.close(for: f.localID, in: f.defaults)
+                    case 1: await f.auth.relogin()
+                    case 2: f.bindingEpoch.advance()
+                    case 3: await f.service.gateClosed()
+                    case 4: await f.service.updateSceneActivity(false)
+                    default: GlobalSyncPreference.setEnabled(false, in: f.defaults)
+                    }
+                }
+                if boundary == 0 { await f.queue.setBeforeClaim(mutation) }
+                else { await f.transport.configure(before: mutation) }
+                do { _ = try await f.sender.sendNext(localProjectID: f.localID); XCTFail("변경 뒤 송신됨") }
+                catch { }
+                let sent = await f.transport.requests
+                let failures = await f.queue.failures
+                let pending = f.queue.pending
+                XCTAssertTrue(sent.isEmpty, "boundary=\(boundary), change=\(change)")
+                XCTAssertEqual(failures, [.transmissionNotStarted])
+                XCTAssertEqual(pending.request, f.request)
+            }
+        }
+    }
+
+    func testSenderRejectsDeviceMismatchWithoutRewritingBatch() async throws {
+        let f = try await senderFixture(deviceMismatch: true)
+        do { _ = try await f.sender.sendNext(localProjectID: f.localID); XCTFail("기기가 바뀐 배치 송신됨") }
+        catch { XCTAssertEqual(error as? SyncV2ContractStructureError, .invalidStoredRequest) }
+        let requests = await f.transport.requests
+        let pending = f.queue.pending
+        XCTAssertTrue(requests.isEmpty)
+        XCTAssertEqual(pending.request, f.request)
+    }
+
+    func testUnknownResultRetriesSameBatchAndLateSuccessStaysWithOriginalQueue() async throws {
+        let f = try await senderFixture()
+        await f.transport.configure(reject: true)
+        do { _ = try await f.sender.sendNext(localProjectID: f.localID); XCTFail("통신 실패 기대") } catch { }
+        await f.transport.configure(after: { await f.auth.relogin() })
+        let report = try await f.sender.sendNext(localProjectID: f.localID)
+        let requests = await f.transport.requests
+        let completed = await f.queue.completed
+        XCTAssertEqual(requests, [f.request.json, f.request.json])
+        XCTAssertEqual(report.batchID, f.request.batchID)
+        XCTAssertTrue(completed)
+        let count = requests.count
+        do { _ = try await f.sender.sendNext(localProjectID: f.localID); XCTFail("완료 배치 재송신") } catch { }
+        let after = await f.transport.requests.count
+        XCTAssertEqual(after, count)
+    }
+
+    func testClosingDuringFreshGateValidationPreventsLateOpening() throws {
+        let defaults = makeDefaults(), id = ProjectID(rawValue: UUID())
+        let revision = ContractPathGate.revision(for: id, in: defaults)
+        ContractPathGate.close(for: id, in: defaults)
+        XCTAssertFalse(ContractPathGate.openAfterValidation(for: id, in: defaults, revision: revision, validate: { true }))
+        XCTAssertFalse(ContractPathGate.isOpen(for: id, in: defaults))
+    }
+}
+
+extension SyncV2HandshakeTests {
+    func testHTTPStatusAndNestedErrorsPreserveRetryPolicy() throws {
+        func http(_ status: Int, body: String = "{}") -> HTTPError {
+            HTTPError(data: Data(body.utf8), response: HTTPURLResponse(url: URL(string: "https://example.invalid")!,
+                statusCode: status, httpVersion: nil, headerFields: nil)!)
+        }
+        for status in [429, 500, 502, 503] {
+            let error = http(status, body: "{\"message\":\"temporary service failure\",\"code\":\"PGRST000\"}")
+            XCTAssertEqual(LiveSyncV2HandshakeTransport.classify(error), .networkUnavailable)
+        }
+        XCTAssertEqual(LiveSyncV2HandshakeTransport.classify(http(401)), .authenticationRequired)
+        XCTAssertEqual(LiveSyncV2HandshakeTransport.classify(http(403)), .forbidden)
+        XCTAssertEqual(LiveSyncV2HandshakeTransport.classify(http(400)), .serverRejected)
+        let wrapped = NSError(domain: "transport-wrapper", code: 1,
+            userInfo: [NSUnderlyingErrorKey: URLError(.timedOut)])
+        XCTAssertEqual(LiveSyncV2HandshakeTransport.classify(wrapped), .timedOut)
+        let rejected = http(500, body: "{\"message\":\"CONTRACT_NOT_ALLOWED\",\"code\":\"P0001\"}")
+        XCTAssertEqual(LiveSyncV2HandshakeTransport.classify(rejected), .contractRejected("CONTRACT_NOT_ALLOWED"))
+        XCTAssertEqual(LiveSupabaseAuthTransport.map(wrapped, isRestore: true), .networkUnavailable)
+        XCTAssertEqual(LiveSupabaseAuthTransport.map(http(403), isRestore: true), .serverRejected)
+    }
+
+    func testExplicitGateOpeningRequiresANewReading() async throws {
+        let ctx = context(serverProjectID: UUID())
+        let transport = StubTransport(results: [
+            .success(supportedResponse(projectID: ctx.serverProjectID)),
+            .failure(SyncV2HandshakeTransportError.networkUnavailable)
+        ])
+        let service = SyncV2HandshakeService(transport: transport)
+        _ = try await service.refresh(context: ctx)
+        await assertThrows(.networkUnavailable) { _ = try await service.refreshForGate(context: ctx) }
+        let count = await transport.callCount
+        let fresh = await service.isFresh(for: ctx)
+        XCTAssertEqual(count, 2)
+        XCTAssertFalse(fresh)
+    }
+
+    func testSameProjectSenderIsSingleFlightAcrossReservationWait() async throws {
+        let f = try await senderFixture()
+        let gate = SyncV2OneShotRace<Bool>()
+        await f.transport.configure(before: { _ = await gate.value() })
+        let first = Task { try await f.sender.sendNext(localProjectID: f.localID) }
+        // 첫 전송은 transport 안에서 기다리는 동안에도 슬롯을 점유한다.
+        try await Task.sleep(for: .milliseconds(30))
+        do { _ = try await f.sender.sendNext(localProjectID: f.localID); XCTFail("중복 송신") }
+        catch { XCTAssertEqual(error as? SyncV2ContractStructureError, .uploadPullGateBusy) }
+        await gate.resolve(true)
+        _ = try await first.value
+        let count = await f.transport.requests.count
+        XCTAssertEqual(count, 1)
+    }
+}
+
+extension SyncV2HandshakeTests {
+    private actor BackoffSleeper {
+        private(set) var delays: [Duration] = []
+        func sleep(_ delay: Duration) async throws {
+            if delay == .seconds(120) { try await Task.sleep(for: delay) }
+            else { delays.append(delay); await Task.yield() }
+        }
+    }
+
+    func testAutomaticBackoffReachesCapAndResetsOnRelogin() async throws {
+        let local = ProjectID(rawValue: UUID()), server = UUID(), account = UUID()
+        let auth = LifecycleAuth(account: account)
+        let bindings = LifecycleBindings([.connected(localProjectID: local, serverProjectID: server,
+            kind: .existingServerProject, projectName: "지연 시험", ownerSubject: account)])
+        let transient: Result<SyncV2HandshakeResponse, Error> = .failure(SyncV2HandshakeTransportError.networkUnavailable)
+        let success: Result<SyncV2HandshakeResponse, Error> = .success(supportedResponse(projectID: server))
+        let transport = StubTransport(results: Array(repeating: transient, count: 7) + [success, transient, success])
+        let sleeper = BackoffSleeper()
+        let service = SyncV2HandshakeService(transport: transport, now: { Date(timeIntervalSince1970: 100) },
+            timeout: .seconds(120), sleep: { try await sleeper.sleep($0) })
+        await service.observeProject(local, authentication: auth, bindings: bindings)
+        let original = SyncV2HandshakeContext(localProjectID: local, serverProjectID: server, accountID: account)
+        await eventually { await service.isFresh(for: original) }
+        await auth.relogin()
+        let renewed = SyncV2HandshakeContext(localProjectID: local, serverProjectID: server, accountID: account, authenticationEpoch: 1)
+        await eventually { await service.isFresh(for: renewed) }
+        let delays = await sleeper.delays
+        XCTAssertEqual(delays, [2,4,8,16,32,60,60,2].map { .seconds($0) })
+        await service.stopObserving()
+    }
+
+    @MainActor
+    func testLocalWritingCompletesWhileAutomaticHandshakeWaitsForNetwork() async throws {
+        let environment = try AppEnvironment.testing()
+        let project = try await environment.projectManager.createProject(named: "오프라인 시험")
+        _ = try await environment.binderRepository.rootNodes(in: project.id)
+        let volume = try await environment.binderCommands.addNewVolume(projectID: project.id)
+        let loaded = try await environment.documentRepository.document(id: volume.documentToOpenID)
+        let document = try XCTUnwrap(loaded)
+        let server = UUID(), account = UUID()
+        let auth = LifecycleAuth(account: account)
+        let bindings = LifecycleBindings([.connected(localProjectID: project.id, serverProjectID: server,
+            kind: .existingServerProject, projectName: project.name, ownerSubject: account)])
+        let transport = ControlledTransport(), service: SyncV2HandshakeService
+        service = SyncV2HandshakeService(transport: transport)
+        await service.observeProject(project.id, authentication: auth, bindings: bindings)
+        await eventually { await transport.count == 1 }
+        _ = try await environment.localDocumentStore.save(.init(projectID: project.id, documentID: document.id,
+            relativePath: document.relativePath, text: "통신 대기 중 저장한 시험 문장", generation: 1))
+        let text = try await environment.localDocumentStore.loadText(for: document)
+        XCTAssertEqual(text, "통신 대기 중 저장한 시험 문장")
+        await transport.finish(.success(supportedResponse(projectID: server)))
+        let context = SyncV2HandshakeContext(localProjectID: project.id, serverProjectID: server, accountID: account)
+        await eventually { await service.isFresh(for: context) }
+        await service.stopObserving()
+    }
+}
+
+extension SyncV2HandshakeTests {
+    @MainActor
+    func testSettingsOpensOnlyAfterFreshResponseAndClosingWinsAgainstLateResponse() async throws {
+        for closeDuringWait in [false, true] {
+            let environment = try AppEnvironment.testing()
+            let project = try await environment.projectManager.createProject(named: "관문 화면 시험")
+            let server = UUID(), account = UUID()
+            let auth = LifecycleAuth(account: account)
+            let binding = ProjectSyncBinding.connected(localProjectID: project.id, serverProjectID: server,
+                kind: .existingServerProject, projectName: project.name, ownerSubject: account)
+            let bindings = LifecycleBindings([binding])
+            let transport = ControlledTransport()
+            let service = SyncV2HandshakeService(transport: transport)
+            let defaults = makeDefaults(function: UUID().uuidString)
+            let model = SyncSettingsModel(projectManager: environment.projectManager, authenticationService: auth,
+                projectBindingService: bindings, syncDispatcher: nil, handshakeService: service, defaults: defaults)
+            let row = SyncProjectRow(project: project, binding: binding)
+            let opening = model.setGateOpen(true, for: row)
+            await eventually { await transport.count == 1 }
+            XCTAssertFalse(ContractPathGate.isOpen(for: project.id, in: defaults))
+            if closeDuringWait { await model.setGateOpen(false, for: row).value }
+            await transport.finish(.success(supportedResponse(projectID: server)))
+            await opening.value
+            XCTAssertEqual(model.isGateOpen(for: row), !closeDuringWait)
+            XCTAssertEqual(ContractPathGate.isOpen(for: project.id, in: defaults), !closeDuringWait)
+            if closeDuringWait { XCTAssertEqual(model.gateReport, "관문 화면 시험 관문: 닫힘") }
+        }
+    }
+}
+
+extension SyncV2HandshakeTests {
+    func testLateContractRejectionCannotInvalidateNewHandshake() async throws {
+        let server = UUID(), ctx = context(serverProjectID: UUID())
+        let transport = StubTransport(results: [
+            .success(supportedResponse(projectID: ctx.serverProjectID)),
+            .success(supportedResponse(projectID: server))
+        ])
+        let service = SyncV2HandshakeService(transport: transport)
+        _ = try await service.refresh(context: ctx)
+        let originalGeneration = service.authorizationEpoch.value
+        let next = context(serverProjectID: server)
+        _ = try await service.refresh(context: next)
+        await service.forgetIfStale(.forbidden, expectedGeneration: originalGeneration)
+        let fresh = await service.isFresh(for: next)
+        XCTAssertTrue(fresh)
+    }
+}
+
+extension SyncV2HandshakeTests {
+    @MainActor
+    func testLateContractReceiptIsStoredWithoutPublishingIntoChangedScreen() async throws {
+        for changeAccount in [false, true] {
+            let f = try await senderFixture()
+            let environment = try AppEnvironment.testing()
+            let bindings = LifecycleBindings([f.queue.savedBinding])
+            let model = SyncSettingsModel(projectManager: environment.projectManager, authenticationService: f.auth,
+                projectBindingService: bindings, syncDispatcher: nil, handshakeService: f.service,
+                contractStructureSender: f.sender, defaults: f.defaults)
+            let project = ManagedProject(project: Project(id: f.localID, name: "원래 작품", createdAt: Date(), modifiedAt: Date()), userOrder: 0, lifecycleState: .active)
+            await f.transport.configure(after: {
+                if changeAccount { await f.auth.relogin() }
+                else { await f.service.projectChanged() }
+            })
+            await model.sendOneContractBatch(for: SyncProjectRow(project: project, binding: f.queue.savedBinding))
+            let completed = await f.queue.completed
+            XCTAssertTrue(completed)
+            XCTAssertNil(model.contractSendReport)
         }
     }
 }

@@ -3,6 +3,7 @@ import UIKit
 import UniformTypeIdentifiers
 
 struct ProjectWorkspaceView: View {
+    @Environment(\.scenePhase) private var scenePhase
     @Environment(\.colorScheme) private var colorScheme
     @AppStorage("writerpad.restore-last-project-on-launch")
     private var restoresLastProjectOnLaunch = true
@@ -155,12 +156,22 @@ struct ProjectWorkspaceView: View {
             }
         }
         .task(id: model.selectedProjectID) {
+            guard !Task.isCancelled else { return }
+            await handshakeService?.observeProject(
+                model.selectedProjectID,
+                authentication: authenticationService,
+                bindings: projectBindingService
+            )
             await syncDispatcher?.prioritizeProject(
                 model.selectedProjectID
             )
             await backgroundSyncCoordinator?.prioritizeProject(
                 model.selectedProjectID
             )
+        }
+        .task(id: scenePhase) {
+            guard !Task.isCancelled else { return }
+            await handshakeService?.updateSceneActivity(scenePhase == .active)
         }
         .sheet(isPresented: $isShowingSettings) {
             AppearanceSettingsView(

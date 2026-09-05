@@ -5,7 +5,7 @@ import XCTest
 @MainActor
 final class SyncSettingsModelTests: XCTestCase {
 #if DEBUG
-    func testContractPathGateTogglePublishesAndRestoresStoredState()
+    func testContractGateCannotOpenWithoutFreshHandshakeButStoredGateCanClose()
         async throws {
         let project = makeManagedProject(
             id: "00000000-0000-0000-0000-000000000899",
@@ -28,13 +28,13 @@ final class SyncSettingsModelTests: XCTestCase {
         let row = try XCTUnwrap(model.projectRows.first)
         XCTAssertFalse(model.isGateOpen(for: row))
 
-        model.setGateOpen(true, for: row)
+        await model.setGateOpen(true, for: row).value
 
-        XCTAssertTrue(model.isGateOpen(for: row))
-        XCTAssertTrue(
-            ContractPathGate.isOpen(for: project.id, in: defaults)
-        )
-        XCTAssertEqual(model.gateReport, "관문 확인 관문: 열림")
+        XCTAssertFalse(model.isGateOpen(for: row))
+        XCTAssertFalse(ContractPathGate.isOpen(for: project.id, in: defaults))
+        XCTAssertNotNil(model.gateReport)
+        // 기존 설치에서 명시적으로 켜 두었던 값의 표시·닫힘을 별도로 확인한다.
+        ContractPathGate.setOpen(true, for: project.id, in: defaults)
 
         let restoredModel = SyncSettingsModel(
             projectLister: SyncSettingsProjectListerStub(projects: [project]),
@@ -51,7 +51,7 @@ final class SyncSettingsModelTests: XCTestCase {
         let restoredRow = try XCTUnwrap(restoredModel.projectRows.first)
         XCTAssertTrue(restoredModel.isGateOpen(for: restoredRow))
 
-        restoredModel.setGateOpen(false, for: restoredRow)
+        await restoredModel.setGateOpen(false, for: restoredRow).value
 
         XCTAssertFalse(restoredModel.isGateOpen(for: restoredRow))
         XCTAssertNil(

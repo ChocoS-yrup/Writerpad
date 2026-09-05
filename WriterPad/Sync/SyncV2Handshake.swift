@@ -1,6 +1,18 @@
 import Foundation
 import Supabase
 
+/// actor 사이의 await 없이 전송 시작 시점까지 수명 변화를 검사한다.
+final class SyncV2ContractEpoch: @unchecked Sendable {
+    private let lock = NSLock()
+    private var counter: UInt64 = 0
+    private var transitions = 0
+    var value: UInt64 { lock.withLock { counter } }
+    var isAvailable: Bool { lock.withLock { transitions == 0 } }
+    func advance() { lock.withLock { counter &+= 1 } }
+    func beginTransition() { lock.withLock { transitions += 1; counter &+= 1 } }
+    func endTransition() { lock.withLock { transitions -= 1; counter &+= 1 } }
+}
+
 /// 서버가 이 작품에 대해 무엇을 지원하는지 한 번에 묻는 경로다.
 ///
 /// 클라이언트는 allowlist 유무나 행의 부재를 추측하지 않는다. 추측하면 언젠가
@@ -65,6 +77,7 @@ enum SyncV2HandshakeTransportError: Error, Equatable, Sendable {
     case timedOut
     case invalidResponse
     case serverRejected
+    case contractRejected(String)
 }
 
 enum SyncV2HandshakeError: Error, Equatable, Sendable {
@@ -82,6 +95,10 @@ enum SyncV2HandshakeError: Error, Equatable, Sendable {
     case identityUnknown
     /// 기다리는 사이에 상황이 바뀌어, 도착한 답이 이미 지난 상황의 것이 됐다.
     case superseded
+
+    var isRetryable: Bool {
+        self == .networkUnavailable || self == .timedOut
+    }
 
     /// 이미 들고 있던 답을 버려야 하는 오류인지다.
     ///
@@ -107,52 +124,90 @@ protocol SyncV2HandshakeTransporting: Sendable {
     ) async throws -> SyncV2HandshakeResponse
 }
 
-actor LiveSyncV2HandshakeTransport: SyncV2HandshakeTransporting {
-    private let client: SupabaseClient
+/// 계약 RPC는 HTTP 상태를 보존한다. SDK의 PostgREST 오류 변환은 JSON 오류의
+/// 429/5xx 상태를 버릴 수 있어 재시도 분류에 사용하지 않는다.
+struct SyncV2ContractHTTPClient: Sendable {
+    let configuration: SupabasePublicConfiguration
+    let accessToken: @Sendable () -> String?
+    var session: URLSession = .shared
 
-    init(client: SupabaseClient) {
-        self.client = client
+    func call(rpc: String, body: Data, authorize: @Sendable () throws -> Void = {}) async throws -> Data {
+        guard let token = accessToken() else { throw SyncV2HandshakeTransportError.authenticationRequired }
+        var request = URLRequest(url: configuration.url.appendingPathComponent("rest/v1/rpc/\(rpc)"))
+        request.httpMethod = "POST"
+        request.httpBody = body
+        request.timeoutInterval = 12
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.setValue(configuration.publishableKey, forHTTPHeaderField: "apikey")
+        request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+        try Task.checkCancellation()
+        // 토큰과 요청을 준비한 뒤, 네트워크 호출 직전에 동기적으로 검사한다.
+        try authorize()
+        let (data, response) = try await session.data(for: request)
+        guard let http = response as? HTTPURLResponse else { throw SyncV2HandshakeTransportError.invalidResponse }
+        guard (200..<300).contains(http.statusCode) else { throw HTTPError(data: data, response: http) }
+        return data
+    }
+}
+
+actor LiveSyncV2HandshakeTransport: SyncV2HandshakeTransporting {
+    private let http: SyncV2ContractHTTPClient
+
+    init(client: SupabaseClient, configuration: SupabasePublicConfiguration) {
+        http = SyncV2ContractHTTPClient(configuration: configuration, accessToken: { client.auth.currentSession?.accessToken })
     }
 
     func fetchHandshake(
         parameters: SyncV2HandshakeParameters
     ) async throws -> SyncV2HandshakeResponse {
         do {
-            let response: PostgrestResponse<SyncV2HandshakeResponse> =
-                try await client
-                    .rpc("get_sync_handshake", params: parameters)
-                    .execute()
-            return response.value
-        } catch let error as PostgrestError {
-            switch (error.message, error.code) {
-            case ("AUTH_REQUIRED", _), (_, "PGRST301"):
-                throw SyncV2HandshakeTransportError.authenticationRequired
-            case ("FORBIDDEN", _), (_, "42501"):
-                throw SyncV2HandshakeTransportError.forbidden
-            default:
-                throw SyncV2HandshakeTransportError.serverRejected
-            }
-        } catch let error as URLError {
-            switch error.code {
-            case .timedOut:
-                throw SyncV2HandshakeTransportError.timedOut
-            case .userAuthenticationRequired:
-                throw SyncV2HandshakeTransportError.authenticationRequired
-            default:
-                throw SyncV2HandshakeTransportError.networkUnavailable
-            }
-        } catch is DecodingError {
-            throw SyncV2HandshakeTransportError.invalidResponse
+            let data = try await http.call(rpc: "get_sync_handshake", body: JSONEncoder().encode(parameters))
+            return try JSONDecoder().decode(SyncV2HandshakeResponse.self, from: data)
         } catch {
-            let nsError = error as NSError
-            if nsError.domain == NSURLErrorDomain {
-                if nsError.code == URLError.timedOut.rawValue {
-                    throw SyncV2HandshakeTransportError.timedOut
-                }
-                throw SyncV2HandshakeTransportError.networkUnavailable
-            }
-            throw SyncV2HandshakeTransportError.serverRejected
+            throw Self.classify(error)
         }
+    }
+
+    static func classify(_ error: Error, depth: Int = 0) -> SyncV2HandshakeTransportError {
+        if let known = error as? SyncV2HandshakeTransportError { return known }
+        if let remote = error as? PostgrestError {
+            switch remote.message {
+            case "AUTH_REQUIRED", "AUTH_EXPIRED": return .authenticationRequired
+            case "FORBIDDEN": return .forbidden
+            case "CONTRACT_NOT_ALLOWED", "CONTRACT_DIGEST_MISMATCH",
+                 "PROTOCOL_TOO_OLD", "CAPABILITY_MISMATCH", "STALE_MIGRATION_EPOCH":
+                return .contractRejected(remote.message)
+            default:
+                if remote.code == "PGRST301" { return .authenticationRequired }
+                if remote.code == "42501" { return .forbidden }
+                return .serverRejected
+            }
+        }
+        if let http = error as? HTTPError {
+            // 명시적인 거절은 오래된 underlying timeout보다 우선한다.
+            if http.response.statusCode == 401 { return .authenticationRequired }
+            if http.response.statusCode == 403 { return .forbidden }
+            if let remote = try? JSONDecoder().decode(PostgrestError.self, from: http.data) {
+                let specific = classify(remote)
+                if specific != .serverRejected { return specific }
+            }
+            if http.response.statusCode == 429 || http.response.statusCode >= 500 {
+                return .networkUnavailable
+            }
+            return .serverRejected
+        }
+        if error is DecodingError { return .invalidResponse }
+        let ns = error as NSError
+        if ns.domain == NSURLErrorDomain {
+            if ns.code == URLError.timedOut.rawValue { return .timedOut }
+            if ns.code == URLError.userAuthenticationRequired.rawValue { return .authenticationRequired }
+            if ns.code == URLError.cancelled.rawValue { return .serverRejected }
+            return .networkUnavailable
+        }
+        if depth < 4, let underlying = ns.userInfo[NSUnderlyingErrorKey] as? Error {
+            return classify(underlying, depth: depth + 1)
+        }
+        return .serverRejected
     }
 }
 
@@ -185,6 +240,9 @@ extension SyncV2Contract {
             serverProtocolVersion > 0
         else {
             throw SyncV2ContractError.invalidArgument
+        }
+        guard contractVersion == version else {
+            throw SyncV2ContractError.contractDigestMismatch
         }
         guard
             !response.supportedProtocolVersions.isEmpty,
@@ -272,17 +330,23 @@ struct SyncV2HandshakeContext: Equatable, Sendable {
     /// 인증 교환이 돌려준 세션의 user id를 쓴다.
     let accountID: UUID
     let clientContractSHA256: String
+    let authenticationEpoch: UInt64
+    let bindingEpoch: UInt64
 
     init(
         localProjectID: ProjectID,
         serverProjectID: UUID,
         accountID: UUID,
-        clientContractSHA256: String = SyncV2Contract.canonicalSHA256
+        clientContractSHA256: String = SyncV2Contract.canonicalSHA256,
+        authenticationEpoch: UInt64 = 0,
+        bindingEpoch: UInt64 = 0
     ) {
         self.localProjectID = localProjectID
         self.serverProjectID = serverProjectID
         self.accountID = accountID
         self.clientContractSHA256 = clientContractSHA256
+        self.authenticationEpoch = authenticationEpoch
+        self.bindingEpoch = bindingEpoch
     }
 
     /// 인증된 상태에서만 문맥이 성립한다.
@@ -292,7 +356,9 @@ struct SyncV2HandshakeContext: Equatable, Sendable {
     static func make(
         authenticationState: AuthenticationState,
         localProjectID: ProjectID,
-        serverProjectID: UUID
+        serverProjectID: UUID,
+        authenticationEpoch: UInt64 = 0,
+        bindingEpoch: UInt64 = 0
     ) -> SyncV2HandshakeContext? {
         guard case let .authenticated(account) = authenticationState else {
             return nil
@@ -300,7 +366,9 @@ struct SyncV2HandshakeContext: Equatable, Sendable {
         return SyncV2HandshakeContext(
             localProjectID: localProjectID,
             serverProjectID: serverProjectID,
-            accountID: account.userID
+            accountID: account.userID,
+            authenticationEpoch: authenticationEpoch,
+            bindingEpoch: bindingEpoch
         )
     }
 }
@@ -323,32 +391,52 @@ struct SyncV2HandshakeReading: Equatable, Sendable {
 /// 있는데, 그 사이 서버 쪽 allowlist나 작품 모드가 바뀌었을 수 있다. 재시작 뒤에는
 /// 다시 묻는 것이 맞다.
 actor SyncV2HandshakeService {
+    private typealias Outcome = Result<SyncV2ValidatedHandshake, SyncV2HandshakeError>
+    private struct Flight {
+        let id: UUID
+        let context: SyncV2HandshakeContext
+        let generation: UInt64
+        let race: SyncV2OneShotRace<Outcome>
+    }
     private let transport: any SyncV2HandshakeTransporting
     private let now: @Sendable () -> Date
-
+    private let sleep: @Sendable (Duration) async throws -> Void
+    private let timeout: Duration
+    nonisolated let authorizationEpoch = SyncV2ContractEpoch()
     private var reading: SyncV2HandshakeReading?
-    /// 무효화가 일어날 때마다 오른다. 올리는 것만으로 들고 있던 답 전부가 한
-    /// 번에 죽으므로, 무효화를 반쪽만 구현하는 실수가 성립하지 않는다.
-    private var generation: UInt64 = 0
-    private var inFlight: Task<SyncV2ValidatedHandshake, Error>?
+    private var inFlight: Flight?
+    private var generation: UInt64 { authorizationEpoch.value }
+    private var automaticTask: Task<Void, Never>?
+    private var authenticationTask: Task<Void, Never>?
+    private var bindingTask: Task<Void, Never>?
+    private var lifecycleGeneration: UInt64 = 0
+    private var selectedProjectID: ProjectID?
+    private var selectionID = UUID()
+    private var authenticationService: (any AuthenticationServicing)?
+    private var bindingService: (any ProjectBindingServicing)?
+    private var sceneActive = true
+    nonisolated let activityEpoch = SyncV2ContractEpoch()
+    private var retryAttempt = 0
+    private var retryAt: Date?
+    private var terminalContext: SyncV2HandshakeContext?
+    private let networkMonitor = SyncV2NetworkRecoveryMonitor()
 
     init(
         transport: any SyncV2HandshakeTransporting,
-        now: @escaping @Sendable () -> Date = Date.init
+        now: @escaping @Sendable () -> Date = Date.init,
+        timeout: Duration = .seconds(12),
+        sleep: @escaping @Sendable (Duration) async throws -> Void = {
+            try await ContinuousClock().sleep(for: $0)
+        }
     ) {
         self.transport = transport
         self.now = now
+        self.timeout = timeout
+        self.sleep = sleep
     }
 
-    // MARK: 읽기
-
-    /// 서버에 묻고, 통과한 답만 이 문맥에 묶어 들고 있는다.
-    ///
-    /// 묻기 전에 먼저 버린다. 조회·해독·검증 중 어디서 실패하든 계약 경로에 쓸 수
-    /// 있는 값이 남지 않게 하려는 것이다.
-    func refresh(
-        context: SyncV2HandshakeContext?
-    ) async throws -> SyncV2ValidatedHandshake {
+    func refresh(context: SyncV2HandshakeContext?) async throws -> SyncV2ValidatedHandshake {
+        guard !Task.isCancelled else { throw SyncV2HandshakeError.superseded }
         guard let context else {
             forget(reason: "identityUnknown")
             throw SyncV2HandshakeError.identityUnknown
@@ -357,121 +445,243 @@ actor SyncV2HandshakeService {
             forget(reason: "clientDigestMismatch")
             throw SyncV2HandshakeError.incompatible(.contractDigestMismatch)
         }
-
-        // 이미 날아간 요청이 있으면 그 결과를 함께 기다린다. 화면 여러 곳이 동시에
-        // 물어도 서버에는 한 번만 간다. 먼저 온 요청이 이미 버리고 출발했으므로
-        // 여기서 다시 버리지 않는다 — 다시 버리면 세대가 올라 그 요청의 답이 죽는다.
-        if let inFlight {
-            return try await inFlight.value
-        }
-
-        forget(reason: "refresh")
-
-        let generation = self.generation
-        let task = Task<SyncV2ValidatedHandshake, Error> { [transport] in
-            let response: SyncV2HandshakeResponse
-            do {
-                response = try await transport.fetchHandshake(
-                    parameters: SyncV2HandshakeParameters(
-                        projectID: context.serverProjectID,
-                        contractSHA256: SyncV2Contract.canonicalSHA256
-                    )
-                )
-            } catch let error as SyncV2HandshakeTransportError {
-                throw Self.classify(error)
-            } catch {
-                throw SyncV2HandshakeError.serverRejected
-            }
-
-            // 우리가 물은 작품에 대한 답인지 먼저 본다. 다른 작품에 대한 답을
-            // 받아 두면 남의 상태로 우리 작품을 판단하게 된다.
-            guard response.projectID == context.serverProjectID else {
-                throw SyncV2HandshakeError.invalidResponse
-            }
-            guard response.supported else {
-                throw SyncV2HandshakeError.contractUnavailable
-            }
-            do {
-                return try SyncV2Contract.readHandshakeCompatibility(response)
-            } catch let error as SyncV2ContractError {
-                throw error == .invalidArgument
-                    ? SyncV2HandshakeError.invalidResponse
-                    : SyncV2HandshakeError.incompatible(error)
-            }
-        }
-        inFlight = task
-
-        defer { inFlight = nil }
-        do {
-            let handshake = try await task.value
-            // 기다리는 사이에 무효화가 일어났다면 이 답은 이미 지난 상황에 대한
-            // 것이다. 늦게 도착한 답이 새 상황을 덮어쓰지 못하게 버린다.
-            guard generation == self.generation else {
+        let flight: Flight
+        if let existing = inFlight {
+            // 다른 문맥은 같은 요청에 합류할 수 없다. 실제 호출 슬롯은 끝날 때까지
+            // 유지하므로 취소를 무시하는 SDK에도 중복 네트워크 요청을 만들지 않는다.
+            guard existing.context == context, existing.generation == generation else {
                 throw SyncV2HandshakeError.superseded
             }
-            reading = SyncV2HandshakeReading(
-                context: context,
-                handshake: handshake,
-                generation: generation,
-                observedAt: now()
-            )
-            return handshake
-        } catch let error as SyncV2HandshakeError {
-            if error.invalidatesStandingReading {
-                forget(reason: "invalidatingError")
+            flight = existing
+        } else {
+            forget(reason: "refresh")
+            let created = Flight(id: UUID(), context: context, generation: generation,
+                                 race: SyncV2OneShotRace<Outcome>())
+            inFlight = created
+            flight = created
+            let transport = self.transport
+            let sleep = self.sleep
+            let timeout = self.timeout
+            let watchdog = Task {
+                do {
+                    try await sleep(timeout)
+                    await created.race.resolve(.failure(.timedOut))
+                } catch { }
             }
+            Task { [weak self] in
+                let outcome: Outcome
+                do {
+                    let response = try await transport.fetchHandshake(parameters:
+                        SyncV2HandshakeParameters(projectID: context.serverProjectID,
+                                                  contractSHA256: context.clientContractSHA256))
+                    guard response.projectID == context.serverProjectID else {
+                        throw SyncV2HandshakeError.invalidResponse
+                    }
+                    guard response.supported else { throw SyncV2HandshakeError.contractUnavailable }
+                    outcome = .success(try SyncV2Contract.readHandshakeCompatibility(response))
+                } catch let error as SyncV2HandshakeError {
+                    outcome = .failure(error)
+                } catch let error as SyncV2ContractError {
+                    outcome = .failure(error == .invalidArgument ? .invalidResponse : .incompatible(error))
+                } catch {
+                    outcome = .failure(Self.classify(LiveSyncV2HandshakeTransport.classify(error)))
+                }
+                watchdog.cancel()
+                await self?.finishFlight(created.id)
+                await created.race.resolve(outcome)
+            }
+        }
+        let outcome = await flight.race.value()
+        // 성공·실패·unsupported와 합류한 호출자 전부에 동일하게 적용한다.
+        guard flight.generation == generation, !Task.isCancelled else { throw SyncV2HandshakeError.superseded }
+        switch outcome {
+        case .success(let handshake):
+            retryAttempt = 0; retryAt = nil; terminalContext = nil
+            reading = SyncV2HandshakeReading(context: context, handshake: handshake,
+                                             generation: generation, observedAt: now())
+            return handshake
+        case .failure(let error):
+            reading = nil
             throw error
         }
     }
 
-    /// 지금 이 문맥을 설명하는 답이 서 있는 동안에만 돌려준다.
-    func standingHandshake(
-        for context: SyncV2HandshakeContext?
-    ) -> SyncV2ValidatedHandshake? {
-        guard let context, let reading else { return nil }
-        guard reading.generation == generation else { return nil }
-        guard reading.context == context else { return nil }
-        guard reading.context.clientContractSHA256
-            == SyncV2Contract.canonicalSHA256 else { return nil }
-        return reading.handshake
+    func refreshForGate(context: SyncV2HandshakeContext) async throws -> SyncV2ValidatedHandshake {
+        // 이미 진행 중인 오래된 조회에 합류하여 스위치를 켜지 않는다.
+        forget(reason: "explicitGateOpen")
+        return try await refresh(context: context)
     }
 
+    private func finishFlight(_ id: UUID) {
+        if inFlight?.id == id { inFlight = nil }
+    }
+
+    func standingHandshake(for context: SyncV2HandshakeContext?) -> SyncV2ValidatedHandshake? {
+        guard let context, let reading, reading.generation == generation,
+              reading.context == context,
+              context.clientContractSHA256 == SyncV2Contract.canonicalSHA256
+        else { return nil }
+        return reading.handshake
+    }
     func isFresh(for context: SyncV2HandshakeContext?) -> Bool {
         standingHandshake(for: context) != nil
     }
-
-    // MARK: 무효화
-
-    /// 들고 있던 답을 버린다. 세대를 올리므로 진행 중인 조회의 결과도 함께 죽는다.
     func forget(reason: String) {
         reading = nil
-        generation &+= 1
-        SyncV2Diagnostics.generation(
-            scope: "handshake",
-            counter: "generation",
-            value: generation,
-            reason: reason
-        )
+        authorizationEpoch.advance()
+        SyncV2Diagnostics.generation(scope: "handshake", counter: "generation",
+                                     value: generation, reason: reason)
     }
-
-    /// 다른 작품으로 옮겼다.
-    func projectChanged() { forget(reason: "projectChanged") }
-
-    /// 로그아웃했거나 세션이 끝났다.
-    func authenticationChanged() { forget(reason: "authenticationChanged") }
-
-    /// 관문을 닫았다.
-    func gateClosed() { forget(reason: "gateClosed") }
-
-    /// 서버가 우리가 읽은 시점을 앞지른 답을 보냈다.
-    func forgetIfStale(_ error: SyncV2HandshakeError) {
+    func projectChanged() { invalidateLifecycle(reason: "projectChanged") }
+    func authenticationChanged() { invalidateLifecycle(reason: "authenticationChanged") }
+    func gateClosed() { invalidateLifecycle(reason: "gateClosed") }
+    func forgetIfStale(_ error: SyncV2HandshakeError, expectedGeneration: UInt64? = nil) {
+        if let expectedGeneration, expectedGeneration != generation { return }
         guard error.invalidatesStandingReading else { return }
-        forget(reason: "staleServerAnswer")
+        invalidateLifecycle(reason: "staleServerAnswer")
     }
 
-    private static func classify(
-        _ error: SyncV2HandshakeTransportError
-    ) -> SyncV2HandshakeError {
+    static func retryDelay(attempt: Int) -> Duration {
+        .seconds([2, 4, 8, 16, 32, 60][min(max(attempt, 0), 5)])
+    }
+
+    /// UI는 사건만 전달하고 네트워크 완료를 기다리지 않는다.
+    func observeProject(
+        _ projectID: ProjectID?,
+        authentication: any AuthenticationServicing,
+        bindings: any ProjectBindingServicing
+    ) async {
+        let first = authenticationService == nil ||
+            authenticationService?.contractEpoch !== authentication.contractEpoch ||
+            bindingService?.contractEpoch !== bindings.contractEpoch
+        authenticationService = authentication
+        bindingService = bindings
+        if first {
+            authenticationTask?.cancel()
+            let updates = await authentication.stateUpdates()
+            authenticationTask = Task { [weak self] in
+                for await _ in updates {
+                    guard !Task.isCancelled else { return }
+                    await self?.authenticationChanged()
+                }
+            }
+            networkMonitor.start { [weak self] in
+                Task { await self?.networkRecovered() }
+            }
+        }
+        guard first || selectedProjectID != projectID else { return }
+        selectedProjectID = projectID
+        selectionID = UUID()
+        bindingTask?.cancel()
+        projectChanged()
+        guard let projectID else { return }
+        let selection = selectionID
+        let updates = await bindings.bindingUpdates(for: projectID)
+        guard selection == selectionID, selectedProjectID == projectID else { return }
+        bindingTask = Task { [weak self] in
+            for await _ in updates {
+                guard !Task.isCancelled else { return }
+                await self?.bindingChanged(for: projectID, selection: selection)
+            }
+        }
+    }
+
+    private func bindingChanged(for projectID: ProjectID, selection: UUID) {
+        guard selectedProjectID == projectID, selectionID == selection else { return }
+        projectChanged()
+    }
+
+    func updateSceneActivity(_ active: Bool) {
+        guard active != sceneActive else { return }
+        sceneActive = active
+        activityEpoch.advance()
+        lifecycleGeneration &+= 1
+        // 복귀만으로 캐시 TTL을 새로 만들지 않는다. 송신 권한과 읽기 캐시는 분리한다.
+        automaticTask?.cancel(); automaticTask = nil
+        if active { scheduleAutomatic() }
+    }
+
+    func networkRecovered() { scheduleAutomatic() }
+
+    func canStartContractWrite() -> Bool { sceneActive }
+
+    func stopObserving() {
+        authenticationTask?.cancel(); authenticationTask = nil
+        bindingTask?.cancel(); bindingTask = nil
+        networkMonitor.cancel()
+        authenticationService = nil
+        bindingService = nil
+        selectedProjectID = nil
+        invalidateLifecycle(reason: "stop")
+    }
+
+    private func invalidateLifecycle(reason: String) {
+        forget(reason: reason)
+        lifecycleGeneration &+= 1
+        retryAttempt = 0
+        retryAt = nil
+        terminalContext = nil
+        automaticTask?.cancel()
+        automaticTask = nil
+        scheduleAutomatic()
+    }
+
+    private func scheduleAutomatic() {
+        guard automaticTask == nil, sceneActive, selectedProjectID != nil,
+              authenticationService != nil, bindingService != nil else { return }
+        let revision = lifecycleGeneration
+        automaticTask = Task { [weak self] in
+            await self?.runAutomatic(revision: revision)
+        }
+    }
+
+    private func runAutomatic(revision: UInt64) async {
+        defer { if revision == lifecycleGeneration { automaticTask = nil } }
+        while !Task.isCancelled, revision == lifecycleGeneration, sceneActive,
+              let projectID = selectedProjectID,
+              let auth = authenticationService, let bindings = bindingService {
+            do {
+                if let retryAt, retryAt > now() {
+                    try await sleep(.seconds(retryAt.timeIntervalSince(now())))
+                }
+                try Task.checkCancellation()
+                let authEpoch = auth.contractEpoch?.value ?? 0
+                let bindingEpoch = bindings.contractEpoch?.value ?? 0
+                let state = await auth.currentState()
+                let binding = await bindings.currentBinding(for: projectID)
+                guard revision == lifecycleGeneration, !Task.isCancelled else { return }
+                guard bindings.contractEpoch?.isAvailable ?? true else { return }
+                guard let serverID = binding?.serverProjectID,
+                      let context = SyncV2HandshakeContext.make(authenticationState: state,
+                          localProjectID: projectID, serverProjectID: serverID,
+                          authenticationEpoch: authEpoch, bindingEpoch: bindingEpoch)
+                else { return }
+                guard authEpoch == (auth.contractEpoch?.value ?? 0),
+                      bindingEpoch == (bindings.contractEpoch?.value ?? 0) else { continue }
+                if standingHandshake(for: context) != nil || terminalContext == context { return }
+                // 옛 실제 요청이 종료될 때까지 슬롯을 유지한다. 재시도 기한도 유지한다.
+                if inFlight != nil {
+                    try await sleep(.seconds(2))
+                    continue
+                }
+                do {
+                    _ = try await refresh(context: context)
+                    guard revision == lifecycleGeneration else { return }
+                    retryAttempt = 0; retryAt = nil
+                    return
+                } catch let error as SyncV2HandshakeError {
+                    guard revision == lifecycleGeneration, !Task.isCancelled else { return }
+                    if error == .superseded { continue }
+                    guard error.isRetryable else { terminalContext = context; return }
+                    let delay = Self.retryDelay(attempt: retryAttempt)
+                    retryAttempt = min(retryAttempt + 1, 5)
+                    retryAt = now().addingTimeInterval(Double(delay.components.seconds))
+                }
+            } catch { return }
+        }
+    }
+
+    private static func classify(_ error: SyncV2HandshakeTransportError) -> SyncV2HandshakeError {
         switch error {
         case .authenticationRequired: return .authenticationRequired
         case .forbidden: return .forbidden
@@ -479,6 +689,8 @@ actor SyncV2HandshakeService {
         case .timedOut: return .timedOut
         case .invalidResponse: return .invalidResponse
         case .serverRejected: return .serverRejected
+        case .contractRejected(let code):
+            return code == "CONTRACT_NOT_ALLOWED" ? .contractUnavailable : .incompatible(SyncV2ContractError(code))
         }
     }
 }
@@ -491,6 +703,11 @@ actor SyncV2HandshakeService {
 /// 있으면 아무것도 움직이지 않는다. 핸드셰이크가 성공했다는 것과 계약 경로를
 /// 쓴다는 것은 별개이며, 그 둘을 잇는 유일한 지점이 여기다.
 enum ContractPathGate {
+    private final class State: @unchecked Sendable {
+        let lock = NSLock()
+        var revisions: [String: UInt64] = [:]
+    }
+    private static let state = State()
     static let storageKeyPrefix = "writerpad.contract-path-enabled."
 
     static func storageKey(for localProjectID: ProjectID) -> String {
@@ -510,14 +727,54 @@ enum ContractPathGate {
         for localProjectID: ProjectID,
         in defaults: UserDefaults = .standard
     ) {
-        defaults.set(isOpen, forKey: storageKey(for: localProjectID))
+        state.lock.withLock {
+            state.revisions[revisionKey(localProjectID, defaults), default: 0] &+= 1
+            defaults.set(isOpen, forKey: storageKey(for: localProjectID))
+        }
     }
 
     static func close(
         for localProjectID: ProjectID,
         in defaults: UserDefaults = .standard
     ) {
-        defaults.removeObject(forKey: storageKey(for: localProjectID))
+        state.lock.withLock {
+            state.revisions[revisionKey(localProjectID, defaults), default: 0] &+= 1
+            defaults.removeObject(forKey: storageKey(for: localProjectID))
+        }
+    }
+
+    private static func revisionKey(_ id: ProjectID, _ defaults: UserDefaults) -> String {
+        "\(ObjectIdentifier(defaults))-\(id.rawValue)"
+    }
+
+    static func revision(for id: ProjectID, in defaults: UserDefaults = .standard) -> UInt64 {
+        state.lock.withLock { state.revisions[revisionKey(id, defaults), default: 0] }
+    }
+
+    static func openAfterValidation(
+        for id: ProjectID, in defaults: UserDefaults, revision: UInt64,
+        validate: () -> Bool
+    ) -> Bool {
+        state.lock.withLock {
+            let key = revisionKey(id, defaults)
+            guard state.revisions[key, default: 0] == revision, validate() else { return false }
+            state.revisions[key, default: 0] &+= 1
+            defaults.set(true, forKey: storageKey(for: id))
+            return true
+        }
+    }
+
+    /// 관문 변경과 송신 시작 예약 사이에 await를 두지 않는다.
+    /// 예약 뒤의 닫힘은 이미 시작한 요청의 서버 취소를 뜻하지 않는다.
+    static func reserveStart(
+        for id: ProjectID, in defaults: UserDefaults,
+        revision: UInt64, validate: () -> Bool
+    ) throws {
+        try state.lock.withLock {
+            guard state.revisions[revisionKey(id, defaults), default: 0] == revision,
+                  isOpen(for: id, in: defaults), validate()
+            else { throw SyncV2ContractStructureError.gateClosed }
+        }
     }
 }
 

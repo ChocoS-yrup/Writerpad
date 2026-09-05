@@ -1,0 +1,28 @@
+{
+  "result": "Passed",
+  "base_commit": "2ef42c8b81da40c458edb2eb0cb139b2c1bee942",
+  "source_state": "uncommitted working tree",
+  "source_test_diff_sha256": "d55c4dfc9aac9a8ca6fce676b90d5a2327a8b509a02374c14bc89a44bad4f609",
+  "command": "Scripts/run_tests.sh",
+  "xcresult": "build/TestDerivedData/Logs/Test/Test-WriterPad-2026.09.06_07-22-37-+0900.xcresult",
+  "source_of_counts": "xcrun xcresulttool get test-results summary",
+  "total": 946,
+  "passed": 945,
+  "failed": 0,
+  "skipped": 1,
+  "started_kst": "2026-09-06T07:22:37+09:00",
+  "finished_kst": "2026-09-06T07:25:40+09:00",
+  "device": "iPad Pro 13-inch (M5), iOS Simulator 26.5 (23F77)",
+  "related_suites": {
+    "SyncV2HandshakeTests": 49,
+    "SupabaseAuthServiceTests": 21,
+    "SyncSettingsModelTests": 6,
+    "SyncV2SnapshotPullTests": 134,
+    "SyncV2StoreTests": 134,
+    "EditLeaseManagerTests": 22
+  },
+  "real_contract_gate_changed": false,
+  "server_settings_changed": false,
+  "real_contract_write_test_performed": false,
+  "physical_device_reinstalled": false
+}

@@ -145,12 +145,14 @@ final class SupabaseClientProvider: SupabaseClientProviding {
     /// 때마다 새로 만들면 들고 있던 답이 매번 사라진다. 서비스를 하나 만들어 두는
     /// 것은 이것을 쓰는 쪽의 몫이다.
     func makeHandshakeTransport() -> (any SyncV2HandshakeTransporting)? {
-        client.map { LiveSyncV2HandshakeTransport(client: $0) }
+        guard case .configured(let configuration) = configurationState else { return nil }
+        return client.map { LiveSyncV2HandshakeTransport(client: $0, configuration: configuration) }
     }
 
     func makeAtomicStructureTransport() ->
         (any SyncV2AtomicStructureTransporting)? {
-        client.map { LiveSyncV2AtomicStructureTransport(client: $0) }
+        guard case .configured(let configuration) = configurationState else { return nil }
+        return client.map { LiveSyncV2AtomicStructureTransport(client: $0, configuration: configuration) }
     }
 
     func makeSnapshotClient() -> SyncV2SnapshotClient? {

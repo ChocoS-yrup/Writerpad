@@ -7759,6 +7759,12 @@ final class SyncV2StoreTests: XCTestCase {
         XCTAssertEqual(uploadQueue.pendingCount, 0)
         XCTAssertEqual(uploadQueue.inflightCount, 1)
         XCTAssertEqual(firstClaim.request.batchID, batchID)
+        await recorder.failContractStructure(firstClaim, error: SyncV2ContractStructureError.transmissionNotStarted)
+        let blockedClaim = try await recorder.claimNextContractStructure(localProjectID: localProjectID)
+        XCTAssertEqual(blockedClaim.request, firstClaim.request)
+        await recorder.failContractStructure(blockedClaim, error: SyncV2ContractError.partialBatchResponse)
+        let uncertainClaim = try await recorder.claimNextContractStructure(localProjectID: localProjectID)
+        XCTAssertEqual(uncertainClaim.request, firstClaim.request)
         try await recorder.recoverInterruptedWork()
         let pending = try await recorder.claimNextContractStructure(
             localProjectID: localProjectID
@@ -7799,6 +7805,8 @@ final class SyncV2StoreTests: XCTestCase {
             pending,
             response: response
         )
+        // 늦은 실패가 완료 영수증과 revision 상태를 되돌릴 수 없다.
+        await recorder.failContractStructure(pending, error: SyncV2ContractStructureError.transmissionNotStarted)
         uploadQueue = try await recorder.uploadQueueSnapshot(
             localProjectID: localProjectID
         )

@@ -4,6 +4,7 @@ import UIKit
 
 enum GlobalSyncPreference {
     static let storageKey = "writerpad.sync-all-projects-enabled"
+    static let contractEpoch = SyncV2ContractEpoch()
 
     static func isEnabled(in defaults: UserDefaults = .standard) -> Bool {
         defaults.bool(forKey: storageKey)
@@ -13,6 +14,7 @@ enum GlobalSyncPreference {
         _ isEnabled: Bool,
         in defaults: UserDefaults = .standard
     ) {
+        contractEpoch.advance()
         defaults.set(isEnabled, forKey: storageKey)
     }
 }
@@ -160,27 +162,69 @@ final class SyncSettingsModel: ObservableObject {
         openContractPathProjectIDs.contains(row.project.id)
     }
 
-    func setGateOpen(_ isOpen: Bool, for row: SyncProjectRow) {
-        if isOpen {
-            ContractPathGate.setOpen(true, for: row.project.id, in: defaults)
-            openContractPathProjectIDs.insert(row.project.id)
-        } else {
+    @discardableResult
+    func setGateOpen(_ isOpen: Bool, for row: SyncProjectRow) -> Task<Void, Never> {
+        // 닫힘은 await 전에 반영한다. 열기는 새 조회가 끝난 뒤에만 허용한다.
+        if !isOpen {
             ContractPathGate.close(for: row.project.id, in: defaults)
             openContractPathProjectIDs.remove(row.project.id)
-            // 관문을 닫으면 들고 있던 답도 버린다. 닫힌 뒤에도 답이 서 있으면
-            // 다시 열었을 때 낡은 답으로 곧장 쓰기 시작한다.
-            Task { await handshakeService?.gateClosed() }
+            gateReport = "\(row.project.name) 관문: 닫힘"
+            return Task { await handshakeService?.gateClosed() }
         }
-        gateReport = "\(row.project.name) 관문: \(isOpen ? "열림" : "닫힘")"
+        let revision = ContractPathGate.revision(for: row.project.id, in: defaults)
+        let authEpoch = authenticationService.contractEpoch?.value ?? 0
+        let bindingEpoch = projectBindingService.contractEpoch?.value ?? 0
+        return Task {
+            guard let handshakeService else {
+                gateReport = "새 핸드셰이크를 확인할 수 없어 관문을 열지 않았습니다."
+                return
+            }
+            let state = await authenticationService.currentState()
+            let binding = await projectBindingService.currentBinding(for: row.project.id)
+            guard let serverID = binding?.serverProjectID,
+                  let context = SyncV2HandshakeContext.make(authenticationState: state,
+                      localProjectID: row.project.id, serverProjectID: serverID,
+                      authenticationEpoch: authEpoch, bindingEpoch: bindingEpoch)
+            else { gateReport = "로그인과 작품 연결을 확인해 주세요."; return }
+            do {
+                // 캐시가 있어도 명시적 열기는 서버를 새로 확인한다.
+                _ = try await handshakeService.refreshForGate(context: context)
+                let handshakeEpoch = handshakeService.authorizationEpoch.value
+                guard await handshakeService.isFresh(for: context), !Task.isCancelled else { return }
+                let opened = ContractPathGate.openAfterValidation(for: row.project.id,
+                    in: defaults, revision: revision) {
+                    authEpoch == (authenticationService.contractEpoch?.value ?? 0) &&
+                    bindingEpoch == (projectBindingService.contractEpoch?.value ?? 0) &&
+                    (projectBindingService.contractEpoch?.isAvailable ?? false) &&
+                    handshakeEpoch == handshakeService.authorizationEpoch.value
+                }
+                if opened { openContractPathProjectIDs.insert(row.project.id) }
+                gateReport = opened ? "\(row.project.name) 관문: 열림" : "상태가 바뀌어 관문을 열지 않았습니다."
+            } catch {
+                guard ContractPathGate.revision(for: row.project.id, in: defaults) == revision else { return }
+                gateReport = "새 핸드셰이크에 실패하여 관문을 열지 않았습니다: \(error)"
+            }
+        }
     }
 
     @Published private(set) var gateReport: String?
     @Published private(set) var contractSendReport: String?
+    private var contractReportRequestID = UUID()
 
     func sendOneContractBatch(for row: SyncProjectRow) async {
         guard let contractStructureSender else {
             contractSendReport = "계약 구조 전송을 사용할 수 없습니다."
             return
+        }
+        let requestID = UUID()
+        contractReportRequestID = requestID
+        let authEpoch = authenticationService.contractEpoch?.value ?? 0
+        let bindingEpoch = projectBindingService.contractEpoch?.value ?? 0
+        let generation = handshakeService?.authorizationEpoch.value
+        func isCurrent() -> Bool {
+            !Task.isCancelled && contractReportRequestID == requestID && authEpoch == (authenticationService.contractEpoch?.value ?? 0) &&
+            bindingEpoch == (projectBindingService.contractEpoch?.value ?? 0) &&
+            generation == handshakeService?.authorizationEpoch.value
         }
         isWorking = true
         defer { isWorking = false }
@@ -188,12 +232,15 @@ final class SyncSettingsModel: ObservableObject {
             let report = try await contractStructureSender.sendNext(
                 localProjectID: row.project.id
             )
+            guard isCurrent() else { return }
             contractSendReport = """
+            서버 응답 검증 완료
             batch_id: \(report.batchID.uuidString.lowercased())
             status: \(report.status.rawValue)
             operations: \(report.operationCount)
             """
         } catch {
+            guard isCurrent() else { return }
             contractSendReport = "실패: \(error)"
         }
     }
@@ -269,9 +316,11 @@ final class SyncSettingsModel: ObservableObject {
             return
         }
         guard let context = SyncV2HandshakeContext.make(
-            authenticationState: authenticationState,
+            authenticationState: await authenticationService.currentState(),
             localProjectID: localProjectID,
-            serverProjectID: serverProjectID
+            serverProjectID: serverProjectID,
+            authenticationEpoch: authenticationService.contractEpoch?.value ?? 0,
+            bindingEpoch: projectBindingService.contractEpoch?.value ?? 0
         ) else {
             handshakeReport = "로그인 상태가 아니라 누구로서 묻는지 확정할 수 없습니다."
             return

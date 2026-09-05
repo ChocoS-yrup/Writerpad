@@ -10246,7 +10246,8 @@ actor SyncV2Store:
         _ batch: LocalMutationBatch,
         binding: ProjectSyncBinding,
         handshake: SyncV2ValidatedHandshake,
-        writerDeviceID: UUID
+        writerDeviceID: UUID,
+        authorize: @Sendable () throws -> Void = {}
     ) async throws -> [UUID] {
         let batchValue = batch.batchID.uuidString.lowercased()
         let existing = try withStatement(
@@ -10351,6 +10352,7 @@ actor SyncV2Store:
         ), order.serverRevision > 0,
               !order.children.contains(folderSource.folderID)
         else { throw SyncV2ContractStructureError.missingTreeOrder }
+        try authorize()
         let orderedChildren = order.children + [folderSource.folderID]
 
         let folderPayload = SyncV2JSON.object([
@@ -10652,6 +10654,8 @@ actor SyncV2Store:
         let code = contractError?.code ?? String(describing: error)
         let isRetryable = error as? SyncV2ContractStructureError
             == .transportRejected
+            || error as? SyncV2ContractStructureError == .transmissionNotStarted
+            || code == "INVALID_ATOMIC_RESPONSE" || code == "PARTIAL_BATCH_RESPONSE"
         let batchStatus = isRetryable ? "ready" : (
             code == "REVISION_CONFLICT" ? "conflict" : "blocked"
         )
@@ -10660,12 +10664,21 @@ actor SyncV2Store:
         )
         let timestamp = Self.timestamp()
         try? transaction {
+            let isProcessing = try withStatement(
+                "SELECT status FROM sync_contract_batches WHERE batch_id = ?;"
+            ) { statement -> Bool in
+                try bind(pending.request.batchID.uuidString.lowercased(), at: 1, to: statement)
+                guard sqlite3_step(statement) == SQLITE_ROW else { return false }
+                return columnText(statement, at: 0) == "processing"
+            }
+            guard isProcessing else { return }
+
             try withStatement(
                 """
                 UPDATE sync_contract_batches
                 SET status = ?, response_json = ?, last_error_code = ?,
                     last_error_detail = ?, updated_at = ?
-                WHERE batch_id = ?;
+                WHERE batch_id = ? AND status = 'processing';
                 """
             ) { statement in
                 try bind(batchStatus, at: 1, to: statement)
@@ -11347,7 +11360,8 @@ actor LazySyncV2ProjectBindingStore:
     func enqueueContractStructure(
         _ batch: LocalMutationBatch,
         binding: ProjectSyncBinding,
-        handshake: SyncV2ValidatedHandshake
+        handshake: SyncV2ValidatedHandshake,
+        authorize: @escaping @Sendable () throws -> Void = {}
     ) async throws -> [UUID] {
         guard let store = await resolvedStore(),
               let deviceIdentityProvider
@@ -11362,7 +11376,8 @@ actor LazySyncV2ProjectBindingStore:
                 batch,
                 binding: binding,
                 handshake: handshake,
-                writerDeviceID: writerDeviceID
+                writerDeviceID: writerDeviceID,
+                authorize: authorize
             )
             if let reservation, let uploadPullCoordinator {
                 let queue = (try? await store.uploadQueueSnapshot(
