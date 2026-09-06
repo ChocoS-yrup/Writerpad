@@ -30,43 +30,48 @@ RFC 8785 정규화 바이트에만 걸린다(`contract-lock.json`의 `protocol_p
 
 ## 클라이언트가 요구하는 것
 
-**양쪽이 같지 않다.** 두 구현의 현재 상태를 그대로 적는다.
+양쪽의 합의 정책과 검증 출처를 구분해서 적는다.
 
 ### 양쪽 공통
 
 - `supported`가 참이 아니면 사용 불가
-- `project_id`가 물은 값과 다르면 거절
-- `server_contract_sha256` 부재 → 거절
-- `server_protocol_version` 부재 → 거절
-- 값이 있는데 어긋나면 거절: `canonical_contract_sha256 == server_contract_sha256`
-  (다르면 서버가 자기 자신과 어긋나게 말한 것이라 어느 쪽도 고르지 않는다),
-  `supported_protocol_versions`가 `server_protocol_version`을 포함할 것,
-  그리고 **클라이언트가 쓰는 번호를 포함**할 것 — `server_protocol_version`은
-  천장일 뿐이라 `>=` 검사만으로는 부족하다. 3을 내리고 4로 답하는 서버는 그
-  검사를 통과하면서 우리가 할 수 있는 말은 전부 거절한다
+- `project_id`는 유효한 UUID 문자열로 필수이며 요청 작품과 일치해야 한다
+- `contract_version`은 pin `0.2.0`과 정확히 일치해야 한다
+- 정본·서버 digest 모두 필수이며 서로 같고 클라이언트 pin과도 일치해야 한다
+- `server_protocol_version`과 `supported_protocol_versions`는 필수다
+- protocol 목록은 양의 정수로만 구성되고 중복이 없어야 한다. 서버 번호와
+  클라이언트가 쓰는 번호 모두 포함해야 한다. 서버 번호는 천장이므로 단순한
+  `>=` 비교로 목록 검사를 대신하지 않는다
+- capability 목록에 중복을 허용하지 않고 필수 capability를 모두 요구한다
 
-### 2026-09-06 대조와 iPad 측 공통 정책 회신
+### 2026-09-06 최신 Windows 보완 회신 반영
 
-기준: iPad `bb40d22164f34371f9ad7f70b9cddf208a692f83`, Windows
-`a3eaa8b97dc9769ad313ac3fe579d0b1443849a9`. Windows 동작은 같은 날짜의
-Windows–iPad 최종 대조 회신에서 제공한 모의 검사 결과다.
+iPad 기준은 `ab893843562e06e14f400d99e18870f1a97c3703`이다. Windows 기준 HEAD는
+`a3eaa8b97dc9769ad313ac3fe579d0b1443849a9`이며 최신 C4·C5·C9와 계약 전송 정책
+보완은 그 위의 **미커밋 작업 트리**라고 회신했다. 설치된 Windows 빌드의
+동작으로 간주하지 않는다.
 
-| 입력 | iPad | Windows 회신의 현재 동작 |
+| 입력 | iPad 구현 | 최신 Windows 보완 회신 |
 |---|---|---|
 | `contract_version` 누락 | 거절 | 거절 |
 | `canonical_contract_sha256` 누락 | 거절 | 거절 |
 | `supported_protocol_versions` 누락 | 거절 | 거절 |
-| `project_id` 누락 | 거절 | 승인 |
-| protocol 목록 중복 또는 0 이하 포함 | 거절 | `[3,3]`, `[0,3]` 승인 재현 |
-| capability 목록 중복 | 거절 | 승인 |
+| `project_id` 누락·다른 UUID·숫자형 | 거절 | 거절 |
+| protocol 목록 중복 또는 0 이하 포함 | 거절 | 거절 |
+| capability 목록 중복 | 거절 | 거절 |
 
-이전 문서의 “Windows가 필수 3개 필드 누락을 통과시킨다”는 설명은 수정 전
-상태였다. 현재 Windows는 이 세 필드의 누락을 거절한다.
+이전 표의 Windows `project_id` 누락·중복 목록 승인 내용은 C4 추가 보완 전
+결과였다. 최신 회신에 맞춰 정정했다. 여기의 Windows 판정은 전달받은 보고에
+근거하며 이 저장소에서 Windows 최신 소스를 독립 실행 검증한 결과는 아니다.
 
-iPad 측은 **작품 ID 필수 및 요청값 일치, 양의 정수로만 구성된 중복 없는
-protocol 목록, 중복 없는 capability 목록**을 공통 정책으로 채택하는 데
-동의한다. iPad의 검사를 완화하지 않는다. Windows의 해당 보완과 회귀 검사가
-완료됐다는 뜻은 아니며, 완료 회신을 받은 뒤 양쪽 일치로 판정한다.
+### 서버 작품 복원 후 재개 순서
+
+계약 전송마다 새 `get_project_status`를 읽고, 요청 작품 ID와 `active` 상태를
+확인한다. 일반 동기화의 호환 조회나 기본 active로 대신 승인하지 않는다.
+Windows는 이미 알려진 비활성·구조 차단을 기존 복원/기준 재조회로 먼저
+해소한다. iPad는 로컬 작품이 활성일 때 수동 송신의 새 상태 읽기로 서버 복원을
+확인할 수 있지만, 최종 active·구조 기준·대기열·인증·관문 검사는 모두 필요하다.
+두 클라이언트의 재개 순서가 같다는 뜻은 아니다.
 
 `supported=true`일 때 `contract_version`은 클라이언트 pin `0.2.0`과 정확히
 일치해야 한다. 이 설명 정정은 정규 계약 `protocol.json`, 잠금 파일, pin,

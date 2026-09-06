@@ -26,6 +26,73 @@ private final class SQLiteConnection: @unchecked Sendable {
     }
 }
 
+/// 최종 transport 경계는 동기 함수이므로 actor의 오래된 snapshot을 재사용하지
+/// 않고 매번 별도 읽기 연결에서 이력을 확인한다. 포인터나 DB 잠금을 네트워크
+/// 대기 동안 보관하지 않으며, 읽기 실패는 계약 쓰기를 차단한다.
+struct SyncV2ContractQueueHistory: Sendable {
+    let databaseURL: URL
+    let localProjectID: ProjectID
+
+    func authorization() throws -> @Sendable () throws -> Void {
+        let expected = try fingerprint()
+        return {
+            guard try fingerprint() == expected else {
+                throw SyncV2ContractStructureError.structureAuthorityUnavailable
+            }
+        }
+    }
+
+    private func fingerprint() throws -> Data {
+        var database: OpaquePointer?
+        let opened = sqlite3_open_v2(databaseURL.path, &database, SQLITE_OPEN_READONLY | SQLITE_OPEN_FULLMUTEX, nil)
+        defer { if let database { sqlite3_close_v2(database) } }
+        guard opened == SQLITE_OK, let database else {
+            throw SyncV2ContractStructureError.structureAuthorityUnavailable
+        }
+        // 한 SELECT의 동일 snapshot에서 현재 차단과 진입·이탈 사건을 읽는다.
+        // 정상 enqueue/dispatch/retry는 차단 직후의 사건이 아닌 한 포함하지 않는다.
+        let sql = """
+            SELECT kind, identifier FROM (
+                SELECT 0 AS kind, e.event_id AS identifier
+                FROM sync_operation_events e
+                JOIN sync_operations o ON o.operation_id = e.operation_id
+                WHERE o.local_project_id = ?1 AND (
+                    e.event_type IN ('blocked', 'conflict_detected') OR EXISTS (
+                        SELECT 1 FROM sync_operation_events previous
+                        WHERE previous.operation_id = e.operation_id
+                          AND previous.event_sequence = e.event_sequence - 1
+                          AND previous.event_type IN ('blocked', 'conflict_detected')
+                    )
+                )
+                UNION ALL
+                SELECT 1, operation_id FROM sync_operations
+                WHERE local_project_id = ?1 AND status IN ('blocked', 'conflict')
+                UNION ALL
+                SELECT 1, batch_id FROM sync_contract_batches
+                WHERE local_project_id = ?1 AND status IN ('blocked', 'conflict')
+            ) ORDER BY kind, identifier;
+            """
+        var statement: OpaquePointer?
+        defer { if let statement { sqlite3_finalize(statement) } }
+        guard sqlite3_prepare_v2(database, sql, -1, &statement, nil) == SQLITE_OK, let statement else {
+            throw SyncV2ContractStructureError.structureAuthorityUnavailable
+        }
+        let key = localProjectID.rawValue.uuidString.lowercased()
+        let bound = key.withCString { sqlite3_bind_text(statement, 1, $0, -1, unsafeBitCast(-1, to: sqlite3_destructor_type.self)) }
+        guard bound == SQLITE_OK else { throw SyncV2ContractStructureError.structureAuthorityUnavailable }
+        var hash = SHA256()
+        while true {
+            let step = sqlite3_step(statement)
+            if step == SQLITE_DONE { return Data(hash.finalize()) }
+            guard step == SQLITE_ROW, sqlite3_column_int(statement, 0) == 0,
+                  let text = sqlite3_column_text(statement, 1) else {
+                throw SyncV2ContractStructureError.structureAuthorityUnavailable
+            }
+            hash.update(data: Data((String(cString: text) + "\n").utf8))
+        }
+    }
+}
+
 enum SyncV2StoreDiagnosticReason: String, Equatable, Sendable {
     case applicationSupportUnavailable
     case resourceMissing
@@ -10799,6 +10866,14 @@ actor LazySyncV2ProjectBindingStore:
     func availability() async -> ProjectBindingStoreAvailability {
         await resolvedStore() == nil ? .unavailable : .available
     }
+
+    func contractQueueAuthorization(localProjectID: ProjectID) async throws -> @Sendable () throws -> Void {
+        guard await resolvedStore() != nil, let databaseURL else {
+            throw SyncV2ContractStructureError.structureAuthorityUnavailable
+        }
+        return try SyncV2ContractQueueHistory(databaseURL: databaseURL, localProjectID: localProjectID).authorization()
+    }
+
 
     func binding(
         for localProjectID: ProjectID

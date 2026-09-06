@@ -935,6 +935,7 @@ extension SyncV2HandshakeTests {
         }
         func setBeforeClaim(_ hook: @escaping @Sendable () async -> Void) { beforeClaim = hook }
         func binding(for projectID: ProjectID) -> ProjectSyncBinding? { savedBinding }
+        func contractQueueAuthorization(localProjectID: ProjectID) -> @Sendable () throws -> Void { {} }
         func uploadQueueSnapshot(localProjectID: ProjectID) -> SyncV2UploadQueueSnapshot { .init(pendingCount: completed ? 0 : 1) }
         func claimNextContractStructure(localProjectID: ProjectID) async throws -> SyncV2PendingContractBatch {
             if completed { throw SyncV2ContractStructureError.noReadyBatch }
@@ -1424,5 +1425,248 @@ extension SyncV2HandshakeTests {
             try data.split(separator: 0x0A).map { try decoder.decode(SyncV2RecoveryDiagnostics.Entry.self, from: Data($0)) }
         }
         XCTAssertTrue(entries.contains { $0.operationID == operation && $0.attempt == 2 })
+    }
+}
+
+extension SyncV2HandshakeTests {
+    private struct DurableSenderFixture: @unchecked Sendable {
+        let base: SenderFixture
+        let store: LazySyncV2ProjectBindingStore
+        let secondStore: SyncV2Store
+        let recorder: SyncV2ContractPathRecorder
+        let sender: SyncV2ContractStructureSender
+        let request: SyncV2ContractRequest
+        let deviceID: UUID
+    }
+
+    private func durableSenderFixture() async throws -> DurableSenderFixture {
+        let f = try await senderFixture()
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        addTeardownBlock { try? FileManager.default.removeItem(at: directory) }
+        let url = directory.appendingPathComponent("sync.sqlite3")
+        let deviceID = UUID(uuidString: f.request.json.objectValue!["batch"]!.objectValue!["writer_device_id"]!.stringValue!)!
+        let device = DeviceIdentityService(store: InMemoryDeviceIdentityStore(), generateUUID: { deviceID })
+        let store = LazySyncV2ProjectBindingStore(databaseURL: url, deviceIdentityProvider: device,
+                                                 uploadPullCoordinator: f.coordinator)
+        try await store.save(f.queue.savedBinding)
+        guard case .available(let secondStore) = await SyncV2Store.open(at: url) else {
+            throw SyncV2DispatchStoreError.unavailable
+        }
+        addTeardownBlock { await secondStore.close() }
+        try await store.applyTreeOrderSnapshotBaselines(localProjectID: f.localID,
+            serverProjectID: f.context.serverProjectID,
+            treeOrders: [.init(treeOrderID: UUID(), parentFolderID: nil, children: [], revision: 1, updatedAt: Date())])
+        let recorder = SyncV2ContractPathRecorder(store: store, handshakeService: f.service,
+            authenticationService: f.auth, defaults: f.defaults, bindingEpoch: f.bindingEpoch,
+            structureAuthority: f.authority, localProjectEpoch: f.localEpoch, isLocalProjectActive: { _ in true })
+        let batch = LocalMutationBatch(batchID: UUID(), projectID: f.localID, localTransactionID: nil,
+            kind: .structureChange, mutations: [
+                .folderSnapshot(operationID: UUID(), folderID: .init(rawValue: UUID()), parentFolderID: nil,
+                                name: "격리 계약 폴더", isDeleted: false),
+                .treeOrder(operationID: UUID(), content: "{\"tree_order\":{},\"version\":1}", generation: 1)])
+        guard case .queued = await recorder.record(batch) else { throw SyncV2ContractStructureError.invalidStoredRequest }
+        let pending = try await store.claimNextContractStructure(localProjectID: f.localID)
+        await store.failContractStructure(pending, error: SyncV2ContractStructureError.transmissionNotStarted, response: nil)
+        let sender = SyncV2ContractStructureSender(store: store, transport: f.transport,
+            handshakeService: f.service, authenticationService: f.auth, uploadPullCoordinator: f.coordinator,
+            defaults: f.defaults, bindingEpoch: f.bindingEpoch, deviceIdentityProvider: device,
+            structureAuthority: f.authority, localProjectEpoch: f.localEpoch, isLocalProjectActive: { _ in true })
+        return .init(base: f, store: store, secondStore: secondStore, recorder: recorder,
+                     sender: sender, request: pending.request, deviceID: deviceID)
+    }
+
+    /// 첫 작업의 오류는 실제 dispatcher가 기록한다. 다음 작업의 응답을 만들 때
+    /// 다른 DB 인스턴스에서 첫 작업을 해소하므로 coordinator에는 최종 상태만 간다.
+    private actor ResolvingDispatchClient: SyncV2CommitClienting {
+        let store: SyncV2Store
+        let code: SyncV2RemoteErrorCode
+        var firstOperationID: UUID?
+        var calls = 0
+        init(store: SyncV2Store, code: SyncV2RemoteErrorCode) { self.store = store; self.code = code }
+        func advance(_ operationID: UUID) async throws {
+            calls += 1
+            if firstOperationID == nil {
+                firstOperationID = operationID
+                throw SyncV2ClientError.remote(code: code, detail: nil)
+            }
+            let events = try await store.operationEvents(operationID: firstOperationID!)
+            guard events.last?.type == (code == .forbidden ? .blocked : .conflictDetected) else {
+                throw SyncV2DispatchStoreError.integrityFailure
+            }
+            try await store.cancelOperation(operationID: firstOperationID!, cancelEventID: UUID())
+        }
+        func commitDocument(_ p: SyncV2CommitDocumentParameters) async throws -> SyncV2CommitDocumentResult {
+            try await advance(p.operationID)
+            return .init(status: .committed, documentID: p.documentID, versionID: UUID(), operationID: p.operationID,
+                operationKind: .create, serverRevision: 1, relativePath: p.relativePath, isDeleted: false,
+                contentHash: SHA256ContentHasher().sha256(for: Data(p.content.utf8)).rawValue, committedAt: Date())
+        }
+        func commitFolder(_ p: SyncV2CommitFolderParameters) async throws -> SyncV2CommitFolderResult {
+            try await advance(p.operationID)
+            return .init(status: .committed, folderID: p.folderID, operationID: p.operationID,
+                serverRevision: 1, parentFolderID: p.parentFolderID, name: p.name, isDeleted: false, committedAt: Date())
+        }
+    }
+
+    func testC9UnobservedDurableTransitionsDuringStatusReadPreventWrite() async throws {
+        for folder in [false, true] {
+            for conflict in [false, true] {
+                let f = try await durableSenderFixture()
+                // 폴더의 기존 전송도 실제 저장소/dispatcher 경로를 거친다.
+                let operations = (0..<2).map { index -> SyncV2Mutation in
+                    if folder { return .folder(.init(operationID: UUID(), folderID: UUID(), parentFolderID: nil,
+                        deviceID: f.deviceID, name: "기존 폴더 \(index)", isDeleted: false)) }
+                    return .document(.init(operationID: UUID(), documentID: UUID(), deviceID: f.deviceID,
+                        localSaveGeneration: 1, kind: .documentCommit, localPath: "원고/\(index).txt",
+                        relativePath: "원고/\(index).txt", content: "격리 시험", isDeleted: false))
+                }
+                _ = try await f.secondStore.enqueue(.init(batchID: UUID(), localProjectID: f.base.localID,
+                    localTransactionID: nil, kind: .documentSave, mutations: operations))
+                let client = ResolvingDispatchClient(store: f.secondStore, code: conflict ? .pathConflict : .forbidden)
+                let dispatcher = SyncV2Dispatcher(store: f.store, client: client, maximumConcurrentDocuments: 1,
+                                                  uploadPullCoordinator: f.base.coordinator)
+                await f.base.transport.configureProjectRead(before: {
+                    await dispatcher.dispatchReadyOperations(now: Date())
+                })
+                do { _ = try await f.sender.sendNext(localProjectID: f.base.localID); XCTFail("미관측 차단·해소 뒤 이전 준비로 송신됨") }
+                catch { }
+                let requests = await f.base.transport.requests
+                let calls = await client.calls
+                let queue = try await f.store.uploadQueueSnapshot(localProjectID: f.base.localID)
+                XCTAssertEqual(calls, 2)
+                XCTAssertEqual(queue.blockedCount + queue.conflictCount, 0)
+                XCTAssertTrue(requests.isEmpty, "folder=\(folder), conflict=\(conflict)")
+                guard requests.isEmpty else { continue }
+                let pending = try await f.store.claimNextContractStructure(localProjectID: f.base.localID)
+                XCTAssertEqual(pending.request, f.request)
+                await f.store.failContractStructure(pending, error: SyncV2ContractStructureError.transmissionNotStarted, response: nil)
+                await f.base.transport.configureProjectRead()
+                let report = try await f.sender.sendNext(localProjectID: f.base.localID)
+                XCTAssertEqual(report.batchID, f.request.batchID)
+                let resumed = await f.base.transport.requests
+                XCTAssertEqual(resumed, [f.request.json])
+            }
+        }
+    }
+}
+
+extension SyncV2HandshakeTests {
+    private static func enqueueDurableDocument(_ f: DurableSenderFixture) async throws -> UUID {
+        let operationID = UUID(), documentID = DocumentID(rawValue: UUID())
+        let content = "일반 저장 시험"
+        let batch = LocalMutationBatch(batchID: UUID(), projectID: f.base.localID, localTransactionID: nil,
+            mutations: [.documentSnapshot(operationID: operationID, documentID: documentID,
+                relativePath: .init(rawValue: "원고/\(documentID.rawValue).txt"), content: content,
+                contentHash: SHA256ContentHasher().sha256(for: Data(content.utf8)), localSaveGeneration: 1, isDeleted: false)])
+        guard case .queued = await f.recorder.record(batch) else { throw SyncV2DispatchStoreError.integrityFailure }
+        return operationID
+    }
+
+    func testC9DurableTransitionsAtFinalTransportPreserveAndResumeBatch() async throws {
+        for conflict in [false, true] {
+            let f = try await durableSenderFixture()
+            let operationID = try await Self.enqueueDurableDocument(f)
+            let claimed = try await f.store.claimReadyOperations(localProjectID: f.base.localID, limit: 1, now: Date())
+            let operation = try XCTUnwrap(claimed.first)
+            XCTAssertEqual(operation.operationID, operationID)
+            await f.base.transport.configure(before: {
+                do {
+                    if conflict { try await f.store.markConflict(operation, errorCode: "PATH_CONFLICT", detail: nil) }
+                    else { try await f.store.markBlocked(operation, errorCode: "FORBIDDEN", detail: nil) }
+                    try await f.secondStore.cancelOperation(operationID: operationID, cancelEventID: UUID())
+                } catch { XCTFail("실제 저장소 전이 실패: \(error)") }
+            })
+            do { _ = try await f.sender.sendNext(localProjectID: f.base.localID); XCTFail("최종 경계의 미관측 전이 누락") }
+            catch { }
+            let requests = await f.base.transport.requests
+            XCTAssertTrue(requests.isEmpty)
+            let pending = try await f.store.claimNextContractStructure(localProjectID: f.base.localID)
+            XCTAssertEqual(pending.request, f.request)
+            await f.store.failContractStructure(pending, error: SyncV2ContractStructureError.transmissionNotStarted, response: nil)
+            await f.base.transport.configure()
+            let report = try await f.sender.sendNext(localProjectID: f.base.localID)
+            XCTAssertEqual(report.batchID, f.request.batchID)
+            let resumed = await f.base.transport.requests
+            XCTAssertEqual(resumed, [f.request.json])
+        }
+    }
+
+    func testC9ActualNormalRecorderEnqueueDoesNotInvalidatePreparedSend() async throws {
+        for finalBoundary in [false, true] {
+            let f = try await durableSenderFixture()
+            let mutation: @Sendable () async -> Void = {
+                do { _ = try await Self.enqueueDurableDocument(f) }
+                catch { XCTFail("일반 저장 실패: \(error)") }
+            }
+            if finalBoundary { await f.base.transport.configure(before: mutation) }
+            else { await f.base.transport.configureProjectRead(before: mutation) }
+            let report = try await f.sender.sendNext(localProjectID: f.base.localID)
+            XCTAssertEqual(report.batchID, f.request.batchID)
+            let requests = await f.base.transport.requests
+            XCTAssertEqual(requests, [f.request.json])
+        }
+    }
+
+    func testC9QueueHistoryFailsClosedAndDetectsCrossConnectionResolution() async throws {
+        let f = try await durableSenderFixture()
+        // 존재하지 않는 경로는 빈 이력으로 승인되어서는 안 된다.
+        let unavailable = SyncV2ContractQueueHistory(databaseURL: FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString).appendingPathComponent("missing.sqlite3"), localProjectID: f.base.localID)
+        XCTAssertThrowsError(try unavailable.authorization())
+        let operationID = try await Self.enqueueDurableDocument(f)
+        let operations = try await f.store.claimReadyOperations(localProjectID: f.base.localID, limit: 1, now: Date())
+        let operation = try XCTUnwrap(operations.first)
+        let old = try await f.store.contractQueueAuthorization(localProjectID: f.base.localID)
+        try await f.store.markBlocked(operation, errorCode: "FORBIDDEN", detail: nil)
+        XCTAssertThrowsError(try old())
+        do { _ = try await f.store.contractQueueAuthorization(localProjectID: f.base.localID); XCTFail("현재 차단 승인") }
+        catch { }
+        try await f.secondStore.cancelOperation(operationID: operationID, cancelEventID: UUID())
+        XCTAssertThrowsError(try old())
+        let fresh = try await f.store.contractQueueAuthorization(localProjectID: f.base.localID)
+        XCTAssertNoThrow(try fresh())
+    }
+}
+
+extension SyncV2HandshakeTests {
+    func testC9ActualConflictPreservationAndResolutionInvalidateOldPreparation() async throws {
+        let f = try await durableSenderFixture()
+        _ = try await Self.enqueueDurableDocument(f)
+        let claimed = try await f.store.claimReadyOperations(localProjectID: f.base.localID, limit: 1, now: Date())
+        let operation = try XCTUnwrap(claimed.first)
+        let local = try await f.store.latestLocalSnapshot(for: operation)
+        await f.base.transport.configureProjectRead(before: {
+            do {
+                let remote = SyncV2RemoteDocumentSnapshot(documentID: operation.documentID,
+                    relativePath: operation.relativePath, content: "서버 시험 문장", revision: 1,
+                    isDeleted: false, deletedAt: nil, updatedAt: Date())
+                _ = try await f.store.preserveConflict(operation, remote: remote, local: local,
+                    mergedContent: "충돌 시험", conflictCount: 1, errorCode: "REVISION_CONFLICT", detail: nil)
+                let found = try await f.store.unresolvedConflict(documentID: operation.documentID)
+                let conflict = try XCTUnwrap(found)
+                let resolvedID = UUID(), resolvedContent = "해소한 시험 문장"
+                // 화면의 중간 snapshot 전달 없이 저장소의 실제 해소 경로를 검증한다.
+                _ = try await f.secondStore.enqueue(.init(batchID: UUID(), localProjectID: f.base.localID,
+                    localTransactionID: nil, kind: .documentSave, mutations: [.document(.init(operationID: resolvedID,
+                        documentID: operation.documentID, deviceID: f.deviceID, localSaveGeneration: 2,
+                        kind: .documentCommit, localPath: operation.localPath, relativePath: operation.relativePath,
+                        content: resolvedContent, isDeleted: false))]))
+                try await f.store.resolveConflict(.init(conflictID: conflict.conflictID, documentID: operation.documentID,
+                    resolutionOperationID: resolvedID, resolvedContent: resolvedContent, kind: .manualMerge))
+            } catch { XCTFail("실제 충돌 해소 실패: \(error)") }
+        })
+        do { _ = try await f.sender.sendNext(localProjectID: f.base.localID); XCTFail("충돌 보존·해소 뒤 옛 준비 승인") }
+        catch { }
+        let requests = await f.base.transport.requests
+        XCTAssertTrue(requests.isEmpty)
+        let queue = try await f.store.uploadQueueSnapshot(localProjectID: f.base.localID)
+        XCTAssertEqual(queue.blockedCount + queue.conflictCount, 0)
+        let pending = try await f.store.claimNextContractStructure(localProjectID: f.base.localID)
+        XCTAssertEqual(pending.request, f.request)
+        await f.store.failContractStructure(pending, error: SyncV2ContractStructureError.transmissionNotStarted, response: nil)
+        await f.base.transport.configureProjectRead()
+        let report = try await f.sender.sendNext(localProjectID: f.base.localID)
+        XCTAssertEqual(report.batchID, f.request.batchID)
     }
 }

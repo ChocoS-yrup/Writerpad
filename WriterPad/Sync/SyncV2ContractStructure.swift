@@ -302,6 +302,7 @@ protocol SyncV2ContractQueue: Sendable {
     func binding(for projectID: ProjectID) async throws -> ProjectSyncBinding?
     func uploadQueueSnapshot(localProjectID: ProjectID) async throws -> SyncV2UploadQueueSnapshot
     func claimNextContractStructure(localProjectID: ProjectID) async throws -> SyncV2PendingContractBatch
+    func contractQueueAuthorization(localProjectID: ProjectID) async throws -> @Sendable () throws -> Void
     func completeContractStructure(_ pending: SyncV2PendingContractBatch, response: SyncV2JSON) async throws
     func failContractStructure(_ pending: SyncV2PendingContractBatch, error: Error, response: SyncV2JSON?) async
 }
@@ -395,9 +396,12 @@ actor SyncV2ContractStructureSender {
         guard let structureAuthority, localProjectEpoch?.isAvailable == true
         else { throw SyncV2ContractStructureError.structureAuthorityUnavailable }
         guard try await isLocalProjectActive(localProjectID) else { throw SyncV2ContractStructureError.projectInactive }
+        // snapshot 사이에 끝난 차단·해소도 이전 준비를 무효화해야 한다.
+        let authorizeQueue = try await store.contractQueueAuthorization(localProjectID: localProjectID)
         let serverRead = structureAuthority.beginServerRead(context)
         do {
             let state = try await transport.fetchProjectState(projectID: serverProjectID)
+            try authorizeQueue()
             structureAuthority.finishServerRead(context, token: serverRead, state: state)
             guard state == .active else { throw SyncV2ContractStructureError.projectInactive }
         } catch {
@@ -414,6 +418,7 @@ actor SyncV2ContractStructureSender {
         let bindingEpoch = self.bindingEpoch
         let authorize: @Sendable () throws -> Void = {
             try Task.checkCancellation()
+            try authorizeQueue()
             try ContractPathGate.reserveStart(for: localProjectID, in: defaults.value, revision: gateRevision) {
                 (authEpoch?.value ?? 0) == authRevision &&
                 (bindingEpoch?.value ?? 0) == bindingRevision &&

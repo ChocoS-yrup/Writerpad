@@ -1,0 +1,62 @@
+{
+  "base_commit": "ab893843562e06e14f400d99e18870f1a97c3703",
+  "branch": "codex/ipad-unified-contract-canary-integration",
+  "source_status": "Uncommitted working tree above base_commit; no new device build or install.",
+  "product_diff_sha256": "f667b293bd047f5c10a615255cd480fa73ddea688822de251f61342827317a60",
+  "source_and_tests_diff_sha256": "585c308188af1395525ec2b0504a8be492fc19bb22c85215d3a87227f311883a",
+  "files": {
+    "WriterPad/Sync/SyncV2ContractStructure.swift": "90df537df4829da460f233696d85f552da9955e83a3b24b089215a0723f7a474",
+    "WriterPad/Sync/SyncV2Store.swift": "cb66789bb266ed94108a6f183b4cf1977f4b4fe135e0d3e34689b83229ba4cbe",
+    "WriterPadTests/SyncV2HandshakeTests.swift": "3973fdf9f4893aeda47b0457d10b5866d06efd292ab47d6d286e4c7c879a92cf"
+  },
+  "before_reproduction": {
+    "product_commit": "ab893843562e06e14f400d99e18870f1a97c3703",
+    "test": "SyncV2HandshakeTests/testC9UnobservedDurableTransitionsDuringStatusReadPreventWrite()",
+    "totalTestCount": 1,
+    "failedTests": 1,
+    "confirmed_failure_case": "folder=false, conflict=false (document blocked -> cancel resolution)",
+    "failure": "Old prepared send reached mock contract write despite unobserved block and resolution.",
+    "result_bundle": "build/TestDerivedData/Logs/Test/Test-WriterPad-2026.09.06_11-00-29-+0900.xcresult"
+  },
+  "intermediate_targeted_handshake_suite": {
+    "passedTests": 63,
+    "failedTests": 0,
+    "scope": "Before adding the final actual conflict preservation/resolution test; do not add to final totals."
+  },
+  "final_full_suite": {
+    "totalTestCount": 962,
+    "passedTests": 961,
+    "failedTests": 0,
+    "skippedTests": 1,
+    "startTime": 1788660603.449,
+    "finishTime": 1788660756.914
+  },
+  "final_start_kst": "2026-09-06T11:10:03.449000+09:00",
+  "final_finish_kst": "2026-09-06T11:12:36.914000+09:00",
+  "final_result_bundle": "build/TestDerivedData/Logs/Test/Test-WriterPad-2026.09.06_11-10-03-+0900.xcresult",
+  "test_command": "Scripts/run_tests.sh",
+  "integration_scope": [
+    "Real contract recorder and SQLite-backed sender",
+    "Real dispatcher with mock legacy client; block/conflict written by dispatcher",
+    "Resolution through a second SQLite store connection",
+    "No test-injected intermediate queue snapshots",
+    "Document/folder x blocked/conflict during status read",
+    "Document blocked/conflict at final transport authorization",
+    "Same stored request preserved and resumed",
+    "Normal manuscript recorder enqueue at both boundaries",
+    "Actual preserveConflict and resolveConflict(manualMerge)",
+    "Read failure and currently blocked queue fail closed"
+  ],
+  "actual_server_writes": false,
+  "actual_contract_gate_changed": false,
+  "server_settings_changed": false,
+  "local_schema_changed": false,
+  "canonical_contract_changed": false,
+  "installed_build_commit": "ab893843562e06e14f400d99e18870f1a97c3703",
+  "this_change_installed": false,
+  "physical_recovery_trial_performed_this_turn": false,
+  "physical_recovery_jsonl_collected_this_turn": false,
+  "historical_recovery_delay_cause": "not established",
+  "handoff_doc": "Docs/ipad-c9-durable-transitions-handoff-2026-09-06.md",
+  "recovery_guide": "Docs/ipad-closed-gate-recovery-guide-2026-09-06.md"
+}
