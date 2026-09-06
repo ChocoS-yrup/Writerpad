@@ -5211,3 +5211,127 @@ private final class VirtualStatisticsClock: @unchecked Sendable {
         }
     }
 }
+
+extension AppEnvironmentTests {
+    @MainActor
+    private struct RemoteCursorFixture {
+        let environment: AppEnvironment
+        let model: EditorSessionModel
+        let document: DocumentNode
+        let other: DocumentNode
+        let applier: LocalSyncV2SnapshotApplier
+        let originalText = "첫 문장🙂\n지난 문장\n마지막 문장"
+        let originalCursor = TextCursorState(location: 2, selectionLength: 1)
+
+        func node(_ document: DocumentNode) -> BinderNode {
+            BinderNode(id: document.id, projectID: document.projectID, kind: .text,
+                relativePath: document.relativePath, displayName: document.relativePath.rawValue,
+                fixedCategory: nil, userOrder: document.userOrder, contentState: .written, isExpanded: false)
+        }
+
+        func applyRemote(_ content: String, path: String? = nil, revision: Int64 = 1) async throws {
+            let snapshot = SyncV2RemoteDocumentSnapshot(documentID: document.id.rawValue,
+                relativePath: path ?? document.relativePath.rawValue, content: content, revision: revision,
+                isDeleted: false, deletedAt: nil, updatedAt: Date())
+            try await applier.apply(localProjectID: document.projectID, snapshot: snapshot)
+            await applier.finish(localProjectID: document.projectID, documentID: document.id.rawValue)
+            _ = model.applyRemoteSnapshotIfClean(documentID: document.id, content: content, relativePath: snapshot.relativePath)
+        }
+    }
+
+    @MainActor
+    private func remoteCursorFixture() async throws -> RemoteCursorFixture {
+        let environment = try AppEnvironment.testing()
+        let project = try await environment.projectManager.createProject(named: "원격 본문 커서")
+        _ = try await environment.binderRepository.rootNodes(in: project.id)
+        _ = try await environment.binderCommands.addNewVolume(projectID: project.id)
+        let documents = try await environment.documentRepository.documents(in: project.id)
+            .filter { $0.kind == .text && $0.relativePath.rawValue.contains("/원고/") }
+            .sorted { $0.userOrder < $1.userOrder }
+        let first = try XCTUnwrap(documents.first), other = try XCTUnwrap(documents.dropFirst().first)
+        let localStore = try XCTUnwrap(environment.localDocumentStore as? LocalDocumentStore)
+        let locator = await localStore.workspaceLocator
+        let model = EditorSessionModel(documentRepository: environment.documentRepository,
+            documentStore: environment.localDocumentStore, workspaceStateRepository: environment.workspaceStateRepository)
+        let applier = LocalSyncV2SnapshotApplier(documentRepository: environment.documentRepository, workspaceLocator: locator)
+        let f = RemoteCursorFixture(environment: environment, model: model, document: first, other: other, applier: applier)
+        await model.select(f.node(first))
+        model.updateText(f.originalText)
+        let saved = await model.saveNow()
+        XCTAssertTrue(saved)
+        model.updateCursor(f.originalCursor)
+        let persisted = await model.persistSessionState()
+        XCTAssertTrue(persisted)
+        return f
+    }
+
+    @MainActor
+    func testRemoteChangedClosedDocumentReopensAtEndAndRestoresPersistedEnd() async throws {
+        let f = try await remoteCursorFixture()
+        await f.model.select(f.node(f.other))
+        let remote = f.originalText + "\nWindows에서 이어 쓴 문장👩‍💻"
+        try await f.applyRemote(remote)
+        let expected = TextCursorState(location: UInt(remote.utf16.count), selectionLength: 0)
+        let persisted = try await f.environment.workspaceStateRepository.cursor(for: f.document.id)
+        XCTAssertEqual(persisted, expected)
+        await f.model.select(f.node(f.document))
+        XCTAssertEqual(f.model.currentText, remote)
+        XCTAssertEqual(f.model.cursor, expected, "닫힌 문서의 예전 세션 커서가 끝 위치를 덮어서는 안 된다")
+        let restarted = EditorSessionModel(documentRepository: f.environment.documentRepository,
+            documentStore: f.environment.localDocumentStore, workspaceStateRepository: f.environment.workspaceStateRepository)
+        await restarted.restore(documentID: f.document.id, cursor: persisted)
+        XCTAssertEqual(restarted.cursor, expected)
+    }
+
+    @MainActor
+    func testUnchangedRemoteBodyAndRenamePreserveClosedDocumentCursor() async throws {
+        let f = try await remoteCursorFixture()
+        await f.model.select(f.node(f.other))
+        let renamedPath = (f.document.relativePath.rawValue as NSString).deletingLastPathComponent + "/이름만 변경.txt"
+        try await f.applyRemote(f.originalText, path: renamedPath, revision: 2)
+        let persisted = try await f.environment.workspaceStateRepository.cursor(for: f.document.id)
+        XCTAssertEqual(persisted, f.originalCursor)
+        await f.model.select(f.node(f.document))
+        XCTAssertEqual(f.model.cursor, f.originalCursor)
+        let restarted = EditorSessionModel(documentRepository: f.environment.documentRepository,
+            documentStore: f.environment.localDocumentStore, workspaceStateRepository: f.environment.workspaceStateRepository)
+        await restarted.restore(documentID: f.document.id, cursor: persisted)
+        XCTAssertEqual(restarted.cursor, f.originalCursor)
+    }
+
+    @MainActor
+    func testChangedOpenRemoteBodyMovesToUTF16EndOnlyOnce() async throws {
+        for content in ["새 문장🙂\n끝", "짧음", "", "다른 문장🙂\n지난 문장\n마지막 문장"] {
+            let f = try await remoteCursorFixture()
+            let navigation = f.model.selectionNavigationRequest
+            try await f.applyRemote(content)
+            XCTAssertEqual(f.model.cursor, TextCursorState(location: UInt(content.utf16.count), selectionLength: 0))
+            XCTAssertEqual(f.model.selectionNavigationRequest, navigation + 1)
+            XCTAssertFalse(f.model.hasUnsavedChanges)
+            let chosen = TextCursorState(location: UInt(min(1, content.utf16.count)), selectionLength: 0)
+            f.model.updateCursor(chosen)
+            let persisted = await f.model.persistSessionState()
+            XCTAssertTrue(persisted)
+            try await f.applyRemote(content, revision: 2)
+            XCTAssertEqual(f.model.cursor, chosen, "같은 본문 재조회는 사용자가 옮긴 커서를 되돌리면 안 된다")
+            XCTAssertEqual(f.model.selectionNavigationRequest, navigation + 1)
+            await f.model.select(f.node(f.other))
+            await f.model.select(f.node(f.document))
+            XCTAssertEqual(f.model.cursor, chosen)
+        }
+    }
+
+    @MainActor
+    func testLocalSaveEchoPreservesClosedDocumentCursor() async throws {
+        let f = try await remoteCursorFixture()
+        let localEdit = f.originalText + "\niPad에서 저장한 문장"
+        f.model.updateText(localEdit)
+        f.model.updateCursor(f.originalCursor)
+        let saved = await f.model.saveNow()
+        XCTAssertTrue(saved)
+        await f.model.select(f.node(f.other))
+        try await f.applyRemote(localEdit)
+        await f.model.select(f.node(f.document))
+        XCTAssertEqual(f.model.cursor, f.originalCursor, "자신의 저장이 서버에서 돌아온 경우는 원격 본문 변경이 아니다")
+    }
+}

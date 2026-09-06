@@ -229,6 +229,7 @@ final class EditorSessionModel: ObservableObject {
     /// SwiftData의 문서 커서는 앱 재실행을 위한 최종 위치다. 같은 문서를 좌우 패널에
     /// 동시에 열 수 있으므로 실행 중 왕복에는 세션별 위치를 우선 사용한다.
     private var sessionCursors: [DocumentID: TextCursorState] = [:]
+    private var sessionContentHashes: [DocumentID: ContentHash] = [:]
 
     init(
         documentRepository: any DocumentRepository,
@@ -460,8 +461,20 @@ final class EditorSessionModel: ObservableObject {
         content: String,
         relativePath: String? = nil
     ) -> Bool {
-        guard currentDocumentID == documentID,
-              !isComposing,
+        guard currentDocumentID == documentID else {
+            // 다른 문서를 보는 동안 내려온 본문도 예전 패널 커서로 덮어 복원하지 않는다.
+            // 같은 본문 재조회와 저장하지 못한 로컬 초안은 기존 위치를 유지한다.
+            if let previousHash = sessionContentHashes[documentID],
+               draftStore.draft(for: documentID) == nil {
+                let hash = SHA256ContentHasher().sha256(for: Data(content.utf8))
+                if previousHash != hash {
+                    sessionCursors[documentID] = TextCursorState(location: UInt(content.utf16.count), selectionLength: 0)
+                    sessionContentHashes[documentID] = hash
+                }
+            }
+            return false
+        }
+        guard !isComposing,
               !hasUnsavedChanges
         else { return false }
         if let relativePath {
@@ -472,13 +485,7 @@ final class EditorSessionModel: ObservableObject {
         let previous = textBuffer.snapshot()
         guard previous != content else { return true }
         autosaveDebouncer.cancel()
-        updateCursor(
-            SharedEditorTextChange.adjustedCursor(
-                cursor,
-                from: previous,
-                to: content
-            )
-        )
+        updateCursor(TextCursorState(location: UInt(content.utf16.count), selectionLength: 0))
         guard setText(content, statisticsUpdate: .immediate) else {
             return false
         }
@@ -486,6 +493,8 @@ final class EditorSessionModel: ObservableObject {
         lastSavedDirtyGeneration = dirtyGeneration
         externalTextMutation = nil
         externalVersion &+= 1
+        sessionContentHashes[documentID] = SHA256ContentHasher().sha256(for: Data(content.utf8))
+        selectionNavigationRequest &+= 1
         saveState = .idle
         draftStore.removeIfMatching(
             text: previous,
@@ -863,6 +872,7 @@ final class EditorSessionModel: ObservableObject {
                     cursor: snapshotCursor
                 )
             )
+            sessionContentHashes[receipt.documentID] = receipt.contentHash
             if let durableRecordResult = receipt.durableRecordResult {
                 apply(
                     durableRecordResult: durableRecordResult,
@@ -1094,6 +1104,7 @@ final class EditorSessionModel: ObservableObject {
         setText(text, statisticsUpdate: .immediate)
         self.cursor = cursor
         sessionCursors[documentID] = cursor
+        sessionContentHashes[documentID] = SHA256ContentHasher().sha256(for: Data(text.utf8))
         isLoading = false
         externalTextMutation = nil
         externalVersion &+= 1

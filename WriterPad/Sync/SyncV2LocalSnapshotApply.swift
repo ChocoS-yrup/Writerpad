@@ -676,17 +676,17 @@ actor LocalSyncV2SnapshotApplier: SyncV2LocalSnapshotApplying {
                 .pathOccupiedByDifferentDocument
         }
 
+        // 재시도 때 파일이 이미 바뀌었더라도 최초 적용 전 본문과 비교한다.
+        // revision/이름만 바뀐 동기화는 읽던 커서 위치를 움직이지 않는다.
+        let previousContent: Data?
+        if recoveringSameSnapshot {
+            previousContent = existingMarker?.previousContent
+        } else if let current {
+            previousContent = try? Data(contentsOf: root.appendingPathComponent(current.relativePath.rawValue))
+        } else {
+            previousContent = nil
+        }
         if !recoveringSameSnapshot {
-            let previousContent: Data?
-            if let current {
-                previousContent = try? Data(
-                    contentsOf: root.appendingPathComponent(
-                        current.relativePath.rawValue
-                    )
-                )
-            } else {
-                previousContent = nil
-            }
             let marker = RecoveryMarker(
                 localProjectID: localProjectID,
                 snapshot: snapshot,
@@ -726,6 +726,7 @@ actor LocalSyncV2SnapshotApplier: SyncV2LocalSnapshotApplying {
         try writer.replaceItem(at: destination, with: temporary)
 
         let hash = hasher.sha256(for: data)
+        let contentChanged = previousContent.map { $0 != data } ?? (current?.contentHash != hash)
         let siblings = documents.filter { $0.parentID == parent?.id }
         let node = DocumentNode(
             id: documentID,
@@ -738,7 +739,9 @@ actor LocalSyncV2SnapshotApplier: SyncV2LocalSnapshotApplying {
             modifiedAt: snapshot.updatedAt,
             contentHash: hash,
             deletionStatus: .active,
-            cursor: current?.cursor ?? .start,
+            cursor: contentChanged
+                ? TextCursorState(location: UInt(snapshot.content.utf16.count), selectionLength: 0)
+                : (current?.cursor ?? .start),
             isExpanded: current?.isExpanded ?? false
         )
         try await documentRepository.save(node)
