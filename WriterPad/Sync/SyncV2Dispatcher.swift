@@ -701,6 +701,12 @@ actor SyncV2ProjectUploadPullCoordinator {
         var lastPullSucceeded = false
     }
 
+    nonisolated let contractStructureAuthority: SyncV2ContractStructureAuthority
+
+    init(contractStructureAuthority: SyncV2ContractStructureAuthority = SyncV2ContractStructureAuthority()) {
+        self.contractStructureAuthority = contractStructureAuthority
+    }
+
     private var entries: [ProjectID: Entry] = [:]
     private var pullReadyHandlers: [UUID: @Sendable () -> Void] = [:]
     private var uploadReadyHandlers: [UUID: @Sendable () -> Void] = [:]
@@ -751,6 +757,7 @@ actor SyncV2ProjectUploadPullCoordinator {
         guard entry.enqueueReservations.remove(reservation.id) != nil else {
             return
         }
+        contractStructureAuthority.observeQueue(queue, projectID: reservation.localProjectID)
         entry.queue = queue
         settlePhase(&entry)
         entries[reservation.localProjectID] = entry
@@ -765,6 +772,7 @@ actor SyncV2ProjectUploadPullCoordinator {
         queue: SyncV2UploadQueueSnapshot
     ) {
         var entry = entries[localProjectID] ?? Entry()
+        contractStructureAuthority.observeQueue(queue, projectID: localProjectID)
         entry.queue = queue
         settlePhase(&entry)
         entries[localProjectID] = entry
@@ -776,6 +784,7 @@ actor SyncV2ProjectUploadPullCoordinator {
         queue: SyncV2UploadQueueSnapshot
     ) -> UploadPermit? {
         var entry = entries[localProjectID] ?? Entry()
+        contractStructureAuthority.observeQueue(queue, projectID: localProjectID)
         entry.queue = queue
         guard entry.pullPermitID == nil,
               entry.uploadPermitID == nil
@@ -798,6 +807,7 @@ actor SyncV2ProjectUploadPullCoordinator {
         var entry = entries[permit.localProjectID] ?? Entry()
         guard entry.uploadPermitID == permit.id else { return }
         entry.uploadPermitID = nil
+        contractStructureAuthority.observeQueue(queue, projectID: permit.localProjectID)
         entry.queue = queue
         settlePhase(&entry)
         entries[permit.localProjectID] = entry
@@ -811,6 +821,7 @@ actor SyncV2ProjectUploadPullCoordinator {
     ) -> PullPermit? {
         var entry = entries[localProjectID] ?? Entry()
         entry.observedGeneration &+= 1
+        contractStructureAuthority.observeQueue(queue, projectID: localProjectID)
         entry.queue = queue
         let permit = beginPullIfPossible(
             localProjectID: localProjectID,
@@ -827,6 +838,7 @@ actor SyncV2ProjectUploadPullCoordinator {
         bootstrapAllowed: Bool
     ) -> PullPermit? {
         var entry = entries[localProjectID] ?? Entry()
+        contractStructureAuthority.observeQueue(queue, projectID: localProjectID)
         entry.queue = queue
         let permit = beginPullIfPossible(
             localProjectID: localProjectID,
@@ -864,6 +876,7 @@ actor SyncV2ProjectUploadPullCoordinator {
         }
         entry.pullPermitID = nil
         entry.pullGeneration = nil
+        contractStructureAuthority.observeQueue(queue, projectID: permit.localProjectID)
         entry.queue = queue
         entry.lastPullSucceeded = succeeded
         if succeeded && localApplicationDeferred {
@@ -1298,6 +1311,8 @@ actor SyncV2Dispatcher {
             uploadPermit = nil
         }
 
+        let diagnosticID = UUID()
+        SyncV2RecoveryDiagnostics.record(stage: .legacyUpload, event: .started, projectID: localProjectID, operationID: diagnosticID)
         let completedNormally = await drainClaimLoop(
             localProjectID: localProjectID,
             limit: limit,
@@ -1321,6 +1336,7 @@ actor SyncV2Dispatcher {
                 queue: queue
             )
         }
+        SyncV2RecoveryDiagnostics.record(stage: .legacyUpload, event: completedNormally ? .finished : .failed, projectID: localProjectID, operationID: diagnosticID)
         return completedNormally
     }
 
@@ -1923,6 +1939,7 @@ final class SyncV2NetworkRecoveryMonitor: @unchecked Sendable {
         )
         handler = recovered ? recoveryHandler : nil
         lock.unlock()
+        if recovered { SyncV2RecoveryDiagnostics.record(stage: .network, event: .available) }
         handler?()
     }
 }

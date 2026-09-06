@@ -146,6 +146,8 @@ actor SyncV2SnapshotPullService: SyncV2SnapshotPulling {
     private let mergeStore: any SyncV2SnapshotMergeStoring
     private let leaseManager: (any EditLeaseManaging)?
     private let mutationGate: SyncV2DocumentMutationGate
+    private let contractStructureAuthority: SyncV2ContractStructureAuthority?
+    private let contractContext: @Sendable (ProjectID, UUID) async -> SyncV2HandshakeContext?
     private var activeProjects: Set<ProjectID> = []
 
     init(
@@ -159,8 +161,12 @@ actor SyncV2SnapshotPullService: SyncV2SnapshotPulling {
         folderDocuments: (any DocumentRepository)? = nil,
         leaseManager: (any EditLeaseManaging)? = nil,
         mutationGate: SyncV2DocumentMutationGate =
-            SyncV2DocumentMutationGate()
+            SyncV2DocumentMutationGate(),
+        contractStructureAuthority: SyncV2ContractStructureAuthority? = nil,
+        contractContext: @escaping @Sendable (ProjectID, UUID) async -> SyncV2HandshakeContext? = { _, _ in nil }
     ) {
+        self.contractStructureAuthority = contractStructureAuthority
+        self.contractContext = contractContext
         self.client = client
         self.stateStore = stateStore
         self.localApplier = localApplier
@@ -184,8 +190,24 @@ actor SyncV2SnapshotPullService: SyncV2SnapshotPulling {
         defer { activeProjects.remove(localProjectID) }
         try Task.checkCancellation()
         // 내부 async let 네트워크 요청까지 실제로 종료한 다음에 슬롯을 돌려준다.
-        return try await performPull(localProjectID: localProjectID,
-                                     serverProjectID: serverProjectID, editingGuards: editingGuards)
+        let context = await contractContext(localProjectID, serverProjectID)
+        let token = context.flatMap { contractStructureAuthority?.beginBaseline($0) }
+        let diagnosticID = UUID()
+        SyncV2RecoveryDiagnostics.record(stage: .baselinePull, event: .started, projectID: localProjectID, operationID: diagnosticID)
+        do {
+            let report = try await performPull(localProjectID: localProjectID,
+                serverProjectID: serverProjectID, editingGuards: editingGuards)
+            try Task.checkCancellation()
+            if let context, let token {
+                contractStructureAuthority?.finishBaseline(context, token: token, allowed: report.contractStructureBaselineReady)
+            }
+            SyncV2RecoveryDiagnostics.record(stage: .baselinePull, event: .finished, projectID: localProjectID, operationID: diagnosticID)
+            return report
+        } catch {
+            if let context, let token { contractStructureAuthority?.finishBaseline(context, token: token, allowed: false) }
+            SyncV2RecoveryDiagnostics.record(stage: .baselinePull, event: .failed, projectID: localProjectID, operationID: diagnosticID)
+            throw error
+        }
     }
 
     private func performPull(
@@ -267,6 +289,7 @@ actor SyncV2SnapshotPullService: SyncV2SnapshotPulling {
         // 입증되기 전까지는 같은 revision의 LEGACY tree_order를 재적용한다.
         // fetch/read/migration/pending 중 하나라도 불확실하면 fail-closed다.
         var folderProjectionIsStable = false
+        var folderBaselineWasEvaluated = false
         let folderApplyStartedAt = DispatchTime.now().uptimeNanoseconds
         folderStage: if let folderApplier {
             // fetch는 Gate 밖에서 한다. 네트워크를 기다리는 동안
@@ -361,11 +384,14 @@ actor SyncV2SnapshotPullService: SyncV2SnapshotPulling {
                 return (
                     report,
                     blockedServerFolderIDs,
-                    projectionIsStable
+                    projectionIsStable,
+                    report.projectionWasEvaluated && blockedServerFolderIDs.isEmpty &&
+                        pendingOperationLookupSucceeded && !migrationRequiresTreeOrderRecovery
                 )
             }
             folderReport = stage.0
             folderProjectionIsStable = stage.2
+            folderBaselineWasEvaluated = stage.3
             permanentFolderBaselineExclusions = stage.1.union(
                 folderReport.rejectedFolderIDs.map(\.rawValue)
             )
@@ -805,6 +831,13 @@ actor SyncV2SnapshotPullService: SyncV2SnapshotPulling {
             changedCount: folderReport.deletedFolderIDs.count
         )
         let report = SyncV2SnapshotPullReport(
+            // 변경이 있었어도 모두 반영하고 기준 revision을 기록했다면 승인한다.
+            // 변경 없는 pull 최적화용 projectionIsStable과 의미를 섞지 않는다.
+            contractStructureBaselineReady: folderBaselineWasEvaluated && permanentFolderBaselineExclusions.isEmpty &&
+                rejectedStructureNames.isEmpty && folderReport.deferredFolderIDs.isEmpty &&
+                folderReport.pendingChildTombstoneFolderIDs.isEmpty && !outcomes.contains {
+                    if case .mergeRequired = $0 { return true }; return false
+                },
             outcomes: outcomes,
             appliedSnapshots: appliedSnapshots,
             rejectedStructureNames: rejectedStructureNames,

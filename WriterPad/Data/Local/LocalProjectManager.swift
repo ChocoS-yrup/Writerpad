@@ -154,6 +154,7 @@ private struct ProjectBackupRestorePlan: Equatable {
 
 /// 작품 폴더와 SwiftData 메타데이터 사이의 다단계 작업을 직렬화하고 복구한다.
 actor LocalProjectManager: ProjectManaging {
+    nonisolated let contractLifecycleEpoch = SyncV2ContractEpoch()
     private static let catalogFileName = ".writerpad-project-catalog.json"
     private static let journalPrefix = ".writerpad-project-transaction-"
     private static let journalSuffix = ".json"
@@ -535,6 +536,10 @@ actor LocalProjectManager: ProjectManaging {
     }
 
     func confirmDeletion(_ confirmation: ProjectDeletionConfirmation) async throws {
+        // 삭제/복원 도중의 늦은 활성 상태 읽기로 계약 송신을 승인하지 않는다.
+        contractLifecycleEpoch.beginTransition()
+        defer { contractLifecycleEpoch.endTransition() }
+
         let managed = try await requireManagedProject(id: confirmation.projectID)
         guard managed.name == confirmation.expectedName else {
             throw ProjectManagerError.staleDeletionConfirmation
@@ -561,6 +566,10 @@ actor LocalProjectManager: ProjectManaging {
     }
 
     func cancelDeletion(id: ProjectID) async throws {
+        // 삭제/복원 도중의 늦은 활성 상태 읽기로 계약 송신을 승인하지 않는다.
+        contractLifecycleEpoch.beginTransition()
+        defer { contractLifecycleEpoch.endTransition() }
+
         let managed = try await requireManagedProject(id: id)
         guard managed.isDeletionRequested else {
             throw ProjectManagerError.deletionNotRequested(id)
@@ -593,6 +602,10 @@ actor LocalProjectManager: ProjectManaging {
     func moveToDeletedList(
         _ confirmation: ProjectDeletedListConfirmation
     ) async throws -> ManagedProject? {
+        // 삭제/복원 도중의 늦은 활성 상태 읽기로 계약 송신을 승인하지 않는다.
+        contractLifecycleEpoch.beginTransition()
+        defer { contractLifecycleEpoch.endTransition() }
+
         let managed = try await requireManagedProject(id: confirmation.projectID)
         guard managed.name == confirmation.expectedName else {
             throw ProjectManagerError.staleDeletionConfirmation
@@ -618,6 +631,10 @@ actor LocalProjectManager: ProjectManaging {
     }
 
     func restoreFromDeletedList(id: ProjectID) async throws {
+        // 삭제/복원 도중의 늦은 활성 상태 읽기로 계약 송신을 승인하지 않는다.
+        contractLifecycleEpoch.beginTransition()
+        defer { contractLifecycleEpoch.endTransition() }
+
         let managed = try await requireManagedProject(id: id)
         guard managed.isInDeletedList else {
             throw ProjectManagerError.projectNotInDeletedList(id)
@@ -653,6 +670,10 @@ actor LocalProjectManager: ProjectManaging {
     func permanentlyDelete(
         _ confirmation: ProjectPermanentDeletionConfirmation
     ) async throws -> ManagedProject? {
+        // 삭제/복원 도중의 늦은 활성 상태 읽기로 계약 송신을 승인하지 않는다.
+        contractLifecycleEpoch.beginTransition()
+        defer { contractLifecycleEpoch.endTransition() }
+
         let managed = try await requireManagedProject(id: confirmation.projectID)
         guard managed.name == confirmation.expectedName else {
             throw ProjectManagerError.staleDeletionConfirmation

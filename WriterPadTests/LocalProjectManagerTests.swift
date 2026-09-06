@@ -388,7 +388,11 @@ final class LocalProjectManagerTests: XCTestCase {
         let beforeConfirmation = try await harness.manager.projects()
         XCTAssertFalse(beforeConfirmation[0].isDeletionRequested)
 
+        let epoch = harness.manager.contractLifecycleEpoch
+        let before = epoch.value
         try await harness.manager.confirmDeletion(confirmation)
+        XCTAssertGreaterThan(epoch.value, before)
+        XCTAssertTrue(epoch.isAvailable)
         let pending = try await harness.manager.projects()[0]
 
         XCTAssertTrue(pending.isDeletionRequested)
@@ -396,7 +400,10 @@ final class LocalProjectManagerTests: XCTestCase {
         let restored = try await harness.manager.restoreLastProject()
         XCTAssertNil(restored)
 
+        let beforeRestore = epoch.value
         try await harness.manager.cancelDeletion(id: created.id)
+        XCTAssertGreaterThan(epoch.value, beforeRestore)
+        XCTAssertTrue(epoch.isAvailable)
         let afterCancellation = try await harness.manager.projects()
         XCTAssertFalse(afterCancellation[0].isDeletionRequested)
     }

@@ -45,20 +45,32 @@ RFC 8785 정규화 바이트에만 걸린다(`contract-lock.json`의 `protocol_p
   천장일 뿐이라 `>=` 검사만으로는 부족하다. 3을 내리고 4로 답하는 서버는 그
   검사를 통과하면서 우리가 할 수 있는 말은 전부 거절한다
 
-### 갈리는 곳
+### 2026-09-06 대조와 iPad 측 공통 정책 회신
 
-| 키가 **없을** 때 | iPad | Windows |
+기준: iPad `bb40d22164f34371f9ad7f70b9cddf208a692f83`, Windows
+`a3eaa8b97dc9769ad313ac3fe579d0b1443849a9`. Windows 동작은 같은 날짜의
+Windows–iPad 최종 대조 회신에서 제공한 모의 검사 결과다.
+
+| 입력 | iPad | Windows 회신의 현재 동작 |
 |---|---|---|
-| `contract_version` | 거절 | **통과** |
-| `canonical_contract_sha256` | 거절 | **통과** |
-| `supported_protocol_versions` | 거절 | **통과** |
+| `contract_version` 누락 | 거절 | 거절 |
+| `canonical_contract_sha256` 누락 | 거절 | 거절 |
+| `supported_protocol_versions` 누락 | 거절 | 거절 |
+| `project_id` 누락 | 거절 | 승인 |
+| protocol 목록 중복 또는 0 이하 포함 | 거절 | `[3,3]`, `[0,3]` 승인 재현 |
+| capability 목록 중복 | 거절 | 승인 |
 
-Windows는 셋 다 "있는데 틀리면 거절, 아예 없으면 통과"다. 판정 근거가 없을 때
-통과시키는 모양이고, **Windows의 미해결 항목**이다 — 서버 응답 모양이 바뀌기
-전에 fail-closed로 맞춘다. 지금 서버가 셋을 항상 보내므로 동작 차이는 없다.
+이전 문서의 “Windows가 필수 3개 필드 누락을 통과시킨다”는 설명은 수정 전
+상태였다. 현재 Windows는 이 세 필드의 누락을 거절한다.
 
-iPad는 `supported_protocol_versions`를 비옵셔널로 두어 부재 시 해독 단계에서
-닫히고, 나머지 둘은 `readHandshakeCompatibility`가 요구한다.
+iPad 측은 **작품 ID 필수 및 요청값 일치, 양의 정수로만 구성된 중복 없는
+protocol 목록, 중복 없는 capability 목록**을 공통 정책으로 채택하는 데
+동의한다. iPad의 검사를 완화하지 않는다. Windows의 해당 보완과 회귀 검사가
+완료됐다는 뜻은 아니며, 완료 회신을 받은 뒤 양쪽 일치로 판정한다.
+
+`supported=true`일 때 `contract_version`은 클라이언트 pin `0.2.0`과 정확히
+일치해야 한다. 이 설명 정정은 정규 계약 `protocol.json`, 잠금 파일, pin,
+다이제스트 또는 서버 설정을 변경하지 않는다.
 
 `server_protocol_version`과 `server_contract_sha256`이 빠진 응답은 두 클라이언트
 모두 거절한다. `becbf42`의 `20260820113209_authenticated_sync_handshake.sql`이

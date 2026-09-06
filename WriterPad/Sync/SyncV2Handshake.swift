@@ -458,6 +458,7 @@ actor SyncV2HandshakeService {
             let created = Flight(id: UUID(), context: context, generation: generation,
                                  race: SyncV2OneShotRace<Outcome>())
             inFlight = created
+            SyncV2RecoveryDiagnostics.record(stage: .handshake, event: .started, projectID: context.localProjectID, operationID: created.id)
             flight = created
             let transport = self.transport
             let sleep = self.sleep
@@ -465,6 +466,7 @@ actor SyncV2HandshakeService {
             let watchdog = Task {
                 do {
                     try await sleep(timeout)
+                    SyncV2RecoveryDiagnostics.record(stage: .handshake, event: .timedOut, projectID: context.localProjectID, operationID: created.id)
                     await created.race.resolve(.failure(.timedOut))
                 } catch { }
             }
@@ -486,6 +488,9 @@ actor SyncV2HandshakeService {
                 } catch {
                     outcome = .failure(Self.classify(LiveSyncV2HandshakeTransport.classify(error)))
                 }
+                let event: SyncV2RecoveryDiagnostics.Event
+                switch outcome { case .success: event = .transportFinished; case .failure: event = .transportFailed }
+                SyncV2RecoveryDiagnostics.record(stage: .handshake, event: event, projectID: context.localProjectID, operationID: created.id)
                 watchdog.cancel()
                 await self?.finishFlight(created.id)
                 await created.race.resolve(outcome)
@@ -493,9 +498,13 @@ actor SyncV2HandshakeService {
         }
         let outcome = await flight.race.value()
         // 성공·실패·unsupported와 합류한 호출자 전부에 동일하게 적용한다.
-        guard flight.generation == generation, !Task.isCancelled else { throw SyncV2HandshakeError.superseded }
+        guard flight.generation == generation, !Task.isCancelled else {
+            SyncV2RecoveryDiagnostics.record(stage: .handshake, event: .superseded, projectID: context.localProjectID, operationID: flight.id)
+            throw SyncV2HandshakeError.superseded
+        }
         switch outcome {
         case .success(let handshake):
+            SyncV2RecoveryDiagnostics.record(stage: .handshake, event: .finished, projectID: context.localProjectID, operationID: flight.id)
             retryAttempt = 0; retryAt = nil; terminalContext = nil
             reading = SyncV2HandshakeReading(context: context, handshake: handshake,
                                              generation: generation, observedAt: now())
@@ -592,6 +601,7 @@ actor SyncV2HandshakeService {
     }
 
     func updateSceneActivity(_ active: Bool) {
+        SyncV2RecoveryDiagnostics.record(stage: .scene, event: active ? .active : .background, projectID: selectedProjectID)
         guard active != sceneActive else { return }
         sceneActive = active
         activityEpoch.advance()
@@ -661,6 +671,7 @@ actor SyncV2HandshakeService {
                 if standingHandshake(for: context) != nil || terminalContext == context { return }
                 // 옛 실제 요청이 종료될 때까지 슬롯을 유지한다. 재시도 기한도 유지한다.
                 if inFlight != nil {
+                    SyncV2RecoveryDiagnostics.record(stage: .handshake, event: .waitingForSlot, projectID: projectID, operationID: inFlight?.id, attempt: retryAttempt)
                     try await sleep(.seconds(2))
                     continue
                 }
@@ -676,6 +687,7 @@ actor SyncV2HandshakeService {
                     let delay = Self.retryDelay(attempt: retryAttempt)
                     retryAttempt = min(retryAttempt + 1, 5)
                     retryAt = now().addingTimeInterval(Double(delay.components.seconds))
+                    SyncV2RecoveryDiagnostics.record(stage: .handshake, event: .retryScheduled, projectID: projectID, attempt: retryAttempt, retryAt: retryAt)
                 }
             } catch { return }
         }

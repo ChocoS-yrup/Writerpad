@@ -19,6 +19,8 @@ enum SyncV2ContractStructureError: Error, Equatable, Sendable {
     case transportRejected
     case uploadPullGateBusy
     case transmissionNotStarted
+    case structureAuthorityUnavailable
+    case projectInactive
 }
 
 struct SyncV2AtomicStructureParameters: Encodable, Equatable, Sendable {
@@ -30,11 +32,15 @@ struct SyncV2AtomicStructureParameters: Encodable, Equatable, Sendable {
 }
 
 protocol SyncV2AtomicStructureTransporting: Sendable {
+    func fetchProjectState(projectID: UUID) async throws -> SyncV2ContractServerProjectState
     func commit(request: SyncV2JSON) async throws -> SyncV2JSON
     func commit(request: SyncV2JSON, authorize: @escaping @Sendable () throws -> Void) async throws -> SyncV2JSON
 }
 
 extension SyncV2AtomicStructureTransporting {
+    func fetchProjectState(projectID: UUID) async throws -> SyncV2ContractServerProjectState {
+        throw SyncV2ContractStructureError.unavailable
+    }
     func commit(request: SyncV2JSON, authorize: @escaping @Sendable () throws -> Void) async throws -> SyncV2JSON {
         try authorize()
         return try await commit(request: request)
@@ -47,6 +53,23 @@ actor LiveSyncV2AtomicStructureTransport:
 
     init(client: SupabaseClient, configuration: SupabasePublicConfiguration) {
         http = SyncV2ContractHTTPClient(configuration: configuration, accessToken: { client.auth.currentSession?.accessToken })
+    }
+
+    func fetchProjectState(projectID: UUID) async throws -> SyncV2ContractServerProjectState {
+        let body = try JSONEncoder().encode(["p_project_id": projectID.uuidString.lowercased()])
+        let data: Data
+        do {
+            data = try await http.call(rpc: "get_project_status", body: body)
+        } catch {
+            switch LiveSyncV2HandshakeTransport.classify(error) {
+            case .authenticationRequired: throw SyncV2HandshakeError.authenticationRequired
+            case .forbidden: throw SyncV2HandshakeError.forbidden
+            case .networkUnavailable: throw SyncV2HandshakeError.networkUnavailable
+            case .timedOut: throw SyncV2HandshakeError.timedOut
+            default: throw SyncV2ContractStructureError.unavailable
+            }
+        }
+        return try SyncV2ContractProjectStatus.decode(data, expectedProjectID: projectID)
     }
 
     func commit(request: SyncV2JSON) async throws -> SyncV2JSON {
@@ -82,6 +105,7 @@ struct SyncV2ContractSendReport: Equatable, Sendable {
     let batchID: UUID
     let status: SyncV2CommitStatus
     let operationCount: Int
+    var mayPresentCompletion: Bool = true
 }
 
 extension SyncV2ContractRequest {
@@ -138,6 +162,9 @@ actor SyncV2ContractPathRecorder: DurableLocalChangeRecording {
     private let store: LazySyncV2ProjectBindingStore
     private let handshakeService: SyncV2HandshakeService?
     private let authenticationService: any AuthenticationServicing
+    private let structureAuthority: SyncV2ContractStructureAuthority?
+    private let localProjectEpoch: SyncV2ContractEpoch?
+    private let isLocalProjectActive: @Sendable (ProjectID) async throws -> Bool
     private let bindingEpoch: SyncV2ContractEpoch?
     private let defaults: UserDefaults
 
@@ -146,12 +173,18 @@ actor SyncV2ContractPathRecorder: DurableLocalChangeRecording {
         handshakeService: SyncV2HandshakeService?,
         authenticationService: any AuthenticationServicing,
         defaults: UserDefaults = .standard,
-        bindingEpoch: SyncV2ContractEpoch? = nil
+        bindingEpoch: SyncV2ContractEpoch? = nil,
+        structureAuthority: SyncV2ContractStructureAuthority? = nil,
+        localProjectEpoch: SyncV2ContractEpoch? = nil,
+        isLocalProjectActive: @escaping @Sendable (ProjectID) async throws -> Bool = { _ in false }
     ) {
         self.store = store
         self.handshakeService = handshakeService
         self.authenticationService = authenticationService
         self.defaults = defaults
+        self.structureAuthority = structureAuthority
+        self.localProjectEpoch = localProjectEpoch
+        self.isLocalProjectActive = isLocalProjectActive
         self.bindingEpoch = bindingEpoch
     }
 
@@ -219,6 +252,13 @@ actor SyncV2ContractPathRecorder: DurableLocalChangeRecording {
                 reason: "이 작품에 서 있는 계약 핸드셰크가 없어 구조 쓰기를 보내지 않습니다."
             )
         }
+        let localProjectEpoch = self.localProjectEpoch
+        let localRevision = localProjectEpoch?.value
+        guard let context, let structureAuthority,
+              let proof = structureAuthority.proof(context, requiresActiveServer: false),
+              (try? await isLocalProjectActive(batch.projectID)) == true,
+              localProjectEpoch?.isAvailable == true
+        else { return .localSavedButNotQueued(reason: "작품 활성 상태와 구조 기준을 다시 확인해야 합니다.") }
         let defaults = ContractDefaults(value: self.defaults)
         let bindingEpoch = self.bindingEpoch
         let authorize: @Sendable () throws -> Void = {
@@ -227,7 +267,9 @@ actor SyncV2ContractPathRecorder: DurableLocalChangeRecording {
                 (authEpoch?.value ?? 0) == authRevision &&
                 (bindingEpoch?.value ?? 0) == bindingRevision &&
                 (bindingEpoch?.isAvailable ?? false) &&
-                handshakeEpoch.value == handshakeRevision
+                handshakeEpoch.value == handshakeRevision &&
+                localProjectEpoch?.value == localRevision && localProjectEpoch?.isAvailable == true &&
+                structureAuthority.validates(proof)
             }
         }
         do {
@@ -276,6 +318,9 @@ actor SyncV2ContractStructureSender {
     private let uploadPullCoordinator:
         SyncV2ProjectUploadPullCoordinator?
     private let defaults: UserDefaults
+    private let structureAuthority: SyncV2ContractStructureAuthority?
+    private let localProjectEpoch: SyncV2ContractEpoch?
+    private let isLocalProjectActive: @Sendable (ProjectID) async throws -> Bool
     private let bindingEpoch: SyncV2ContractEpoch?
     private let deviceIdentityProvider: (any DeviceIdentityProviding)?
     private var sendingProjects: Set<ProjectID> = []
@@ -289,7 +334,10 @@ actor SyncV2ContractStructureSender {
             SyncV2ProjectUploadPullCoordinator? = nil,
         defaults: UserDefaults = .standard,
         bindingEpoch: SyncV2ContractEpoch? = nil,
-        deviceIdentityProvider: (any DeviceIdentityProviding)? = nil
+        deviceIdentityProvider: (any DeviceIdentityProviding)? = nil,
+        structureAuthority: SyncV2ContractStructureAuthority? = nil,
+        localProjectEpoch: SyncV2ContractEpoch? = nil,
+        isLocalProjectActive: @escaping @Sendable (ProjectID) async throws -> Bool = { _ in false }
     ) {
         self.store = store
         self.transport = transport
@@ -297,6 +345,9 @@ actor SyncV2ContractStructureSender {
         self.authenticationService = authenticationService
         self.uploadPullCoordinator = uploadPullCoordinator
         self.defaults = defaults
+        self.structureAuthority = structureAuthority
+        self.localProjectEpoch = localProjectEpoch
+        self.isLocalProjectActive = isLocalProjectActive
         self.bindingEpoch = bindingEpoch
         self.deviceIdentityProvider = deviceIdentityProvider
     }
@@ -337,6 +388,27 @@ actor SyncV2ContractStructureSender {
            await handshakeService.canStartContractWrite(),
            let deviceIdentityProvider
         else { throw SyncV2ContractStructureError.handshakeMissing }
+        let localProjectEpoch = self.localProjectEpoch
+        let localRevision = localProjectEpoch?.value
+        // 삭제 뒤 복원된 서버 작품도 매번 상태를 다시 읽는다. 이 읽기는 쓰기
+        // 허가가 아니며 아래의 active + 구조 증명과 최종 authorize가 필수다.
+        guard let structureAuthority, localProjectEpoch?.isAvailable == true
+        else { throw SyncV2ContractStructureError.structureAuthorityUnavailable }
+        guard try await isLocalProjectActive(localProjectID) else { throw SyncV2ContractStructureError.projectInactive }
+        let serverRead = structureAuthority.beginServerRead(context)
+        do {
+            let state = try await transport.fetchProjectState(projectID: serverProjectID)
+            structureAuthority.finishServerRead(context, token: serverRead, state: state)
+            guard state == .active else { throw SyncV2ContractStructureError.projectInactive }
+        } catch {
+            structureAuthority.finishServerRead(context, token: serverRead, state: nil)
+            if let error = error as? SyncV2HandshakeError {
+                await handshakeService.forgetIfStale(error, expectedGeneration: handshakeRevision)
+            }
+            throw error
+        }
+        guard let structureProof = structureAuthority.proof(context, requiresActiveServer: true)
+        else { throw SyncV2ContractStructureError.structureAuthorityUnavailable }
         let writerDeviceID = try await deviceIdentityProvider.currentIdentifier().uuid
         let defaults = ContractDefaults(value: self.defaults)
         let bindingEpoch = self.bindingEpoch
@@ -348,7 +420,9 @@ actor SyncV2ContractStructureSender {
                 (bindingEpoch?.isAvailable ?? false) &&
                 handshakeEpoch.value == handshakeRevision && activityEpoch.value == activityRevision &&
                 GlobalSyncPreference.contractEpoch.value == globalRevision &&
-                GlobalSyncPreference.isEnabled(in: defaults.value)
+                GlobalSyncPreference.isEnabled(in: defaults.value) &&
+                localProjectEpoch?.value == localRevision && localProjectEpoch?.isAvailable == true &&
+                structureAuthority.validates(structureProof)
             }
         }
         try authorize()
@@ -359,6 +433,8 @@ actor SyncV2ContractStructureSender {
             let queue = try await store.uploadQueueSnapshot(
                 localProjectID: localProjectID
             )
+            structureAuthority.observeQueue(queue, projectID: localProjectID)
+            try authorize()
             guard let permit = await uploadPullCoordinator.beginUploadDrain(
                 localProjectID: localProjectID,
                 queue: queue
@@ -367,7 +443,7 @@ actor SyncV2ContractStructureSender {
             }
             uploadPermit = permit
         } else {
-            uploadPermit = nil
+            throw SyncV2ContractStructureError.structureAuthorityUnavailable
         }
         var claimed: SyncV2PendingContractBatch?
         let started = SyncV2ContractEpoch()
@@ -384,7 +460,11 @@ actor SyncV2ContractStructureSender {
                                                         writerDeviceID: writerDeviceID)
             let response = try await transport.commit(
                 request: pending.request.json,
-                authorize: { try authorize(); started.advance() }
+                authorize: {
+                    try authorize(); started.advance()
+                    SyncV2RecoveryDiagnostics.record(stage: .contractUpload, event: .started,
+                        projectID: localProjectID, operationID: pending.request.batchID)
+                }
             )
             let status: SyncV2CommitStatus
             do {
@@ -404,7 +484,7 @@ actor SyncV2ContractStructureSender {
                 pending,
                 response: response
             )
-            let report = SyncV2ContractSendReport(
+            var report = SyncV2ContractSendReport(
                 batchID: pending.request.batchID,
                 status: status,
                 operationCount: pending.request.orderedIntents.count
@@ -413,8 +493,13 @@ actor SyncV2ContractStructureSender {
                 uploadPermit,
                 localProjectID: localProjectID
             )
+            do { try authorize() } catch { report.mayPresentCompletion = false }
+            SyncV2RecoveryDiagnostics.record(stage: .contractUpload, event: .finished,
+                projectID: localProjectID, operationID: pending.request.batchID)
             return report
         } catch {
+            SyncV2RecoveryDiagnostics.record(stage: .contractUpload, event: .failed,
+                projectID: localProjectID, operationID: claimed?.request.batchID)
             // 서버 응답 검증 실패는 위에서 응답과 함께 이미 남겼다.
             // 전송 단계 실패만 재시도 가능 상태로 돌린다.
             if let stale = error as? SyncV2HandshakeError {
@@ -452,5 +537,104 @@ actor SyncV2ContractStructureSender {
             permit,
             queue: queue
         )
+    }
+}
+
+/// 동기화 완료 표시와 별개인 계약 구조 쓰기 증명이다. 읽기 실패나 늦은 응답이
+/// 새 차단 상태를 지우지 못하도록 실제 pull/작품 조회별 토큰을 따로 둔다.
+final class SyncV2ContractStructureAuthority: @unchecked Sendable {
+    struct Proof: Sendable {
+        let context: SyncV2HandshakeContext
+        let revision: UInt64
+        let requiresActiveServer: Bool
+    }
+    private struct Entry {
+        var revision: UInt64 = 0
+        var baselineToken: UUID?
+        var baselineContext: SyncV2HandshakeContext?
+        var baselineAllowed = false
+        var queueBlocked = false
+        var serverToken: UUID?
+        var serverReadRevision: UInt64?
+        var serverContext: SyncV2HandshakeContext?
+        var serverState: SyncV2ContractServerProjectState?
+    }
+    private let lock = NSLock()
+    private var entries: [ProjectID: Entry] = [:]
+
+    func beginBaseline(_ context: SyncV2HandshakeContext) -> UUID {
+        lock.withLock {
+            var e = entries[context.localProjectID] ?? Entry()
+            let token = UUID()
+            e.revision &+= 1; e.baselineToken = token
+            e.baselineContext = context; e.baselineAllowed = false
+            entries[context.localProjectID] = e
+            return token
+        }
+    }
+    func finishBaseline(_ context: SyncV2HandshakeContext, token: UUID, allowed: Bool) {
+        lock.withLock {
+            guard var e = entries[context.localProjectID], e.baselineToken == token else { return }
+            e.revision &+= 1; e.baselineToken = nil; e.baselineAllowed = allowed
+            entries[context.localProjectID] = e
+        }
+    }
+    func observeQueue(_ queue: SyncV2UploadQueueSnapshot, projectID: ProjectID) {
+        lock.withLock {
+            var e = entries[projectID] ?? Entry()
+            let blocked = queue.blockedCount > 0 || queue.conflictCount > 0
+            if e.queueBlocked != blocked { e.revision &+= 1 }
+            e.queueBlocked = blocked; entries[projectID] = e
+        }
+    }
+    func beginServerRead(_ context: SyncV2HandshakeContext) -> UUID {
+        lock.withLock {
+            var e = entries[context.localProjectID] ?? Entry()
+            let token = UUID()
+            e.revision &+= 1; e.serverReadRevision = e.revision; e.serverToken = token; e.serverContext = context; e.serverState = nil
+            entries[context.localProjectID] = e
+            return token
+        }
+    }
+    func finishServerRead(_ context: SyncV2HandshakeContext, token: UUID, state: SyncV2ContractServerProjectState?) {
+        lock.withLock {
+            guard var e = entries[context.localProjectID], e.serverToken == token, e.serverReadRevision == e.revision else { return }
+            e.revision &+= 1; e.serverToken = nil; e.serverState = state
+            entries[context.localProjectID] = e
+        }
+    }
+    func proof(_ context: SyncV2HandshakeContext, requiresActiveServer: Bool) -> Proof? {
+        lock.withLock {
+            let e = entries[context.localProjectID] ?? Entry()
+            guard allows(e, context: context, requiresActiveServer: requiresActiveServer) else { return nil }
+            return Proof(context: context, revision: e.revision, requiresActiveServer: requiresActiveServer)
+        }
+    }
+    func validates(_ proof: Proof) -> Bool {
+        lock.withLock {
+            let e = entries[proof.context.localProjectID] ?? Entry()
+            return e.revision == proof.revision && allows(e, context: proof.context, requiresActiveServer: proof.requiresActiveServer)
+        }
+    }
+    private func allows(_ e: Entry, context: SyncV2HandshakeContext, requiresActiveServer: Bool) -> Bool {
+        guard e.baselineAllowed, e.baselineContext == context, !e.queueBlocked else { return false }
+        if requiresActiveServer { return e.serverContext == context && e.serverState == .active }
+        return e.serverContext != context || e.serverState == nil || e.serverState == .active
+    }
+}
+
+enum SyncV2ContractServerProjectState: String, Decodable, Sendable {
+    case active, trashed, purged
+}
+
+struct SyncV2ContractProjectStatus: Decodable {
+    let projectID: UUID
+    let state: SyncV2ContractServerProjectState
+    enum CodingKeys: String, CodingKey { case projectID = "project_id", state }
+
+    static func decode(_ data: Data, expectedProjectID: UUID) throws -> SyncV2ContractServerProjectState {
+        let status = try JSONDecoder().decode(Self.self, from: data)
+        guard status.projectID == expectedProjectID else { throw SyncV2ContractStructureError.projectNotConnected }
+        return status.state
     }
 }

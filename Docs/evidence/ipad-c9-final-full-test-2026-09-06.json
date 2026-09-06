@@ -1,0 +1,49 @@
+{
+  "devicesAndConfigurations" : [
+    {
+      "device" : {
+        "architecture" : "arm64",
+        "deviceId" : "39ADD620-67C9-4F0A-8047-C32AC64D448A",
+        "deviceName" : "iPad Pro 13-inch (M5)",
+        "modelName" : "iPad Pro 13-inch (M5)",
+        "osBuildNumber" : "23F77",
+        "osVersion" : "26.5",
+        "platform" : "iOS Simulator"
+      },
+      "expectedFailures" : 0,
+      "failedTests" : 0,
+      "passedTests" : 956,
+      "skippedTests" : 1,
+      "testPlanConfiguration" : {
+        "configurationId" : "1",
+        "configurationName" : "Test Scheme Action"
+      }
+    }
+  ],
+  "environmentDescription" : "WriterPad · Built with macOS 26.6.2",
+  "expectedFailures" : 0,
+  "failedTests" : 0,
+  "finishTime" : 1788656787.328,
+  "passedTests" : 956,
+  "result" : "Passed",
+  "skippedTests" : 1,
+  "startTime" : 1788656623.464,
+  "statistics" : [
+    {
+      "subtitle" : "1 test run",
+      "title" : "1 test collected performance metrics"
+    }
+  ],
+  "testFailures" : [
+
+  ],
+  "title" : "Test - WriterPad",
+  "topInsights" : [
+    {
+      "category" : "Longest Test Runs",
+      "impact" : "36% of duration",
+      "text" : "15 longest test runs with outlier durations exceeding 0.80s (three standard deviations)"
+    }
+  ],
+  "totalTestCount" : 957
+}

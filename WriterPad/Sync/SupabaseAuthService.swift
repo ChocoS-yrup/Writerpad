@@ -314,6 +314,7 @@ actor SupabaseAuthService: AuthenticationServicing {
     private var state: AuthenticationState = .localOnly {
         didSet {
             guard oldValue != state else { return }
+            SyncV2RecoveryDiagnostics.record(stage: .authentication, event: state.isAuthenticated ? .available : .unavailable, operationID: activeOperationID)
             stateObservers.values.forEach { $0.yield(state) }
         }
     }
@@ -825,6 +826,7 @@ actor SupabaseAuthService: AuthenticationServicing {
         contractEpoch?.advance()
         let operationID = UUID()
         activeOperationID = operationID
+        SyncV2RecoveryDiagnostics.record(stage: .authentication, event: .started, operationID: operationID)
         return operationID
     }
 
@@ -851,6 +853,8 @@ actor SupabaseAuthService: AuthenticationServicing {
         guard refreshRetryTask == nil else { return }
         let sleep = self.sleep
         let refreshRetryDelay = self.refreshRetryDelay
+        SyncV2RecoveryDiagnostics.record(stage: .authentication, event: .retryScheduled, operationID: activeOperationID,
+            retryAt: now().addingTimeInterval(Double(refreshRetryDelay.components.seconds)))
         refreshRetryTask = Task { [weak self] in
             do {
                 try await sleep(refreshRetryDelay)

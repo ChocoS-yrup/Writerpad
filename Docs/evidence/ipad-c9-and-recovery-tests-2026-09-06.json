@@ -1,0 +1,53 @@
+{
+  "base_commit": "bb40d22164f34371f9ad7f70b9cddf208a692f83",
+  "status": "Validated before commit; the source/test diff from base_commit is included in the commit containing this evidence. Installation status below is the validation-time snapshot.",
+  "product_diff_sha256": "c2d62e6936380a0dc14e9283b9194e435e69025b697a37f08917531e219c5e9b",
+  "source_and_tests_diff_sha256": "e955f146482d53632f074736326948973981f0ea66ab86bbaa037e0f55321a28",
+  "full_suite_failure": "testSnapshotNetworkReadsStartConcurrently checked after 500 yields before any request had started; replaced with start-event synchronization while withholding every response.",
+  "after_test_only_fix": {
+    "totalTestCount": 135,
+    "passedTests": 135,
+    "failedTests": 0,
+    "skippedTests": 0,
+    "startTime": 1788656215.192,
+    "finishTime": 1788656311.167
+  },
+  "validation_scope": "Final source and tests passed the complete 957-test run: 956 passed, 0 failed, 1 skipped. Includes actual diagnostic persistence and size-limit test.",
+  "device_build": {
+    "result": "BUILD SUCCEEDED",
+    "configuration": "Debug",
+    "bundle_id": "com.chocos.writerpad.debug",
+    "version": "0.1.0",
+    "build_number": "1",
+    "binary_sha256": "426fc13fa198fd1a5e71c3ae2969b8953aea6ad80f4341dd1c34936243ff0e88",
+    "installed": false,
+    "log": "build/device-c9-recovery-build-20260906.log"
+  },
+  "server_read_only": [
+    "public.get_project_status(uuid) function definition",
+    "private.has_project_role(uuid,uuid,text) function definition"
+  ],
+  "server_write": false,
+  "contract_gate_changed": false,
+  "canonical_contract_changed": false,
+  "actual_canary_executed": false,
+  "historical_recovery_delay_cause": "not established",
+  "intermediate_full_suite": {
+    "totalTestCount": 956,
+    "passedTests": 954,
+    "failedTests": 1,
+    "skippedTests": 1,
+    "startTime": 1788655926.748,
+    "finishTime": 1788656162.454
+  },
+  "final_full_suite": {
+    "totalTestCount": 957,
+    "passedTests": 956,
+    "failedTests": 0,
+    "skippedTests": 1,
+    "startTime": 1788656623.464,
+    "finishTime": 1788656787.328
+  },
+  "final_result_bundle": "build/TestDerivedData/Logs/Test/Test-WriterPad-2026.09.06_10-03-43-+0900.xcresult",
+  "diagnostic_persistence_verified": "testRecoveryDiagnosticActuallyPersistsWithinSizeLimit passed in the final simulator suite; not yet verified on physical iPad."
+}

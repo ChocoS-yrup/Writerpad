@@ -1,0 +1,59 @@
+diff --git a/WriterPadTests/SyncV2HandshakeTests.swift b/WriterPadTests/SyncV2HandshakeTests.swift
+index c6aa27e..b171d9a 100644
+--- a/WriterPadTests/SyncV2HandshakeTests.swift
++++ b/WriterPadTests/SyncV2HandshakeTests.swift
+@@ -987,7 +987,7 @@ extension SyncV2HandshakeTests {
+         let request: SyncV2ContractRequest
+     }
+ 
+-    private func senderFixture(deviceMismatch: Bool = false) async throws -> SenderFixture {
++    private func senderFixture(deviceMismatch: Bool = false, coordinator: SyncV2ProjectUploadPullCoordinator? = nil) async throws -> SenderFixture {
+         let local = ProjectID(rawValue: UUID()), server = UUID(), account = UUID(), device = UUID()
+         let defaults = makeDefaults(function: UUID().uuidString)
+         GlobalSyncPreference.setEnabled(true, in: defaults)
+@@ -1006,7 +1006,7 @@ extension SyncV2HandshakeTests {
+         let transport = ContractTransportStub()
+         let actualDevice = deviceMismatch ? UUID() : device
+         let sender = SyncV2ContractStructureSender(store: queue, transport: transport,
+-            handshakeService: handshake, authenticationService: auth, defaults: defaults,
++            handshakeService: handshake, authenticationService: auth, uploadPullCoordinator: coordinator, defaults: defaults,
+             bindingEpoch: bindingEpoch, deviceIdentityProvider: DeviceIdentityService(
+                 store: InMemoryDeviceIdentityStore(), generateUUID: { actualDevice }))
+         return SenderFixture(sender: sender, service: handshake, auth: auth, bindingEpoch: bindingEpoch,
+@@ -1258,3 +1258,36 @@ extension SyncV2HandshakeTests {
+         }
+     }
+ }
++
++// 검토용 재현: 통과는 안전 판정이 아니라 현재 전송 누락 검사의 재현 성공이다.
++extension SyncV2HandshakeTests {
++    func testReviewProbeContractSenderWithoutBaseline() async throws {
++        let coordinator = SyncV2ProjectUploadPullCoordinator()
++        let f = try await senderFixture(coordinator: coordinator)
++        let before = await coordinator.snapshot(localProjectID: f.localID)
++        XCTAssertFalse(before.lastPullSucceeded)
++        _ = try await f.sender.sendNext(localProjectID: f.localID)
++        let calls = await f.transport.requests.count
++        XCTAssertEqual(calls, 1, "현재 기준 조회 증명 없이 전송되는 현상 재현")
++    }
++
++    func testReviewProbeContractSenderIgnoresBlockedQueueAtBoundaries() async throws {
++        for boundary in 0..<2 {
++            for queue in [SyncV2UploadQueueSnapshot(blockedCount: 1), SyncV2UploadQueueSnapshot(conflictCount: 1)] {
++                let coordinator = SyncV2ProjectUploadPullCoordinator()
++                let f = try await senderFixture(coordinator: coordinator)
++                let mutation: @Sendable () async -> Void = {
++                    await coordinator.restore(localProjectID: f.localID, queue: queue)
++                    let snapshot = await coordinator.snapshot(localProjectID: f.localID)
++                    XCTAssertEqual(snapshot.queue, queue)
++                }
++                if boundary == 0 { await f.queue.setBeforeClaim(mutation) }
++                else { await f.transport.configure(before: mutation) }
++                _ = try await f.sender.sendNext(localProjectID: f.localID)
++                let calls = await f.transport.requests.count
++                XCTAssertEqual(calls, 1, "현재 차단/충돌 이후 전송되는 현상 재현")
++                XCTAssertEqual(f.queue.pending.request, f.request)
++            }
++        }
++    }
++}

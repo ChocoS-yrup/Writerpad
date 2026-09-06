@@ -243,7 +243,10 @@ final class AppEnvironment: ObservableObject {
                 store: liveSyncV2Store,
                 handshakeService: handshakeService,
                 authenticationService: authenticationService,
-                bindingEpoch: contractBindingEpoch
+                bindingEpoch: contractBindingEpoch,
+                structureAuthority: uploadPullCoordinator.contractStructureAuthority,
+                localProjectEpoch: projectManager.contractLifecycleEpoch,
+                isLocalProjectActive: { id in try await projectManager.projects().contains { $0.id == id && $0.isActive } }
             )
             conflictResolutionService = liveSyncV2Store
             snapshotStateStore = liveSyncV2Store
@@ -293,7 +296,10 @@ final class AppEnvironment: ObservableObject {
                     authenticationService: authenticationService,
                     uploadPullCoordinator: uploadPullCoordinator,
                     bindingEpoch: contractBindingEpoch,
-                    deviceIdentityProvider: deviceIdentityService
+                    deviceIdentityProvider: deviceIdentityService,
+                    structureAuthority: uploadPullCoordinator.contractStructureAuthority,
+                    localProjectEpoch: projectManager.contractLifecycleEpoch,
+                    isLocalProjectActive: { id in try await projectManager.projects().contains { $0.id == id && $0.isActive } }
                 )
             } else {
                 contractStructureSender = nil
@@ -370,7 +376,17 @@ final class AppEnvironment: ObservableObject {
                 folderMarker: folderMigrationMarker,
                 folderDocuments: repository,
                 leaseManager: editLeaseManager,
-                mutationGate: syncMutationGate
+                mutationGate: syncMutationGate,
+                contractStructureAuthority: uploadPullCoordinator.contractStructureAuthority,
+                contractContext: { localID, serverID in
+                    let authRevision = authenticationService.contractEpoch?.value ?? 0
+                    let bindingRevision = contractBindingEpoch.value
+                    let state = await authenticationService.currentState()
+                    guard authenticationService.contractEpoch?.value == authRevision,
+                          contractBindingEpoch.value == bindingRevision, contractBindingEpoch.isAvailable else { return nil }
+                    return SyncV2HandshakeContext.make(authenticationState: state, localProjectID: localID,
+                        serverProjectID: serverID, authenticationEpoch: authRevision, bindingEpoch: bindingRevision)
+                }
             )
         } else {
             snapshotPullService = nil

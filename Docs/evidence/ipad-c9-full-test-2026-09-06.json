@@ -1,0 +1,56 @@
+{
+  "devicesAndConfigurations" : [
+    {
+      "device" : {
+        "architecture" : "arm64",
+        "deviceId" : "39ADD620-67C9-4F0A-8047-C32AC64D448A",
+        "deviceName" : "iPad Pro 13-inch (M5)",
+        "modelName" : "iPad Pro 13-inch (M5)",
+        "osBuildNumber" : "23F77",
+        "osVersion" : "26.5",
+        "platform" : "iOS Simulator"
+      },
+      "expectedFailures" : 0,
+      "failedTests" : 1,
+      "passedTests" : 954,
+      "skippedTests" : 1,
+      "testPlanConfiguration" : {
+        "configurationId" : "1",
+        "configurationName" : "Test Scheme Action"
+      }
+    }
+  ],
+  "environmentDescription" : "WriterPad · Built with macOS 26.6.2",
+  "expectedFailures" : 0,
+  "failedTests" : 1,
+  "finishTime" : 1788656162.454,
+  "passedTests" : 954,
+  "result" : "Failed",
+  "skippedTests" : 1,
+  "startTime" : 1788655926.748,
+  "statistics" : [
+    {
+      "subtitle" : "1 test run",
+      "title" : "1 test collected performance metrics"
+    }
+  ],
+  "testFailures" : [
+    {
+      "failureText" : "XCTAssertEqual failed: (\"[]\") is not equal to (\"[WriterPadTests.(unknown context at $10844f688).ConcurrentSnapshotClientProbe.Stage.folders, WriterPadTests.(unknown context at $10844f688).ConcurrentSnapshotClientProbe.Stage.treeOrders, WriterPadTests.(unknown context at $10844f688).ConcurrentSnapshotClientProbe.Stage.documents]\") - 서로 독립적인 snapshot 네트워크 읽기는 한 왕복 구간에 시작해야 합니다.",
+      "targetName" : "WriterPadTests",
+      "testIdentifier" : 232,
+      "testIdentifierString" : "SyncV2SnapshotPullTests/testSnapshotNetworkReadsStartConcurrently()",
+      "testIdentifierURL" : "test://com.apple.xcode/WriterPad/WriterPadTests/SyncV2SnapshotPullTests/testSnapshotNetworkReadsStartConcurrently",
+      "testName" : "testSnapshotNetworkReadsStartConcurrently()"
+    }
+  ],
+  "title" : "Test - WriterPad",
+  "topInsights" : [
+    {
+      "category" : "Longest Test Runs",
+      "impact" : "35% of duration",
+      "text" : "15 longest test runs with outlier durations exceeding 0.80s (three standard deviations)"
+    }
+  ],
+  "totalTestCount" : 956
+}

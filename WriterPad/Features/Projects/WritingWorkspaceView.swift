@@ -2444,6 +2444,14 @@ private struct SaveStatusBadge: View {
     let onRetry: () -> Void
     let onResolveConflict: (() -> Void)?
 
+    private func recordRecoveryPresentation(_ label: String) {
+        let event: SyncV2RecoveryDiagnostics.Event
+        if label == "서버 동기화됨" { event = .uiSynced }
+        else if label == "서버 재연결 중" { event = .uiReconnecting }
+        else { event = .changed }
+        SyncV2RecoveryDiagnostics.record(stage: .presentation, event: event)
+    }
+
     private var presentation: WorkspaceSyncStatusPresentation {
         WorkspaceSyncStatusReducer.presentation(
             saveState: state,
@@ -2460,6 +2468,9 @@ private struct SaveStatusBadge: View {
             badgeLabel
         }
         .buttonStyle(.plain)
+        .onChange(of: presentation.label, initial: true) { _, label in
+            recordRecoveryPresentation(label)
+        }
         .popover(isPresented: $isShowingDetail) {
             VStack(alignment: .leading, spacing: 12) {
                 Label(

@@ -232,7 +232,7 @@ final class SyncSettingsModel: ObservableObject {
             let report = try await contractStructureSender.sendNext(
                 localProjectID: row.project.id
             )
-            guard isCurrent() else { return }
+            guard isCurrent(), report.mayPresentCompletion else { return }
             contractSendReport = """
             서버 응답 검증 완료
             batch_id: \(report.batchID.uuidString.lowercased())

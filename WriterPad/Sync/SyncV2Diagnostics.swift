@@ -429,3 +429,76 @@ private extension SyncV2WorkspaceState.Result {
         }
     }
 }
+
+/// 복구 단계는 병렬로 움직인다. 절대 시각과 단조 시각, 실행/호출 ID를 함께
+/// 남겨 재시도 기한 대기와 실제 네트워크 슬롯 대기를 구분한다. 자유 텍스트나
+/// 서버 오류 본문을 받지 않아 이메일·토큰·원고가 진단 파일에 들어갈 수 없다.
+enum SyncV2RecoveryDiagnostics {
+    enum Stage: String, Codable { case network, authentication, handshake, baselinePull, legacyUpload, contractUpload, presentation, scene }
+    enum Event: String, Codable { case started, finished, failed, transportFinished, transportFailed, superseded, timedOut, retryScheduled, waitingForSlot, available, unavailable, active, background, uiSynced, uiReconnecting, changed }
+    struct Entry: Codable, Sendable {
+        let sessionID: UUID
+        let timestamp: Date
+        let uptime: TimeInterval
+        let stage: Stage
+        let event: Event
+        let projectID: UUID?
+        let operationID: UUID?
+        let attempt: Int?
+        let retryAt: Date?
+    }
+    private static let sessionID = UUID()
+    private static let writer = DispatchQueue(label: "com.chocos.writerpad.recovery-diagnostics")
+
+#if DEBUG
+    static func persistedDataForTesting() async -> [Data] {
+        await withCheckedContinuation { continuation in
+            writer.async {
+                guard let root = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask).first else {
+                    continuation.resume(returning: []); return
+                }
+                let directory = root.appendingPathComponent("SyncDiagnostics", isDirectory: true)
+                continuation.resume(returning: ["recovery.jsonl", "recovery.previous.jsonl"].compactMap {
+                    try? Data(contentsOf: directory.appendingPathComponent($0))
+                })
+            }
+        }
+    }
+#endif
+
+    static func record(stage: Stage, event: Event, projectID: ProjectID? = nil,
+                       operationID: UUID? = nil, attempt: Int? = nil, retryAt: Date? = nil) {
+#if DEBUG
+        let entry = Entry(sessionID: sessionID, timestamp: Date(), uptime: ProcessInfo.processInfo.systemUptime,
+            stage: stage, event: event, projectID: projectID?.rawValue, operationID: operationID, attempt: attempt, retryAt: retryAt)
+        syncV2Logger.info("event=recoveryTrace stage=\(stage.rawValue, privacy: .public) phase=\(event.rawValue, privacy: .public)")
+        writer.async { persist(entry) }
+#endif
+    }
+
+    private static func persist(_ entry: Entry) {
+#if DEBUG
+        // 원고 저장 경로와 분리된 크기 제한 진단이다. 파일 I/O는 UI/동기화
+        // actor 밖에서 수행하며 실패해도 집필이나 복구를 중단하지 않는다.
+        let fm = FileManager.default
+        guard let root = fm.urls(for: .cachesDirectory, in: .userDomainMask).first else { return }
+        let directory = root.appendingPathComponent("SyncDiagnostics", isDirectory: true)
+        let file = directory.appendingPathComponent("recovery.jsonl")
+        let previous = directory.appendingPathComponent("recovery.previous.jsonl")
+        do {
+            try fm.createDirectory(at: directory, withIntermediateDirectories: true)
+            let encoder = JSONEncoder(); encoder.dateEncodingStrategy = .iso8601
+            var data = try encoder.encode(entry); data.append(0x0A)
+            let size = (try? fm.attributesOfItem(atPath: file.path)[.size] as? NSNumber)?.intValue ?? 0
+            if size + data.count > 524_288 {
+                try? fm.removeItem(at: previous)
+                if fm.fileExists(atPath: file.path) { try fm.moveItem(at: file, to: previous) }
+            }
+            if !fm.fileExists(atPath: file.path) { fm.createFile(atPath: file.path, contents: nil) }
+            let handle = try FileHandle(forWritingTo: file)
+            defer { try? handle.close() }
+            try handle.seekToEnd(); try handle.write(contentsOf: data)
+        } catch { }
+#endif
+    }
+}

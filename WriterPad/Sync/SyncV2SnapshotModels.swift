@@ -363,6 +363,8 @@ enum SyncV2SnapshotPullOutcome: Equatable, Sendable {
 }
 
 struct SyncV2SnapshotPullReport: Equatable, Sendable {
+    // 폴더 조회 실패를 삼킨 일반 원고 pull 성공은 계약 구조 기준의 증명이 아니다.
+    var contractStructureBaselineReady: Bool = false
     let outcomes: [SyncV2SnapshotPullOutcome]
     let appliedSnapshots: [SyncV2RemoteDocumentSnapshot]
     /// 구조를 적용하지 못하게 만든 이름과 사유다. merge reason은 문자열 raw

@@ -952,6 +952,17 @@ extension SyncV2HandshakeTests {
         var afterReservation: (@Sendable () async -> Void)?
         private(set) var requests: [SyncV2JSON] = []
         var reject = false
+        var projectState: SyncV2ContractServerProjectState = .active
+        var beforeProjectRead: (@Sendable () async -> Void)?
+        var projectReadFails = false
+        func configureProjectRead(state: SyncV2ContractServerProjectState = .active, fails: Bool = false, before: (@Sendable () async -> Void)? = nil) {
+            projectState = state; projectReadFails = fails; beforeProjectRead = before
+        }
+        func fetchProjectState(projectID: UUID) async throws -> SyncV2ContractServerProjectState {
+            await beforeProjectRead?()
+            if projectReadFails { throw SyncV2HandshakeError.networkUnavailable }
+            return projectState
+        }
         func configure(before: (@Sendable () async -> Void)? = nil,
                        after: (@Sendable () async -> Void)? = nil, reject: Bool = false) {
             beforeReservation = before; afterReservation = after; self.reject = reject
@@ -976,6 +987,10 @@ extension SyncV2HandshakeTests {
     }
 
     private struct SenderFixture: @unchecked Sendable {
+        let coordinator: SyncV2ProjectUploadPullCoordinator
+        let authority: SyncV2ContractStructureAuthority
+        let context: SyncV2HandshakeContext
+        let localEpoch: SyncV2ContractEpoch
         let sender: SyncV2ContractStructureSender
         let service: SyncV2HandshakeService
         let auth: LifecycleAuth
@@ -987,7 +1002,7 @@ extension SyncV2HandshakeTests {
         let request: SyncV2ContractRequest
     }
 
-    private func senderFixture(deviceMismatch: Bool = false) async throws -> SenderFixture {
+    private func senderFixture(deviceMismatch: Bool = false, localIsActive: Bool = true) async throws -> SenderFixture {
         let local = ProjectID(rawValue: UUID()), server = UUID(), account = UUID(), device = UUID()
         let defaults = makeDefaults(function: UUID().uuidString)
         GlobalSyncPreference.setEnabled(true, in: defaults)
@@ -1005,11 +1020,18 @@ extension SyncV2HandshakeTests {
         let queue = ContractQueueStub(binding: binding, request: request)
         let transport = ContractTransportStub()
         let actualDevice = deviceMismatch ? UUID() : device
+        let coordinator = SyncV2ProjectUploadPullCoordinator()
+        let authority = coordinator.contractStructureAuthority
+        let context = SyncV2HandshakeContext(localProjectID: local, serverProjectID: server, accountID: account)
+        let token = authority.beginBaseline(context)
+        authority.finishBaseline(context, token: token, allowed: true)
+        let localEpoch = SyncV2ContractEpoch()
         let sender = SyncV2ContractStructureSender(store: queue, transport: transport,
-            handshakeService: handshake, authenticationService: auth, defaults: defaults,
+            handshakeService: handshake, authenticationService: auth, uploadPullCoordinator: coordinator, defaults: defaults,
             bindingEpoch: bindingEpoch, deviceIdentityProvider: DeviceIdentityService(
-                store: InMemoryDeviceIdentityStore(), generateUUID: { actualDevice }))
-        return SenderFixture(sender: sender, service: handshake, auth: auth, bindingEpoch: bindingEpoch,
+                store: InMemoryDeviceIdentityStore(), generateUUID: { actualDevice }),
+            structureAuthority: authority, localProjectEpoch: localEpoch, isLocalProjectActive: { _ in localIsActive })
+        return SenderFixture(coordinator: coordinator, authority: authority, context: context, localEpoch: localEpoch, sender: sender, service: handshake, auth: auth, bindingEpoch: bindingEpoch,
             queue: queue, transport: transport, localID: local, defaults: defaults, request: request)
     }
 
@@ -1256,5 +1278,151 @@ extension SyncV2HandshakeTests {
             XCTAssertTrue(completed)
             XCTAssertNil(model.contractSendReport)
         }
+    }
+}
+
+
+extension SyncV2HandshakeTests {
+    func testC9BlocksStructureAndProjectTransitionsAtBothDispatchBoundaries() async throws {
+        for boundary in 0..<2 {
+            for change in 0..<7 {
+                let f = try await senderFixture()
+                let mutation: @Sendable () async -> Void = {
+                    switch change {
+                    case 0: _ = f.authority.beginBaseline(f.context)
+                    case 1:
+                        let token = f.authority.beginBaseline(f.context)
+                        f.authority.finishBaseline(f.context, token: token, allowed: false)
+                    case 2: await f.coordinator.restore(localProjectID: f.localID, queue: .init(blockedCount: 1))
+                    case 3: await f.coordinator.restore(localProjectID: f.localID, queue: .init(conflictCount: 1))
+                    case 4: f.localEpoch.beginTransition()
+                    case 5:
+                        let token = f.authority.beginServerRead(f.context)
+                        f.authority.finishServerRead(f.context, token: token, state: .trashed)
+                    default: _ = f.authority.beginServerRead(f.context)
+                    }
+                }
+                if boundary == 0 { await f.queue.setBeforeClaim(mutation) }
+                else { await f.transport.configure(before: mutation) }
+                do { _ = try await f.sender.sendNext(localProjectID: f.localID); XCTFail("차단 후 송신") }
+                catch { }
+                let requests = await f.transport.requests
+                let failures = await f.queue.failures
+                XCTAssertTrue(requests.isEmpty, "boundary=\(boundary) change=\(change)")
+                XCTAssertEqual(failures, [.transmissionNotStarted])
+                XCTAssertEqual(f.queue.pending.request, f.request)
+            }
+        }
+    }
+
+    func testC9RejectsUnknownBaselineAndInactiveServerBeforeClaim() async throws {
+        for change in 0..<5 {
+            let f = try await senderFixture(localIsActive: change != 3)
+            if change == 0 { _ = f.authority.beginBaseline(f.context) }
+            else if change == 1 || change == 2 { await f.transport.configureProjectRead(state: change == 1 ? .trashed : .purged) }
+            else if change == 4 { await f.transport.configureProjectRead(fails: true) }
+            do { _ = try await f.sender.sendNext(localProjectID: f.localID); XCTFail("미확인/비활성 작품 송신") }
+            catch { }
+            let requests = await f.transport.requests
+            XCTAssertTrue(requests.isEmpty)
+            XCTAssertEqual(f.queue.pending.request, f.request)
+        }
+    }
+
+    func testC9LateActiveServerReadingCannotClearNewStructureBlock() async throws {
+        let f = try await senderFixture()
+        await f.transport.configureProjectRead(before: {
+            await f.coordinator.restore(localProjectID: f.localID, queue: .init(blockedCount: 1))
+            await f.coordinator.restore(localProjectID: f.localID, queue: .idle)
+        })
+        do { _ = try await f.sender.sendNext(localProjectID: f.localID); XCTFail("차단 수명이 바뀐 요청 송신") }
+        catch { }
+        let requests = await f.transport.requests
+        XCTAssertTrue(requests.isEmpty)
+    }
+
+    func testC9BaselineIsScopedAndLatePullCannotReplaceNewBlock() throws {
+        let authority = SyncV2ContractStructureAuthority()
+        let first = context(serverProjectID: UUID())
+        let old = authority.beginBaseline(first)
+        let current = authority.beginBaseline(first)
+        authority.finishBaseline(first, token: current, allowed: false)
+        authority.finishBaseline(first, token: old, allowed: true)
+        XCTAssertNil(authority.proof(first, requiresActiveServer: false))
+        let fresh = authority.beginBaseline(first)
+        authority.finishBaseline(first, token: fresh, allowed: true)
+        XCTAssertNotNil(authority.proof(first, requiresActiveServer: false))
+        let relogin = SyncV2HandshakeContext(localProjectID: first.localProjectID, serverProjectID: first.serverProjectID,
+            accountID: first.accountID, authenticationEpoch: 1)
+        XCTAssertNil(authority.proof(relogin, requiresActiveServer: false))
+    }
+
+    func testC9LocalEnqueueDoesNotInvalidateConfirmedStructureBaseline() async throws {
+        let f = try await senderFixture()
+        let reservation = await f.coordinator.beginEnqueue(localProjectID: f.localID)
+        await f.coordinator.finishEnqueue(reservation, queue: .init(pendingCount: 1))
+        let snapshot = await f.coordinator.snapshot(localProjectID: f.localID)
+        XCTAssertFalse(snapshot.lastPullSucceeded)
+        _ = try await f.sender.sendNext(localProjectID: f.localID)
+        let requests = await f.transport.requests
+        XCTAssertEqual(requests, [f.request.json])
+    }
+
+    func testC9StartedReceiptRemainsValidAfterStructureAndProjectBlock() async throws {
+        let f = try await senderFixture()
+        await f.transport.configure(after: {
+            _ = f.authority.beginBaseline(f.context)
+            f.localEpoch.advance()
+            let token = f.authority.beginServerRead(f.context)
+            f.authority.finishServerRead(f.context, token: token, state: .purged)
+        })
+        let receipt = try await f.sender.sendNext(localProjectID: f.localID)
+        let completed = await f.queue.completed
+        XCTAssertTrue(completed)
+        XCTAssertEqual(receipt.batchID, f.request.batchID)
+        XCTAssertFalse(receipt.mayPresentCompletion)
+    }
+
+    func testC9RestoredServerProjectIsReadAgainAndUsesSamePendingBatch() async throws {
+        let f = try await senderFixture()
+        await f.transport.configureProjectRead(state: .trashed)
+        do { _ = try await f.sender.sendNext(localProjectID: f.localID); XCTFail("삭제 작품 전송") } catch { }
+        await f.transport.configureProjectRead(state: .active)
+        let receipt = try await f.sender.sendNext(localProjectID: f.localID)
+        let requests = await f.transport.requests
+        XCTAssertEqual(requests, [f.request.json])
+        XCTAssertEqual(receipt.batchID, f.request.batchID)
+    }
+
+    func testC9ProjectStatusDecodingFailsClosed() throws {
+        let id = UUID()
+        for state in ["active", "trashed", "purged"] {
+            let data = try JSONEncoder().encode(["project_id": id.uuidString, "state": state])
+            XCTAssertEqual(try SyncV2ContractProjectStatus.decode(data, expectedProjectID: id).rawValue, state)
+        }
+        for fields in [["state": "active"], ["project_id": id.uuidString, "state": "unknown"],
+                       ["project_id": UUID().uuidString, "state": "active"]] {
+            XCTAssertThrowsError(try SyncV2ContractProjectStatus.decode(JSONEncoder().encode(fields), expectedProjectID: id))
+        }
+    }
+
+    func testRecoveryDiagnosticSchemaContainsOnlyTimingAndOpaqueIdentifiers() throws {
+        let event = SyncV2RecoveryDiagnostics.Entry(sessionID: UUID(), timestamp: Date(), uptime: 1,
+            stage: .handshake, event: .retryScheduled, projectID: UUID(), operationID: UUID(), attempt: 2, retryAt: Date())
+        let json = try XCTUnwrap(JSONSerialization.jsonObject(with: JSONEncoder().encode(event)) as? [String: Any])
+        XCTAssertEqual(Set(json.keys), Set(["sessionID", "timestamp", "uptime", "stage", "event", "projectID", "operationID", "attempt", "retryAt"]))
+    }
+
+    func testRecoveryDiagnosticActuallyPersistsWithinSizeLimit() async throws {
+        let operation = UUID()
+        SyncV2RecoveryDiagnostics.record(stage: .handshake, event: .retryScheduled, operationID: operation, attempt: 2)
+        let files = await SyncV2RecoveryDiagnostics.persistedDataForTesting()
+        XCTAssertFalse(files.isEmpty)
+        XCTAssertTrue(files.allSatisfy { $0.count <= 524_288 })
+        let decoder = JSONDecoder(); decoder.dateDecodingStrategy = .iso8601
+        let entries = try files.flatMap { data in
+            try data.split(separator: 0x0A).map { try decoder.decode(SyncV2RecoveryDiagnostics.Entry.self, from: Data($0)) }
+        }
+        XCTAssertTrue(entries.contains { $0.operationID == operation && $0.attempt == 2 })
     }
 }

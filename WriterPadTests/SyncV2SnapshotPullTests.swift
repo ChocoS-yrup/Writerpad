@@ -135,9 +135,16 @@ final class SyncV2SnapshotPullTests: XCTestCase {
             )
         }
 
-        for _ in 0..<500 where await client.startedCount() < 3 {
-            await Task.yield()
+        // yield 횟수는 실행 시간을 보장하지 않는다. 응답은 모두 막아 둔 채
+        // 세 요청의 시작 사건을 기다려 실제 병렬 시작 여부만 검증한다.
+        let timeout = Task {
+            do {
+                try await Task.sleep(for: .seconds(3))
+                await client.allStagesStarted.resolve(false)
+            } catch { }
         }
+        _ = await client.allStagesStarted.value()
+        timeout.cancel()
         let started = await client.startedStages()
         XCTAssertEqual(
             started,
@@ -162,11 +169,12 @@ final class SyncV2SnapshotPullTests: XCTestCase {
             folderApplier: FolderWiringApplierSpy(order: order)
         )
 
-        _ = try await service.pull(
+        let report = try await service.pull(
             localProjectID: ProjectID(rawValue: UUID()),
             serverProjectID: UUID()
         )
 
+        XCTAssertFalse(report.contractStructureBaselineReady)
         let projections = await projectionApplier.projections()
         XCTAssertEqual(
             projections,
@@ -174,6 +182,28 @@ final class SyncV2SnapshotPullTests: XCTestCase {
         )
         let folderApplySteps = await order.steps()
         XCTAssertTrue(folderApplySteps.isEmpty)
+    }
+
+    func testContractBaselineAuthorityUsesEvaluatedPullAndRejectsFolderFailure() async throws {
+        for failure in 0..<4 {
+            let localID = ProjectID(rawValue: UUID()), serverID = UUID()
+            let context = SyncV2HandshakeContext(localProjectID: localID, serverProjectID: serverID, accountID: UUID())
+            let authority = SyncV2ContractStructureAuthority()
+            let old = authority.beginBaseline(context)
+            authority.finishBaseline(context, token: old, allowed: true)
+            let client: any SyncV2SnapshotClienting = failure == 1
+                ? SelectiveFailureSnapshotClient(failure: .folders) : SnapshotClientStub(snapshots: [])
+            let service = SyncV2SnapshotPullService(client: client,
+                stateStore: SnapshotStateStoreStub(states: [:]), localApplier: SnapshotApplierSpy(),
+                mergeStore: SnapshotMergeStoreSpy(),
+                folderApplier: OrderedFolderApplier(recorder: SnapshotMutationSequence(),
+                    report: SyncV2RemoteFolderApplyReport(createdFolderIDs: failure == 3 ? [DocumentID(rawValue: UUID())] : []),
+                    projectionWasEvaluated: failure != 2),
+                contractStructureAuthority: authority, contractContext: { _, _ in context })
+            let report = try await service.pull(localProjectID: localID, serverProjectID: serverID)
+            XCTAssertEqual(report.contractStructureBaselineReady, failure == 0 || failure == 3)
+            XCTAssertEqual(authority.proof(context, requiresActiveServer: false) != nil, failure == 0 || failure == 3)
+        }
     }
 
     func testTreeOrderFetchFailureStopsBeforeDocumentApply() async {
@@ -7903,6 +7933,7 @@ private actor SnapshotClientStub: SyncV2SnapshotClienting {
 }
 
 private actor ConcurrentSnapshotClientProbe: SyncV2SnapshotClienting {
+    nonisolated let allStagesStarted = SyncV2OneShotRace<Bool>()
     enum Stage: CaseIterable, Hashable, Sendable {
         case documents
         case folders
@@ -7947,6 +7978,7 @@ private actor ConcurrentSnapshotClientProbe: SyncV2SnapshotClienting {
 
     private func arrive(_ stage: Stage) async {
         started.insert(stage)
+        if started.count == Stage.allCases.count { await allStagesStarted.resolve(true) }
         guard !isReleased else { return }
         await withCheckedContinuation { continuation in
             waiters.append(continuation)
