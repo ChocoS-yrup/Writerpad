@@ -725,7 +725,8 @@ extension LocalBinderCommandService {
             projectID: journal.projectID,
             localTransactionID: journal.transactionID,
             kind: batchKind,
-            mutations: mutations
+            mutations: mutations,
+            structureSnapshot: try await metadataStore.binderDocuments(in: journal.projectID)
         )
     }
 

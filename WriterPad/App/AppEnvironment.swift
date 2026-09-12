@@ -26,6 +26,10 @@ final class AppEnvironment: ObservableObject {
     let authenticationService: any AuthenticationServicing
     let deviceIdentityService: any DeviceIdentityProviding
     let projectBindingService: any ProjectBindingServicing
+    var bodyValidationService: BodyValidationService?
+    var generalValidationModel: GeneralValidationScreenModel?
+    var makeGeneralValidationAdapter: (@Sendable () -> GeneralValidationProductAdapter)?
+    let serverProjectCatalog: ServerProjectCatalogService?
     let syncDispatcher: SyncV2Dispatcher?
     let conflictResolutionService: (any SyncV2ConflictResolving)?
     let snapshotPullService: SyncV2SnapshotPullService?
@@ -70,6 +74,7 @@ final class AppEnvironment: ObservableObject {
         editLeaseManager: EditLeaseManager? = nil,
         handshakeService: SyncV2HandshakeService? = nil,
         contractStructureSender: SyncV2ContractStructureSender? = nil,
+        serverProjectCatalog: ServerProjectCatalogService? = nil,
         exporter: (any Exporting)? = nil
     ) {
         self.modelContainer = modelContainer
@@ -98,6 +103,7 @@ final class AppEnvironment: ObservableObject {
         self.authenticationService = authenticationService
         self.deviceIdentityService = deviceIdentityService
         self.projectBindingService = projectBindingService
+        self.serverProjectCatalog = serverProjectCatalog
         self.syncDispatcher = syncDispatcher
         self.conflictResolutionService = conflictResolutionService
         self.snapshotPullService = snapshotPullService
@@ -110,6 +116,15 @@ final class AppEnvironment: ObservableObject {
         self.contractStructureSender = contractStructureSender
     }
 
+    static func startupDefault() throws -> AppEnvironment {
+#if WRITERPAD_ISOLATED_TESTS
+        URLProtocol.registerClass(ReceiveValidationTestNetworkBlock.self)
+        return try testing()
+#else
+        return try live()
+#endif
+    }
+
     static func live() throws -> AppEnvironment {
         try make(isStoredInMemoryOnly: false)
     }
@@ -119,6 +134,7 @@ final class AppEnvironment: ObservableObject {
     }
 
     private static func make(isStoredInMemoryOnly: Bool) throws -> AppEnvironment {
+        _ = ReceiveValidationPolicy.current // Before constructing services or SDK tasks.
         let container = try WriterPadMetadataStore.makeContainer(
             isStoredInMemoryOnly: isStoredInMemoryOnly
         )
@@ -299,7 +315,8 @@ final class AppEnvironment: ObservableObject {
                     deviceIdentityProvider: deviceIdentityService,
                     structureAuthority: uploadPullCoordinator.contractStructureAuthority,
                     localProjectEpoch: projectManager.contractLifecycleEpoch,
-                    isLocalProjectActive: { id in try await projectManager.projects().contains { $0.id == id && $0.isActive } }
+                    isLocalProjectActive: { id in try await projectManager.projects().contains { $0.id == id && $0.isActive } },
+                    localDocuments: { id in try await repository.documents(in: id) }
                 )
             } else {
                 contractStructureSender = nil
@@ -320,6 +337,8 @@ final class AppEnvironment: ObservableObject {
                 return SyncV2Dispatcher(
                     store: liveSyncV2Store,
                     client: $0,
+                    contractSender: contractStructureSender,
+                    projectScope: GeneralSyncValidationScope.current.dispatcherScope,
                     leaseManager: editLeaseManager,
                     projectRecoveryTransport: projectBindingTransport,
                     automaticRebaser: automaticRebaser,
@@ -342,6 +361,7 @@ final class AppEnvironment: ObservableObject {
             initialSyncRecorder: initialSyncRecorder,
             // 초기 snapshot을 올리기 전에 서버 작품이 비어 있는지 확인한다.
             snapshotClient: supabaseClientProvider.makeSnapshotClient(),
+            bindingIsVisible: { id in (try? await projectManager.isReceiving(id)) == false },
             contractEpoch: contractBindingEpoch,
             handshakeInvalidated: { Task { await handshakeService?.projectChanged() } }
         )
@@ -391,6 +411,24 @@ final class AppEnvironment: ObservableObject {
         } else {
             snapshotPullService = nil
         }
+        let serverProjectCatalog: ServerProjectCatalogService?
+        if let transport = supabaseClientProvider.makeServerCatalogTransport(),
+           let snapshotClient = supabaseClientProvider.makeSnapshotClient(),
+           let snapshotStateStore, let syncV2Store {
+            // 일반 pull의 lease·legacy 이관 송신 의존성을 수신 전용 경로에 넣지 않는다.
+            let receivingPuller = SyncV2SnapshotPullService(
+                client: snapshotClient, stateStore: snapshotStateStore,
+                localApplier: LocalSyncV2SnapshotApplier(documentRepository: repository,
+                    workspaceLocator: workspaceLocator, backupStore: backupStore),
+                mergeStore: LocalSyncV2SnapshotMergeStore(workspaceLocator: workspaceLocator),
+                folderApplier: SyncV2RemoteFolderApplier(documentRepository: repository, workspaceLocator: workspaceLocator),
+                folderDocuments: repository, mutationGate: syncMutationGate)
+            serverProjectCatalog = ServerProjectCatalogService(transport: transport,
+                authentication: authenticationService, receiver: projectManager, projects: repository,
+                bindings: projectBindingStore, puller: receivingPuller,
+                queueIsEmpty: { try await syncV2Store.receivingQueueIsEmpty($0) },
+                markFolderIdentity: { try await syncV2Store.markFolderMigrationCompleted(localProjectID: $0) })
+        } else { serverProjectCatalog = nil }
         // 두 trigger는 같은 SupabaseClientProvider가 보유한 subscription gate를
         // 공유해 workspace/background 채널의 동시 subscribe를 직렬화한다.
         let workspaceRealtimeTrigger =
@@ -455,7 +493,8 @@ final class AppEnvironment: ObservableObject {
         let projectBackupCoordinator = ProjectBackupCoordinator(
             projectRepository: repository,
             documentRepository: repository,
-            workspaceLocator: workspaceLocator
+            workspaceLocator: workspaceLocator,
+            mutationGate: syncMutationGate
         )
         let binderCommands = LocalBinderCommandService(
             metadataStore: repository,
@@ -478,7 +517,7 @@ final class AppEnvironment: ObservableObject {
             pathPolicy: pathResolver.policy
         )
 
-        return AppEnvironment(
+        let environment = AppEnvironment(
             modelContainer: container,
             projectRepository: repository,
             documentRepository: repository,
@@ -508,8 +547,121 @@ final class AppEnvironment: ObservableObject {
             editLeaseManager: editLeaseManager,
             handshakeService: handshakeService,
             contractStructureSender: contractStructureSender,
+            serverProjectCatalog: serverProjectCatalog,
             exporter: exporter
         )
+        if GeneralSyncValidationScope.current.restricted, !isStoredInMemoryOnly,
+           let syncV2Store, let metadataURL = container.configurations.first?.url, let syncURL = SyncV2Store.defaultDatabaseURL() {
+            environment.generalValidationModel = GeneralValidationScreenModel(
+                auth: authenticationService, bindingEpoch: contractBindingEpoch,
+                projectEpoch: projectManager.contractLifecycleEpoch,
+                journalRoot: URL.applicationSupportDirectory.appendingPathComponent("GeneralValidation/" + GeneralValidationPlan.id),
+                binding: { try await syncV2Store.binding(for: GeneralValidationPlan.local) },
+                queueIsEmpty: {
+                    let legacy = try await syncV2Store.uploadQueueSnapshot(localProjectID: GeneralValidationPlan.local)
+                    let general = try await syncV2Store.generalQueueStatus(localProjectID: GeneralValidationPlan.local)
+                    return legacy == .idle && general.pendingCount == 0 && general.attentionCount == 0 && general.retryCount == 0
+                },
+                probe: {
+                    GeneralValidationLocalProbe(syncURL: syncURL, metadataURL: metadataURL,
+                        workspace: try await workspaceLocator.workspaceRoot(for: GeneralValidationPlan.local))
+                })
+        }
+        if GeneralSyncValidationScope.current.restricted, let syncV2Store, let snapshotStateStore {
+            let generalPreflight: @Sendable (Bool) async throws -> (@Sendable () throws -> Void) = { requiresBaseline in
+
+                        let id = GeneralValidationPlan.local
+                        let authEpoch = authenticationService.contractEpoch
+                        let authVersion = authEpoch?.value
+                        let bindingVersion = contractBindingEpoch.value
+                        let localEpoch = projectManager.contractLifecycleEpoch
+                        let localVersion = localEpoch.value
+                        let gateVersion = ContractPathGate.revision(for: id)
+                        guard ContractPathGate.isOpen(for: id), let handshakeService,
+                              case let .authenticated(account) = await authenticationService.currentState(),
+                              let binding = try await syncV2Store.binding(for: id), binding.ownerSubject == account.userID,
+                              binding.serverProjectID == GeneralValidationPlan.server, binding.kind == .existingServerProject,
+                              let context = SyncV2HandshakeContext.make(authenticationState: .authenticated(account), localProjectID: id,
+                                serverProjectID: GeneralValidationPlan.server, authenticationEpoch: authVersion ?? 0, bindingEpoch: bindingVersion),
+                              let handshake = await handshakeService.standingHandshake(for: context),
+                              handshake.projectSyncMode == .idBased, handshake.migrationEpoch == 1,
+                              handshake.contractSHA256 == SyncV2Contract.canonicalSHA256,
+                              (try await projectManager.projects()).contains(where: { $0.id == id && $0.isActive }),
+                              (!requiresBaseline || uploadPullCoordinator.contractStructureAuthority.proof(context, requiresActiveServer: false) != nil)
+                        else { throw GeneralValidationFailure.denied }
+                        let handshakeEpoch = handshakeService.authorizationEpoch, handshakeVersion = handshakeEpoch.value
+                        let check: @Sendable () throws -> Void = {
+                            try Task.checkCancellation()
+                            guard authEpoch?.isAvailable == true, authEpoch?.value == authVersion,
+                                  contractBindingEpoch.isAvailable, contractBindingEpoch.value == bindingVersion,
+                                  localEpoch.isAvailable, localEpoch.value == localVersion,
+                                  handshakeEpoch.isAvailable, handshakeEpoch.value == handshakeVersion,
+                                  ContractPathGate.isOpen(for: id), ContractPathGate.revision(for: id) == gateVersion
+                            else { throw GeneralValidationFailure.denied }
+                        }
+                        try check(); return check
+            }
+            environment.makeGeneralValidationAdapter = {
+                GeneralValidationProductAdapter(store: syncV2Store, documents: repository,
+                    local: localDocumentStore, identity: deviceIdentityService, coordinator: uploadPullCoordinator,
+                    contractPreflight: { try await generalPreflight(true) },
+                    receivePreflight: { try await generalPreflight(false) },
+                    makePuller: { snapshot in
+                        SyncV2SnapshotPullService(client: snapshot, stateStore: snapshotStateStore,
+                            localApplier: localSnapshotApplier,
+                            mergeStore: LocalSyncV2SnapshotMergeStore(workspaceLocator: workspaceLocator),
+                            folderApplier: SyncV2RemoteFolderApplier(documentRepository: repository, workspaceLocator: workspaceLocator),
+                            folderDocuments: repository, mutationGate: syncMutationGate,
+                            contractStructureAuthority: uploadPullCoordinator.contractStructureAuthority,
+                            contractContext: { localID, serverID in
+                                let authRevision = authenticationService.contractEpoch?.value ?? 0
+                                let bindingRevision = contractBindingEpoch.value
+                                let state = await authenticationService.currentState()
+                                guard authenticationService.contractEpoch?.value == authRevision,
+                                      contractBindingEpoch.value == bindingRevision, contractBindingEpoch.isAvailable else { return nil }
+                                return SyncV2HandshakeContext.make(authenticationState: state, localProjectID: localID,
+                                    serverProjectID: serverID, authenticationEpoch: authRevision, bindingEpoch: bindingRevision)
+                            })
+                    })
+            }
+        }
+        if let model = environment.generalValidationModel, let makeAdapter = environment.makeGeneralValidationAdapter,
+           let handshakeService, let syncV2Store, case let .configured(configuration) = supabaseClientProvider.configurationState {
+            model.runtime = GeneralValidationRuntime(auth: authenticationService, handshake: handshakeService,
+                identity: deviceIdentityService, configuration: configuration,
+                binding: { try await syncV2Store.binding(for: GeneralValidationPlan.local) },
+                context: {
+                    let authRevision = authenticationService.contractEpoch?.value ?? 0
+                    let bindingRevision = contractBindingEpoch.value
+                    let state = await authenticationService.currentState()
+                    guard authenticationService.contractEpoch?.value == authRevision,
+                          contractBindingEpoch.value == bindingRevision,
+                          let context = SyncV2HandshakeContext.make(authenticationState: state, localProjectID: GeneralValidationPlan.local,
+                            serverProjectID: GeneralValidationPlan.server, authenticationEpoch: authRevision, bindingEpoch: bindingRevision)
+                    else { throw GeneralValidationFailure.denied }
+                    return context
+                },
+                gate: {
+                    let version = ContractPathGate.revision(for: GeneralValidationPlan.local)
+                    let check: @Sendable () throws -> Void = {
+                        guard ContractPathGate.isOpen(for: GeneralValidationPlan.local),
+                              ContractPathGate.revision(for: GeneralValidationPlan.local) == version else { throw GeneralValidationFailure.denied }
+                    }
+                    try check(); return check
+                }, adapter: makeAdapter)
+        }
+        if !GeneralSyncValidationScope.current.restricted,
+           ReceiveValidationPolicy.current.bodyValidationEnabled, let syncV2Store, let snapshotPullService,
+           let snapshot = supabaseClientProvider.makeSnapshotClient(),
+           let commit = supabaseClientProvider.makeSyncV2Client(),
+           let lease = supabaseClientProvider.makeEditLeaseClient(),
+           let handshake = supabaseClientProvider.makeHandshakeTransport() {
+            environment.bodyValidationService = BodyValidationService(store: syncV2Store, documents: repository,
+                local: localDocumentStore, puller: snapshotPullService, snapshot: snapshot, commit: commit,
+                lease: lease, handshake: handshake, auth: authenticationService, identity: deviceIdentityService,
+                coordinator: uploadPullCoordinator, bindingEpoch: contractBindingEpoch)
+        }
+        return environment
     }
 }
 

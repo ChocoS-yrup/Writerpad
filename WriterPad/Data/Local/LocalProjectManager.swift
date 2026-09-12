@@ -153,7 +153,7 @@ private struct ProjectBackupRestorePlan: Equatable {
 }
 
 /// 작품 폴더와 SwiftData 메타데이터 사이의 다단계 작업을 직렬화하고 복구한다.
-actor LocalProjectManager: ProjectManaging {
+actor LocalProjectManager: ProjectManaging, ServerProjectReceiving {
     nonisolated let contractLifecycleEpoch = SyncV2ContractEpoch()
     private static let catalogFileName = ".writerpad-project-catalog.json"
     private static let journalPrefix = ".writerpad-project-transaction-"
@@ -743,6 +743,7 @@ actor LocalProjectManager: ProjectManaging {
     }
 
     func recoverPendingTransactions() async throws {
+        guard ReceiveValidationPolicy.current.sendingAllowed else { return }
         guard fileManager.fileExists(atPath: pathResolver.projectsRootURL.path) else {
             return
         }
@@ -1057,7 +1058,10 @@ actor LocalProjectManager: ProjectManaging {
     }
 
     private func managedProjectsWithoutRecovery() async throws -> [ManagedProject] {
-        let projects = try await projectRepository.projects()
+        let storedProjects = try await projectRepository.projects()
+        // 메타데이터 조회 대기 중 새 수신 journal이 생겨도 공개하지 않는다.
+        let receiving = Set(try receivingJournals().map { $0.project.id })
+        let projects = storedProjects.filter { !receiving.contains($0.id) }
         var catalog = try loadCatalog()
         let validIDs = Set(projects.map(\.id))
         catalog.entries.removeAll { !validIDs.contains($0.projectID) }
@@ -1561,6 +1565,153 @@ actor LocalProjectManager: ProjectManaging {
         throw ProjectManagerError.injectedFailure(
             recoveryPending: faultPlan.leavesTransactionForRecovery
         )
+    }
+}
+
+extension LocalProjectManager {
+    private static var receivingPrefix: String { ".writerpad-server-receive-" }
+    private func receivingURL(_ id: ProjectID) -> URL {
+        pathResolver.projectsRootURL.appendingPathComponent(Self.receivingPrefix + id.rawValue.uuidString.lowercased() + ".json")
+    }
+
+    func receivingJournals() throws -> [ServerReceivingJournal] {
+        guard fileManager.fileExists(atPath: pathResolver.projectsRootURL.path) else { return [] }
+        let urls = try fileManager.contentsOfDirectory(at: pathResolver.projectsRootURL,
+            includingPropertiesForKeys: [.isSymbolicLinkKey]).filter { $0.lastPathComponent.hasPrefix(Self.receivingPrefix) }
+        return try urls.map { url in
+            guard try url.resourceValues(forKeys: [.isSymbolicLinkKey]).isSymbolicLink != true,
+                  let journal = try? JSONDecoder.writerPad.decode(ServerReceivingJournal.self, from: Data(contentsOf: url)),
+                  journal.version == 1, journal.localIdentityPolicy == "server_uuid_for_new_project",
+                  journal.project.id.rawValue == journal.serverProjectID,
+                  url.lastPathComponent == receivingURL(journal.project.id).lastPathComponent,
+                  !journal.endpoint.isEmpty else { throw ServerCatalogError.interrupted }
+            try pathResolver.policy.validateName(journal.project.name)
+            return journal
+        }
+    }
+
+    func isReceiving(_ id: ProjectID) throws -> Bool {
+        try receivingJournals().contains { $0.project.id == id }
+    }
+
+    func receivedOriginMatches(_ id: ProjectID, scope: ServerCatalogScope) async throws -> Bool {
+        guard let project = try await projectRepository.project(id: id) else { return false }
+        let paths = try pathResolver.standardPaths(forProjectNamed: project.name)
+        let ownerURL = paths.projectContainerURL.appendingPathComponent(".writerpad-server-receive-owner.json")
+        // 기존 수동 binding에는 수신 표식이 없다. 그 ID나 연결을 소급 수정하지 않는다.
+        guard fileManager.fileExists(atPath: ownerURL.path) else { return true }
+        guard try paths.projectContainerURL.resourceValues(forKeys: [.isSymbolicLinkKey]).isSymbolicLink != true,
+              try ownerURL.resourceValues(forKeys: [.isSymbolicLinkKey]).isSymbolicLink != true,
+              let origin = try? JSONDecoder.writerPad.decode(ServerReceivingJournal.self, from: Data(contentsOf: ownerURL)) else {
+            return false
+        }
+        return origin.version == 1 && origin.localIdentityPolicy == "server_uuid_for_new_project"
+            && origin.project.id == id && origin.serverProjectID == id.rawValue
+            && origin.accountID == scope.accountID && origin.endpoint == scope.endpoint
+    }
+
+    func beginReceiving(_ server: ServerCatalogProject, localName: String,
+                        scope: ServerCatalogScope) async throws -> ServerReceivingJournal {
+        try ReceiveValidationPolicy.current.requireRead(account: scope.accountID, endpoint: scope.endpoint, project: server.id)
+        try await recoverPendingTransactions()
+        let journals = try receivingJournals()
+        let journal: ServerReceivingJournal
+        if let existing = journals.first(where: { $0.serverProjectID == server.id }) {
+            guard existing.accountID == scope.accountID, existing.endpoint == scope.endpoint,
+                  existing.project.name == localName else { throw ServerCatalogError.bindingConflict }
+            journal = existing
+        } else {
+            try pathResolver.policy.validateName(localName)
+            try ReceiveValidationPolicy.current.mutate { try ensureProjectsRootExists() }
+            let all = try await projectRepository.projects()
+            guard !all.contains(where: { $0.id.rawValue == server.id }),
+                  !all.contains(where: { pathResolver.policy.collisionKey(for: $0.name) == pathResolver.policy.collisionKey(for: localName) }),
+                  !journals.contains(where: { pathResolver.policy.collisionKey(for: $0.project.name) == pathResolver.policy.collisionKey(for: localName) }) else {
+                throw ServerCatalogError.bindingConflict
+            }
+            try validateFilesystemNameIsAvailable(localName, excluding: nil)
+            // journal의 ISO-8601 정밀도와 저장 메타데이터를 동일하게 고정한다.
+            let now = Date(timeIntervalSince1970: floor(clock.now().timeIntervalSince1970))
+            journal = ServerReceivingJournal(version: 1, localIdentityPolicy: "server_uuid_for_new_project", transactionID: UUID(),
+                project: Project(id: ProjectID(rawValue: server.id), name: localName, createdAt: now, modifiedAt: now),
+                serverProjectID: server.id, accountID: scope.accountID, endpoint: scope.endpoint)
+            // 디스크와 메타데이터보다 먼저 목적 UUID를 고정한다. 재개 중 새 ID를 만들지 않는다.
+            try ReceiveValidationPolicy.current.requireRead(account: scope.accountID, endpoint: scope.endpoint, project: server.id)
+            try ReceiveValidationPolicy.current.mutate { try writeAtomically(journal, to: receivingURL(journal.project.id)) }
+        }
+        let paths = try pathResolver.standardPaths(forProjectNamed: journal.project.name)
+        let ownerURL = paths.projectContainerURL.appendingPathComponent(".writerpad-server-receive-owner.json")
+        if fileManager.fileExists(atPath: paths.projectContainerURL.path) {
+            guard try paths.projectContainerURL.resourceValues(forKeys: [.isSymbolicLinkKey]).isSymbolicLink != true else {
+                throw ServerCatalogError.interrupted
+            }
+            if !fileManager.fileExists(atPath: ownerURL.path) {
+                // journal 직후 빈 디렉터리 생성 중 중단된 경우만 소유 표식을 복구한다.
+                guard try fileManager.contentsOfDirectory(atPath: paths.projectContainerURL.path).isEmpty else {
+                    throw ServerCatalogError.interrupted
+                }
+                try ReceiveValidationPolicy.current.mutate { try writeAtomically(journal, to: ownerURL) }
+            }
+        } else {
+            try ReceiveValidationPolicy.current.mutate { try fileManager.createDirectory(at: paths.projectContainerURL, withIntermediateDirectories: false) }
+            try ReceiveValidationPolicy.current.mutate { try writeAtomically(journal, to: ownerURL) }
+        }
+        guard try ownerURL.resourceValues(forKeys: [.isSymbolicLinkKey]).isSymbolicLink != true,
+              try JSONDecoder.writerPad.decode(ServerReceivingJournal.self, from: Data(contentsOf: ownerURL)) == journal else {
+            throw ServerCatalogError.interrupted
+        }
+        // 일반 신규 생성의 임의 UUID 표준 폴더를 만들지 않는다.
+        if fileManager.fileExists(atPath: paths.workspaceRootURL.path) {
+            guard try paths.workspaceRootURL.resourceValues(forKeys: [.isSymbolicLinkKey]).isSymbolicLink != true else {
+                throw ServerCatalogError.interrupted
+            }
+        }
+        try ReceiveValidationPolicy.current.mutate { try fileManager.createDirectory(at: paths.workspaceRootURL, withIntermediateDirectories: true) }
+        if let existing = try await projectRepository.project(id: journal.project.id) {
+            guard existing == journal.project else { throw ServerCatalogError.interrupted }
+        } else {
+            try ReceiveValidationPolicy.current.requireRead(account: scope.accountID, endpoint: scope.endpoint, project: server.id)
+            try await creationMetadataStore.saveProjectCreation(journal.project, standardNodes: [])
+        }
+        return journal
+    }
+
+    func validateReceiving(_ journal: ServerReceivingJournal) async throws {
+        guard try receivingJournals().contains(journal),
+              try await projectRepository.project(id: journal.project.id) == journal.project else {
+            throw ServerCatalogError.interrupted
+        }
+        let paths = try pathResolver.standardPaths(forProjectNamed: journal.project.name)
+        let ownerURL = paths.projectContainerURL.appendingPathComponent(".writerpad-server-receive-owner.json")
+        guard try paths.projectContainerURL.resourceValues(forKeys: [.isSymbolicLinkKey]).isSymbolicLink != true,
+              try paths.workspaceRootURL.resourceValues(forKeys: [.isSymbolicLinkKey]).isSymbolicLink != true,
+              try ownerURL.resourceValues(forKeys: [.isSymbolicLinkKey]).isSymbolicLink != true,
+              try JSONDecoder.writerPad.decode(ServerReceivingJournal.self, from: Data(contentsOf: ownerURL)) == journal else {
+            throw ServerCatalogError.interrupted
+        }
+    }
+
+    func finishReceiving(_ journal: ServerReceivingJournal,
+                         authorized: @Sendable () -> Bool) async throws -> ManagedProject {
+        try await validateReceiving(journal)
+        await ReceiveValidationPolicy.beforeMutation("receiver.publish")
+        var catalog = try loadCatalog()
+        appendCatalogEntryIfNeeded(for: journal.project.id, to: &catalog)
+        if ReceiveValidationPolicy.current.enabled {
+            guard authorized() else { throw ServerCatalogError.staleContext }
+            return try ReceiveValidationPolicy.current.publish(journal) {
+                try saveCatalog(catalog)
+                try fileManager.removeItem(at: receivingURL(journal.project.id))
+                let entry = catalog.entries.first { $0.projectID == journal.project.id }!
+                return ManagedProject(project: journal.project, userOrder: entry.userOrder, lifecycleState: .active)
+            }
+        }
+        try saveCatalog(catalog)
+        guard authorized() else { throw ServerCatalogError.staleContext }
+        // 마지막 journal 제거가 공개 시점이다. 그 전 실패는 항상 중단 상태로 남는다.
+        try fileManager.removeItem(at: receivingURL(journal.project.id))
+        let entry = catalog.entries.first { $0.projectID == journal.project.id }!
+        return ManagedProject(project: journal.project, userOrder: entry.userOrder, lifecycleState: .active)
     }
 }
 

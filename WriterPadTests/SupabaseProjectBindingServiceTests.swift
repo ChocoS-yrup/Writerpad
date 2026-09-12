@@ -862,3 +862,29 @@ private actor EnsureProjectTransportStub: EnsureProjectTransporting {
         parameters.count
     }
 }
+
+
+extension SupabaseProjectBindingServiceTests {
+    func testReceiveGuardBindingLookupDoesNotEnqueueInitialSnapshotOrEnsure() async throws {
+        let project = makeProject(id: "00000000-0000-4000-8000-000000000499", name: "합성 기존 연결")
+        let recorder = InitialSyncRecorderSpy()
+        let fixture = makeFixture(projects: [project], initialSyncRecorder: recorder)
+        let binding = ProjectSyncBinding.connected(localProjectID: project.id, serverProjectID: UUID(),
+            kind: .newServerProject, projectName: project.name, ownerSubject: fixture.userID)
+        try await fixture.store.save(binding)
+        let policy = ReceiveValidationPolicy(enabled: true, configuration: nil)
+        await ReceiveValidationPolicy.$override.withValue(policy) {
+            let current = await fixture.service.currentBinding(for: project.id)
+            let all = await fixture.service.connectedBindings()
+            XCTAssertEqual(current, binding)
+            XCTAssertEqual(all, [binding])
+            _ = await fixture.service.createServerProject(for: project.id)
+        }
+        let requests = await fixture.transport.receivedParameters()
+        let calls = await recorder.calls()
+        let after = await fixture.store.binding(for: project.id)
+        XCTAssertTrue(requests.isEmpty)
+        XCTAssertTrue(calls.isEmpty)
+        XCTAssertEqual(after, binding)
+    }
+}

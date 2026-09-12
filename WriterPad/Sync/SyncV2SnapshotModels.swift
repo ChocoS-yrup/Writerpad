@@ -12,6 +12,9 @@ struct SyncV2RemoteDocumentManifestEntry: Codable, Equatable, Sendable {
     let documentID: UUID
     let relativePath: String
     let revision: Int64
+    let parentFolderID: UUID?
+    let name: String?
+    let structureRevision: Int64?
     let isDeleted: Bool
     let deletedAt: Date?
     let updatedAt: Date
@@ -20,6 +23,9 @@ struct SyncV2RemoteDocumentManifestEntry: Codable, Equatable, Sendable {
         case documentID = "document_id"
         case relativePath = "relative_path"
         case revision
+        case parentFolderID = "parent_folder_id"
+        case name
+        case structureRevision = "structure_revision"
         case isDeleted = "is_deleted"
         case deletedAt = "deleted_at"
         case updatedAt = "updated_at"
@@ -31,11 +37,17 @@ struct SyncV2RemoteDocumentManifestEntry: Codable, Equatable, Sendable {
         revision: Int64,
         isDeleted: Bool,
         deletedAt: Date?,
-        updatedAt: Date
+        updatedAt: Date,
+        parentFolderID: UUID? = nil,
+        name: String? = nil,
+        structureRevision: Int64? = nil
     ) {
         self.documentID = documentID
         self.relativePath = relativePath
         self.revision = revision
+        self.parentFolderID = parentFolderID
+        self.name = name
+        self.structureRevision = structureRevision
         self.isDeleted = isDeleted
         self.deletedAt = deletedAt
         self.updatedAt = updatedAt
@@ -48,6 +60,9 @@ struct SyncV2RemoteDocumentManifestEntry: Codable, Equatable, Sendable {
             && revision == snapshot.revision
             && relativePath == snapshot.relativePath
             && isDeleted == snapshot.isDeleted
+            && parentFolderID == snapshot.parentFolderID
+            && name == snapshot.name
+            && structureRevision == snapshot.structureRevision
     }
 }
 
@@ -59,7 +74,8 @@ extension SyncV2RemoteDocumentSnapshot {
             revision: revision,
             isDeleted: isDeleted,
             deletedAt: deletedAt,
-            updatedAt: updatedAt
+            updatedAt: updatedAt,
+            parentFolderID: parentFolderID, name: name, structureRevision: structureRevision
         )
     }
 }
@@ -69,6 +85,9 @@ struct SyncV2RemoteDocumentSnapshot: Codable, Equatable, Sendable {
     let relativePath: String
     let content: String
     let revision: Int64
+    let parentFolderID: UUID?
+    let name: String?
+    let structureRevision: Int64?
     let isDeleted: Bool
     let deletedAt: Date?
     let updatedAt: Date
@@ -78,6 +97,9 @@ struct SyncV2RemoteDocumentSnapshot: Codable, Equatable, Sendable {
         case relativePath = "relative_path"
         case content
         case revision
+        case parentFolderID = "parent_folder_id"
+        case name
+        case structureRevision = "structure_revision"
         case isDeleted = "is_deleted"
         case deletedAt = "deleted_at"
         case updatedAt = "updated_at"
@@ -90,12 +112,18 @@ struct SyncV2RemoteDocumentSnapshot: Codable, Equatable, Sendable {
         revision: Int64,
         isDeleted: Bool,
         deletedAt: Date?,
-        updatedAt: Date
+        updatedAt: Date,
+        parentFolderID: UUID? = nil,
+        name: String? = nil,
+        structureRevision: Int64? = nil
     ) {
         self.documentID = documentID
         self.relativePath = relativePath
         self.content = content
         self.revision = revision
+        self.parentFolderID = parentFolderID
+        self.name = name
+        self.structureRevision = structureRevision
         self.isDeleted = isDeleted
         self.deletedAt = deletedAt
         self.updatedAt = updatedAt
@@ -107,6 +135,9 @@ struct SyncV2RemoteDocumentSnapshot: Codable, Equatable, Sendable {
         relativePath = try values.decode(String.self, forKey: .relativePath)
         content = try values.decode(String.self, forKey: .content)
         revision = try values.decode(Int64.self, forKey: .revision)
+        parentFolderID = try values.decodeIfPresent(UUID.self, forKey: .parentFolderID)
+        name = try values.decodeIfPresent(String.self, forKey: .name)
+        structureRevision = try values.decodeIfPresent(Int64.self, forKey: .structureRevision)
         isDeleted = try values.decode(Bool.self, forKey: .isDeleted)
         deletedAt = try Self.decodeOptionalDate(
             values,
@@ -121,6 +152,9 @@ struct SyncV2RemoteDocumentSnapshot: Codable, Equatable, Sendable {
         try values.encode(relativePath, forKey: .relativePath)
         try values.encode(content, forKey: .content)
         try values.encode(revision, forKey: .revision)
+        try values.encodeIfPresent(parentFolderID, forKey: .parentFolderID)
+        try values.encodeIfPresent(name, forKey: .name)
+        try values.encodeIfPresent(structureRevision, forKey: .structureRevision)
         try values.encode(isDeleted, forKey: .isDeleted)
         try values.encode(
             deletedAt.map(Self.encodeDate),

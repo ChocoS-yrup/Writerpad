@@ -7,6 +7,15 @@
 	objects = {
 
 /* Begin PBXBuildFile section */
+		910820D2CCDD43C1B145B48A /* BodyValidationServiceTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 6149B499E2044377A6FB9123 /* BodyValidationServiceTests.swift */; };
+		21808931C4834475911BFBC7 /* BodyValidationService.swift in Sources */ = {isa = PBXBuildFile; fileRef = FA15C99D063642E0AE8C73F9 /* BodyValidationService.swift */; };
+		AA1100000000000000000003 /* ReceiveValidationPolicyTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = AA1100000000000000000004; };
+		AA1100000000000000000001 /* ReceiveValidationPolicy.swift in Sources */ = {isa = PBXBuildFile; fileRef = AA1100000000000000000002; };
+		AB1200000000000000000001 /* GeneralSyncValidationScope.swift in Sources */ = {isa = PBXBuildFile; fileRef = AB1200000000000000000002; };
+		AC1300000000000000000001 /* GeneralValidationExecution.swift in Sources */ = {isa = PBXBuildFile; fileRef = AC1300000000000000000002; };
+		AD1400000000000000000001 /* GeneralValidationScreen.swift in Sources */ = {isa = PBXBuildFile; fileRef = AD1400000000000000000002; };
+		AE1500000000000000000001 /* GeneralValidationStageService.swift in Sources */ = {isa = PBXBuildFile; fileRef = AE1500000000000000000002; };
+		AF1600000000000000000001 /* GeneralValidationProductAdapter.swift in Sources */ = {isa = PBXBuildFile; fileRef = AF1600000000000000000002; };
 		A10000000000000000000001 /* WriterPadApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = B10000000000000000000001 /* WriterPadApp.swift */; };
 		A10000000000000000000002 /* AppEnvironment.swift in Sources */ = {isa = PBXBuildFile; fileRef = B10000000000000000000002 /* AppEnvironment.swift */; };
 		A10000000000000000000003 /* BootstrapRecord.swift in Sources */ = {isa = PBXBuildFile; fileRef = B10000000000000000000003 /* BootstrapRecord.swift */; };
@@ -95,6 +104,7 @@
 		A10000000000000000000055 /* WorkspaceStorageCoordinator.swift in Sources */ = {isa = PBXBuildFile; fileRef = B10000000000000000000059 /* WorkspaceStorageCoordinator.swift */; };
 		A10000000000000000000056 /* WriterPadTheme.swift in Sources */ = {isa = PBXBuildFile; fileRef = B1000000000000000000005A /* WriterPadTheme.swift */; };
 		A10000000000000000000057 /* ProjectWorkspaceView.swift in Sources */ = {isa = PBXBuildFile; fileRef = B1000000000000000000005B /* ProjectWorkspaceView.swift */; };
+		B60D0D2047F042C6809DD755 /* ServerProjectCatalogView.swift in Sources */ = {isa = PBXBuildFile; fileRef = E9E12880BB5B44E69F3231D3 /* ServerProjectCatalogView.swift */; };
 		A10000000000000000000058 /* NewProjectAlertPresenter.swift in Sources */ = {isa = PBXBuildFile; fileRef = B1000000000000000000005C /* NewProjectAlertPresenter.swift */; };
 		A10000000000000000000059 /* WorkspaceLayoutSupport.swift in Sources */ = {isa = PBXBuildFile; fileRef = B1000000000000000000005D /* WorkspaceLayoutSupport.swift */; };
 		A1000000000000000000005A /* ImportReportView.swift in Sources */ = {isa = PBXBuildFile; fileRef = B1000000000000000000005E /* ImportReportView.swift */; };
@@ -115,12 +125,16 @@
 		A90000000000000000000008 /* DeviceIdentityService.swift in Sources */ = {isa = PBXBuildFile; fileRef = B9000000000000000000000C /* DeviceIdentityService.swift */; };
 		A90000000000000000000009 /* DeviceIdentityServiceTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = B9000000000000000000000D /* DeviceIdentityServiceTests.swift */; };
 		A9000000000000000000000A /* SupabaseProjectBindingService.swift in Sources */ = {isa = PBXBuildFile; fileRef = B9000000000000000000000E /* SupabaseProjectBindingService.swift */; };
+		F0762D30B42A4D60B20C05CC /* ServerProjectCatalog.swift in Sources */ = {isa = PBXBuildFile; fileRef = 99FE0000630044F3840CC995 /* ServerProjectCatalog.swift */; };
 		A9000000000000000000000B /* SupabaseProjectBindingServiceTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = B9000000000000000000000F /* SupabaseProjectBindingServiceTests.swift */; };
+		BB63450BDAA24B159C3BD875 /* ServerProjectCatalogTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = E263868E1CDE46E8B8FD5F19 /* ServerProjectCatalogTests.swift */; };
 		A9000000000000000000000C /* SyncV2Store.swift in Sources */ = {isa = PBXBuildFile; fileRef = B90000000000000000000010 /* SyncV2Store.swift */; };
 		A9000000000000000000000D /* SyncV2StoreTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = B90000000000000000000011 /* SyncV2StoreTests.swift */; };
 		A96000000000000000000001 /* SyncV2Contract.swift in Sources */ = {isa = PBXBuildFile; fileRef = B96000000000000000000001 /* SyncV2Contract.swift */; };
 		A96000000000000000000008 /* SyncV2Handshake.swift in Sources */ = {isa = PBXBuildFile; fileRef = B96000000000000000000008 /* SyncV2Handshake.swift */; };
 		A96000000000000000000012 /* SyncV2ContractStructure.swift in Sources */ = {isa = PBXBuildFile; fileRef = B96000000000000000000012 /* SyncV2ContractStructure.swift */; };
+		A9A100000000000000000001 /* SyncV2ContractPreparation.swift in Sources */ = {isa = PBXBuildFile; fileRef = B9A100000000000000000001 /* SyncV2ContractPreparation.swift */; };
+		A9A200000000000000000001 /* SyncV2GeneralRecovery.swift in Sources */ = {isa = PBXBuildFile; fileRef = B9A200000000000000000001 /* SyncV2GeneralRecovery.swift */; };
 		A96000000000000000000007 /* SyncV2UnicodeCasefold.swift in Sources */ = {isa = PBXBuildFile; fileRef = B96000000000000000000007 /* SyncV2UnicodeCasefold.swift */; };
 		A96000000000000000000002 /* SyncV2ContractTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = B96000000000000000000002 /* SyncV2ContractTests.swift */; };
 		A96000000000000000000009 /* SyncV2HandshakeTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = B96000000000000000000009 /* SyncV2HandshakeTests.swift */; };
@@ -143,10 +157,17 @@
 		A98000000000000000000008 /* SyncV2StoreSchemaV8.sql in Resources */ = {isa = PBXBuildFile; fileRef = B98000000000000000000008 /* SyncV2StoreSchemaV8.sql */; };
 		A98000000000000000000009 /* SyncV2StoreSchemaV9.sql in Resources */ = {isa = PBXBuildFile; fileRef = B98000000000000000000009 /* SyncV2StoreSchemaV9.sql */; };
 		A9800000000000000000000A /* SyncV2StoreSchemaV10.sql in Resources */ = {isa = PBXBuildFile; fileRef = B9800000000000000000000A /* SyncV2StoreSchemaV10.sql */; };
+		A9800000000000000000000B /* SyncV2StoreSchemaV11.sql in Resources */ = {isa = PBXBuildFile; fileRef = B9800000000000000000000B /* SyncV2StoreSchemaV11.sql */; };
+		A9800000000000000000000C /* SyncV2StoreSchemaV12.sql in Resources */ = {isa = PBXBuildFile; fileRef = B9800000000000000000000C /* SyncV2StoreSchemaV12.sql */; };
+		A9800000000000000000000D /* SyncV2StoreSchemaV13.sql in Resources */ = {isa = PBXBuildFile; fileRef = B9800000000000000000000D /* SyncV2StoreSchemaV13.sql */; };
+		A9800000000000000000000E /* SyncV2StoreSchemaV14.sql in Resources */ = {isa = PBXBuildFile; fileRef = B9800000000000000000000E /* SyncV2StoreSchemaV14.sql */; };
+		A9800000000000000000000F /* SyncV2StoreSchemaV15.sql in Resources */ = {isa = PBXBuildFile; fileRef = B9800000000000000000000F /* SyncV2StoreSchemaV15.sql */; };
+		A98000000000000000000010 /* SyncV2StoreSchemaV16.sql in Resources */ = {isa = PBXBuildFile; fileRef = B98000000000000000000010 /* SyncV2StoreSchemaV16.sql */; };
 		A9000000000000000000000F /* SyncV2Client.swift in Sources */ = {isa = PBXBuildFile; fileRef = B90000000000000000000013 /* SyncV2Client.swift */; };
 		A90000000000000000000010 /* SyncV2ClientTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = B90000000000000000000014 /* SyncV2ClientTests.swift */; };
 		A90000000000000000000011 /* SyncV2Dispatcher.swift in Sources */ = {isa = PBXBuildFile; fileRef = B90000000000000000000015 /* SyncV2Dispatcher.swift */; };
 		A90000000000000000000012 /* SyncSettingsView.swift in Sources */ = {isa = PBXBuildFile; fileRef = B90000000000000000000016 /* SyncSettingsView.swift */; };
+		A9A200000000000000000002 /* GeneralSyncRecoveryView.swift in Sources */ = {isa = PBXBuildFile; fileRef = B9A200000000000000000002 /* GeneralSyncRecoveryView.swift */; };
 		A90000000000000000000014 /* EditLeaseManager.swift in Sources */ = {isa = PBXBuildFile; fileRef = B90000000000000000000018 /* EditLeaseManager.swift */; };
 		A90000000000000000000013 /* SyncSettingsModelTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = B90000000000000000000017 /* SyncSettingsModelTests.swift */; };
 		A90000000000000000000015 /* SyncV2SnapshotPull.swift in Sources */ = {isa = PBXBuildFile; fileRef = B90000000000000000000019 /* SyncV2SnapshotPull.swift */; };
@@ -189,6 +210,15 @@
 /* End PBXContainerItemProxy section */
 
 /* Begin PBXFileReference section */
+		6149B499E2044377A6FB9123 /* BodyValidationServiceTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BodyValidationServiceTests.swift; sourceTree = "<group>"; };
+		FA15C99D063642E0AE8C73F9 /* BodyValidationService.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BodyValidationService.swift; sourceTree = "<group>"; };
+		AA1100000000000000000004 /* ReceiveValidationPolicyTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ReceiveValidationPolicyTests.swift; sourceTree = "<group>"; };
+		AA1100000000000000000002 /* ReceiveValidationPolicy.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ReceiveValidationPolicy.swift; sourceTree = "<group>"; };
+		AB1200000000000000000002 /* GeneralSyncValidationScope.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = GeneralSyncValidationScope.swift; sourceTree = "<group>"; };
+		AC1300000000000000000002 /* GeneralValidationExecution.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = GeneralValidationExecution.swift; sourceTree = "<group>"; };
+		AD1400000000000000000002 /* GeneralValidationScreen.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = GeneralValidationScreen.swift; sourceTree = "<group>"; };
+		AE1500000000000000000002 /* GeneralValidationStageService.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = GeneralValidationStageService.swift; sourceTree = "<group>"; };
+		AF1600000000000000000002 /* GeneralValidationProductAdapter.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = GeneralValidationProductAdapter.swift; sourceTree = "<group>"; };
 		B10000000000000000000001 /* WriterPadApp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WriterPadApp.swift; sourceTree = "<group>"; };
 		B10000000000000000000002 /* AppEnvironment.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppEnvironment.swift; sourceTree = "<group>"; };
 		B10000000000000000000003 /* BootstrapRecord.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BootstrapRecord.swift; sourceTree = "<group>"; };
@@ -285,6 +315,7 @@
 		B10000000000000000000059 /* WorkspaceStorageCoordinator.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WorkspaceStorageCoordinator.swift; sourceTree = "<group>"; };
 		B1000000000000000000005A /* WriterPadTheme.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WriterPadTheme.swift; sourceTree = "<group>"; };
 		B1000000000000000000005B /* ProjectWorkspaceView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ProjectWorkspaceView.swift; sourceTree = "<group>"; };
+		E9E12880BB5B44E69F3231D3 /* ServerProjectCatalogView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ServerProjectCatalogView.swift; sourceTree = "<group>"; };
 		B1000000000000000000005C /* NewProjectAlertPresenter.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NewProjectAlertPresenter.swift; sourceTree = "<group>"; };
 		B1000000000000000000005D /* WorkspaceLayoutSupport.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WorkspaceLayoutSupport.swift; sourceTree = "<group>"; };
 		B1000000000000000000005E /* ImportReportView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ImportReportView.swift; sourceTree = "<group>"; };
@@ -306,12 +337,16 @@
 		B9000000000000000000000C /* DeviceIdentityService.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DeviceIdentityService.swift; sourceTree = "<group>"; };
 		B9000000000000000000000D /* DeviceIdentityServiceTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DeviceIdentityServiceTests.swift; sourceTree = "<group>"; };
 		B9000000000000000000000E /* SupabaseProjectBindingService.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SupabaseProjectBindingService.swift; sourceTree = "<group>"; };
+		99FE0000630044F3840CC995 /* ServerProjectCatalog.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ServerProjectCatalog.swift; sourceTree = "<group>"; };
 		B9000000000000000000000F /* SupabaseProjectBindingServiceTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SupabaseProjectBindingServiceTests.swift; sourceTree = "<group>"; };
+		E263868E1CDE46E8B8FD5F19 /* ServerProjectCatalogTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ServerProjectCatalogTests.swift; sourceTree = "<group>"; };
 		B90000000000000000000010 /* SyncV2Store.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SyncV2Store.swift; sourceTree = "<group>"; };
 		B90000000000000000000011 /* SyncV2StoreTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SyncV2StoreTests.swift; sourceTree = "<group>"; };
 		B96000000000000000000001 /* SyncV2Contract.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SyncV2Contract.swift; sourceTree = "<group>"; };
 		B96000000000000000000008 /* SyncV2Handshake.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SyncV2Handshake.swift; sourceTree = "<group>"; };
 		B96000000000000000000012 /* SyncV2ContractStructure.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SyncV2ContractStructure.swift; sourceTree = "<group>"; };
+		B9A100000000000000000001 /* SyncV2ContractPreparation.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SyncV2ContractPreparation.swift; sourceTree = "<group>"; };
+		B9A200000000000000000001 /* SyncV2GeneralRecovery.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SyncV2GeneralRecovery.swift; sourceTree = "<group>"; };
 		B96000000000000000000007 /* SyncV2UnicodeCasefold.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SyncV2UnicodeCasefold.swift; sourceTree = "<group>"; };
 		B96000000000000000000002 /* SyncV2ContractTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SyncV2ContractTests.swift; sourceTree = "<group>"; };
 		B96000000000000000000009 /* SyncV2HandshakeTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SyncV2HandshakeTests.swift; sourceTree = "<group>"; };
@@ -334,6 +369,12 @@
 		B98000000000000000000008 /* SyncV2StoreSchemaV8.sql */ = {isa = PBXFileReference; lastKnownFileType = text; path = Scripts/fixtures/SyncV2StoreSchemaV8.sql; sourceTree = SOURCE_ROOT; };
 		B98000000000000000000009 /* SyncV2StoreSchemaV9.sql */ = {isa = PBXFileReference; lastKnownFileType = text; path = Scripts/fixtures/SyncV2StoreSchemaV9.sql; sourceTree = SOURCE_ROOT; };
 		B9800000000000000000000A /* SyncV2StoreSchemaV10.sql */ = {isa = PBXFileReference; lastKnownFileType = text; path = Scripts/fixtures/SyncV2StoreSchemaV10.sql; sourceTree = SOURCE_ROOT; };
+		B9800000000000000000000B /* SyncV2StoreSchemaV11.sql */ = {isa = PBXFileReference; lastKnownFileType = text; path = Scripts/fixtures/SyncV2StoreSchemaV11.sql; sourceTree = SOURCE_ROOT; };
+		B9800000000000000000000C /* SyncV2StoreSchemaV12.sql */ = {isa = PBXFileReference; lastKnownFileType = text; path = Scripts/fixtures/SyncV2StoreSchemaV12.sql; sourceTree = SOURCE_ROOT; };
+		B9800000000000000000000D /* SyncV2StoreSchemaV13.sql */ = {isa = PBXFileReference; lastKnownFileType = text; path = Scripts/fixtures/SyncV2StoreSchemaV13.sql; sourceTree = SOURCE_ROOT; };
+		B9800000000000000000000E /* SyncV2StoreSchemaV14.sql */ = {isa = PBXFileReference; lastKnownFileType = text; path = Scripts/fixtures/SyncV2StoreSchemaV14.sql; sourceTree = SOURCE_ROOT; };
+		B9800000000000000000000F /* SyncV2StoreSchemaV15.sql */ = {isa = PBXFileReference; lastKnownFileType = text; path = Scripts/fixtures/SyncV2StoreSchemaV15.sql; sourceTree = SOURCE_ROOT; };
+		B98000000000000000000010 /* SyncV2StoreSchemaV16.sql */ = {isa = PBXFileReference; lastKnownFileType = text; path = Scripts/fixtures/SyncV2StoreSchemaV16.sql; sourceTree = SOURCE_ROOT; };
 		B90000000000000000000013 /* SyncV2Client.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SyncV2Client.swift; sourceTree = "<group>"; };
 		B90000000000000000000014 /* SyncV2ClientTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SyncV2ClientTests.swift; sourceTree = "<group>"; };
 		B90000000000000000000015 /* SyncV2Dispatcher.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SyncV2Dispatcher.swift; sourceTree = "<group>"; };
@@ -355,6 +396,7 @@
 		B94000000000000000000008 /* WorkspaceSyncStatusPresentation.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WorkspaceSyncStatusPresentation.swift; sourceTree = "<group>"; };
 		B95000000000000000000001 /* SyncV2Timing.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SyncV2Timing.swift; sourceTree = "<group>"; };
 		B90000000000000000000016 /* SyncSettingsView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SyncSettingsView.swift; sourceTree = "<group>"; };
+		B9A200000000000000000002 /* GeneralSyncRecoveryView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = GeneralSyncRecoveryView.swift; sourceTree = "<group>"; };
 		B90000000000000000000018 /* EditLeaseManager.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = EditLeaseManager.swift; sourceTree = "<group>"; };
 		B90000000000000000000017 /* SyncSettingsModelTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SyncSettingsModelTests.swift; sourceTree = "<group>"; };
 		B92000000000000000000001 /* ThreeWayMerge.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ThreeWayMerge.swift; sourceTree = "<group>"; };
@@ -405,6 +447,12 @@
 				B98000000000000000000008 /* SyncV2StoreSchemaV8.sql */,
 				B98000000000000000000009 /* SyncV2StoreSchemaV9.sql */,
 				B9800000000000000000000A /* SyncV2StoreSchemaV10.sql */,
+				B9800000000000000000000B /* SyncV2StoreSchemaV11.sql */,
+				B9800000000000000000000C /* SyncV2StoreSchemaV12.sql */,
+				B9800000000000000000000D /* SyncV2StoreSchemaV13.sql */,
+				B9800000000000000000000E /* SyncV2StoreSchemaV14.sql */,
+				B9800000000000000000000F /* SyncV2StoreSchemaV15.sql */,
+				B98000000000000000000010 /* SyncV2StoreSchemaV16.sql */,
 				G10000000000000000000013 /* Products */,
 			);
 			sourceTree = "<group>";
@@ -492,9 +540,19 @@
 				B9000000000000000000000A /* SupabaseAuthService.swift */,
 				B9000000000000000000000C /* DeviceIdentityService.swift */,
 				B9000000000000000000000E /* SupabaseProjectBindingService.swift */,
+				99FE0000630044F3840CC995 /* ServerProjectCatalog.swift */,
+				AA1100000000000000000002 /* ReceiveValidationPolicy.swift */,
+				AB1200000000000000000002 /* GeneralSyncValidationScope.swift */,
+				AC1300000000000000000002 /* GeneralValidationExecution.swift */,
+				AD1400000000000000000002 /* GeneralValidationScreen.swift */,
+				AE1500000000000000000002 /* GeneralValidationStageService.swift */,
+				AF1600000000000000000002 /* GeneralValidationProductAdapter.swift */,
+				FA15C99D063642E0AE8C73F9 /* BodyValidationService.swift */,
 				B96000000000000000000001 /* SyncV2Contract.swift */,
 				B96000000000000000000008 /* SyncV2Handshake.swift */,
 				B96000000000000000000012 /* SyncV2ContractStructure.swift */,
+				B9A100000000000000000001 /* SyncV2ContractPreparation.swift */,
+				B9A200000000000000000001 /* SyncV2GeneralRecovery.swift */,
 				B96000000000000000000007 /* SyncV2UnicodeCasefold.swift */,
 				B90000000000000000000010 /* SyncV2Store.swift */,
 				B90000000000000000000013 /* SyncV2Client.swift */,
@@ -559,6 +617,9 @@
 				B9000000000000000000000B /* SupabaseAuthServiceTests.swift */,
 				B9000000000000000000000D /* DeviceIdentityServiceTests.swift */,
 				B9000000000000000000000F /* SupabaseProjectBindingServiceTests.swift */,
+				E263868E1CDE46E8B8FD5F19 /* ServerProjectCatalogTests.swift */,
+				AA1100000000000000000004 /* ReceiveValidationPolicyTests.swift */,
+				6149B499E2044377A6FB9123 /* BodyValidationServiceTests.swift */,
 				B96000000000000000000002 /* SyncV2ContractTests.swift */,
 				B96000000000000000000009 /* SyncV2HandshakeTests.swift */,
 				B96000000000000000000003 /* SyncV2TransitionVector.swift */,
@@ -719,6 +780,7 @@
 			children = (
 				B10000000000000000000007 /* RootView.swift */,
 				B1000000000000000000005B /* ProjectWorkspaceView.swift */,
+				E9E12880BB5B44E69F3231D3 /* ServerProjectCatalogView.swift */,
 				B1000000000000000000005C /* NewProjectAlertPresenter.swift */,
 				B1000000000000000000005D /* WorkspaceLayoutSupport.swift */,
 				B1000000000000000000005E /* ImportReportView.swift */,
@@ -777,6 +839,7 @@
 			children = (
 				B10000000000000000000049 /* AppearanceSettingsView.swift */,
 				B90000000000000000000016 /* SyncSettingsView.swift */,
+				B9A200000000000000000002 /* GeneralSyncRecoveryView.swift */,
 			);
 			path = Settings;
 			sourceTree = "<group>";
@@ -902,6 +965,12 @@
 				A98000000000000000000008 /* SyncV2StoreSchemaV8.sql in Resources */,
 				A98000000000000000000009 /* SyncV2StoreSchemaV9.sql in Resources */,
 				A9800000000000000000000A /* SyncV2StoreSchemaV10.sql in Resources */,
+				A9800000000000000000000B /* SyncV2StoreSchemaV11.sql in Resources */,
+				A9800000000000000000000C /* SyncV2StoreSchemaV12.sql in Resources */,
+				A9800000000000000000000D /* SyncV2StoreSchemaV13.sql in Resources */,
+				A9800000000000000000000E /* SyncV2StoreSchemaV14.sql in Resources */,
+				A9800000000000000000000F /* SyncV2StoreSchemaV15.sql in Resources */,
+				A98000000000000000000010 /* SyncV2StoreSchemaV16.sql in Resources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -936,6 +1005,7 @@
 				A10000000000000000000007 /* RootView.swift in Sources */,
 				A10000000000000000000056 /* WriterPadTheme.swift in Sources */,
 				A10000000000000000000057 /* ProjectWorkspaceView.swift in Sources */,
+				B60D0D2047F042C6809DD755 /* ServerProjectCatalogView.swift in Sources */,
 				A10000000000000000000058 /* NewProjectAlertPresenter.swift in Sources */,
 				A10000000000000000000059 /* WorkspaceLayoutSupport.swift in Sources */,
 				A1000000000000000000005A /* ImportReportView.swift in Sources */,
@@ -1006,9 +1076,19 @@
 				A90000000000000000000006 /* SupabaseAuthService.swift in Sources */,
 				A90000000000000000000008 /* DeviceIdentityService.swift in Sources */,
 				A9000000000000000000000A /* SupabaseProjectBindingService.swift in Sources */,
+				F0762D30B42A4D60B20C05CC /* ServerProjectCatalog.swift in Sources */,
+				AA1100000000000000000001 /* ReceiveValidationPolicy.swift in Sources */,
+				AB1200000000000000000001 /* GeneralSyncValidationScope.swift in Sources */,
+				AC1300000000000000000001 /* GeneralValidationExecution.swift in Sources */,
+				AD1400000000000000000001 /* GeneralValidationScreen.swift in Sources */,
+				AE1500000000000000000001 /* GeneralValidationStageService.swift in Sources */,
+				AF1600000000000000000001 /* GeneralValidationProductAdapter.swift in Sources */,
+				21808931C4834475911BFBC7 /* BodyValidationService.swift in Sources */,
 				A96000000000000000000001 /* SyncV2Contract.swift in Sources */,
 				A96000000000000000000008 /* SyncV2Handshake.swift in Sources */,
 				A96000000000000000000012 /* SyncV2ContractStructure.swift in Sources */,
+				A9A100000000000000000001 /* SyncV2ContractPreparation.swift in Sources */,
+				A9A200000000000000000001 /* SyncV2GeneralRecovery.swift in Sources */,
 				A96000000000000000000007 /* SyncV2UnicodeCasefold.swift in Sources */,
 				A9000000000000000000000C /* SyncV2Store.swift in Sources */,
 				A9000000000000000000000F /* SyncV2Client.swift in Sources */,
@@ -1028,6 +1108,7 @@
 				A93000000000000000000001 /* SyncV2Diagnostics.swift in Sources */,
 				A92000000000000000000001 /* ThreeWayMerge.swift in Sources */,
 				A90000000000000000000012 /* SyncSettingsView.swift in Sources */,
+				A9A200000000000000000002 /* GeneralSyncRecoveryView.swift in Sources */,
 				A90000000000000000000014 /* EditLeaseManager.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
@@ -1060,6 +1141,9 @@
 				A90000000000000000000007 /* SupabaseAuthServiceTests.swift in Sources */,
 				A90000000000000000000009 /* DeviceIdentityServiceTests.swift in Sources */,
 				A9000000000000000000000B /* SupabaseProjectBindingServiceTests.swift in Sources */,
+				BB63450BDAA24B159C3BD875 /* ServerProjectCatalogTests.swift in Sources */,
+				AA1100000000000000000003 /* ReceiveValidationPolicyTests.swift in Sources */,
+				910820D2CCDD43C1B145B48A /* BodyValidationServiceTests.swift in Sources */,
 				A96000000000000000000002 /* SyncV2ContractTests.swift in Sources */,
 				A96000000000000000000009 /* SyncV2HandshakeTests.swift in Sources */,
 				A96000000000000000000003 /* SyncV2TransitionVector.swift in Sources */,

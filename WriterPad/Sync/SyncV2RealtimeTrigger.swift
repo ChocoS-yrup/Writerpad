@@ -183,6 +183,8 @@ actor LiveSyncV2RealtimeTrigger: SyncV2RealtimeTriggering {
         onStatus: @escaping @Sendable
             (SyncV2RealtimeConnectionStatus) -> Void
     ) async throws {
+        try GeneralSyncValidationScope.current.requireRealtime()
+        try ReceiveValidationPolicy.current.requireSending()
         await stop()
         let generation = UUID()
         channelGeneration = generation

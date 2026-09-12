@@ -123,8 +123,10 @@ extension SyncV2SnapshotClienting {
 
 actor LiveSyncV2SnapshotTransport: SyncV2SnapshotTransporting {
     private let client: SupabaseClient
+    private let receiveClients: ReceiveValidationSDKClients?
 
-    init(client: SupabaseClient) {
+    init(client: SupabaseClient, receiveClients: ReceiveValidationSDKClients? = nil) {
+        self.receiveClients = receiveClients
         self.client = client
     }
 
@@ -185,11 +187,11 @@ actor LiveSyncV2SnapshotTransport: SyncV2SnapshotTransporting {
     ) async throws -> [SyncV2RemoteDocumentSnapshot] {
         do {
             return try await executeRows(
-                client
+                (try ReceiveValidationSDKClients.operationClient(client, pool: receiveClients))
                 .from("documents")
                 .select(
                     """
-                    document_id,relative_path,content,revision,is_deleted,\
+                    document_id,parent_folder_id,name,structure_revision,relative_path,content,revision,is_deleted,\
                     deleted_at,updated_at
                     """
                 )
@@ -226,11 +228,11 @@ actor LiveSyncV2SnapshotTransport: SyncV2SnapshotTransporting {
     ) async throws -> [SyncV2RemoteDocumentManifestEntry] {
         do {
             return try await executeRows(
-                client
+                (try ReceiveValidationSDKClients.operationClient(client, pool: receiveClients))
                 .from("documents")
                 .select(
                     """
-                    document_id,relative_path,revision,is_deleted,\
+                    document_id,parent_folder_id,name,structure_revision,relative_path,revision,is_deleted,\
                     deleted_at,updated_at
                     """
                 )
@@ -285,11 +287,11 @@ actor LiveSyncV2SnapshotTransport: SyncV2SnapshotTransporting {
             index = end
             do {
                 let rows = try await executeRows(
-                    client
+                    (try ReceiveValidationSDKClients.operationClient(client, pool: receiveClients))
                     .from("documents")
                     .select(
                         """
-                        document_id,relative_path,content,revision,\
+                        document_id,parent_folder_id,name,structure_revision,relative_path,content,revision,\
                         is_deleted,deleted_at,updated_at
                         """
                     )
@@ -337,7 +339,7 @@ actor LiveSyncV2SnapshotTransport: SyncV2SnapshotTransporting {
     ) async throws -> [SyncV2RemoteTreeOrder] {
         do {
             return try await executeRows(
-                client
+                (try ReceiveValidationSDKClients.operationClient(client, pool: receiveClients))
                     .from("tree_orders")
                     .select(
                         "tree_order_id,parent_folder_id,children,revision,updated_at"
@@ -377,7 +379,7 @@ actor LiveSyncV2SnapshotTransport: SyncV2SnapshotTransporting {
     ) async throws -> [SyncV2RemoteFolder] {
         do {
             return try await executeRows(
-                client
+                (try ReceiveValidationSDKClients.operationClient(client, pool: receiveClients))
                     .from("folders")
                     .select(
                         """
@@ -422,11 +424,11 @@ actor LiveSyncV2SnapshotTransport: SyncV2SnapshotTransporting {
         do {
             let response: PostgrestResponse<
                 [SyncV2RemoteDocumentSnapshot]
-            > = try await client
+            > = try await (try ReceiveValidationSDKClients.operationClient(client, pool: receiveClients))
                 .from("documents")
                 .select(
                     """
-                    document_id,relative_path,content,revision,is_deleted,\
+                    document_id,parent_folder_id,name,structure_revision,relative_path,content,revision,is_deleted,\
                     deleted_at,updated_at
                     """
                 )

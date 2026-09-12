@@ -143,7 +143,14 @@ struct SyncV2ContractHTTPClient: Sendable {
         try Task.checkCancellation()
         // 토큰과 요청을 준비한 뒤, 네트워크 호출 직전에 동기적으로 검사한다.
         try authorize()
-        let (data, response) = try await session.data(for: request)
+        let policy = ReceiveValidationPolicy.current
+        let scope = GeneralSyncValidationScope.current
+        try scope.authorize(request)
+        let permit = try policy.authorize(request)
+        let transportSession = (policy.enabled || scope.restricted || GeneralValidationExecution.current != nil) ? ReceiveValidationURLProtocol.session(policy: policy, ticket: permit) : session
+        let (data, response) = try await transportSession.data(for: request)
+        try scope.authorize(request)
+        try policy.validateResponse(data, request: request, ticket: permit)
         guard let http = response as? HTTPURLResponse else { throw SyncV2HandshakeTransportError.invalidResponse }
         guard (200..<300).contains(http.statusCode) else { throw HTTPError(data: data, response: http) }
         return data
@@ -152,8 +159,11 @@ struct SyncV2ContractHTTPClient: Sendable {
 
 actor LiveSyncV2HandshakeTransport: SyncV2HandshakeTransporting {
     private let http: SyncV2ContractHTTPClient
+    private let client: SupabaseClient
+    private let receiveClients: ReceiveValidationSDKClients?
 
-    init(client: SupabaseClient, configuration: SupabasePublicConfiguration) {
+    init(client: SupabaseClient, configuration: SupabasePublicConfiguration, receiveClients: ReceiveValidationSDKClients? = nil) {
+        self.client = client; self.receiveClients = receiveClients
         http = SyncV2ContractHTTPClient(configuration: configuration, accessToken: { client.auth.currentSession?.accessToken })
     }
 
@@ -161,6 +171,17 @@ actor LiveSyncV2HandshakeTransport: SyncV2HandshakeTransporting {
         parameters: SyncV2HandshakeParameters
     ) async throws -> SyncV2HandshakeResponse {
         do {
+            if let capability = GeneralValidationCapability.current {
+                try capability.check()
+                let transport = SyncV2ContractHTTPClient(configuration: http.configuration, accessToken: { capability.rawToken })
+                let data = try await transport.call(rpc: "get_sync_handshake", body: JSONEncoder().encode(parameters))
+                return try JSONDecoder().decode(SyncV2HandshakeResponse.self, from: data)
+            }
+            if ReceiveValidationPolicy.current.enabled {
+                let client = try ReceiveValidationSDKClients.operationClient(client, pool: receiveClients)
+                let result: PostgrestResponse<SyncV2HandshakeResponse> = try await client.rpc("get_sync_handshake", params: parameters).execute()
+                return result.value
+            }
             let data = try await http.call(rpc: "get_sync_handshake", body: JSONEncoder().encode(parameters))
             return try JSONDecoder().decode(SyncV2HandshakeResponse.self, from: data)
         } catch {
@@ -560,6 +581,7 @@ actor SyncV2HandshakeService {
         authentication: any AuthenticationServicing,
         bindings: any ProjectBindingServicing
     ) async {
+        guard ReceiveValidationPolicy.current.sendingAllowed else { return }
         let first = authenticationService == nil ||
             authenticationService?.contractEpoch !== authentication.contractEpoch ||
             bindingService?.contractEpoch !== bindings.contractEpoch
@@ -637,6 +659,7 @@ actor SyncV2HandshakeService {
     }
 
     private func scheduleAutomatic() {
+        guard ReceiveValidationPolicy.current.sendingAllowed else { return }
         guard automaticTask == nil, sceneActive, selectedProjectID != nil,
               authenticationService != nil, bindingService != nil else { return }
         let revision = lifecycleGeneration

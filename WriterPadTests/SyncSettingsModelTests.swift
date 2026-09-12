@@ -482,3 +482,83 @@ private actor SyncSettingsBindingStub: ProjectBindingServicing {
         return .connected(binding)
     }
 }
+
+
+@MainActor
+final class GeneralSyncRecoveryModelTests: XCTestCase {
+    private actor Reader: SyncV2GeneralRecoveryReading {
+        let detail: SyncV2GeneralRecoveryDetail
+        var failPage = false
+        var holdDetail = false
+        private var continuation: CheckedContinuation<Void, Never>?
+        init(detail: SyncV2GeneralRecoveryDetail) { self.detail = detail }
+        func configure(fail: Bool = false, hold: Bool = false) { failPage = fail; holdDetail = hold }
+        func generalRecoveryPage(localProjectID: ProjectID, after queueID: Int64?) async throws -> SyncV2GeneralRecoveryPage {
+            if failPage { throw SyncV2GeneralRecoveryError.unavailable }
+            return .init(rows: [detail.row], nextCursor: nil)
+        }
+        func generalRecoveryDetail(localProjectID: ProjectID, batchID: UUID) async throws -> SyncV2GeneralRecoveryDetail {
+            if holdDetail { await withCheckedContinuation { continuation = $0 } }
+            return detail
+        }
+        func waiting() -> Bool { continuation != nil }
+        func release() { continuation?.resume(); continuation = nil }
+    }
+
+    private func fixture() throws -> (GeneralSyncRecoveryModel, Reader, SyncV2GeneralRecoveryDetail) {
+        let local = ProjectID(rawValue: UUID()), batchID = UUID()
+        let batch = LocalMutationBatch(batchID: batchID, projectID: local, localTransactionID: nil,
+            mutations: [.documentSnapshot(operationID: UUID(), documentID: .init(rawValue: UUID()),
+                relativePath: .init(rawValue: "본문.txt"), content: "보관된 원고", contentHash: SHA256ContentHasher().sha256(for: Data("보관된 원고".utf8)),
+                localSaveGeneration: 1, isDeleted: false)])
+        let row = SyncV2GeneralRecoveryRow(queueID: 1, batchID: batchID, sourceStatus: "blocked", requestStatus: nil,
+            errorCode: "REVISION_CONFLICT", createdAt: "2026-09-08", isQueueHead: true)
+        let detail = try SyncV2GeneralRecoveryDetail(localProjectID: local, serverProjectID: UUID(), row: row,
+            sourceJSON: String(decoding: JSONEncoder().encode(batch), as: UTF8.self), requestJSON: nil, responseJSON: nil)
+        let reader = Reader(detail: detail)
+        return (GeneralSyncRecoveryModel(projectID: local, reader: reader), reader, detail)
+    }
+
+    func testLoadsAndExportsLocalDataWithoutAuthenticationOrDispatcher() async throws {
+        let (model, _, detail) = try fixture()
+        await model.load(); await model.select(detail.row)
+        XCTAssertEqual(model.rows.map(\.id), [detail.row.id])
+        XCTAssertEqual(try model.detail?.manuscripts().first?.content, "보관된 원고")
+        XCTAssertFalse(model.isLoading); XCTAssertNil(model.errorMessage)
+    }
+
+    func testFailedRefreshIsVisibleAndClearsStaleDetail() async throws {
+        let (model, reader, detail) = try fixture()
+        await model.load(); await model.select(detail.row)
+        await reader.configure(fail: true)
+        await model.load()
+        XCTAssertNotNil(model.errorMessage); XCTAssertNil(model.detail); XCTAssertTrue(model.rows.isEmpty)
+        XCTAssertFalse(model.isLoading)
+    }
+
+    func testClosedScreenDiscardsLateDetail() async throws {
+        let (model, reader, detail) = try fixture()
+        await reader.configure(hold: true)
+        let task = Task { await model.select(detail.row) }
+        for _ in 0..<200 {
+            if await reader.waiting() { break }
+            try await Task.sleep(for: .milliseconds(5))
+        }
+        let waiting = await reader.waiting(); XCTAssertTrue(waiting)
+        model.stop(); await reader.release(); await task.value
+        XCTAssertNil(model.detail); XCTAssertFalse(model.isLoading)
+    }
+
+    func testRefreshDiscardsLateSelectionFromPreviousGeneration() async throws {
+        let (model, reader, detail) = try fixture()
+        await reader.configure(hold: true)
+        let task = Task { await model.select(detail.row) }
+        for _ in 0..<200 {
+            if await reader.waiting() { break }
+            try await Task.sleep(for: .milliseconds(5))
+        }
+        let waiting = await reader.waiting(); XCTAssertTrue(waiting)
+        await model.load(); await reader.release(); await task.value
+        XCTAssertNil(model.detail); XCTAssertEqual(model.rows.count, 1); XCTAssertFalse(model.isLoading)
+    }
+}

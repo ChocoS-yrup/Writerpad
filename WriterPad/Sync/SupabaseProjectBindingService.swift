@@ -207,6 +207,7 @@ actor LiveEnsureProjectTransport: EnsureProjectTransporting {
     func ensureProject(
         parameters: EnsureProjectParameters
     ) async throws -> EnsuredServerProject {
+        try ReceiveValidationPolicy.current.requireSending()
         do {
             let response: PostgrestResponse<EnsuredServerProject> =
                 try await client
@@ -364,6 +365,7 @@ actor SupabaseProjectBindingService: ProjectBindingServicing {
     private let authenticationService: any AuthenticationServicing
     private let initialSyncRecorder: any InitialProjectSyncRecording
     private let snapshotClient: (any SyncV2SnapshotClienting)?
+    private let bindingIsVisible: @Sendable (ProjectID) async -> Bool
     private var bindingObservers: [
         ProjectID: [UUID: AsyncStream<ProjectSyncBinding?>.Continuation]
     ] = [:]
@@ -376,6 +378,7 @@ actor SupabaseProjectBindingService: ProjectBindingServicing {
         initialSyncRecorder: any InitialProjectSyncRecording =
             NoOpInitialProjectSyncRecorder(),
         snapshotClient: (any SyncV2SnapshotClienting)? = nil,
+        bindingIsVisible: @escaping @Sendable (ProjectID) async -> Bool = { _ in true },
         contractEpoch: SyncV2ContractEpoch = SyncV2ContractEpoch(),
         handshakeInvalidated: @escaping @Sendable () -> Void = {}
     ) {
@@ -385,6 +388,7 @@ actor SupabaseProjectBindingService: ProjectBindingServicing {
         self.authenticationService = authenticationService
         self.initialSyncRecorder = initialSyncRecorder
         self.snapshotClient = snapshotClient
+        self.bindingIsVisible = bindingIsVisible
         self.contractEpoch = contractEpoch
         self.handshakeInvalidated = handshakeInvalidated
     }
@@ -392,6 +396,7 @@ actor SupabaseProjectBindingService: ProjectBindingServicing {
     func currentBinding(
         for localProjectID: ProjectID
     ) async -> ProjectSyncBinding? {
+        guard await bindingIsVisible(localProjectID) else { return nil }
         guard await bindingStore.availability() == .available else {
             return nil
         }
@@ -400,9 +405,9 @@ actor SupabaseProjectBindingService: ProjectBindingServicing {
         ) else {
             return nil
         }
-        return await prepareInitialSnapshotIfNeeded(for: binding)
-            ? binding
-            : nil
+        guard await prepareInitialSnapshotIfNeeded(for: binding),
+              await bindingIsVisible(localProjectID) else { return nil }
+        return binding
     }
 
     func bindingUpdates(
@@ -432,6 +437,7 @@ actor SupabaseProjectBindingService: ProjectBindingServicing {
             .filter { $0.serverProjectID != nil } ?? []
         var prepared: [ProjectSyncBinding] = []
         for binding in bindings {
+            guard await bindingIsVisible(binding.localProjectID) else { continue }
             if await prepareInitialSnapshotIfNeeded(for: binding) {
                 prepared.append(binding)
             }
@@ -568,6 +574,7 @@ actor SupabaseProjectBindingService: ProjectBindingServicing {
         serverProjectID: UUID,
         kind: ProjectBindingKind
     ) async -> ProjectBindingResult {
+        guard ReceiveValidationPolicy.current.sendingAllowed else { return .failed(.configurationUnavailable) }
         contractEpoch?.beginTransition()
         defer { contractEpoch?.endTransition(); handshakeInvalidated() }
         guard let transport else {
@@ -680,6 +687,7 @@ actor SupabaseProjectBindingService: ProjectBindingServicing {
     private func prepareInitialSnapshotIfNeeded(
         for binding: ProjectSyncBinding
     ) async -> Bool {
+        guard ReceiveValidationPolicy.current.sendingAllowed else { return true }
         let batchKind: DurableLocalBatchKind
         switch binding.kind {
         case .newServerProject:

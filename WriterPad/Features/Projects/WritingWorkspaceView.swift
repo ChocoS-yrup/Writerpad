@@ -151,6 +151,7 @@ struct WritingWorkspaceShell: View {
     let conflictResolutionService:
         (any SyncV2ConflictResolving)?
     let conflictRecoveryStore: ConflictRecoveryStore?
+    let generalRecoveryReader: (any SyncV2GeneralRecoveryReading)?
     private let storageCoordinator: WorkspaceStorageCoordinator
     @Binding var isShowingSettings: Bool
     @Binding var smartPairsEnabled: Bool
@@ -182,6 +183,7 @@ struct WritingWorkspaceShell: View {
         ConflictResolutionRoute?
     @State private var conflictResolutionErrorMessage: String?
     @State private var isShowingConflictRecovery = false
+    @State private var isShowingGeneralRecovery = false
     @State private var conflictRecoveryCount = 0
     @State private var isLoadingConflictResolution = false
     @State private var binderErrorMessage: String?
@@ -224,6 +226,7 @@ struct WritingWorkspaceShell: View {
         conflictResolutionService:
             (any SyncV2ConflictResolving)? = nil,
         conflictRecoveryStore: ConflictRecoveryStore? = nil,
+        generalRecoveryReader: (any SyncV2GeneralRecoveryReading)? = nil,
         snapshotPullService: SyncV2SnapshotPullService? = nil,
         realtimeTrigger: (any SyncV2RealtimeTriggering)? = nil,
         editLeaseManager: (any EditLeaseManaging)? = nil,
@@ -245,6 +248,7 @@ struct WritingWorkspaceShell: View {
         self.futureChangeNotifier = futureChangeNotifier
         self.conflictResolutionService = conflictResolutionService
         self.conflictRecoveryStore = conflictRecoveryStore
+        self.generalRecoveryReader = generalRecoveryReader
         self.storageCoordinator = WorkspaceStorageCoordinator(
             projectID: project.id,
             binderRepository: repository,
@@ -545,6 +549,35 @@ struct WritingWorkspaceShell: View {
                         result.copiedText.isEmpty ? .empty : .written
                 }
             )
+        }
+        .sheet(isPresented: $isShowingGeneralRecovery) {
+            if let generalRecoveryReader {
+                GeneralSyncRecoveryView(projectID: project.id, projectName: project.name, reader: generalRecoveryReader,
+                    saveLocalSelection: { review, content, authorize in
+                        let writer = GeneralSyncConflictLocalWriter(projectID: project.id, repository: documentRepository,
+                            store: documentStore, editors: [leftEditorModel, rightEditorModel], notifier: futureChangeNotifier)
+                        let operation = try await writer.save(review, content: content, authorize: authorize)
+                        binderContentStateOverrides[.init(rawValue: review.documentID)] = content.isEmpty ? .empty : .written
+                        binderSnapshotRefreshGeneration &+= 1
+                        return operation
+                    }, validateStructureLocal: { review in
+                        try await MainActor.run {
+                            guard !leftEditorModel.hasUnsavedChanges, !rightEditorModel.hasUnsavedChanges,
+                                  !leftEditorModel.isComposing, !rightEditorModel.isComposing else { throw SyncV2GeneralConflictError.changed }
+                        }
+                        let documents = try await documentRepository.documents(in: project.id)
+                        let current = documents.map(LocalStructureSnapshotNode.init).filter(\.isIncludedInTree)
+                        guard Set(current.map(\.id)) == Set(review.savedNodes.map(\.id)),
+                              current.allSatisfy({ node in review.savedNodes.contains(node) }) else { throw SyncV2GeneralConflictError.changed }
+                        // UI 저장 이후 외부에서 바뀐 TXT도 선택 직전에 다시 보호한다.
+                        for body in review.remoteDocuments {
+                            guard let fields = body.objectValue, let id = fields["document_id"]?.stringValue.flatMap(UUID.init(uuidString:)),
+                                  let node = documents.first(where: { $0.id.rawValue == id }), let expected = fields["content"]?.stringValue else { throw SyncV2GeneralConflictError.changed }
+                            let actual = try await documentStore.loadText(for: node)
+                            guard Data(actual.utf8) == Data(expected.utf8) else { throw SyncV2GeneralConflictError.changed }
+                        }
+                    })
+            }
         }
         .sheet(item: $conflictResolutionRoute) { route in
             ConflictResolutionView(
@@ -938,6 +971,19 @@ struct WritingWorkspaceShell: View {
             )
 
             Menu {
+                if generalRecoveryReader != nil {
+                    Button("동기화 보관본", systemImage: "arrow.triangle.2.circlepath") {
+                        Task {
+                            guard !leftEditorModel.isComposing, !rightEditorModel.isComposing,
+                                  await leftEditorModel.saveNow(), await rightEditorModel.saveNow() else {
+                                notice = .localSaveFailure
+                                return
+                            }
+                            isShowingGeneralRecovery = true
+                        }
+                    }
+                    .accessibilityIdentifier("writerpad.general-sync-recovery")
+                }
                 Button("설정", systemImage: "gearshape") {
                     isShowingSettings = true
                 }

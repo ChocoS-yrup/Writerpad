@@ -417,6 +417,7 @@ actor SyncV2BackgroundSyncCoordinator {
     }
 
     func start() async {
+        guard ReceiveValidationPolicy.current.sendingAllowed else { return }
         guard !isStarted, GlobalSyncPreference.isEnabled() else { return }
         isStarted = true
         await uploadPullCoordinator?.installPullReadyHandler(
@@ -513,7 +514,7 @@ actor SyncV2BackgroundSyncCoordinator {
     }
 
     private func startRealtime() {
-        guard isStarted else { return }
+        guard !GeneralSyncValidationScope.current.restricted, isStarted else { return }
         realtimeTask.cancel()
         realtimeGeneration &+= 1
         SyncV2Diagnostics.generation(
@@ -743,6 +744,7 @@ actor SyncV2BackgroundSyncCoordinator {
                   let serverProjectID = binding.serverProjectID
             else { continue }
             let localProjectID = binding.localProjectID
+            guard (try? GeneralSyncValidationScope.current.require(local: localProjectID, server: serverProjectID)) != nil else { continue }
             let queue = await readUploadQueueSnapshot?(localProjectID)
                 ?? (uploadPullCoordinator == nil
                     ? .idle
@@ -1176,6 +1178,7 @@ final class SyncV2WorkspaceSyncModel: ObservableObject {
             @escaping @MainActor @Sendable
             ([SyncV2RemoteDocumentSnapshot]) -> Void
     ) async {
+        guard ReceiveValidationPolicy.current.sendingAllowed else { return }
         if pendingDiagnosticsContext == nil {
             pendingDiagnosticsContext = SyncV2PullDiagnostics.current
         }
@@ -1196,6 +1199,9 @@ final class SyncV2WorkspaceSyncModel: ObservableObject {
     }
 
     func updateSceneActivity(_ active: Bool) async {
+        // Scene callbacks also arrive after guarded start() returns early.
+        // Keep automatic auth observation off; inactive callbacks still clean up.
+        guard !active || ReceiveValidationPolicy.current.sendingAllowed else { return }
         guard active != isActive else { return }
         generation &+= 1
         SyncV2Diagnostics.generation(
@@ -1326,6 +1332,7 @@ final class SyncV2WorkspaceSyncModel: ObservableObject {
     }
 
     func networkRecovered() async {
+        guard ReceiveValidationPolicy.current.sendingAllowed else { return }
         guard isActive else { return }
         activationRequestID &+= 1
         // NWPath가 반복해서 흔들려도 사용자에게 보이는 12초 제한을

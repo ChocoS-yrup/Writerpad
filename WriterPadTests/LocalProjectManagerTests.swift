@@ -687,6 +687,58 @@ final class LocalProjectManagerTests: XCTestCase {
         )
     }
 
+    @MainActor
+    func testBackupScreenSavesExternalPackageAndRestoresIntoSeparateLibrary() async throws {
+        let source = try makeHarness()
+        let fixture = try await makeBackupFixture(in: source)
+        let original = try await source.manager.restoreProjectBackup(at: fixture.packageURL)
+        let paths = try source.resolver.standardPaths(forProjectNamed: original.name)
+        // 설정과 과거 백업은 원고·구조 v1의 범위 밖이며 몰래 섞지 않는다.
+        try Data("{\"custom\":true}".utf8).write(to: paths.settingsFileURL)
+        try Data("과거 합성 원고".utf8).write(to: paths.automaticBackupsURL.appendingPathComponent("old.txt"))
+        let before = try directoryFingerprint(paths.projectContainerURL)
+        let destination = source.root.appendingPathComponent("External")
+        try FileManager.default.createDirectory(at: destination, withIntermediateDirectories: true)
+        let model = ProjectBackupExportModel(coordinator: ProjectBackupCoordinator(
+            projectRepository: source.repository,
+            documentRepository: source.repository,
+            workspaceLocator: RepositoryProjectWorkspaceLocator(
+                projectRepository: source.repository, pathResolver: source.resolver
+            )
+        ))
+        await model.save(projectID: original.id, in: destination)
+        XCTAssertFalse(model.isWorking)
+        XCTAssertNil(model.errorMessage)
+        let package = try XCTUnwrap(model.savedPackageURL)
+        XCTAssertEqual(package.deletingLastPathComponent().path, destination.path)
+        XCTAssertEqual(Set(try FileManager.default.contentsOfDirectory(atPath: package.path)),
+                       Set(["manifest.json", "workspace"]))
+        let manifest = try await ProjectBackupStore().validatedManifest(at: package)
+        XCTAssertEqual(Set(manifest.nodes.map(\.uuid)), Set(fixture.nodes.map { $0.id.rawValue.uuidString.lowercased() }))
+        let target = try makeHarness()
+        let restored = try await target.manager.restoreProjectBackup(at: package)
+        XCTAssertEqual(restored.id, original.id)
+        let restoredNodes = try await target.repository.documents(in: restored.id)
+        XCTAssertEqual(Set(restoredNodes.map(\.id)), Set(fixture.nodes.map(\.id)))
+        let restoredPaths = try target.resolver.standardPaths(forProjectNamed: restored.name)
+        for (path, bytes) in fixture.documentBytes {
+            XCTAssertEqual(try Data(contentsOf: restoredPaths.workspaceRootURL.appendingPathComponent(path)), bytes)
+        }
+        XCTAssertEqual(try directoryFingerprint(paths.projectContainerURL), before)
+        XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath: restoredPaths.automaticBackupsURL.path), [])
+
+        // 같은 위치에서 반복해도 앞선 백업을 교체하지 않는다.
+        let firstFingerprint = try directoryFingerprint(package)
+        await model.save(projectID: original.id, in: destination)
+        XCTAssertNotEqual(model.savedPackageURL, package)
+        XCTAssertEqual(try directoryFingerprint(package), firstFingerprint)
+
+        await model.save(projectID: original.id, in: paths.projectContainerURL)
+        XCTAssertNil(model.savedPackageURL)
+        XCTAssertNotNil(model.errorMessage)
+        XCTAssertEqual(try directoryFingerprint(paths.projectContainerURL), before)
+    }
+
     func testRestoreProjectBackupRejectsDuplicateProjectUUIDWithoutMutation() async throws {
         let harness = try makeHarness()
         let fixture = try await makeBackupFixture(in: harness)

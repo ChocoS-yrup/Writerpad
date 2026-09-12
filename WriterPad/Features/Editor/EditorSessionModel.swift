@@ -503,6 +503,32 @@ final class EditorSessionModel: ObservableObject {
         return true
     }
 
+    /// 외부 충돌 선택의 저장 결과를 표시와 재시도 상태에 함께 반영한다.
+    /// Swift 문자열의 정규화 동등성으로 실제 저장 바이트 차이를 무시하지 않는다.
+    @discardableResult
+    func applyComparedSave(_ receipt: DocumentSaveReceipt, content: String,
+        expected: SyncV2RebaseLocalSnapshot) -> Bool {
+        guard currentDocumentID == receipt.documentID, !isReadOnly, !hasUnsavedChanges,
+              canApplyAutomaticRebase(expected: expected),
+              Data(currentText.utf8) == Data(expected.content.utf8) else { return false }
+        let previous = currentText
+        autosaveDebouncer.cancel()
+        if setText(content, statisticsUpdate: .immediate, preservingUTF8: true) {
+            updateCursor(TextCursorState(location: UInt(content.utf16.count), selectionLength: 0))
+            externalTextMutation = nil; externalVersion &+= 1; selectionNavigationRequest &+= 1
+        }
+        saveGeneration = max(saveGeneration, receipt.generation)
+        dirtyGeneration = max(dirtyGeneration, saveGeneration)
+        lastSavedDirtyGeneration = dirtyGeneration
+        sessionContentHashes[receipt.documentID] = receipt.contentHash
+        saveState = .saved(generation: receipt.generation, savedAt: receipt.modifiedAt, contentHash: receipt.contentHash)
+        apply(durableRecordResult: receipt.durableRecordResult ?? .localSavedButNotQueued(
+            reason: "원고는 저장됐지만 메타데이터 복구가 필요합니다. 앱을 다시 열어 복구한 뒤 확인해 주세요."),
+            generation: receipt.generation, documentID: receipt.documentID)
+        draftStore.removeIfMatching(text: previous, for: receipt.documentID)
+        return true
+    }
+
     /// 같은 문서를 표시 중인 반대 패널의 변경을 표시 버전으로만 반영한다.
     /// 패널별 커서·선택·Undo 상태는 건드리지 않는다.
     @discardableResult
@@ -1316,9 +1342,11 @@ final class EditorSessionModel: ObservableObject {
     @discardableResult
     private func setText(
         _ updatedText: String,
-        statisticsUpdate: StatisticsUpdate
+        statisticsUpdate: StatisticsUpdate,
+        preservingUTF8: Bool = false
     ) -> Bool {
-        guard textBuffer.snapshot() != updatedText else { return false }
+        let previous = textBuffer.snapshot()
+        guard preservingUTF8 ? Data(previous.utf8) != Data(updatedText.utf8) : previous != updatedText else { return false }
         text = updatedText
         textBuffer = ManuscriptTextBuffer(updatedText)
         if !documentSearch.query.isEmpty {

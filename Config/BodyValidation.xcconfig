@@ -1,0 +1,2 @@
+// Foreground synthetic body only; all general senders stay locked.
+OTHER_SWIFT_FLAGS = $(inherited) -DWRITERPAD_RECEIVE_VALIDATION -DWRITERPAD_BODY_VALIDATION

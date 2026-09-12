@@ -53,12 +53,19 @@ protocol WorkspaceStateRepository: Sendable {
 protocol LocalDocumentStoring: Sendable {
     func loadText(for document: DocumentNode) async throws -> String
     func save(_ request: DocumentSaveRequest) async throws -> DocumentSaveReceipt
+    func saveCompared(_ request: DocumentSaveRequest,
+        authorize: @escaping @Sendable () throws -> Void) async throws -> DocumentSaveReceipt
     func retryPendingSyncHandoff(
         for document: DocumentNode
     ) async -> DurableRecordResult
 }
 
 extension LocalDocumentStoring {
+    func saveCompared(_ request: DocumentSaveRequest,
+        authorize: @escaping @Sendable () throws -> Void) async throws -> DocumentSaveReceipt {
+        throw LocalDocumentStoreError.comparedContentChanged
+    }
+
     func retryPendingSyncHandoff(
         for document: DocumentNode
     ) async -> DurableRecordResult {

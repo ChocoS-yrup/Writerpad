@@ -2280,6 +2280,122 @@ private enum FolderDispatchFixtureError: Error {
 }
 
 final class SyncV2DispatcherTests: XCTestCase {
+    func testRestrictedDispatchPreservesOtherPendingAndConflictsEvenWhenPrioritized() async throws {
+        let selected = ProjectID(rawValue: UUID()), other = ProjectID(rawValue: UUID())
+        let target = dispatchOperation(documentID: UUID(), sequence: 1, suffix: 100, localProjectID: selected)
+        let protected = (0..<7).map { dispatchOperation(documentID: UUID(), sequence: 1, suffix: $0, localProjectID: other) }
+        let store = DispatcherStoreStub(operations: [target] + protected), client = DispatcherClientStub()
+        for operation in protected.suffix(3) { await store.markConflict(operation, errorCode: "REVISION_CONFLICT", detail: "preserve") }
+        let before = await store.scopeSnapshot(excluding: [target.operationID])
+        let dispatcher = SyncV2Dispatcher(store: store, client: client, projectScope: .only([selected]))
+        await dispatcher.prioritizeProject(other)
+        await dispatcher.dispatchReadyOperations(now: Date())
+        let requests = await client.receivedRequests(), after = await store.scopeSnapshot(excluding: [target.operationID])
+        XCTAssertEqual(requests.map(\.operationID), [target.operationID])
+        XCTAssertEqual(before, after)
+        XCTAssertEqual(after.values.filter { $0 == "pending:0" }.count, 4)
+        XCTAssertEqual(after.values.filter { $0 == "conflict:0" }.count, 3)
+    }
+
+    func testRestrictedGeneralRouteReceivesOnlySelectedLocalProject() async {
+        let selected = ProjectID(rawValue: UUID()), other = ProjectID(rawValue: UUID())
+        let operations = [selected, other].enumerated().map { dispatchOperation(documentID: UUID(), sequence: 1, suffix: $0.offset, localProjectID: $0.element) }
+        let store = DispatcherStoreStub(operations: operations), client = DispatcherClientStub(), sender = GeneralRouteSpy()
+        let dispatcher = SyncV2Dispatcher(store: store, client: client, contractSender: sender, projectScope: .only([selected]))
+        await dispatcher.dispatchReadyOperations(now: Date())
+        let projects = await sender.projects, requests = await client.receivedRequests()
+        XCTAssertEqual(projects, [selected]); XCTAssertTrue(requests.isEmpty)
+    }
+
+    func testRestrictedStartupSkipsGlobalRecoveryAndGlobalNetworkRecovery() async throws {
+        let selected = ProjectID(rawValue: UUID()), other = ProjectID(rawValue: UUID())
+        let target = dispatchOperation(documentID: UUID(), sequence: 1, suffix: 1, localProjectID: selected)
+        let blocked = dispatchOperation(documentID: UUID(), sequence: 1, suffix: 2, localProjectID: other)
+        let store = DispatcherStoreStub(operations: [target, blocked]), client = DispatcherClientStub()
+        let hub = SyncV2NetworkRecoveryHub(), probe = ScopeRecoveryProbe()
+        await hub.install { await probe.called() }
+        let dispatcher = SyncV2Dispatcher(store: store, client: client, projectScope: .only([selected]), networkRecoveryHub: hub)
+        await dispatcher.start()
+        try await waitUntilCompleted(target, store: store)
+        await dispatcher.networkRecovered()
+        await dispatcher.stop()
+        let recoveries = await store.globalRecoveryCount(), signals = await probe.count
+        let requests = await client.receivedRequests()
+        XCTAssertEqual(recoveries, 0); XCTAssertEqual(signals, 0)
+        XCTAssertEqual(requests.map(\.operationID), [target.operationID])
+    }
+
+    func testRestrictedRetryOpportunitiesCannotReleaseOtherProject() async throws {
+        let selected = ProjectID(rawValue: UUID()), other = ProjectID(rawValue: UUID())
+        let target = dispatchOperation(documentID: UUID(), sequence: 1, suffix: 1, localProjectID: selected)
+        let protected = dispatchOperation(documentID: UUID(), sequence: 1, suffix: 2, localProjectID: other)
+        let store = DispatcherStoreStub(operations: [target, protected], initialStatus: .retryWait), client = DispatcherClientStub()
+        let dispatcher = SyncV2Dispatcher(store: store, client: client, projectScope: .only([selected]))
+        let before = await store.scopeSnapshot(excluding: [target.operationID])
+        await dispatcher.start()
+        await dispatcher.loginSucceeded()
+        try await waitUntilCompleted(target, store: store)
+        await dispatcher.appEnteredForeground()
+        await dispatcher.userRequestedRetry()
+        await dispatcher.networkRecovered()
+        await dispatcher.stop()
+        let after = await store.scopeSnapshot(excluding: [target.operationID]), scopes = await store.retryScopes()
+        XCTAssertEqual(before, after)
+        XCTAssertEqual(scopes, Array(repeating: Optional(selected), count: 4))
+    }
+
+    func testEmptyRestrictedScopeDoesNotRecoverRetryOrSend() async {
+        let operation = dispatchOperation(documentID: UUID(), sequence: 1, suffix: 1)
+        let store = DispatcherStoreStub(operations: [operation]), client = DispatcherClientStub()
+        let before = await store.scopeSnapshot(excluding: [])
+        let dispatcher = SyncV2Dispatcher(store: store, client: client, projectScope: .only([]))
+        await dispatcher.start(); await dispatcher.prioritizeProject(operation.localProjectID)
+        await dispatcher.loginSucceeded(); await dispatcher.appEnteredForeground()
+        await dispatcher.networkRecovered(); await dispatcher.userRequestedRetry()
+        await dispatcher.dispatchReadyOperations(now: Date()); await dispatcher.stop()
+        let after = await store.scopeSnapshot(excluding: []), scopes = await store.retryScopes(), recoveries = await store.globalRecoveryCount()
+        let requests = await client.receivedRequests()
+        XCTAssertEqual(before, after); XCTAssertTrue(scopes.isEmpty); XCTAssertEqual(recoveries, 0); XCTAssertTrue(requests.isEmpty)
+    }
+
+    func testProjectScopeCannotBypassReceiveValidationLock() async {
+        let selected = ProjectID(rawValue: UUID())
+        let operation = dispatchOperation(documentID: UUID(), sequence: 1, suffix: 1, localProjectID: selected)
+        let store = DispatcherStoreStub(operations: [operation]), client = DispatcherClientStub()
+        let before = await store.scopeSnapshot(excluding: [])
+        await ReceiveValidationPolicy.$override.withValue(ReceiveValidationPolicy(enabled: true, configuration: nil)) {
+            let dispatcher = SyncV2Dispatcher(store: store, client: client, projectScope: .only([selected]))
+            await dispatcher.start(); await dispatcher.loginSucceeded(); await dispatcher.networkRecovered()
+            await dispatcher.dispatchReadyOperations(now: Date()); await dispatcher.stop()
+        }
+        let after = await store.scopeSnapshot(excluding: []), recoveries = await store.globalRecoveryCount(), scopes = await store.retryScopes()
+        let requests = await client.receivedRequests()
+        XCTAssertEqual(before, after); XCTAssertEqual(recoveries, 0); XCTAssertTrue(scopes.isEmpty); XCTAssertTrue(requests.isEmpty)
+    }
+
+    private actor ScopeRecoveryProbe {
+        private(set) var count = 0
+        func called() { count += 1 }
+    }
+
+    private actor GeneralRouteSpy: SyncV2GeneralContractSending {
+        private(set) var projects: [ProjectID] = []
+        func handlesProject(_ projectID: ProjectID) -> Bool { true }
+        func drainGeneralContract(localProjectID: ProjectID) -> Bool { projects.append(localProjectID); return false }
+    }
+
+    func testGeneralRouteOwnsDrainBeforeLegacyQueueCanBeClaimed() async throws {
+        let operation = dispatchOperation(documentID: UUID(), sequence: 1, suffix: 15)
+        let store = DispatcherStoreStub(operations: [operation]), client = DispatcherClientStub(), sender = GeneralRouteSpy()
+        let dispatcher = SyncV2Dispatcher(store: store, client: client, contractSender: sender)
+        await dispatcher.dispatchReadyOperations(now: Date())
+        let requests = await client.receivedRequests(), projects = await sender.projects
+        XCTAssertTrue(requests.isEmpty)
+        XCTAssertEqual(projects.count, 1)
+        let completed = await store.completedOperationIDs()
+        XCTAssertTrue(completed.isEmpty)
+    }
+
     func testRetryPolicyIsExponentialCappedAndJittered() {
         let policy = SyncV2RetryPolicy(
             initialDelay: 2,
@@ -3661,6 +3777,8 @@ private actor DispatcherStoreStub: SyncV2DispatchStoring {
     private var retries: [UUID: RetryRecord] = [:]
     private var rebases: [UUID: RebaseRecord] = [:]
     private var opportunities = 0
+    private var globalRecoveries = 0
+    private var requestedRetryScopes: [ProjectID?] = []
     private var missingRecoveries = 0
     private var missingProjectRecoveries = 0
 
@@ -3679,7 +3797,14 @@ private actor DispatcherStoreStub: SyncV2DispatchStoring {
         )
     }
 
-    func recoverInterruptedWork() {}
+    func recoverInterruptedWork() { globalRecoveries += 1 }
+    func globalRecoveryCount() -> Int { globalRecoveries }
+    func retryScopes() -> [ProjectID?] { requestedRetryScopes }
+    func scopeSnapshot(excluding ids: Set<UUID>) -> [UUID: String] {
+        Dictionary(uniqueKeysWithValues: statuses.filter { !ids.contains($0.key) }.map {
+            ($0.key, String(describing: $0.value) + ":" + String(operations[$0.key]?.attempts ?? -1))
+        })
+    }
 
     func readyLocalProjectIDs(now: Date) -> [ProjectID] {
         _ = now
@@ -3850,6 +3975,7 @@ private actor DispatcherStoreStub: SyncV2DispatchStoring {
     }
 
     func makeRetryWaitOperationsReady(localProjectID: ProjectID?) {
+        requestedRetryScopes.append(localProjectID)
         opportunities += 1
         for identifier in order where statuses[identifier] == .retryWait {
             if let localProjectID,
@@ -4645,5 +4771,54 @@ private final class EditLeaseConnectivityMonitorStub:
         let started = handler != nil
         lock.unlock()
         return started
+    }
+}
+
+
+extension SyncV2DispatcherTests {
+    func testReceiveGuardOverlappingStartupRetryAndDirectDrainPreserveAllStates() async throws {
+        for state in [DispatcherStoreStub.Status.pending, .inflight, .retryWait, .conflict] {
+            let operation = dispatchOperation(documentID: UUID(), sequence: 1, suffix: 15)
+            let store = DispatcherStoreStub(operations: [operation], initialStatus: state)
+            let client = DispatcherClientStub()
+            let dispatcher = SyncV2Dispatcher(store: store, client: client)
+            let policy = ReceiveValidationPolicy(enabled: true, configuration: nil)
+            await ReceiveValidationPolicy.$override.withValue(policy) {
+                await withTaskGroup(of: Void.self) { group in
+                    group.addTask { await dispatcher.start() }
+                    group.addTask { await dispatcher.loginSucceeded() }
+                    group.addTask { await dispatcher.appEnteredForeground() }
+                    group.addTask { await dispatcher.networkRecovered() }
+                    group.addTask { await dispatcher.userRequestedRetry() }
+                    group.addTask { await dispatcher.dispatchReadyOperations(now: Date()) }
+                }
+            }
+            let calls = await client.receivedRequests()
+            let opportunities = await store.immediateOpportunityCount()
+            let completed = await store.completedOperationIDs()
+            XCTAssertTrue(calls.isEmpty)
+            XCTAssertEqual(opportunities, 0)
+            XCTAssertTrue(completed.isEmpty)
+        }
+    }
+}
+
+
+extension EditLeaseManagerTests {
+    func testReceiveGuardBlocksAcquireDirectTokenAndCleanupWithGlobalEnabled() async throws {
+        let client = EditLeaseClientStub(), device = UUID(), document = UUID()
+        let manager = EditLeaseManager(client: client, revisionProvider: FixedRevisionProvider(revision: 4),
+            deviceIdentityProvider: FixedDeviceIdentityProvider(identifier: DeviceIdentifier(uuid: device)), isEnabled: { true })
+        let policy = ReceiveValidationPolicy(enabled: true, configuration: nil)
+        await ReceiveValidationPolicy.$override.withValue(policy) {
+            let state = await manager.beginEditing(documentID: document)
+            XCTAssertEqual(state, .localOnly)
+            do { _ = try await manager.leaseTokenForCommit(documentID: document, deviceID: device, baseRevision: 4); XCTFail() } catch {}
+            await manager.ensureLeaseForActiveLiveDocument(documentID: document, serverRevision: 4)
+            await manager.releaseAll()
+            await manager.endEditing(documentID: document)
+        }
+        let acquired = await client.acquireCount(), released = await client.releaseCount(), renewed = await client.renewCount()
+        XCTAssertEqual([acquired, released, renewed], [0, 0, 0])
     }
 }

@@ -37,6 +37,28 @@ protocol FutureChangeNotifying: Sendable {
     func record(_ event: LocalChangeEvent) async
 }
 
+/// 저널의 날짜 인코딩 정밀도나 화면 상태가 재시도 원본을 바꾸지 않도록
+/// 구조 동기화에 필요한 값만 명령 시점에 고정한다.
+struct LocalStructureSnapshotNode: Codable, Equatable, Sendable {
+    let id: DocumentID
+    let projectID: ProjectID
+    let kind: DocumentKind
+    let parentID: DocumentID?
+    let relativePath: RelativeDocumentPath
+    let userOrder: Int
+    let isIncludedInTree: Bool
+
+    init(_ node: DocumentNode) {
+        id = node.id; projectID = node.projectID; kind = node.kind
+        parentID = node.parentID; relativePath = node.relativePath; userOrder = node.userOrder
+        let path = node.relativePath.rawValue.precomposedStringWithCanonicalMapping
+        let trash = BinderFixedCategory.trash.relativePath.rawValue.precomposedStringWithCanonicalMapping
+        if case .active = node.deletionStatus {
+            isIncludedInTree = path != trash && !path.hasPrefix(trash + "/")
+        } else { isIncludedInTree = false }
+    }
+}
+
 /// 로컬 저장 성공 뒤 Sync v2 SQLite로 넘기는 불변 handoff다.
 /// 서버 전송과는 분리되며, 동일 batch/operation ID로 안전하게 재기록할 수 있다.
 struct LocalMutationBatch: Codable, Equatable, Sendable {
@@ -45,19 +67,36 @@ struct LocalMutationBatch: Codable, Equatable, Sendable {
     let localTransactionID: UUID?
     let kind: DurableLocalBatchKind
     let mutations: [DurableLocalMutation]
+    /// 이름 기반 순서를 UUID 계약으로 바꿀 때 명령 당시의 구조만 사용한다.
+    let structureSnapshot: [LocalStructureSnapshotNode]?
+    var contractStep: SyncV2GeneralContractStep? = nil
+    var originBatchID: UUID? = nil
 
     init(
         batchID: UUID,
         projectID: ProjectID,
         localTransactionID: UUID?,
         kind: DurableLocalBatchKind = .documentSave,
-        mutations: [DurableLocalMutation]
+        mutations: [DurableLocalMutation],
+        structureSnapshot: [DocumentNode]? = nil
     ) {
         self.batchID = batchID
         self.projectID = projectID
         self.localTransactionID = localTransactionID
         self.kind = kind
         self.mutations = mutations
+        self.structureSnapshot = structureSnapshot?.map(LocalStructureSnapshotNode.init)
+    }
+
+    /// 충돌 재선택은 당시 구조를 현재 메타데이터로 다시 만들지 않고 그대로 잇는다.
+    init(replacing source: LocalMutationBatch, batchID: UUID, mutations: [DurableLocalMutation]) {
+        self.batchID = batchID
+        self.projectID = source.projectID
+        self.localTransactionID = nil
+        self.kind = source.kind
+        self.mutations = mutations
+        self.structureSnapshot = source.structureSnapshot
+        self.contractStep = source.contractStep; self.originBatchID = source.originBatchID
     }
 
     private enum CodingKeys: String, CodingKey {
@@ -66,6 +105,7 @@ struct LocalMutationBatch: Codable, Equatable, Sendable {
         case localTransactionID
         case kind
         case mutations
+        case structureSnapshot, contractStep, originBatchID
     }
 
     init(from decoder: Decoder) throws {
@@ -80,6 +120,9 @@ struct LocalMutationBatch: Codable, Equatable, Sendable {
             DurableLocalBatchKind.self,
             forKey: .kind
         ) ?? .documentSave
+        structureSnapshot = try container.decodeIfPresent([LocalStructureSnapshotNode].self, forKey: .structureSnapshot)
+        contractStep = try container.decodeIfPresent(SyncV2GeneralContractStep.self, forKey: .contractStep)
+        originBatchID = try container.decodeIfPresent(UUID.self, forKey: .originBatchID)
         mutations = try container.decode(
             [DurableLocalMutation].self,
             forKey: .mutations

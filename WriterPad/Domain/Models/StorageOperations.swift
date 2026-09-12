@@ -9,6 +9,8 @@ struct DocumentSaveRequest: Equatable, Sendable {
     let generation: UInt64
     let cursor: TextCursorState?
     let durableBatchKind: DurableLocalBatchKind
+    /// 충돌 선택은 비교했던 TXT가 그대로일 때만 교체한다.
+    let expectedCurrentContentHash: ContentHash?
 
     init(
         projectID: ProjectID,
@@ -17,7 +19,8 @@ struct DocumentSaveRequest: Equatable, Sendable {
         text: String,
         generation: UInt64,
         cursor: TextCursorState? = nil,
-        durableBatchKind: DurableLocalBatchKind = .documentSave
+        durableBatchKind: DurableLocalBatchKind = .documentSave,
+        expectedCurrentContentHash: ContentHash? = nil
     ) {
         self.projectID = projectID
         self.documentID = documentID
@@ -26,6 +29,7 @@ struct DocumentSaveRequest: Equatable, Sendable {
         self.generation = generation
         self.cursor = cursor
         self.durableBatchKind = durableBatchKind
+        self.expectedCurrentContentHash = expectedCurrentContentHash
     }
 }
 

@@ -1,9 +1,115 @@
 import Foundation
 import SQLite3
+import CryptoKit
 import XCTest
 @testable import WriterPad
 
 final class SyncV2StoreTests: XCTestCase {
+    func testGeneralScopeRejectsOtherProjectAndChangedBindingWithoutSQLiteChanges() async throws {
+        let url = try databaseURL(), selected = QueueAPIContext(), other = QueueAPIContext()
+        let store = try await connectedStore(at: url, context: selected)
+        try await store.save(other.binding)
+        let raw = try RawSQLite(url: url)
+        let tables = ["sync_projects", "sync_documents", "sync_operations", "sync_batches", "sync_operation_events", "sync_contract_local_batches", "sync_contract_batches"]
+        let before = try tables.map { try raw.rowFingerprints("SELECT * FROM \($0)") }
+        let scope = GeneralSyncValidationScope(restricted: true, selection: .init(local: selected.localProjectID, server: UUID(), documents: [], reviewedRPCs: []))
+        await GeneralSyncValidationScope.$override.withValue(scope) {
+            for context in [other, selected] {
+                do { _ = try await store.enqueue(context.batch(mutations: [context.documentMutation(operationID: UUID())])); XCTFail("excluded project or binding changed") } catch {}
+            }
+        }
+        XCTAssertEqual(try tables.map { try raw.rowFingerprints("SELECT * FROM \($0)") }, before)
+        raw.close(); await store.close()
+    }
+
+    func testRestrictedDispatcherPreservesSevenOtherSQLiteOperationsAndTheirRows() async throws {
+        let url = try databaseURL(), selected = QueueAPIContext(), other = QueueAPIContext()
+        let store = try await connectedStore(at: url, context: selected)
+        try await store.save(other.binding)
+        let target = UUID(), protected = (0..<7).map { _ in UUID() }
+        _ = try await store.enqueue(selected.batch(mutations: [selected.documentMutation(operationID: target)]))
+        for (index, id) in protected.enumerated() {
+            _ = try await store.enqueue(other.batch(mutations: [other.documentMutation(operationID: id, documentID: UUID(), relativePath: "원고/보존\(index).txt", content: "보존할 합성 원고 \(index)\n")]))
+        }
+        let raw = try RawSQLite(url: url)
+        for id in protected.suffix(3) {
+            try raw.execute("UPDATE sync_operations SET status='conflict', last_error_code='LEASE_CONFLICT', attempts=3 WHERE operation_id='\(id.uuidString.lowercased())';")
+        }
+        let local = other.localProjectID.rawValue.uuidString.lowercased()
+        let queries = ["sync_projects", "sync_documents", "sync_folders", "sync_operations", "sync_batches"].map {
+            "SELECT * FROM \($0) WHERE local_project_id='\(local)'"
+        } + ["SELECT * FROM sync_operation_events WHERE operation_id IN (SELECT operation_id FROM sync_operations WHERE local_project_id='\(local)')", "SELECT * FROM sync_conflicts", "SELECT * FROM sync_tree_orders"]
+        let before = try queries.map { try raw.rowFingerprints($0) }
+        let client = ScopeSQLiteClient()
+        let dispatcher = SyncV2Dispatcher(store: store, client: client, projectScope: .only([selected.localProjectID]))
+        await dispatcher.prioritizeProject(other.localProjectID)
+        await dispatcher.start()
+        for _ in 0..<100 {
+            if try await store.operationStatus(operationID: target) == "completed" { break }
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        await dispatcher.loginSucceeded(); await dispatcher.appEnteredForeground()
+        await dispatcher.userRequestedRetry(); await dispatcher.networkRecovered(); await dispatcher.stop()
+        let status = try await store.operationStatus(operationID: target), requests = await client.operations
+        XCTAssertEqual(status, "completed"); XCTAssertEqual(requests, [target])
+        XCTAssertEqual(try queries.map { try raw.rowFingerprints($0) }, before)
+        XCTAssertEqual(try raw.scalarInt("SELECT COUNT(*) FROM sync_operations WHERE local_project_id='\(local)' AND status='pending'"), 4)
+        XCTAssertEqual(try raw.scalarInt("SELECT COUNT(*) FROM sync_operations WHERE local_project_id='\(local)' AND status='conflict'"), 3)
+        raw.close(); await store.close()
+    }
+
+    private actor ScopeSQLiteClient: SyncV2CommitClienting {
+        private(set) var operations: [UUID] = []
+        func commitDocument(_ p: SyncV2CommitDocumentParameters) throws -> SyncV2CommitDocumentResult {
+            operations.append(p.operationID)
+            return .init(status: .committed, documentID: p.documentID, versionID: UUID(), operationID: p.operationID,
+                         operationKind: p.baseServerRevision == 0 ? .create : .update, serverRevision: p.baseServerRevision + 1,
+                         relativePath: p.relativePath, isDeleted: p.isDeleted,
+                         contentHash: SHA256ContentHasher().sha256(for: Data(p.content.utf8)).rawValue, committedAt: Date())
+        }
+        func commitFolder(_ p: SyncV2CommitFolderParameters) throws -> SyncV2CommitFolderResult {
+            XCTFail("Unexpected folder request"); throw SyncV2ClientError.networkUnavailable
+        }
+    }
+
+    func testVersion11UpgradePreservesPendingContractOperationsAndRequest() async throws {
+        let url = try databaseURL(), context = QueueAPIContext(), batchID = UUID(), operationID = UUID(), folderID = UUID()
+        let store = try await connectedStore(at: url, context: context)
+        await store.close()
+        let raw = try RawSQLite(url: url)
+        let request = "{\"fixture\":\"V11 원본 요청\"}"
+        try raw.execute("""
+            INSERT INTO sync_contract_batches(batch_id, local_project_id, project_id, request_json,
+                batch_payload_sha256, status, attempts, created_at, updated_at)
+            VALUES ('\(batchID.uuidString.lowercased())', '\(context.localProjectID.rawValue.uuidString.lowercased())',
+                '\(context.serverProjectID.uuidString.lowercased())', '\(request)', '\(String(repeating: "a", count: 64))',
+                'ready', 2, '2026-09-07T00:00:00.000Z', '2026-09-07T00:00:00.000Z');
+            INSERT INTO sync_contract_operations(operation_id, batch_id, sequence, entity_kind, entity_id, intent_kind,
+                base_revision, payload_json, payload_sha256, status, created_at, updated_at)
+            VALUES ('\(operationID.uuidString.lowercased())', '\(batchID.uuidString.lowercased())', 1, 'folder',
+                '\(folderID.uuidString.lowercased())', 'create', 0, '{}', '\(String(repeating: "b", count: 64))',
+                'pending', '2026-09-07T00:00:00.000Z', '2026-09-07T00:00:00.000Z');
+            DROP TABLE sync_contract_local_batches;
+            ALTER TABLE sync_contract_batches DROP COLUMN next_attempt_at;
+            ALTER TABLE sync_documents DROP COLUMN parent_folder_id;
+            ALTER TABLE sync_documents DROP COLUMN name;
+            ALTER TABLE sync_documents DROP COLUMN structure_revision;
+            ALTER TABLE sync_contract_batches DROP COLUMN superseded_by;
+            ALTER TABLE sync_contract_batches DROP COLUMN resolution_json;
+            DELETE FROM schema_migrations WHERE version >= 12;
+            PRAGMA user_version = 11;
+            """)
+        raw.close()
+        let reopened = try await openStore(at: url)
+        await reopened.close()
+        let result = try RawSQLite(url: url)
+        XCTAssertEqual(try result.scalarText("SELECT request_json FROM sync_contract_batches;"), request)
+        XCTAssertEqual(try result.scalarInt("SELECT attempts FROM sync_contract_batches;"), 2)
+        XCTAssertEqual(try result.scalarText("SELECT operation_id FROM sync_contract_operations;"), operationID.uuidString.lowercased())
+        XCTAssertEqual(try result.scalarText("SELECT status FROM sync_contract_operations;"), "pending")
+        XCTAssertEqual(try result.scalarInt("PRAGMA user_version;"), SyncV2Store.currentSchemaVersion)
+    }
+
     func testNewDatabaseCreatesFullSchemaAndWAL() async throws {
         let url = try databaseURL()
 
@@ -4079,8 +4185,13 @@ final class SyncV2StoreTests: XCTestCase {
         await store.close()
     }
 
-    func testEquivalentRevisionZeroInitialDocumentAdoptsServerIdentity()
-        async throws {
+    func testBoundaryReceiveModeCannotAdoptEquivalentInitialUploadIdentity() async throws {
+        try await exerciseEquivalentInitialIdentity(receiveGuard: true)
+    }
+    func testEquivalentRevisionZeroInitialDocumentAdoptsServerIdentity() async throws {
+        try await exerciseEquivalentInitialIdentity(receiveGuard: false)
+    }
+    private func exerciseEquivalentInitialIdentity(receiveGuard: Bool) async throws {
         let url = try databaseURL()
         let store = try await openStore(at: url)
         let localProjectID = ProjectID(rawValue: UUID())
@@ -4144,6 +4255,24 @@ final class SyncV2StoreTests: XCTestCase {
             queuedBeforeClaim.first?.contentHash,
             SHA256ContentHasher().sha256(for: Data()).rawValue
         )
+
+        if receiveGuard {
+            let policy = ReceiveValidationPolicy(enabled: true, configuration: nil)
+            let before = try await store.uploadQueueSnapshot(localProjectID: localProjectID)
+            let adopted = try await ReceiveValidationPolicy.$override.withValue(policy) {
+                try await store.adoptEquivalentInitialDocument(localProjectID: localProjectID,
+                    serverProjectID: serverProjectID, localDocumentID: localDocumentID, snapshot: snapshot)
+            }
+            XCTAssertFalse(adopted, "initial-upload adoption is outside server-identity receiving")
+            let after = try await store.uploadQueueSnapshot(localProjectID: localProjectID)
+            let state = try await store.snapshotState(localProjectID: localProjectID,
+                serverProjectID: serverProjectID, documentID: localDocumentID)
+            let remote = try await store.snapshotState(localProjectID: localProjectID,
+                serverProjectID: serverProjectID, documentID: remoteDocumentID)
+            XCTAssertEqual(before, after); XCTAssertEqual(state, initialState); XCTAssertNil(remote)
+            await store.close()
+            return
+        }
 
         let adopted = try await store.adoptEquivalentInitialDocument(
             localProjectID: localProjectID,
@@ -4827,6 +4956,11 @@ final class SyncV2StoreTests: XCTestCase {
         let downgrade = try RawSQLite(url: url)
         try downgrade.execute(
             """
+            DROP TABLE sync_contract_local_batches;
+            ALTER TABLE sync_documents DROP COLUMN parent_folder_id;
+            ALTER TABLE sync_documents DROP COLUMN name;
+            ALTER TABLE sync_documents DROP COLUMN structure_revision;
+            DROP TABLE sync_contract_preparations;
             DROP TABLE conflict_recovery_entities;
             DROP TABLE conflict_recovery_packages;
             DROP TABLE sync_contract_operations;
@@ -4913,6 +5047,14 @@ final class SyncV2StoreTests: XCTestCase {
                 '2026-08-26T00:00:00.000Z'
             );
 
+            ALTER TABLE sync_contract_batches DROP COLUMN next_attempt_at;
+            ALTER TABLE sync_contract_batches DROP COLUMN superseded_by;
+            ALTER TABLE sync_contract_batches DROP COLUMN resolution_json;
+            DROP TABLE sync_contract_local_batches;
+            ALTER TABLE sync_documents DROP COLUMN parent_folder_id;
+            ALTER TABLE sync_documents DROP COLUMN name;
+            ALTER TABLE sync_documents DROP COLUMN structure_revision;
+            DROP TABLE sync_contract_preparations;
             DROP TABLE conflict_recovery_entities;
             DROP TABLE conflict_recovery_packages;
             DROP INDEX sync_operations_supersedes_idx;
@@ -9116,6 +9258,28 @@ private final class RawSQLite {
         }
     }
 
+    func rowFingerprints(_ sql: String) throws -> [String] {
+        var statement: OpaquePointer?
+        guard sqlite3_prepare_v2(database, sql, -1, &statement, nil) == SQLITE_OK, let statement else {
+            throw RawSQLiteError(code: SQLITE_ERROR)
+        }
+        defer { sqlite3_finalize(statement) }
+        var rows: [String] = []
+        while true {
+            let status = sqlite3_step(statement)
+            if status == SQLITE_DONE { return rows.sorted() }
+            guard status == SQLITE_ROW else { throw RawSQLiteError(code: status) }
+            var columns: [String] = []
+            for index in 0..<sqlite3_column_count(statement) {
+                let type = sqlite3_column_type(statement, index)
+                let size = Int(sqlite3_column_bytes(statement, index))
+                let bytes = sqlite3_column_blob(statement, index).map { Data(bytes: $0, count: size).base64EncodedString() } ?? ""
+                columns.append("\(type):\(bytes)")
+            }
+            rows.append(columns.joined(separator: "|"))
+        }
+    }
+
     func scalarInt(_ sql: String) throws -> Int {
         Int(try scalarInt64(sql))
     }
@@ -9328,4 +9492,1900 @@ private actor UnavailableInitialSnapshotStateRecorder:
     }
 
     func recordCallCount() -> Int { calls }
+}
+
+/// 서버·실제 원고를 사용하지 않고 일반 연결의 영속성과 순서를 확인한다.
+func makeGeneralCommitResponseForTesting(_ pending: SyncV2PendingContractBatch) -> SyncV2JSON {
+    let document = pending.request.json.objectValue?["kind"] == .string("document_commit_request")
+    let results = pending.request.orderedIntents.map { intent -> SyncV2JSON in
+        let i = intent.objectValue!, payload = i["payload"]!.objectValue!
+        var result: [String: SyncV2JSON] = ["sequence": i["sequence"]!, "operation_id": i["operation_id"]!,
+            "result_revision": .int((i["base_revision"]?.intValue ?? 0) + 1)]
+        if document {
+            result["document_id"] = i["document_id"]!
+            for key in ["structure_revision", "parent_folder_id", "name", "content_sha256", "content_byte_count", "is_deleted"] { result[key] = payload[key]! }
+        } else { result["entity_id"] = i["entity_id"]! }
+        return .object(result)
+    }
+    return .object(["kind": .string(document ? "document_commit_success" : "atomic_structure_commit_success"),
+        "batch_id": .string(pending.request.batchID.uuidString.lowercased()), "batch_payload_sha256": .string(pending.request.batchPayloadSHA256),
+        "status": .string("committed"), "applied": .bool(true), "results": .array(results)])
+}
+
+func makeGeneralCommitReceiptForTesting(_ pending: SyncV2PendingContractBatch, accountID: UUID, response: SyncV2JSON) throws -> SyncV2GeneralCommitReceipt {
+    let request = pending.request.json.objectValue!
+    var batch = request["batch"]!.objectValue!
+    batch["project_id"] = request["project_id"]
+    batch["project_sync_mode"] = request["project_sync_mode"]
+    batch["migration_epoch"] = request["migration_epoch"]
+    batch["writer_user_id"] = .string(accountID.uuidString.lowercased())
+    batch["request_sha256"] = .string(try pending.request.json.sha256Hex())
+    return .init(batch: .object(batch), result: .object([
+        "batch_id": .string(pending.request.batchID.uuidString.lowercased()), "applied": .bool(true),
+        "response": response, "response_sha256": .string(try response.sha256Hex())]))
+}
+
+final class SyncV2GeneralSyncTests: XCTestCase {
+    private struct Fixture {
+        let url: URL
+        let store: SyncV2Store
+        let binding: ProjectSyncBinding
+        let handshake: SyncV2ValidatedHandshake
+        let device: UUID
+        let document: UUID
+        var local: ProjectID { binding.localProjectID }
+        var server: UUID { binding.serverProjectID! }
+    }
+
+    private func fixture(metadata: Bool = true) async throws -> Fixture {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        addTeardownBlock { try? FileManager.default.removeItem(at: root) }
+        let url = root.appendingPathComponent("general.sqlite")
+        guard case .available(let store) = await SyncV2Store.open(at: url) else { throw NSError(domain: "fixture", code: 1) }
+        let local = ProjectID(rawValue: UUID()), server = UUID(), device = UUID(), document = UUID()
+        let binding = ProjectSyncBinding.connected(localProjectID: local, serverProjectID: server,
+            kind: .existingServerProject, projectName: "합성 작품", ownerSubject: UUID())
+        try await store.save(binding)
+        let snapshot = SyncV2RemoteDocumentSnapshot(documentID: document, relativePath: "문서.txt", content: "처음",
+            revision: 1, isDeleted: false, deletedAt: nil, updatedAt: Date(),
+            name: metadata ? "문서.txt" : nil, structureRevision: metadata ? 3 : nil)
+        let applied = try await store.applySnapshotBaseline(localProjectID: local, serverProjectID: server, snapshot: snapshot, expectedRevision: nil)
+        XCTAssertTrue(applied)
+        let handshake = SyncV2ValidatedHandshake(serverProjectID: server, projectSyncMode: .idBased, migrationEpoch: 1,
+            contractVersion: SyncV2Contract.version, contractSHA256: SyncV2Contract.canonicalSHA256,
+            serverProtocolVersion: SyncV2Contract.syncProtocolVersion, supportedProtocolVersions: [SyncV2Contract.syncProtocolVersion],
+            serverCapabilities: Array(SyncV2Contract.requiredServerCapabilities).sorted())
+        return Fixture(url: url, store: store, binding: binding, handshake: handshake, device: device, document: document)
+    }
+
+    private func save(_ f: Fixture, content: String, batchID: UUID = UUID(), operationID: UUID = UUID()) -> LocalMutationBatch {
+        LocalMutationBatch(batchID: batchID, projectID: f.local, localTransactionID: nil, mutations: [
+            .documentSnapshot(operationID: operationID, documentID: DocumentID(rawValue: f.document),
+                relativePath: RelativeDocumentPath(rawValue: "문서.txt"), content: content,
+                contentHash: SHA256ContentHasher().sha256(for: Data(content.utf8)), localSaveGeneration: 1, isDeleted: false)
+        ])
+    }
+
+    private func enqueue(_ batch: LocalMutationBatch, _ f: Fixture) async throws {
+        _ = try await f.store.enqueueGeneralContract(batch, binding: f.binding, handshake: f.handshake, writerDeviceID: f.device)
+    }
+
+    private func response(_ pending: SyncV2PendingContractBatch, document: Bool = true) -> SyncV2JSON {
+        let results = pending.request.orderedIntents.map { intent -> SyncV2JSON in
+            let i = intent.objectValue!, payload = i["payload"]!.objectValue!
+            var result: [String: SyncV2JSON] = ["sequence": i["sequence"]!, "operation_id": i["operation_id"]!,
+                "result_revision": .int(i["base_revision"]!.intValue! + 1)]
+            if document {
+                result["document_id"] = i["document_id"]!
+                for key in ["structure_revision", "parent_folder_id", "name", "content_sha256", "content_byte_count", "is_deleted"] { result[key] = payload[key]! }
+            } else { result["entity_id"] = i["entity_id"]! }
+            return .object(result)
+        }
+        return .object(["kind": .string(document ? "document_commit_success" : "atomic_structure_commit_success"),
+            "batch_id": .string(pending.request.batchID.uuidString.lowercased()),
+            "batch_payload_sha256": .string(pending.request.batchPayloadSHA256),
+            "status": .string("committed"), "applied": .bool(true), "results": .array(results)])
+    }
+
+    private func conflictReview(_ f: Fixture, content: String = "선택한 원고") async throws -> SyncV2GeneralConflictReview {
+        let batch = save(f, content: content)
+        try await enqueue(batch, f)
+        let pending = try await f.store.claimNextGeneralContract(localProjectID: f.local)
+        await f.store.failContractStructure(pending, error: SyncV2ContractError("REVISION_CONFLICT"),
+            response: .object(["error_code": .string("REVISION_CONFLICT")]))
+        let local = try await f.store.generalConflictLocal(localProjectID: f.local, batchID: batch.batchID)
+        var remote = local.baseline.documents.first { $0.objectValue?["document_id"] == .string(f.document.uuidString.lowercased()) }!.objectValue!
+        remote["revision"] = .int(2)
+        let remoteBaseline = SyncV2PreparationSnapshot(folders: local.baseline.folders,
+            documents: local.baseline.documents.map { $0.objectValue?["document_id"] == .string(f.document.uuidString.lowercased()) ? .object(remote) : $0 }, treeOrders: local.baseline.treeOrders)
+        remote["content"] = .string("서버에서 바뀐 원고")
+        return try .init(local: local, remote: .object(remote), remoteBaseline: remoteBaseline,
+            context: .init(localProjectID: f.local, serverProjectID: f.server, accountID: f.binding.ownerSubject!),
+            authorizationFingerprint: "synthetic-review")
+    }
+
+    private func refreshedReview(_ f: Fixture, previous: SyncV2GeneralConflictReview) async throws -> SyncV2GeneralConflictReview {
+        let local = try await f.store.generalConflictLocal(localProjectID: f.local, batchID: previous.local.detail.row.batchID)
+        return try .init(local: local, remote: previous.remote, remoteBaseline: previous.remoteBaseline,
+            context: previous.context, authorizationFingerprint: previous.authorizationFingerprint)
+    }
+
+    private func addOtherDocument(_ f: Fixture) async throws -> UUID {
+        let id = UUID()
+        let applied = try await f.store.applySnapshotBaseline(localProjectID: f.local, serverProjectID: f.server,
+            snapshot: .init(documentID: id, relativePath: "다른 원고.txt", content: "다른 기준", revision: 7,
+                isDeleted: false, deletedAt: nil, updatedAt: Date(), name: "다른 원고.txt", structureRevision: 2), expectedRevision: nil)
+        XCTAssertTrue(applied)
+        return id
+    }
+
+    private func otherSave(_ f: Fixture, document: UUID, content: String = "다른 문서 저장") -> LocalMutationBatch {
+        .init(batchID: UUID(), projectID: f.local, localTransactionID: nil, mutations: [
+            .documentSnapshot(operationID: UUID(), documentID: .init(rawValue: document), relativePath: .init(rawValue: "다른 원고.txt"),
+                content: content, contentHash: SHA256ContentHasher().sha256(for: Data(content.utf8)), localSaveGeneration: 10, isDeleted: false)])
+    }
+
+    private func failWithStructureEnvelope(_ f: Fixture, pending: SyncV2PendingContractBatch, code: String) async {
+        let response = SyncV2JSON.object(["kind": .string("atomic_structure_commit_failure"),
+            "batch_id": .string(pending.request.batchID.uuidString.lowercased()), "batch_payload_sha256": .string(pending.request.batchPayloadSHA256),
+            "status": .string("rejected"), "applied": .bool(false), "results": .array([]),
+            "error": .object(["code": .string(code), "message": .string(code), "failed_sequence": .int(1)])])
+        do { _ = try SyncV2Contract.validateAtomicStructureResponse(request: pending.request, response: response); XCTFail("rejected response") }
+        catch {
+            XCTAssertEqual((error as? SyncV2ContractError)?.code, code)
+            await f.store.failContractStructure(pending, error: error, response: response)
+        }
+    }
+
+    private func folderNameSource(_ f: Fixture, folder: UUID, child: UUID, name: String) -> LocalMutationBatch {
+        let outside = DocumentNode(id: .init(rawValue: f.document), projectID: f.local, kind: .text, parentID: nil,
+            relativePath: .init(rawValue: "문서.txt"), userOrder: 0, modifiedAt: Date(), contentHash: nil)
+        let target = DocumentNode(id: .init(rawValue: folder), projectID: f.local, kind: .folder, parentID: nil,
+            relativePath: .init(rawValue: name), userOrder: 1, modifiedAt: Date(), contentHash: nil)
+        let nested = DocumentNode(id: .init(rawValue: child), projectID: f.local, kind: .folder, parentID: target.id,
+            relativePath: .init(rawValue: name + "/하위"), userOrder: 0, modifiedAt: Date(), contentHash: nil)
+        return .init(batchID: UUID(), projectID: f.local, localTransactionID: nil, kind: .structureChange,
+            mutations: [.folderSnapshot(operationID: UUID(), folderID: target.id, parentFolderID: nil, name: name, isDeleted: false),
+                .treeOrder(operationID: UUID(), content: "{}", generation: 1)], structureSnapshot: [outside, target, nested])
+    }
+
+    private func folderNameConflict(_ f: Fixture) async throws -> SyncV2GeneralRenameConflictReview {
+        let folder = UUID(), child = UUID()
+        try await f.store.applyFolderSnapshotBaselines(localProjectID: f.local, serverProjectID: f.server, folders: [
+            .init(folderID: folder, parentFolderID: nil, name: "이전 폴더", revision: 1, isDeleted: false, updatedAt: Date()),
+            .init(folderID: child, parentFolderID: folder, name: "하위", revision: 2, isDeleted: false, updatedAt: Date())], excluding: [])
+        try await f.store.applyTreeOrderSnapshotBaselines(localProjectID: f.local, serverProjectID: f.server, treeOrders: [
+            .init(treeOrderID: UUID(), parentFolderID: nil, children: [f.document, folder], revision: 1, updatedAt: Date()),
+            .init(treeOrderID: UUID(), parentFolderID: folder, children: [child], revision: 2, updatedAt: Date()),
+            .init(treeOrderID: UUID(), parentFolderID: child, children: [], revision: 3, updatedAt: Date())])
+        let source = folderNameSource(f, folder: folder, child: child, name: "iPad 폴더"); try await enqueue(source, f)
+        let pending = try await f.store.claimNextGeneralContract(localProjectID: f.local)
+        await failWithStructureEnvelope(f, pending: pending, code: "REVISION_CONFLICT")
+        let local = try await f.store.generalConflictLocal(localProjectID: f.local, batchID: source.batchID)
+        var remote = local.baseline.folders.first { $0.objectValue?["folder_id"] == .string(folder.uuidString.lowercased()) }!.objectValue!
+        remote["name"] = .string("Windows 폴더"); remote["revision"] = .int(4)
+        let folders = local.baseline.folders.map { $0.objectValue?["folder_id"] == remote["folder_id"] ? .object(remote) : $0 }
+        return try .init(local: local, remote: .object(remote), remoteBaseline: .init(folders: folders,
+            documents: local.baseline.documents, treeOrders: local.baseline.treeOrders),
+            context: .init(localProjectID: f.local, serverProjectID: f.server, accountID: f.binding.ownerSubject!), authorizationFingerprint: "synthetic-folder-name")
+    }
+
+    private func compoundCreation(_ f: Fixture) async throws -> LocalMutationBatch {
+        try await f.store.applyTreeOrderSnapshotBaselines(localProjectID: f.local, serverProjectID: f.server,
+            treeOrders: [.init(treeOrderID: UUID(), parentFolderID: nil, children: [f.document], revision: 1, updatedAt: Date())])
+        let folder = DocumentNode(id: .init(rawValue: UUID()), projectID: f.local, kind: .folder, parentID: nil,
+            relativePath: .init(rawValue: "새 권"), userOrder: 1, modifiedAt: Date(), contentHash: nil)
+        var nodes = [DocumentNode(id: .init(rawValue: f.document), projectID: f.local, kind: .text, parentID: nil,
+            relativePath: .init(rawValue: "문서.txt"), userOrder: 0, modifiedAt: Date(), contentHash: nil), folder]
+        var mutations: [DurableLocalMutation] = [.folderSnapshot(operationID: UUID(), folderID: folder.id, parentFolderID: nil, name: "새 권", isDeleted: false)]
+        for index in 0..<2 {
+            let node = DocumentNode(id: .init(rawValue: UUID()), projectID: f.local, kind: .text, parentID: folder.id,
+                relativePath: .init(rawValue: "새 권/\(index + 1)장.txt"), userOrder: index, modifiedAt: Date(), contentHash: nil)
+            let content = index == 0 ? "" : "새 장 본문"
+            nodes.append(node)
+            mutations.append(.documentSnapshot(operationID: UUID(), documentID: node.id, relativePath: node.relativePath, content: content,
+                contentHash: SHA256ContentHasher().sha256(for: Data(content.utf8)), localSaveGeneration: 1, isDeleted: false))
+        }
+        mutations.append(.treeOrder(operationID: UUID(), content: "{}", generation: 1))
+        return .init(batchID: UUID(), projectID: f.local, localTransactionID: UUID(), kind: .volumeCreation, mutations: mutations, structureSnapshot: nodes)
+    }
+
+    @discardableResult
+    private func finishGeneralPlan(_ f: Fixture, restarting: Bool = false) async throws -> [SyncV2PendingContractBatch] {
+        var store = f.store, sent: [SyncV2PendingContractBatch] = []
+        for _ in 0..<40 {
+            let status = try await store.generalQueueStatus(localProjectID: f.local)
+            if status.pendingCount == 0 { if restarting { await store.close() }; return sent }
+            let pending: SyncV2PendingContractBatch
+            do { pending = try await store.claimNextGeneralContract(localProjectID: f.local) }
+            catch SyncV2ContractStructureError.noReadyBatch {
+                let final = try await store.generalQueueStatus(localProjectID: f.local)
+                if final.pendingCount == 0 { if restarting { await store.close() }; return sent }
+                throw SyncV2ContractStructureError.noReadyBatch
+            }
+            sent.append(pending)
+            let body = pending.request.json.objectValue?["kind"] == .string("document_commit_request")
+            let result = response(pending, document: body)
+            if restarting {
+                let receipt = try makeGeneralCommitReceiptForTesting(pending, accountID: f.binding.ownerSubject!, response: result)
+                await store.close()
+                guard case .available(let reopened) = await SyncV2Store.open(at: f.url) else { throw SyncV2GeneralConflictError.unavailable }
+                store = reopened; try await store.recoverInterruptedWork()
+                try await store.recoverGeneralContract(pending, receipt: receipt, accountID: f.binding.ownerSubject!, authorize: {})
+            } else { try await store.completeContractStructure(pending, response: result) }
+        }
+        XCTFail("plan did not drain"); return sent
+    }
+
+    func testCompoundVolumeCreationResumesEachStepAndPreservesOriginalAndLaterSave() async throws {
+        let f = try await fixture(), source = try await compoundCreation(f)
+        try await enqueue(source, f); try await enqueue(save(f, content: "후속 저장"), f)
+        let sent = try await finishGeneralPlan(f, restarting: true)
+        XCTAssertEqual(sent.first?.request.orderedIntents.first?.objectValue?["entity_kind"], .string("folder"))
+        let creates = sent.filter { $0.request.json.objectValue?["kind"] == .string("document_commit_request") && $0.request.orderedIntents[0].objectValue?["intent_kind"] == .string("create") }
+        XCTAssertEqual(creates.count, 2)
+        XCTAssertTrue(creates.contains { $0.request.orderedIntents[0].objectValue?["payload"]?.objectValue?["content"] == .string("") })
+        let operationIDs = sent.flatMap { $0.request.orderedIntents.compactMap { $0.objectValue?["operation_id"]?.stringValue } }
+        XCTAssertEqual(Set(operationIDs).count, operationIDs.count)
+        XCTAssertEqual(sent.last?.request.orderedIntents[0].objectValue?["payload"]?.objectValue?["content"], .string("후속 저장"))
+        guard case .available(let store) = await SyncV2Store.open(at: f.url) else { return XCTFail("open") }
+        let archive = try await store.generalRecoveryDetail(localProjectID: f.local, batchID: source.batchID)
+        XCTAssertEqual(archive.source, source); XCTAssertEqual(archive.row.errorCode, "EXPANDED_CONTRACT_PLAN")
+        let raw = try RawSQLite(url: f.url)
+        XCTAssertEqual(try raw.scalarInt("SELECT COUNT(*) FROM sync_documents WHERE is_deleted=0;"), 3)
+        XCTAssertEqual(try raw.scalarInt("SELECT COUNT(*) FROM sync_contract_local_batches WHERE parent_batch_id IS NOT NULL;"), 5)
+        XCTAssertEqual(try raw.scalarInt("PRAGMA user_version;"), 16)
+        await store.close()
+    }
+
+    func testCompoundPartialTransportFailureRetriesOnlyUnacknowledgedRequest() async throws {
+        let f = try await fixture(), batch = try await compoundCreation(f)
+        try await enqueue(batch, f)
+        let folder = try await f.store.claimNextGeneralContract(localProjectID: f.local)
+        try await f.store.completeContractStructure(folder, response: response(folder, document: false))
+        let document = try await f.store.claimNextGeneralContract(localProjectID: f.local)
+        await f.store.failContractStructure(document, error: SyncV2ContractStructureError.transmissionNotStarted, response: nil)
+        do { _ = try await f.store.claimNextGeneralContract(localProjectID: f.local); XCTFail("retry backoff") } catch SyncV2ContractStructureError.noReadyBatch {}
+        let clock = try RawSQLite(url: f.url)
+        try clock.execute("UPDATE sync_contract_batches SET next_attempt_at='2000-01-01T00:00:00.000Z' WHERE status='ready';")
+        clock.close()
+        let retried = try await f.store.claimNextGeneralContract(localProjectID: f.local)
+        XCTAssertEqual(retried.request, document.request)
+        try await f.store.completeContractStructure(retried, response: response(retried))
+        let rest = try await finishGeneralPlan(f)
+        XCTAssertFalse(rest.contains { $0.request.batchID == folder.request.batchID || $0.request.batchID == document.request.batchID })
+        let raw = try RawSQLite(url: f.url)
+        XCTAssertEqual(try raw.scalarInt("SELECT COUNT(*) FROM sync_folders;"), 1)
+        XCTAssertEqual(try raw.scalarInt("SELECT COUNT(*) FROM sync_documents;"), 3)
+        XCTAssertEqual(try raw.scalarInt("SELECT MAX(attempts) FROM sync_contract_batches;"), 2)
+        await f.store.close()
+    }
+
+    func testVersion15MigrationPreservesImmutableRequestAndAddsPlanColumns() async throws {
+        let f = try await fixture(), review = try await conflictReview(f)
+        let before = review.local.detail
+        await f.store.close()
+        let raw = try RawSQLite(url: f.url)
+        try raw.execute("DROP INDEX sync_contract_local_parent; ALTER TABLE sync_contract_local_batches DROP COLUMN parent_batch_id; ALTER TABLE sync_contract_local_batches DROP COLUMN local_resolution_json; DELETE FROM schema_migrations WHERE version=16; PRAGMA user_version=15;")
+        raw.close()
+        guard case .available(let reopened) = await SyncV2Store.open(at: f.url) else { return XCTFail("V15 migration") }
+        let after = try await reopened.generalRecoveryDetail(localProjectID: f.local, batchID: before.row.batchID)
+        XCTAssertEqual(before.sourceJSON, after.sourceJSON); XCTAssertEqual(before.requestJSON, after.requestJSON); XCTAssertEqual(before.responseJSON, after.responseJSON)
+        let version = try await reopened.schemaVersion(); XCTAssertEqual(version, 16)
+        await reopened.close()
+    }
+
+    func testDocumentTrashRestoreAndPurgeUseRequiredDependencyOrder() async throws {
+        let f = try await fixture()
+        try await f.store.applyTreeOrderSnapshotBaselines(localProjectID: f.local, serverProjectID: f.server,
+            treeOrders: [.init(treeOrderID: UUID(), parentFolderID: nil, children: [f.document], revision: 1, updatedAt: Date())])
+        let active = DocumentNode(id: .init(rawValue: f.document), projectID: f.local, kind: .text, parentID: nil,
+            relativePath: .init(rawValue: "문서.txt"), userOrder: 0, modifiedAt: Date(), contentHash: nil)
+        let trashed = active.movedToTrash(at: .init(rawValue: "휴지통/문서.txt"), trashParentID: nil, deletedAt: Date())
+        func source(deleted: Bool) -> LocalMutationBatch {
+            .init(batchID: UUID(), projectID: f.local, localTransactionID: nil, kind: .trashChange, mutations: [
+                .documentSnapshot(operationID: UUID(), documentID: active.id, relativePath: active.relativePath, content: "처음",
+                    contentHash: SHA256ContentHasher().sha256(for: Data("처음".utf8)), localSaveGeneration: 1, isDeleted: deleted),
+                .treeOrder(operationID: UUID(), content: "{}", generation: 1)], structureSnapshot: [deleted ? trashed : active])
+        }
+        try await enqueue(source(deleted: true), f)
+        let deletion = try await finishGeneralPlan(f)
+        XCTAssertEqual(deletion.count, 2)
+        XCTAssertEqual(deletion[0].request.orderedIntents[0].objectValue?["entity_kind"], .string("tree_order"))
+        XCTAssertEqual(deletion[1].request.orderedIntents[0].objectValue?["intent_kind"], .string("delete"))
+        let raw = try RawSQLite(url: f.url)
+        XCTAssertEqual(try raw.scalarInt("SELECT is_deleted FROM sync_documents;"), 1)
+        try await enqueue(source(deleted: false), f)
+        let restoration = try await finishGeneralPlan(f)
+        XCTAssertEqual(restoration.first?.request.orderedIntents[0].objectValue?["intent_kind"], .string("restore"))
+        XCTAssertEqual(restoration.last?.request.orderedIntents[0].objectValue?["entity_kind"], .string("tree_order"))
+        XCTAssertEqual(try raw.scalarInt("SELECT is_deleted FROM sync_documents;"), 0)
+        try await enqueue(source(deleted: true), f); try await finishGeneralPlan(f)
+        let purge = try SyncV2TrashPurgePayload(purgedRevisions: [f.document: 0], emptyGeneration: "").canonicalContent()
+        let batch = LocalMutationBatch(batchID: UUID(), projectID: f.local, localTransactionID: nil, kind: .trashChange,
+            mutations: [.trashPurge(operationID: UUID(), content: purge, generation: UUID())], structureSnapshot: [])
+        try await enqueue(batch, f)
+        let pending = try await f.store.claimNextGeneralContract(localProjectID: f.local)
+        XCTAssertEqual(pending.request.orderedIntents[0].objectValue?["entity_kind"], .string("trash_purge"))
+        let purgeContent = try XCTUnwrap(pending.request.orderedIntents[0].objectValue?["payload"]?.objectValue?["content"]?.stringValue)
+        XCTAssertEqual(try SyncV2TrashPurgePayload(strictContent: purgeContent).purgedRevisions[f.document], 4)
+        try await f.store.completeContractStructure(pending, response: response(pending, document: false))
+        XCTAssertEqual(try raw.scalarInt("SELECT COUNT(*) FROM sync_documents WHERE is_deleted=1;"), 1)
+        await f.store.close()
+    }
+
+    func testRestoreOutOfDeletedAncestorsReopensParentsMovesDocumentAndClosesParents() async throws {
+        let f = try await fixture(), initial = try await folderWithManuscript(f, includeSnapshot: true)
+        try await enqueue(initial, f); try await finishGeneralPlan(f)
+        let originals = try XCTUnwrap(initial.structureSnapshot).map { n in
+            DocumentNode(id: n.id, projectID: n.projectID, kind: n.kind, parentID: n.parentID,
+                relativePath: n.relativePath, userOrder: n.userOrder, modifiedAt: Date(), contentHash: nil)
+        }
+        let trashed = originals.map { $0.movedToTrash(at: .init(rawValue: "휴지통/" + $0.relativePath.rawValue), trashParentID: $0.parentID, deletedAt: Date()) }
+        var mutations: [DurableLocalMutation] = originals.filter { $0.kind == .folder }.map {
+            .folderSnapshot(operationID: UUID(), folderID: $0.id, parentFolderID: $0.parentID,
+                            name: ($0.relativePath.rawValue as NSString).lastPathComponent, isDeleted: true)
+        }
+        mutations.append(.documentSnapshot(operationID: UUID(), documentID: .init(rawValue: f.document), relativePath: originals[2].relativePath,
+            content: "처음", contentHash: SHA256ContentHasher().sha256(for: Data("처음".utf8)), localSaveGeneration: 1, isDeleted: true))
+        mutations.append(.treeOrder(operationID: UUID(), content: "{}", generation: 1))
+        try await enqueue(.init(batchID: UUID(), projectID: f.local, localTransactionID: nil, kind: .trashChange, mutations: mutations, structureSnapshot: trashed), f)
+        let deletion = try await finishGeneralPlan(f)
+        XCTAssertEqual(deletion.first?.request.orderedIntents[0].objectValue?["entity_kind"], .string("tree_order"))
+        let raw = try RawSQLite(url: f.url)
+        XCTAssertEqual(try raw.scalarInt("SELECT COUNT(*) FROM sync_folders WHERE is_deleted=1;"), 2)
+        let occupyingFolder = UUID()
+        try await f.store.applyFolderSnapshotBaselines(localProjectID: f.local, serverProjectID: f.server,
+            folders: [.init(folderID: occupyingFolder, parentFolderID: nil, name: "새 폴더", revision: 1, isDeleted: false, updatedAt: Date())], excluding: [])
+        let occupied = DocumentNode(id: .init(rawValue: occupyingFolder), projectID: f.local, kind: .folder, parentID: nil,
+            relativePath: .init(rawValue: "새 폴더"), userOrder: 1, modifiedAt: Date(), contentHash: nil)
+        let restored = DocumentNode(id: .init(rawValue: f.document), projectID: f.local, kind: .text, parentID: nil,
+            relativePath: .init(rawValue: "복원한 원고.txt"), userOrder: 0, modifiedAt: Date(), contentHash: nil)
+        let source = LocalMutationBatch(batchID: UUID(), projectID: f.local, localTransactionID: nil, kind: .trashChange,
+            mutations: [.documentSnapshot(operationID: UUID(), documentID: restored.id, relativePath: restored.relativePath,
+                         content: "처음", contentHash: SHA256ContentHasher().sha256(for: Data("처음".utf8)), localSaveGeneration: 2, isDeleted: false),
+                        .treeOrder(operationID: UUID(), content: "{}", generation: 2)], structureSnapshot: Array(trashed.prefix(2)) + [restored, occupied])
+        try await enqueue(source, f)
+        let requests = try await finishGeneralPlan(f)
+        XCTAssertEqual(requests.first?.request.orderedIntents[0].objectValue?["intent_kind"], .string("restore"))
+        XCTAssertTrue(requests.contains { $0.request.orderedIntents.contains { $0.objectValue?["intent_kind"] == .string("move") } })
+        XCTAssertEqual(try raw.scalarInt("SELECT COUNT(*) FROM sync_folders WHERE is_deleted=1;"), 2)
+        XCTAssertEqual(try raw.scalarInt("SELECT COUNT(*) FROM sync_folders WHERE is_deleted=0 AND name='새 폴더';"), 1)
+        XCTAssertEqual(try raw.scalarInt("SELECT is_deleted FROM sync_documents;"), 0)
+        XCTAssertEqual(try raw.scalarText("SELECT server_path FROM sync_documents;"), "복원한 원고.txt")
+        XCTAssertEqual(try raw.scalarText("SELECT base_content FROM sync_documents;"), "처음")
+        await f.store.close()
+    }
+
+    func testHistoricalInventedServerPathRepairsBeforePreservedBody() async throws {
+        let f = try await fixture(), source = try await folderWithManuscript(f, includeSnapshot: true)
+        try await enqueue(source, f)
+        let first = try await f.store.claimNextGeneralContract(localProjectID: f.local)
+        try await f.store.completeContractStructure(first, response: response(first, document: false))
+        let raw = try RawSQLite(url: f.url)
+        try raw.execute("UPDATE sync_documents SET server_path='이전/하위/문서.txt';")
+        let body = LocalMutationBatch(batchID: UUID(), projectID: f.local, localTransactionID: nil, mutations: [
+            .documentSnapshot(operationID: UUID(), documentID: .init(rawValue: f.document), relativePath: .init(rawValue: "새 폴더/하위/문서.txt"), content: "미전송 원고",
+                contentHash: SHA256ContentHasher().sha256(for: Data("미전송 원고".utf8)), localSaveGeneration: 2, isDeleted: false)])
+        try await enqueue(body, f)
+        do { _ = try await f.store.claimNextGeneralContract(localProjectID: f.local); XCTFail("stale path") } catch {}
+        let local = try await f.store.generalConflictLocal(localProjectID: f.local, batchID: body.batchID)
+        var remoteBody = local.baseline.documents[0].objectValue!; remoteBody["content"] = .string("처음")
+        let review = try SyncV2GeneralStructureReview(local: local, remoteBaseline: local.baseline, remoteDocuments: [.object(remoteBody)],
+            context: .init(localProjectID: f.local, serverProjectID: f.server, accountID: f.binding.ownerSubject!), authorizationFingerprint: "path")
+        XCTAssertTrue(review.repairsHistoricalPath)
+        _ = try await f.store.replaceGeneralStructureConflict(review, adoptServer: false, authorize: {})
+        let sent = try await finishGeneralPlan(f)
+        XCTAssertEqual(sent.count, 2)
+        XCTAssertEqual(sent[0].request.json.objectValue?["kind"], .string("atomic_structure_commit_request"))
+        XCTAssertEqual(sent[1].request.orderedIntents[0].objectValue?["payload"]?.objectValue?["content"], .string("미전송 원고"))
+        XCTAssertEqual(try raw.scalarText("SELECT base_content FROM sync_documents;"), "미전송 원고")
+        XCTAssertEqual(try raw.scalarText("SELECT server_path FROM sync_documents;"), "새 폴더/하위/문서.txt")
+        await f.store.close()
+    }
+
+    func testHistoricalLocalOnlyPathMismatchResumesBodyWithoutRedundantStructureWrite() async throws {
+        let f = try await fixture(), source = try await folderWithManuscript(f, includeSnapshot: true)
+        try await enqueue(source, f)
+        let first = try await f.store.claimNextGeneralContract(localProjectID: f.local)
+        try await f.store.completeContractStructure(first, response: response(first, document: false))
+        let raw = try RawSQLite(url: f.url)
+        try raw.execute("UPDATE sync_documents SET server_path='이전/하위/문서.txt';")
+        let body = LocalMutationBatch(batchID: UUID(), projectID: f.local, localTransactionID: nil, mutations: [
+            .documentSnapshot(operationID: UUID(), documentID: .init(rawValue: f.document), relativePath: .init(rawValue: "새 폴더/하위/문서.txt"), content: "미전송 원고",
+                contentHash: SHA256ContentHasher().sha256(for: Data("미전송 원고".utf8)), localSaveGeneration: 2, isDeleted: false)])
+        try await enqueue(body, f)
+        do { _ = try await f.store.claimNextGeneralContract(localProjectID: f.local); XCTFail("stale path") } catch {}
+        let local = try await f.store.generalConflictLocal(localProjectID: f.local, batchID: body.batchID)
+        var metadata = local.baseline.documents[0].objectValue!
+        metadata["relative_path"] = .string("새 폴더/하위/문서.txt")
+        let remoteBaseline = SyncV2PreparationSnapshot(folders: local.baseline.folders, documents: [.object(metadata)], treeOrders: local.baseline.treeOrders)
+        var remoteBody = metadata; remoteBody["content"] = .string("처음")
+        let review = try SyncV2GeneralStructureReview(local: local, remoteBaseline: remoteBaseline, remoteDocuments: [.object(remoteBody)],
+            context: .init(localProjectID: f.local, serverProjectID: f.server, accountID: f.binding.ownerSubject!), authorizationFingerprint: "path")
+        XCTAssertTrue(review.repairsHistoricalPath)
+        _ = try await f.store.replaceGeneralStructureConflict(review, adoptServer: false, authorize: {})
+        let sent = try await finishGeneralPlan(f)
+        XCTAssertEqual(sent.count, 1)
+        XCTAssertEqual(sent[0].request.orderedIntents[0].objectValue?["payload"]?.objectValue?["content"], .string("미전송 원고"))
+        XCTAssertEqual(try raw.scalarText("SELECT base_content FROM sync_documents;"), "미전송 원고")
+        XCTAssertEqual(try raw.scalarText("SELECT server_path FROM sync_documents;"), "새 폴더/하위/문서.txt")
+        await f.store.close()
+    }
+
+    private func combinedStructureConflict(_ f: Fixture) async throws -> SyncV2GeneralStructureReview {
+        let original = try await populatedFolderConflict(f)
+        var documents = original.remoteBaseline.documents, bodies = original.descendantDocuments
+        var first = bodies[0].objectValue!
+        let id = first["document_id"]!
+        first["name"] = .string("이동한 원고.txt"); first["relative_path"] = .string("이동한 원고.txt")
+        first["parent_folder_id"] = .null; first["structure_revision"] = .int(9)
+        bodies[0] = .object(first); first.removeValue(forKey: "content")
+        documents = documents.map { $0.objectValue?["document_id"] == id ? .object(first) : $0 }
+        let orders = original.remoteBaseline.treeOrders.map { row -> SyncV2JSON in
+            var f = row.objectValue!, children = f["children"]!.arrayValue!
+            children.removeAll { $0 == id }
+            if f["parent_folder_id"] == .null { children.insert(id, at: 0) }
+            f["children"] = .array(children); f["revision"] = .int(f["revision"]!.intValue! + 1)
+            return .object(f)
+        }
+        return try .init(local: original.local, remoteBaseline: .init(folders: original.remoteBaseline.folders, documents: documents, treeOrders: orders),
+            remoteDocuments: bodies, context: original.context, authorizationFingerprint: "combined")
+    }
+
+    func testCombinedMoveNameAndOrderConflictKeepsAllBodiesAndRollsBackAuthorization() async throws {
+        let f = try await fixture(), review = try await combinedStructureConflict(f)
+        let epoch = SyncV2ContractEpoch()
+        do {
+            _ = try await f.store.replaceGeneralStructureConflict(review, adoptServer: false, authorize: {
+                if epoch.value > 0 { throw SyncV2GeneralConflictError.changed }; epoch.advance()
+            }); XCTFail("authorization")
+        } catch {}
+        let unchanged = try await f.store.generalConflictLocal(localProjectID: f.local, batchID: review.local.detail.row.batchID)
+        XCTAssertEqual(try unchanged.baseline.fingerprint(), try review.local.baseline.fingerprint())
+        let replacement = try await f.store.replaceGeneralStructureConflict(review, adoptServer: false, authorize: {})
+        let pending = try await f.store.claimNextGeneralContract(localProjectID: f.local)
+        XCTAssertEqual(pending.request.batchID, replacement)
+        XCTAssertTrue(pending.request.orderedIntents.contains { $0.objectValue?["intent_kind"] == .string("move") })
+        XCTAssertTrue(pending.request.orderedIntents.contains { $0.objectValue?["entity_kind"] == .string("tree_order") })
+        try await f.store.completeContractStructure(pending, response: response(pending, document: false))
+        let raw = try RawSQLite(url: f.url)
+        XCTAssertEqual(try raw.scalarInt("SELECT COUNT(*) FROM sync_documents WHERE name LIKE '_sync_%';"), 0)
+        XCTAssertEqual(try raw.scalarInt("SELECT COUNT(*) FROM sync_documents WHERE server_path LIKE '새 폴더/하위/%';"), 2)
+        XCTAssertEqual(try raw.scalarInt("SELECT COUNT(*) FROM sync_documents WHERE server_revision IN (1,2);"), 2)
+        await f.store.close()
+    }
+
+    func testServerStructureAdoptionRejectsUnrefreshedServerPaths() async throws {
+        let f = try await fixture(), initial = try await combinedStructureConflict(f)
+        var bodies = initial.remoteDocuments, documents = initial.remoteBaseline.documents
+        var body = bodies[0].objectValue!; body["relative_path"] = .string("낡은 경로/문서.txt")
+        bodies[0] = .object(body); body.removeValue(forKey: "content")
+        documents = documents.map { $0.objectValue?["document_id"] == body["document_id"] ? .object(body) : $0 }
+        let review = try SyncV2GeneralStructureReview(local: initial.local,
+            remoteBaseline: .init(folders: initial.remoteBaseline.folders, documents: documents, treeOrders: initial.remoteBaseline.treeOrders),
+            remoteDocuments: bodies, context: initial.context, authorizationFingerprint: "stale-server-path")
+        XCTAssertFalse(review.canAdoptServer)
+        do { _ = try await f.store.replaceGeneralStructureConflict(review, adoptServer: true, authorize: {}); XCTFail("stale server path") } catch {}
+        let detail = try await f.store.generalRecoveryDetail(localProjectID: f.local, batchID: initial.local.detail.row.batchID)
+        XCTAssertNil(detail.resolutionJSON)
+        _ = try await f.store.replaceGeneralStructureConflict(review, adoptServer: false, authorize: {})
+        try await finishGeneralPlan(f)
+        await f.store.close()
+    }
+
+    func testServerStructureSelectionPreservesSourceAndLeavesBaselineForProtectedPull() async throws {
+        let f = try await fixture(), review = try await combinedStructureConflict(f)
+        XCTAssertTrue(review.canAdoptServer)
+        let original = review.local.detail
+        _ = try await f.store.replaceGeneralStructureConflict(review, adoptServer: true, authorize: {})
+        let archive = try await f.store.generalRecoveryDetail(localProjectID: f.local, batchID: original.row.batchID)
+        XCTAssertEqual(archive.sourceJSON, original.sourceJSON); XCTAssertEqual(archive.requestJSON, original.requestJSON)
+        XCTAssertEqual(archive.responseJSON, original.responseJSON)
+        XCTAssertTrue(archive.resolutionJSON?.contains("adopt_server_structure_pending_pull") == true)
+        let raw = try RawSQLite(url: f.url)
+        XCTAssertEqual(try raw.scalarInt("SELECT COUNT(*) FROM sync_contract_batches;"), 1)
+        XCTAssertEqual(try raw.scalarInt("SELECT COUNT(*) FROM sync_folders WHERE name='이전';"), 1)
+        let status = try await f.store.generalQueueStatus(localProjectID: f.local); XCTAssertEqual(status.pendingCount, 0)
+        await f.store.close()
+    }
+
+    private func folderWithManuscript(_ f: Fixture, includeSnapshot: Bool, includeSecondDocument: Bool = false) async throws -> LocalMutationBatch {
+        let folder = UUID(), child = UUID(), other = includeSecondDocument ? UUID() : nil
+        try await f.store.applyFolderSnapshotBaselines(localProjectID: f.local, serverProjectID: f.server, folders: [
+            .init(folderID: folder, parentFolderID: nil, name: "이전", revision: 1, isDeleted: false, updatedAt: Date()),
+            .init(folderID: child, parentFolderID: folder, name: "하위", revision: 1, isDeleted: false, updatedAt: Date())], excluding: [])
+        _ = try await f.store.applySnapshotBaseline(localProjectID: f.local, serverProjectID: f.server,
+            snapshot: .init(documentID: f.document, relativePath: "이전/하위/문서.txt", content: "처음", revision: 2,
+                isDeleted: false, deletedAt: nil, updatedAt: Date(), parentFolderID: child, name: "문서.txt", structureRevision: 3), expectedRevision: 1)
+        if let other {
+            _ = try await f.store.applySnapshotBaseline(localProjectID: f.local, serverProjectID: f.server,
+                snapshot: .init(documentID: other, relativePath: "이전/하위/둘째.txt", content: "두 번째", revision: 1,
+                    isDeleted: false, deletedAt: nil, updatedAt: Date(), parentFolderID: child, name: "둘째.txt", structureRevision: 2), expectedRevision: nil)
+        }
+        try await f.store.applyTreeOrderSnapshotBaselines(localProjectID: f.local, serverProjectID: f.server, treeOrders: [
+            .init(treeOrderID: UUID(), parentFolderID: nil, children: [folder], revision: 1, updatedAt: Date()),
+            .init(treeOrderID: UUID(), parentFolderID: folder, children: [child], revision: 1, updatedAt: Date()),
+            .init(treeOrderID: UUID(), parentFolderID: child, children: [f.document] + (other.map { [$0] } ?? []), revision: 1, updatedAt: Date())])
+        var nodes = [
+            DocumentNode(id: .init(rawValue: folder), projectID: f.local, kind: .folder, parentID: nil,
+                relativePath: .init(rawValue: "새 폴더"), userOrder: 0, modifiedAt: Date(), contentHash: nil),
+            DocumentNode(id: .init(rawValue: child), projectID: f.local, kind: .folder, parentID: .init(rawValue: folder),
+                relativePath: .init(rawValue: "새 폴더/하위"), userOrder: 0, modifiedAt: Date(), contentHash: nil),
+            DocumentNode(id: .init(rawValue: f.document), projectID: f.local, kind: .text, parentID: .init(rawValue: child),
+                relativePath: .init(rawValue: "새 폴더/하위/문서.txt"), userOrder: 0, modifiedAt: Date(), contentHash: nil)]
+        var mutations: [DurableLocalMutation] = includeSnapshot ? [.documentSnapshot(operationID: UUID(), documentID: .init(rawValue: f.document),
+            relativePath: nodes[2].relativePath, content: "처음", contentHash: SHA256ContentHasher().sha256(for: Data("처음".utf8)), localSaveGeneration: 1, isDeleted: false)] : []
+        if let other {
+            let node = DocumentNode(id: .init(rawValue: other), projectID: f.local, kind: .text, parentID: .init(rawValue: child),
+                relativePath: .init(rawValue: "새 폴더/하위/둘째.txt"), userOrder: 1, modifiedAt: Date(), contentHash: nil)
+            nodes.append(node)
+            if includeSnapshot {
+                mutations.append(.documentSnapshot(operationID: UUID(), documentID: node.id, relativePath: node.relativePath,
+                    content: "두 번째", contentHash: SHA256ContentHasher().sha256(for: Data("두 번째".utf8)), localSaveGeneration: 1, isDeleted: false))
+            }
+        }
+        mutations += [.folderSnapshot(operationID: UUID(), folderID: nodes[0].id, parentFolderID: nil, name: "새 폴더", isDeleted: false),
+            .treeOrder(operationID: UUID(), content: "{}", generation: 1)]
+        return .init(batchID: UUID(), projectID: f.local, localTransactionID: nil, kind: .structureChange, mutations: mutations, structureSnapshot: nodes)
+    }
+
+    private func populatedFolderConflict(_ f: Fixture, refreshed: Bool = true) async throws -> SyncV2GeneralRenameConflictReview {
+        let source = try await folderWithManuscript(f, includeSnapshot: true, includeSecondDocument: true)
+        try await enqueue(source, f)
+        let pending = try await f.store.claimNextGeneralContract(localProjectID: f.local)
+        await failWithStructureEnvelope(f, pending: pending, code: "REVISION_CONFLICT")
+        let local = try await f.store.generalConflictLocal(localProjectID: f.local, batchID: source.batchID)
+        let folderKey = pending.request.orderedIntents[0].objectValue!["entity_id"]!
+        var remote = local.baseline.folders.first { $0.objectValue?["folder_id"] == folderKey }!.objectValue!
+        remote["name"] = .string("Windows"); remote["revision"] = .int(4)
+        let folders = local.baseline.folders.map { $0.objectValue?["folder_id"] == folderKey ? .object(remote) : $0 }
+        var documents = local.baseline.documents, bodies: [SyncV2JSON] = []
+        for manuscript in try local.detail.manuscripts() {
+            let index = documents.firstIndex { $0.objectValue?["document_id"] == .string(manuscript.documentID.rawValue.uuidString.lowercased()) }!
+            var fields = documents[index].objectValue!
+            if refreshed {
+                fields["relative_path"] = .string("Windows/하위/" + fields["name"]!.stringValue!)
+                fields["structure_revision"] = .int(fields["structure_revision"]!.intValue! + 2)
+            }
+            documents[index] = .object(fields); fields["content"] = .string(manuscript.content); bodies.append(.object(fields))
+        }
+        remote["descendant_documents"] = .array(bodies)
+        return try .init(local: local, remote: .object(remote), remoteBaseline: .init(folders: folders, documents: documents,
+            treeOrders: local.baseline.treeOrders), context: .init(localProjectID: f.local, serverProjectID: f.server,
+                accountID: f.binding.ownerSubject!), authorizationFingerprint: "synthetic-populated-folder")
+    }
+
+    func testPopulatedFolderConflictPreservesEachOperationAndTailAcrossReceiptRecovery() async throws {
+        for refreshed in [false, true] {
+            let f = try await fixture(), initial = try await populatedFolderConflict(f, refreshed: refreshed)
+            let content = "폴더 복구 뒤 저장"
+            let tail = LocalMutationBatch(batchID: UUID(), projectID: f.local, localTransactionID: nil, mutations: [
+                .documentSnapshot(operationID: UUID(), documentID: .init(rawValue: f.document), relativePath: .init(rawValue: "새 폴더/하위/문서.txt"),
+                    content: content, contentHash: SHA256ContentHasher().sha256(for: Data(content.utf8)), localSaveGeneration: 2, isDeleted: false)])
+            try await enqueue(tail, f)
+            let local = try await f.store.generalConflictLocal(localProjectID: f.local, batchID: initial.local.detail.row.batchID)
+            let review = try SyncV2GeneralRenameConflictReview(local: local, remote: initial.remote, remoteBaseline: initial.remoteBaseline,
+                context: initial.context, authorizationFingerprint: initial.authorizationFingerprint)
+            let replacement = try await f.store.replaceGeneralRenameConflict(review, authorize: {})
+            let archive = try await f.store.generalRecoveryDetail(localProjectID: f.local, batchID: local.detail.row.batchID)
+            XCTAssertEqual(archive.sourceJSON, local.detail.sourceJSON); XCTAssertEqual(archive.requestJSON, local.detail.requestJSON)
+            XCTAssertEqual(archive.responseJSON, local.detail.responseJSON); XCTAssertNotNil(archive.resolutionJSON)
+            let baseline = try await f.store.generalResumeBaseline(localProjectID: f.local)
+            XCTAssertEqual(try baseline.fingerprint(), try review.remoteBaseline.fingerprint())
+            let pending = try await f.store.claimNextGeneralContract(localProjectID: f.local)
+            XCTAssertEqual(pending.request.batchID, replacement); XCTAssertEqual(pending.request.orderedIntents.count, 3)
+            let original = try SyncV2ContractRequest(storedJSON: JSONDecoder().decode(SyncV2JSON.self, from: Data(local.detail.requestJSON!.utf8)))
+            let operationKeys = pending.request.orderedIntents.compactMap { $0.objectValue?["operation_id"]?.stringValue }
+            XCTAssertEqual(Set(operationKeys).count, 3)
+            XCTAssertTrue(Set(operationKeys).isDisjoint(with: original.orderedIntents.compactMap { $0.objectValue?["operation_id"]?.stringValue }))
+            XCTAssertEqual(pending.request.orderedIntents[0].objectValue?["base_revision"], .int(4))
+            for (index, child) in review.descendantDocuments.enumerated() {
+                XCTAssertEqual(pending.request.orderedIntents[index + 1].objectValue?["base_revision"], child.objectValue?["structure_revision"])
+            }
+            let replacementDetail = try await f.store.generalRecoveryDetail(localProjectID: f.local, batchID: replacement)
+            XCTAssertEqual(replacementDetail.source.structureSnapshot, local.detail.source.structureSnapshot)
+            XCTAssertEqual(try replacementDetail.manuscripts().map(\.content), try local.detail.manuscripts().map(\.content))
+            let receipt = try makeGeneralCommitReceiptForTesting(pending, accountID: f.binding.ownerSubject!, response: response(pending, document: false))
+            await f.store.close()
+            guard case .available(let reopened) = await SyncV2Store.open(at: f.url) else { return XCTFail("restart") }
+            try await reopened.recoverInterruptedWork()
+            try await reopened.recoverGeneralContract(pending, receipt: receipt, accountID: f.binding.ownerSubject!, authorize: {})
+            let next = try await reopened.claimNextGeneralContract(localProjectID: f.local)
+            XCTAssertEqual(next.request.batchID, tail.batchID)
+            XCTAssertEqual(next.request.orderedIntents[0].objectValue?["base_revision"], .int(2))
+            XCTAssertEqual(next.request.orderedIntents[0].objectValue?["payload"]?.objectValue?["structure_revision"], .int(refreshed ? 6 : 4))
+            try await reopened.completeContractStructure(next, response: response(next))
+            let status = try await reopened.generalQueueStatus(localProjectID: f.local); XCTAssertEqual(status.pendingCount, 0)
+            await reopened.close()
+        }
+    }
+
+    func testPopulatedFolderConflictRejectsBodyMetadataAndMissingChildChanges() async throws {
+        let f = try await fixture(), review = try await populatedFolderConflict(f)
+        for variant in 0..<9 {
+            var remote = review.remote.objectValue!, children = review.descendantDocuments
+            var child = children[0].objectValue!, documents = review.remoteBaseline.documents
+            switch variant {
+            case 0: child["content"] = .string("변경된 원고")
+            case 1: child["revision"] = .int(99)
+            case 2: child["parent_folder_id"] = .null
+            case 3: child["is_deleted"] = .bool(true)
+            case 4: child["relative_path"] = .string("다른 경로.txt")
+            case 5: child["structure_revision"] = .int(1)
+            case 6: child["name"] = .string("다른 이름.txt")
+            case 7: children.removeLast()
+            default: children.reverse()
+            }
+            if variant < 7 {
+                children[0] = .object(child)
+                child.removeValue(forKey: "content")
+                documents = documents.map { $0.objectValue?["document_id"] == child["document_id"] ? .object(child) : $0 }
+            }
+            remote["descendant_documents"] = .array(children)
+            XCTAssertThrowsError(try SyncV2GeneralRenameConflictReview(local: review.local, remote: .object(remote),
+                remoteBaseline: .init(folders: review.remoteBaseline.folders, documents: documents, treeOrders: review.remoteBaseline.treeOrders),
+                context: review.context, authorizationFingerprint: review.authorizationFingerprint), "variant \(variant)")
+        }
+        await f.store.close()
+    }
+
+    func testPopulatedFolderConflictRollsBackAllBaselinesOnFinalAuthorizationFailure() async throws {
+        let f = try await fixture(), review = try await populatedFolderConflict(f)
+        let epoch = SyncV2ContractEpoch()
+        do {
+            _ = try await f.store.replaceGeneralRenameConflict(review, authorize: {
+                if epoch.value > 0 { throw SyncV2GeneralConflictError.changed }; epoch.advance()
+            }); XCTFail("final authorization")
+        } catch {}
+        let baseline = try await f.store.generalConflictLocal(localProjectID: f.local, batchID: review.local.detail.row.batchID).baseline
+        XCTAssertEqual(try baseline.fingerprint(), try review.local.baseline.fingerprint())
+        let raw = try RawSQLite(url: f.url)
+        XCTAssertEqual(try raw.scalarInt("SELECT COUNT(*) FROM sync_contract_batches;"), 1)
+        let original = try await f.store.generalRecoveryDetail(localProjectID: f.local, batchID: review.local.detail.row.batchID)
+        XCTAssertNil(original.resolutionJSON); XCTAssertEqual(original.row.requestStatus, "conflict")
+        await f.store.close()
+    }
+
+    func testFolderRenameRefreshesDescendantPathInSameAtomicRequestBeforeBodySave() async throws {
+        let f = try await fixture(), source = try await folderWithManuscript(f, includeSnapshot: true)
+        try await enqueue(source, f)
+        let pending = try await f.store.claimNextGeneralContract(localProjectID: f.local)
+        let intents = pending.request.orderedIntents.map { $0.objectValue! }
+        XCTAssertEqual(intents.count, 2)
+        XCTAssertEqual(intents[0]["entity_kind"], .string("folder"))
+        XCTAssertEqual(intents[1]["entity_kind"], .string("document")); XCTAssertEqual(intents[1]["intent_kind"], .string("rename"))
+        XCTAssertEqual(intents[1]["payload"], .object(["name": .string("문서.txt")]))
+        XCTAssertEqual(intents[1]["base_revision"], .int(3))
+        let raw = try RawSQLite(url: f.url)
+        XCTAssertEqual(try raw.scalarText("SELECT server_path FROM sync_documents;"), "이전/하위/문서.txt")
+        try await f.store.completeContractStructure(pending, response: response(pending, document: false))
+        XCTAssertEqual(try raw.scalarText("SELECT server_path FROM sync_documents;"), "새 폴더/하위/문서.txt")
+        XCTAssertEqual(try raw.scalarInt("SELECT structure_revision FROM sync_documents;"), 4)
+        XCTAssertEqual(try raw.scalarInt("SELECT server_revision FROM sync_documents;"), 2)
+        let content = "폴더 변경 뒤 원고"
+        let body = LocalMutationBatch(batchID: UUID(), projectID: f.local, localTransactionID: nil, mutations: [
+            .documentSnapshot(operationID: UUID(), documentID: .init(rawValue: f.document), relativePath: .init(rawValue: "새 폴더/하위/문서.txt"),
+                content: content, contentHash: SHA256ContentHasher().sha256(for: Data(content.utf8)), localSaveGeneration: 2, isDeleted: false)])
+        try await enqueue(body, f)
+        let next = try await f.store.claimNextGeneralContract(localProjectID: f.local)
+        XCTAssertEqual(next.request.orderedIntents[0].objectValue?["payload"]?.objectValue?["structure_revision"], .int(4))
+        XCTAssertEqual(next.request.orderedIntents[0].objectValue?["base_revision"], .int(2))
+        try await f.store.completeContractStructure(next, response: response(next))
+        await f.store.close()
+    }
+
+    func testFolderRenameWithMissingDescendantSnapshotDoesNotCreateWireRequest() async throws {
+        let f = try await fixture(), source = try await folderWithManuscript(f, includeSnapshot: false)
+        try await enqueue(source, f)
+        do { _ = try await f.store.claimNextGeneralContract(localProjectID: f.local); XCTFail("missing descendant") } catch {}
+        let raw = try RawSQLite(url: f.url)
+        XCTAssertEqual(try raw.scalarInt("SELECT COUNT(*) FROM sync_contract_batches;"), 0)
+        XCTAssertEqual(try raw.scalarText("SELECT server_path FROM sync_documents;"), "이전/하위/문서.txt")
+        let detail = try await f.store.generalRecoveryDetail(localProjectID: f.local, batchID: source.batchID)
+        XCTAssertEqual(detail.row.sourceStatus, "blocked"); XCTAssertEqual(detail.source, source)
+        await f.store.close()
+    }
+
+    func testFolderNameConflictPreservesNestedFoldersAndTailAfterRestart() async throws {
+        let f = try await fixture(), initial = try await folderNameConflict(f)
+        XCTAssertTrue(initial.isFolder)
+        let child = initial.local.detail.source.structureSnapshot!.first { $0.kind == .folder && $0.id.rawValue != initial.entityID }!.id.rawValue
+        let later = folderNameSource(f, folder: initial.entityID, child: child, name: "후속 폴더")
+        try await enqueue(later, f); try await enqueue(save(f, content: "폴더 밖 원고"), f)
+        let local = try await f.store.generalConflictLocal(localProjectID: f.local, batchID: initial.local.detail.row.batchID)
+        let review = try SyncV2GeneralRenameConflictReview(local: local, remote: initial.remote, remoteBaseline: initial.remoteBaseline,
+            context: initial.context, authorizationFingerprint: initial.authorizationFingerprint)
+        let replacement = try await f.store.replaceGeneralRenameConflict(review, authorize: {})
+        let archive = try await f.store.generalRecoveryDetail(localProjectID: f.local, batchID: local.detail.row.batchID)
+        XCTAssertEqual(archive.sourceJSON, local.detail.sourceJSON); XCTAssertEqual(archive.requestJSON, local.detail.requestJSON)
+        XCTAssertEqual(archive.responseJSON, local.detail.responseJSON); XCTAssertTrue(archive.resolutionJSON!.contains("keep_saved_folder_name"))
+        let baseline = try await f.store.generalResumeBaseline(localProjectID: f.local)
+        XCTAssertEqual(try baseline.fingerprint(), try review.remoteBaseline.fingerprint())
+        let pending = try await f.store.claimNextGeneralContract(localProjectID: f.local)
+        XCTAssertEqual(pending.request.batchID, replacement); XCTAssertEqual(pending.request.orderedIntents.count, 1)
+        XCTAssertEqual(pending.request.orderedIntents[0].objectValue?["entity_kind"], .string("folder"))
+        XCTAssertEqual(pending.request.orderedIntents[0].objectValue?["base_revision"], .int(4))
+        let receipt = try makeGeneralCommitReceiptForTesting(pending, accountID: f.binding.ownerSubject!, response: response(pending, document: false))
+        await f.store.close()
+        guard case .available(let reopened) = await SyncV2Store.open(at: f.url) else { return XCTFail("restart") }
+        try await reopened.recoverInterruptedWork()
+        try await reopened.recoverGeneralContract(pending, receipt: receipt, accountID: f.binding.ownerSubject!, authorize: {})
+        let next = try await reopened.claimNextGeneralContract(localProjectID: f.local)
+        XCTAssertEqual(next.request.batchID, later.batchID); XCTAssertEqual(next.request.orderedIntents[0].objectValue?["base_revision"], .int(5))
+        try await reopened.completeContractStructure(next, response: response(next, document: false))
+        let body = try await reopened.claimNextGeneralContract(localProjectID: f.local)
+        XCTAssertEqual(body.request.orderedIntents[0].objectValue?["base_revision"], .int(1))
+        try await reopened.completeContractStructure(body, response: response(body))
+        let status = try await reopened.generalQueueStatus(localProjectID: f.local); XCTAssertEqual(status.pendingCount, 0)
+        await reopened.close()
+    }
+
+    func testFolderNameConflictRejectsDescendantManuscriptMoveOrderAndCollision() async throws {
+        let f = try await fixture(), review = try await folderNameConflict(f)
+        let nested = review.local.baseline.folders.first { $0.objectValue?["parent_folder_id"] == .string(review.entityID.uuidString.lowercased()) }!
+        for variant in 0..<6 {
+            var remote = review.remote.objectValue!, folders = review.remoteBaseline.folders, docs = review.remoteBaseline.documents
+            var localBaseline = review.local.baseline
+            var orders = review.remoteBaseline.treeOrders
+            switch variant {
+            case 0:
+                var document = docs[0].objectValue!; document["parent_folder_id"] = nested.objectValue!["folder_id"]
+                docs = [.object(document)]
+                localBaseline = .init(folders: localBaseline.folders, documents: docs, treeOrders: localBaseline.treeOrders)
+            case 1: remote["parent_folder_id"] = nested.objectValue!["folder_id"]
+            case 2: var order = orders[0].objectValue!; order["revision"] = .int(99); orders[0] = .object(order)
+            case 3: remote["is_deleted"] = .bool(true)
+            case 4: remote["revision"] = .int(1)
+            default:
+                var sibling = docs[0].objectValue!; sibling["name"] = .string("IPAD 폴더 "); docs = [.object(sibling)]
+                localBaseline = .init(folders: localBaseline.folders, documents: docs, treeOrders: localBaseline.treeOrders)
+            }
+            folders = folders.map { $0.objectValue?["folder_id"] == remote["folder_id"] ? .object(remote) : $0 }
+            XCTAssertThrowsError(try SyncV2GeneralRenameConflictReview(local: .init(detail: review.local.detail, baseline: localBaseline),
+                remote: .object(remote), remoteBaseline: .init(folders: folders, documents: docs, treeOrders: orders),
+                context: review.context, authorizationFingerprint: review.authorizationFingerprint), "variant \(variant)")
+        }
+        await f.store.close()
+    }
+
+    func testFolderNameConflictRollsBackFinalAuthorizationAndRejectsAddedTail() async throws {
+        let f = try await fixture(), review = try await folderNameConflict(f), checks = SyncV2ContractEpoch()
+        do {
+            _ = try await f.store.replaceGeneralRenameConflict(review, authorize: {
+                if checks.value > 0 { throw SyncV2GeneralConflictError.changed }; checks.advance()
+            }); XCTFail("authorization")
+        } catch {}
+        let unchanged = try await f.store.generalConflictLocal(localProjectID: f.local, batchID: review.local.detail.row.batchID)
+        XCTAssertEqual(try unchanged.baseline.fingerprint(), try review.local.baseline.fingerprint()); XCTAssertNil(unchanged.detail.resolutionJSON)
+        try await enqueue(save(f, content: "후속 입력"), f)
+        do { _ = try await f.store.replaceGeneralRenameConflict(review, authorize: {}); XCTFail("stale tail") } catch {}
+        await f.store.close()
+    }
+
+    func testPreviouslyBlockedStructureRevisionConflictCanBeComparedAndReplaced() async throws {
+        let f = try await fixture(), initial = try await renameConflict(f)
+        let raw = try RawSQLite(url: f.url)
+        XCTAssertEqual(initial.local.detail.row.errorCode, "STRUCTURE_REVISION_CONFLICT")
+        try raw.execute("UPDATE sync_contract_batches SET status = 'blocked'; UPDATE sync_contract_operations SET status = 'blocked';")
+        let local = try await f.store.generalConflictLocal(localProjectID: f.local, batchID: initial.local.detail.row.batchID)
+        XCTAssertTrue(local.detail.row.isConflictReviewCandidate)
+        let review = try SyncV2GeneralRenameConflictReview(local: local, remote: initial.remote, remoteBaseline: initial.remoteBaseline,
+            context: initial.context, authorizationFingerprint: initial.authorizationFingerprint)
+        _ = try await f.store.replaceGeneralRenameConflict(review, authorize: {})
+        let pending = try await f.store.claimNextGeneralContract(localProjectID: f.local)
+        try await f.store.completeContractStructure(pending, response: response(pending, document: false))
+        let status = try await f.store.generalQueueStatus(localProjectID: f.local); XCTAssertEqual(status.pendingCount, 0)
+        await f.store.close()
+    }
+
+    private func renameSource(_ f: Fixture, name: String = "아이패드.txt", content: String = "처음") -> LocalMutationBatch {
+        let node = DocumentNode(id: .init(rawValue: f.document), projectID: f.local, kind: .text, parentID: nil,
+            relativePath: .init(rawValue: name), userOrder: 0, modifiedAt: Date(), contentHash: nil)
+        return .init(batchID: UUID(), projectID: f.local, localTransactionID: UUID(), kind: .structureChange,
+            mutations: [.documentSnapshot(operationID: UUID(), documentID: node.id, relativePath: node.relativePath,
+                content: content, contentHash: SHA256ContentHasher().sha256(for: Data(content.utf8)), localSaveGeneration: 1, isDeleted: false),
+                .treeOrder(operationID: UUID(), content: "{}", generation: 1)], structureSnapshot: [node])
+    }
+
+    private func renameConflict(_ f: Fixture) async throws -> SyncV2GeneralRenameConflictReview {
+        try await f.store.applyTreeOrderSnapshotBaselines(localProjectID: f.local, serverProjectID: f.server,
+            treeOrders: [.init(treeOrderID: UUID(), parentFolderID: nil, children: [f.document], revision: 2, updatedAt: Date())])
+        let source = renameSource(f); try await enqueue(source, f)
+        let pending = try await f.store.claimNextGeneralContract(localProjectID: f.local)
+        await failWithStructureEnvelope(f, pending: pending, code: "STRUCTURE_REVISION_CONFLICT")
+        let local = try await f.store.generalConflictLocal(localProjectID: f.local, batchID: source.batchID)
+        var remote = local.baseline.documents[0].objectValue!
+        remote["name"] = .string("서버.txt"); remote["relative_path"] = .string("서버.txt"); remote["structure_revision"] = .int(5)
+        let baseline = SyncV2PreparationSnapshot(folders: local.baseline.folders, documents: [.object(remote)], treeOrders: local.baseline.treeOrders)
+        remote["content"] = .string("처음")
+        return try .init(local: local, remote: .object(remote), remoteBaseline: baseline,
+            context: .init(localProjectID: f.local, serverProjectID: f.server, accountID: f.binding.ownerSubject!), authorizationFingerprint: "synthetic-rename")
+    }
+
+    func testRenameConflictPreservesBodyPathsArchiveAndTailAcrossReceiptRecovery() async throws {
+        let f = try await fixture(), initial = try await renameConflict(f)
+        let tail = LocalMutationBatch(batchID: UUID(), projectID: f.local, localTransactionID: nil, mutations: [
+            .documentSnapshot(operationID: UUID(), documentID: .init(rawValue: f.document), relativePath: .init(rawValue: "아이패드.txt"),
+                content: "이름 변경 뒤 저장", contentHash: SHA256ContentHasher().sha256(for: Data("이름 변경 뒤 저장".utf8)), localSaveGeneration: 2, isDeleted: false)])
+        try await enqueue(tail, f)
+        let local = try await f.store.generalConflictLocal(localProjectID: f.local, batchID: initial.local.detail.row.batchID)
+        let review = try SyncV2GeneralRenameConflictReview(local: local, remote: initial.remote, remoteBaseline: initial.remoteBaseline,
+            context: initial.context, authorizationFingerprint: initial.authorizationFingerprint)
+        let raw = try RawSQLite(url: f.url), beforePath = try raw.scalarText("SELECT local_path FROM sync_documents;")
+        let newID = try await f.store.replaceGeneralRenameConflict(review, authorize: {})
+        XCTAssertEqual(try raw.scalarText("SELECT local_path FROM sync_documents;"), beforePath)
+        XCTAssertEqual(try raw.scalarText("SELECT base_content FROM sync_documents;"), "처음")
+        XCTAssertEqual(try raw.scalarInt("SELECT server_revision FROM sync_documents;"), 1)
+        XCTAssertEqual(try raw.scalarText("SELECT server_path FROM sync_documents;"), "서버.txt")
+        let archived = try await f.store.generalRecoveryDetail(localProjectID: f.local, batchID: local.detail.row.batchID)
+        XCTAssertEqual(archived.sourceJSON, local.detail.sourceJSON); XCTAssertEqual(archived.requestJSON, local.detail.requestJSON)
+        XCTAssertEqual(archived.responseJSON, local.detail.responseJSON); XCTAssertEqual(archived.row.requestStatus, "superseded")
+        XCTAssertTrue(archived.resolutionJSON!.contains("keep_saved_name"))
+        let nextBaseline = try await f.store.generalResumeBaseline(localProjectID: f.local)
+        XCTAssertEqual(try nextBaseline.fingerprint(), try review.remoteBaseline.fingerprint())
+        let pending = try await f.store.claimNextGeneralContract(localProjectID: f.local)
+        XCTAssertEqual(pending.request.batchID, newID)
+        XCTAssertEqual(pending.request.orderedIntents[0].objectValue?["base_revision"], .int(5))
+        XCTAssertEqual(pending.request.orderedIntents[0].objectValue?["payload"], .object(["name": .string("아이패드.txt")]))
+        XCTAssertNotEqual(pending.request.orderedIntents[0].objectValue?["operation_id"], .string(try local.detail.manuscripts()[0].operationID.uuidString.lowercased()))
+        let receipt = try makeGeneralCommitReceiptForTesting(pending, accountID: f.binding.ownerSubject!, response: response(pending, document: false))
+        await f.store.close()
+        guard case .available(let reopened) = await SyncV2Store.open(at: f.url) else { return XCTFail("restart") }
+        try await reopened.recoverInterruptedWork()
+        try await reopened.recoverGeneralContract(pending, receipt: receipt, accountID: f.binding.ownerSubject!, authorize: {})
+        let follower = try await reopened.claimNextGeneralContract(localProjectID: f.local)
+        XCTAssertEqual(follower.request.batchID, tail.batchID)
+        let payload = follower.request.orderedIntents[0].objectValue?["payload"]?.objectValue
+        XCTAssertEqual(payload?["name"], .string("아이패드.txt")); XCTAssertEqual(payload?["structure_revision"], .int(6))
+        XCTAssertEqual(follower.request.orderedIntents[0].objectValue?["base_revision"], .int(1))
+        try await reopened.completeContractStructure(follower, response: response(follower))
+        let status = try await reopened.generalQueueStatus(localProjectID: f.local); XCTAssertEqual(status.pendingCount, 0)
+        await reopened.close()
+    }
+
+    func testRenameConflictRejectsChangedBodyLocationOrderAndNameCollision() async throws {
+        let f = try await fixture(), review = try await renameConflict(f)
+        for variant in 0..<9 {
+            var remote = review.remote.objectValue!, orders = review.remoteBaseline.treeOrders
+            switch variant {
+            case 0: remote["content"] = .string("서버 새 원고")
+            case 1: remote["revision"] = .int(2)
+            case 2: remote["parent_folder_id"] = .string(UUID().uuidString.lowercased())
+            case 3: remote["relative_path"] = .string("폴더/서버.txt")
+            case 4: remote["is_deleted"] = .bool(true)
+            case 5: remote["structure_revision"] = .int(3)
+            case 6: var order = orders[0].objectValue!; order["revision"] = .int(3); orders[0] = .object(order)
+            case 7: remote["project_id"] = .string(UUID().uuidString.lowercased())
+            default: remote["name"] = .string("다른 이름.txt")
+            }
+            var projection = remote; projection.removeValue(forKey: "content")
+            XCTAssertThrowsError(try SyncV2GeneralRenameConflictReview(local: review.local, remote: .object(remote),
+                remoteBaseline: .init(folders: review.remoteBaseline.folders, documents: [.object(projection)], treeOrders: orders),
+                context: review.context, authorizationFingerprint: review.authorizationFingerprint), "variant \(variant)")
+        }
+        // 같은 부모의 이름 충돌은 서버의 유니코드 이름 규칙으로 검사한다.
+        var collision = review.local.baseline.documents[0].objectValue!
+        collision["document_id"] = .string(UUID().uuidString.lowercased()); collision["name"] = .string("아이패드.txt ")
+        collision["relative_path"] = .string("아이패드.txt ")
+        let local = SyncV2GeneralConflictLocal(detail: review.local.detail,
+            baseline: .init(folders: [], documents: review.local.baseline.documents + [.object(collision)], treeOrders: review.local.baseline.treeOrders))
+        XCTAssertThrowsError(try SyncV2GeneralRenameConflictReview(local: local, remote: review.remote,
+            remoteBaseline: .init(folders: [], documents: review.remoteBaseline.documents + [.object(collision)], treeOrders: review.remoteBaseline.treeOrders),
+            context: review.context, authorizationFingerprint: review.authorizationFingerprint))
+        await f.store.close()
+    }
+
+    func testRenameConflictStaleQueueAndFinalAuthorizationLeaveOriginalUnchanged() async throws {
+        let f = try await fixture(), initial = try await renameConflict(f)
+        try await enqueue(renameSource(f, name: "후속.txt"), f)
+        do { _ = try await f.store.replaceGeneralRenameConflict(initial, authorize: {}); XCTFail("stale tail") } catch {}
+        let local = try await f.store.generalConflictLocal(localProjectID: f.local, batchID: initial.local.detail.row.batchID)
+        let review = try SyncV2GeneralRenameConflictReview(local: local, remote: initial.remote, remoteBaseline: initial.remoteBaseline,
+            context: initial.context, authorizationFingerprint: initial.authorizationFingerprint)
+        let checks = SyncV2ContractEpoch()
+        do {
+            _ = try await f.store.replaceGeneralRenameConflict(review, authorize: {
+                if checks.value > 0 { throw SyncV2GeneralConflictError.changed }; checks.advance()
+            }); XCTFail("commit authorization")
+        } catch {}
+        let after = try await f.store.generalConflictLocal(localProjectID: f.local, batchID: local.detail.row.batchID)
+        XCTAssertEqual(after.records.map(\.sourceJSON), local.records.map(\.sourceJSON))
+        XCTAssertEqual(try after.baseline.fingerprint(), try local.baseline.fingerprint()); XCTAssertNil(after.detail.resolutionJSON)
+        await f.store.close()
+    }
+
+    func testRenameReplacementCanConflictAgainWhenServerAlreadyHasSelectedName() async throws {
+        let f = try await fixture(), initial = try await renameConflict(f)
+        var review = initial
+        for revision in [7, 9] {
+            let replacement = try await f.store.replaceGeneralRenameConflict(review, authorize: {})
+            let pending = try await f.store.claimNextGeneralContract(localProjectID: f.local)
+            XCTAssertEqual(pending.request.batchID, replacement)
+            await failWithStructureEnvelope(f, pending: pending, code: "STRUCTURE_REVISION_CONFLICT")
+            let local = try await f.store.generalConflictLocal(localProjectID: f.local, batchID: replacement)
+            var remote = initial.remote.objectValue!; remote["name"] = .string("아이패드.txt"); remote["relative_path"] = .string("아이패드.txt")
+            remote["structure_revision"] = .int(revision)
+            var projection = remote; projection.removeValue(forKey: "content")
+            review = try .init(local: local, remote: .object(remote),
+                remoteBaseline: .init(folders: local.baseline.folders, documents: [.object(projection)], treeOrders: local.baseline.treeOrders),
+                context: initial.context, authorizationFingerprint: initial.authorizationFingerprint)
+        }
+        _ = try await f.store.replaceGeneralRenameConflict(review, authorize: {})
+        let pending = try await f.store.claimNextGeneralContract(localProjectID: f.local)
+        try await f.store.completeContractStructure(pending, response: response(pending, document: false))
+        let status = try await f.store.generalQueueStatus(localProjectID: f.local); XCTAssertEqual(status.pendingCount, 0)
+        await f.store.close()
+    }
+
+    private func orderConflict(_ f: Fixture) async throws -> SyncV2GeneralOrderConflictReview {
+        let other = try await addOtherDocument(f), third = UUID(), orderID = UUID()
+        _ = try await f.store.applySnapshotBaseline(localProjectID: f.local, serverProjectID: f.server,
+            snapshot: .init(documentID: third, relativePath: "셋째.txt", content: "셋째 기준", revision: 1,
+                isDeleted: false, deletedAt: nil, updatedAt: Date(), name: "셋째.txt", structureRevision: 1), expectedRevision: nil)
+        try await f.store.applyTreeOrderSnapshotBaselines(localProjectID: f.local, serverProjectID: f.server,
+            treeOrders: [.init(treeOrderID: orderID, parentFolderID: nil, children: [f.document, other, third], revision: 4, updatedAt: Date())])
+        let nodes = [(third, "셋째.txt"), (f.document, "문서.txt"), (other, "다른 원고.txt")].enumerated().map { index, value in
+            DocumentNode(id: .init(rawValue: value.0), projectID: f.local, kind: .text, parentID: nil,
+                relativePath: .init(rawValue: value.1), userOrder: index, modifiedAt: Date(), contentHash: nil)
+        }
+        let source = LocalMutationBatch(batchID: UUID(), projectID: f.local, localTransactionID: UUID(), kind: .structureChange,
+            mutations: [.treeOrder(operationID: UUID(), content: "{}", generation: 1)], structureSnapshot: nodes)
+        try await enqueue(source, f)
+        let pending = try await f.store.claimNextGeneralContract(localProjectID: f.local)
+        await f.store.failContractStructure(pending, error: SyncV2ContractError("REVISION_CONFLICT"),
+            response: .object(["error_code": .string("REVISION_CONFLICT")]))
+        let local = try await f.store.generalConflictLocal(localProjectID: f.local, batchID: source.batchID)
+        var order = local.baseline.treeOrders[0].objectValue!
+        order["revision"] = .int(6); order["children"] = .array([other, third, f.document].map { .string($0.uuidString.lowercased()) })
+        return try .init(local: local, remoteBaseline: .init(folders: local.baseline.folders, documents: local.baseline.documents, treeOrders: [.object(order)]),
+            context: .init(localProjectID: f.local, serverProjectID: f.server, accountID: f.binding.ownerSubject!), authorizationFingerprint: "synthetic-order")
+    }
+
+    func testOrderConflictRebasesOnlyOrderPreservesArchiveTailAndRestartReceipt() async throws {
+        let f = try await fixture(), initial = try await orderConflict(f), tail = save(f, content: "순서 뒤 원고")
+        try await enqueue(tail, f)
+        let local = try await f.store.generalConflictLocal(localProjectID: f.local, batchID: initial.local.detail.row.batchID)
+        let review = try SyncV2GeneralOrderConflictReview(local: local, remoteBaseline: initial.remoteBaseline,
+            context: initial.context, authorizationFingerprint: initial.authorizationFingerprint)
+        let replacement = try await f.store.replaceGeneralOrderConflict(review, authorize: {})
+        let archived = try await f.store.generalRecoveryDetail(localProjectID: f.local, batchID: local.detail.row.batchID)
+        XCTAssertEqual(archived.row.requestStatus, "superseded")
+        XCTAssertEqual(archived.sourceJSON, local.detail.sourceJSON); XCTAssertEqual(archived.requestJSON, local.detail.requestJSON)
+        XCTAssertEqual(archived.responseJSON, local.detail.responseJSON)
+        XCTAssertTrue(archived.resolutionJSON!.contains("keep_saved_order"))
+        XCTAssertTrue(archived.resolutionJSON!.contains(tail.batchID.uuidString.lowercased()))
+        let baseline = try await f.store.generalResumeBaseline(localProjectID: f.local)
+        XCTAssertEqual(try baseline.fingerprint(), try review.remoteBaseline.fingerprint())
+        let pending = try await f.store.claimNextGeneralContract(localProjectID: f.local)
+        XCTAssertEqual(pending.request.batchID, replacement)
+        let intent = pending.request.orderedIntents[0].objectValue!
+        XCTAssertEqual(intent["base_revision"], .int(6)); XCTAssertEqual(intent["payload"], review.payload)
+        let original = try SyncV2ContractRequest(storedJSON: JSONDecoder().decode(SyncV2JSON.self, from: Data(local.detail.requestJSON!.utf8)))
+        XCTAssertNotEqual(intent["operation_id"], original.orderedIntents[0].objectValue?["operation_id"])
+        await f.store.close()
+        guard case .available(let reopened) = await SyncV2Store.open(at: f.url) else { return XCTFail("restart") }
+        try await reopened.recoverInterruptedWork()
+        let recoverable = try await reopened.recoverableGeneralContract(localProjectID: f.local)
+        XCTAssertEqual(recoverable, pending)
+        let receipt = try makeGeneralCommitReceiptForTesting(pending, accountID: f.binding.ownerSubject!, response: response(pending, document: false))
+        try await reopened.recoverGeneralContract(pending, receipt: receipt, accountID: f.binding.ownerSubject!, authorize: {})
+        let next = try await reopened.claimNextGeneralContract(localProjectID: f.local)
+        XCTAssertEqual(next.request.batchID, tail.batchID)
+        XCTAssertEqual(next.request.orderedIntents[0].objectValue?["base_revision"], .int(1))
+        try await reopened.completeContractStructure(next, response: response(next))
+        let status = try await reopened.generalQueueStatus(localProjectID: f.local); XCTAssertEqual(status.pendingCount, 0)
+        await reopened.close()
+    }
+
+    func testOrderConflictRejectsOtherRemoteChangesAndInvalidMembership() async throws {
+        let f = try await fixture(), review = try await orderConflict(f)
+        for variant in 0..<7 {
+            var docs = review.remoteBaseline.documents, orders = review.remoteBaseline.treeOrders
+            var order = orders[0].objectValue!
+            switch variant {
+            case 0: var doc = docs[0].objectValue!; doc["revision"] = .int(99); docs[0] = .object(doc)
+            case 1: var doc = docs[0].objectValue!; doc["name"] = .string("다른 이름.txt"); docs[0] = .object(doc)
+            case 2: order["children"] = .array(Array(order["children"]!.arrayValue!.dropLast()))
+            case 3: let first = order["children"]!.arrayValue![0]; order["children"] = .array([first, first, first])
+            case 4: order["parent_folder_id"] = .string(UUID().uuidString.lowercased())
+            case 5: order["revision"] = .int(4)
+            default: order["project_id"] = .string(UUID().uuidString.lowercased())
+            }
+            orders[0] = .object(order)
+            XCTAssertThrowsError(try SyncV2GeneralOrderConflictReview(local: review.local,
+                remoteBaseline: .init(folders: review.remoteBaseline.folders, documents: docs, treeOrders: orders),
+                context: review.context, authorizationFingerprint: review.authorizationFingerprint), "variant \(variant)")
+        }
+        let state = try await f.store.generalRecoveryDetail(localProjectID: f.local, batchID: review.local.detail.row.batchID)
+        XCTAssertEqual(state.row.requestStatus, "conflict"); XCTAssertNil(state.resolutionJSON)
+        await f.store.close()
+    }
+
+    func testOrderConflictStaleTailAndCommitAuthorizationRollBack() async throws {
+        let f = try await fixture(), initial = try await orderConflict(f)
+        try await enqueue(save(f, content: "새 대기열"), f)
+        do { _ = try await f.store.replaceGeneralOrderConflict(initial, authorize: {}); XCTFail("stale") } catch {}
+        let local = try await f.store.generalConflictLocal(localProjectID: f.local, batchID: initial.local.detail.row.batchID)
+        let review = try SyncV2GeneralOrderConflictReview(local: local, remoteBaseline: initial.remoteBaseline,
+            context: initial.context, authorizationFingerprint: initial.authorizationFingerprint)
+        let epoch = SyncV2ContractEpoch()
+        do {
+            _ = try await f.store.replaceGeneralOrderConflict(review, authorize: {
+                if epoch.value > 0 { throw SyncV2GeneralConflictError.changed }
+                epoch.advance()
+            }); XCTFail("commit authorization")
+        } catch {}
+        let after = try await f.store.generalConflictLocal(localProjectID: f.local, batchID: local.detail.row.batchID)
+        XCTAssertEqual(after.records.map(\.sourceJSON), local.records.map(\.sourceJSON))
+        XCTAssertEqual(try after.baseline.fingerprint(), try local.baseline.fingerprint())
+        XCTAssertNil(after.detail.resolutionJSON); XCTAssertEqual(after.detail.row.requestStatus, "conflict")
+        await f.store.close()
+    }
+
+    func testOrderReplacementCanConflictAgainWithoutMovingBehindTail() async throws {
+        let f = try await fixture(), initial = try await orderConflict(f)
+        let firstID = try await f.store.replaceGeneralOrderConflict(initial, authorize: {})
+        let tail = save(f, content: "후속 원고"); try await enqueue(tail, f)
+        let pending = try await f.store.claimNextGeneralContract(localProjectID: f.local)
+        await f.store.failContractStructure(pending, error: SyncV2ContractError("REVISION_CONFLICT"), response: nil)
+        let local = try await f.store.generalConflictLocal(localProjectID: f.local, batchID: firstID)
+        var order = initial.remoteOrder.objectValue!; order["revision"] = .int(8)
+        // 서버가 이미 같은 순서여도 기존 충돌 요청을 재사용하지 않는다.
+        order["children"] = initial.payload.objectValue!["children"]
+        let review = try SyncV2GeneralOrderConflictReview(local: local,
+            remoteBaseline: .init(folders: local.baseline.folders, documents: local.baseline.documents, treeOrders: [.object(order)]),
+            context: initial.context, authorizationFingerprint: initial.authorizationFingerprint)
+        let nextID = try await f.store.replaceGeneralOrderConflict(review, authorize: {})
+        let next = try await f.store.claimNextGeneralContract(localProjectID: f.local)
+        XCTAssertEqual(next.request.batchID, nextID); XCTAssertNotEqual(nextID, firstID)
+        await f.store.failContractStructure(next, error: SyncV2ContractError("REVISION_CONFLICT"), response: nil)
+        let lastLocal = try await f.store.generalConflictLocal(localProjectID: f.local, batchID: nextID)
+        order["revision"] = .int(9)
+        let lastReview = try SyncV2GeneralOrderConflictReview(local: lastLocal,
+            remoteBaseline: .init(folders: lastLocal.baseline.folders, documents: lastLocal.baseline.documents, treeOrders: [.object(order)]),
+            context: initial.context, authorizationFingerprint: initial.authorizationFingerprint)
+        let lastID = try await f.store.replaceGeneralOrderConflict(lastReview, authorize: {})
+        let last = try await f.store.claimNextGeneralContract(localProjectID: f.local)
+        XCTAssertEqual(last.request.batchID, lastID)
+        try await f.store.completeContractStructure(last, response: response(last, document: false))
+        let follower = try await f.store.claimNextGeneralContract(localProjectID: f.local)
+        XCTAssertEqual(follower.request.batchID, tail.batchID)
+        await f.store.close()
+    }
+
+    func testMixedConflictPreservesOtherDocumentAndLaterSameDocumentOrder() async throws {
+        let f = try await fixture(), other = try await addOtherDocument(f)
+        let initial = try await conflictReview(f), consecutive = save(f, content: "첫 묶음 최신"), separate = otherSave(f, document: other), later = save(f, content: "다른 문서 뒤의 저장")
+        for batch in [consecutive, separate, later] { try await enqueue(batch, f) }
+        let review = try await refreshedReview(f, previous: initial)
+        XCTAssertEqual(review.savedContent, "첫 묶음 최신")
+        XCTAssertEqual(review.local.resolutionRecords.map(\.row.batchID), [initial.local.detail.row.batchID, consecutive.batchID])
+        XCTAssertEqual(review.local.deferredRecords.map(\.row.batchID), [separate.batchID, later.batchID])
+        let originals = Dictionary(uniqueKeysWithValues: review.local.records.map { ($0.row.batchID, $0.sourceJSON) })
+        let newID = try await f.store.replaceGeneralConflict(review, authorize: {})
+        let page = try await f.store.generalRecoveryPage(localProjectID: f.local, after: nil)
+        XCTAssertEqual(page.rows.filter(\.isQueueHead).map(\.batchID), [newID])
+        XCTAssertEqual(Array(page.rows.prefix(4)).map(\.batchID), review.local.records.map(\.row.batchID))
+        for record in review.local.records {
+            let after = try await f.store.generalRecoveryDetail(localProjectID: f.local, batchID: record.row.batchID)
+            XCTAssertEqual(after.sourceJSON, originals[record.row.batchID]); XCTAssertEqual(after.row.queueID, record.row.queueID)
+        }
+        let ready = try await f.store.generalContractReadyProjects(now: Date()); XCTAssertEqual(ready, [f.local])
+        let first = try await f.store.claimNextGeneralContract(localProjectID: f.local)
+        XCTAssertEqual(first.request.batchID, newID)
+        let whileProcessing = try await f.store.generalContractReadyProjects(now: Date())
+        XCTAssertFalse(whileProcessing.contains(f.local), "뒤의 waiting 문서가 처리 중인 head를 앞지르면 안 됩니다.")
+        await f.store.close()
+        guard case .available(let reopened) = await SyncV2Store.open(at: f.url) else { return XCTFail("restart") }
+        try await reopened.recoverInterruptedWork()
+        let recoverable = try await reopened.recoverableGeneralContract(localProjectID: f.local)
+        XCTAssertEqual(recoverable, first)
+        let retry = try await reopened.claimNextGeneralContract(localProjectID: f.local); XCTAssertEqual(retry, first)
+        try await reopened.completeContractStructure(retry, response: response(retry))
+        let next = try await reopened.claimNextGeneralContract(localProjectID: f.local)
+        XCTAssertEqual(next.request.batchID, separate.batchID)
+        XCTAssertEqual(next.request.orderedIntents[0].objectValue?["base_revision"], .int(7))
+        try await reopened.completeContractStructure(next, response: response(next))
+        let last = try await reopened.claimNextGeneralContract(localProjectID: f.local)
+        XCTAssertEqual(last.request.batchID, later.batchID)
+        XCTAssertEqual(last.request.orderedIntents[0].objectValue?["base_revision"], .int(3))
+        try await reopened.completeContractStructure(last, response: response(last))
+        let state = try await reopened.generalQueueStatus(localProjectID: f.local); XCTAssertEqual(state.pendingCount, 0)
+        await reopened.close()
+    }
+
+    func testMixedConflictRunsDocumentRenameBeforeLaterBodyAtNewPath() async throws {
+        let f = try await fixture()
+        try await f.store.applyTreeOrderSnapshotBaselines(localProjectID: f.local, serverProjectID: f.server,
+            treeOrders: [.init(treeOrderID: UUID(), parentFolderID: nil, children: [f.document], revision: 2, updatedAt: Date())])
+        let initial = try await conflictReview(f)
+        let node = DocumentNode(id: .init(rawValue: f.document), projectID: f.local, kind: .text, parentID: nil,
+            relativePath: .init(rawValue: "새 제목.txt"), userOrder: 0, modifiedAt: Date(), contentHash: nil)
+        let rename = LocalMutationBatch(batchID: UUID(), projectID: f.local, localTransactionID: UUID(), kind: .structureChange,
+            mutations: [.documentSnapshot(operationID: UUID(), documentID: node.id, relativePath: node.relativePath,
+                content: initial.savedContent, contentHash: SHA256ContentHasher().sha256(for: Data(initial.savedContent.utf8)), localSaveGeneration: 2, isDeleted: false),
+                .treeOrder(operationID: UUID(), content: "{}", generation: 1)], structureSnapshot: [node])
+        let later = LocalMutationBatch(batchID: UUID(), projectID: f.local, localTransactionID: nil, mutations: [
+            .documentSnapshot(operationID: UUID(), documentID: node.id, relativePath: node.relativePath, content: "이름 변경 후 원고",
+                contentHash: SHA256ContentHasher().sha256(for: Data("이름 변경 후 원고".utf8)), localSaveGeneration: 3, isDeleted: false)])
+        try await enqueue(rename, f); try await enqueue(later, f)
+        let review = try await refreshedReview(f, previous: initial)
+        XCTAssertEqual(review.local.resolutionRecords.count, 1); XCTAssertEqual(review.local.deferredRecords.count, 2)
+        let newID = try await f.store.replaceGeneralConflict(review, authorize: {})
+        let first = try await f.store.claimNextGeneralContract(localProjectID: f.local)
+        XCTAssertEqual(first.request.batchID, newID)
+        try await f.store.completeContractStructure(first, response: response(first))
+        let structural = try await f.store.claimNextGeneralContract(localProjectID: f.local)
+        XCTAssertEqual(structural.request.batchID, rename.batchID)
+        XCTAssertEqual(structural.request.orderedIntents[0].objectValue?["intent_kind"], .string("rename"))
+        try await f.store.completeContractStructure(structural, response: response(structural, document: false))
+        let last = try await f.store.claimNextGeneralContract(localProjectID: f.local)
+        XCTAssertEqual(last.request.batchID, later.batchID)
+        XCTAssertEqual(last.request.orderedIntents[0].objectValue?["payload"]?.objectValue?["name"], .string("새 제목.txt"))
+        try await f.store.completeContractStructure(last, response: response(last))
+        let raw = try RawSQLite(url: f.url)
+        XCTAssertEqual(try raw.scalarText("SELECT base_content FROM sync_documents;"), "이름 변경 후 원고")
+        raw.close(); await f.store.close()
+    }
+
+    func testReplacementConflictKeepsPriorityAcrossASecondResolution() async throws {
+        let f = try await fixture(), other = try await addOtherDocument(f)
+        let initial = try await conflictReview(f), separate = otherSave(f, document: other)
+        try await enqueue(separate, f)
+        let review = try await refreshedReview(f, previous: initial)
+        let firstID = try await f.store.replaceGeneralConflict(review, authorize: {})
+        let first = try await f.store.claimNextGeneralContract(localProjectID: f.local)
+        await f.store.failContractStructure(first, error: SyncV2ContractError("REVISION_CONFLICT"), response: nil)
+        let local = try await f.store.generalConflictLocal(localProjectID: f.local, batchID: firstID)
+        XCTAssertGreaterThan(local.detail.row.queueID, local.followers[0].row.queueID)
+        var remote = review.remote.objectValue!; remote["revision"] = .int(3)
+        var projected = remote; projected.removeValue(forKey: "content")
+        let nextReview = try SyncV2GeneralConflictReview(local: local, remote: .object(remote),
+            remoteBaseline: .init(folders: local.baseline.folders, documents: local.baseline.documents.map {
+                $0.objectValue?["document_id"] == .string(f.document.uuidString.lowercased()) ? .object(projected) : $0
+            }, treeOrders: local.baseline.treeOrders), context: review.context, authorizationFingerprint: "second review")
+        let secondID = try await f.store.replaceGeneralConflict(nextReview, authorize: {})
+        let next = try await f.store.claimNextGeneralContract(localProjectID: f.local)
+        XCTAssertEqual(next.request.batchID, secondID)
+        XCTAssertEqual(next.request.orderedIntents[0].objectValue?["base_revision"], .int(3))
+        try await f.store.completeContractStructure(next, response: response(next))
+        let after = try await f.store.claimNextGeneralContract(localProjectID: f.local)
+        XCTAssertEqual(after.request.batchID, separate.batchID)
+        await f.store.close()
+    }
+
+    func testMixedConflictTailChangesAndCommitFailurePreserveAllSources() async throws {
+        let f = try await fixture(), other = try await addOtherDocument(f)
+        let initial = try await conflictReview(f), separate = otherSave(f, document: other)
+        try await enqueue(separate, f)
+        let review = try await refreshedReview(f, previous: initial)
+        let probe = ResolutionAuthorizationProbe()
+        do { _ = try await f.store.replaceGeneralConflict(review, authorize: { try probe.check() }); XCTFail("rollback") } catch {}
+        for original in review.local.records {
+            let record = try await f.store.generalRecoveryDetail(localProjectID: f.local, batchID: original.row.batchID)
+            XCTAssertEqual(record.sourceJSON, original.sourceJSON); XCTAssertEqual(record.row.sourceStatus, original.row.sourceStatus)
+        }
+        let raw = try RawSQLite(url: f.url)
+        XCTAssertEqual(try raw.scalarInt("SELECT COUNT(*) FROM sync_contract_local_batches WHERE dispatch_order IS NOT NULL;"), 0)
+        raw.close()
+        try await enqueue(otherSave(f, document: other, content: "비교 후 추가"), f)
+        do { _ = try await f.store.replaceGeneralConflict(review, authorize: {}); XCTFail("stale tail") } catch {}
+        let status = try await f.store.generalQueueStatus(localProjectID: f.local); XCTAssertEqual(status.pendingCount, 3)
+        await f.store.close()
+    }
+
+    func testVersion14MigrationPreservesConflictTailAndAddsDispatchOrder() async throws {
+        let f = try await fixture(), other = try await addOtherDocument(f)
+        let initial = try await conflictReview(f)
+        try await enqueue(otherSave(f, document: other), f)
+        let before = try await f.store.generalRecoveryPage(localProjectID: f.local, after: nil)
+        await f.store.close()
+        let raw = try RawSQLite(url: f.url)
+        try raw.execute("DROP INDEX sync_contract_local_parent; ALTER TABLE sync_contract_local_batches DROP COLUMN parent_batch_id; ALTER TABLE sync_contract_local_batches DROP COLUMN local_resolution_json; DELETE FROM schema_migrations WHERE version=16; DROP INDEX sync_contract_local_dispatch_order; ALTER TABLE sync_contract_local_batches DROP COLUMN dispatch_order; DELETE FROM schema_migrations WHERE version = 15; PRAGMA user_version = 14;")
+        raw.close()
+        guard case .available(let reopened) = await SyncV2Store.open(at: f.url) else { return XCTFail("V14 upgrade") }
+        let after = try await reopened.generalRecoveryPage(localProjectID: f.local, after: nil)
+        XCTAssertEqual(before.rows.map(\.batchID), after.rows.map(\.batchID)); XCTAssertEqual(before.rows.map(\.queueID), after.rows.map(\.queueID))
+        let local = try await reopened.generalConflictLocal(localProjectID: f.local, batchID: initial.local.detail.row.batchID)
+        let review = try SyncV2GeneralConflictReview(local: local, remote: initial.remote, remoteBaseline: initial.remoteBaseline,
+            context: initial.context, authorizationFingerprint: initial.authorizationFingerprint)
+        let newID = try await reopened.replaceGeneralConflict(review, authorize: {})
+        let next = try await reopened.claimNextGeneralContract(localProjectID: f.local); XCTAssertEqual(next.request.batchID, newID)
+        await reopened.close()
+    }
+
+    func testConflictChainSelectsLatestBodyAndPreservesEveryOriginalAfterRestart() async throws {
+        let f = try await fixture(), initial = try await conflictReview(f)
+        try await enqueue(save(f, content: "중간 원고"), f)
+        try await enqueue(save(f, content: ""), f)
+        try await enqueue(save(f, content: "e\u{301}\r\n최신 원고"), f)
+        let review = try await refreshedReview(f, previous: initial)
+        XCTAssertEqual(review.local.records.count, 4)
+        XCTAssertEqual(Data(review.savedContent.utf8), Data("e\u{301}\r\n최신 원고".utf8))
+        let newID = try await f.store.replaceGeneralConflict(review, authorize: {})
+        let pending = try await f.store.claimNextGeneralContract(localProjectID: f.local)
+        XCTAssertEqual(pending.request.batchID, newID)
+        XCTAssertEqual(pending.request.orderedIntents[0].objectValue?["payload"]?.objectValue?["content"], .string(review.savedContent))
+        try await f.store.completeContractStructure(pending, response: response(pending))
+        await f.store.close()
+        guard case .available(let reopened) = await SyncV2Store.open(at: f.url) else { return XCTFail("reopen") }
+        let page = try await reopened.generalRecoveryPage(localProjectID: f.local, after: nil)
+        XCTAssertEqual(page.rows.map(\.batchID), review.local.records.map { $0.row.batchID })
+        for record in review.local.records {
+            let archived = try await reopened.generalRecoveryDetail(localProjectID: f.local, batchID: record.row.batchID)
+            XCTAssertEqual(archived.sourceJSON, record.sourceJSON)
+            XCTAssertEqual(archived.requestJSON, record.requestJSON)
+            XCTAssertEqual(archived.row.requestStatus, "superseded")
+            let resolution = try JSONDecoder().decode(SyncV2JSON.self, from: Data(try XCTUnwrap(archived.resolutionJSON).utf8))
+            XCTAssertEqual(resolution.objectValue?["selected_batch_id"], .string(review.local.selected.row.batchID.uuidString.lowercased()))
+            XCTAssertEqual(resolution.objectValue?["source_batches"]?.arrayValue?.count, 4)
+            XCTAssertEqual(resolution.objectValue?["remote"], review.remote)
+        }
+        let queue = try await reopened.uploadQueueSnapshot(localProjectID: f.local)
+        XCTAssertEqual(queue, .idle)
+        await reopened.close()
+    }
+
+    func testConflictChainCanSelectEmptyLatestBodyAndRollBackAllRows() async throws {
+        let f = try await fixture(), initial = try await conflictReview(f)
+        try await enqueue(save(f, content: ""), f)
+        let review = try await refreshedReview(f, previous: initial)
+        XCTAssertEqual(review.savedContent, "")
+        let probe = ResolutionAuthorizationProbe()
+        do { _ = try await f.store.replaceGeneralConflict(review, authorize: { try probe.check() }); XCTFail("must rollback chain") } catch {}
+        let raw = try RawSQLite(url: f.url)
+        XCTAssertEqual(try raw.scalarInt("SELECT COUNT(*) FROM sync_contract_local_batches WHERE status <> 'completed';"), 2)
+        XCTAssertEqual(try raw.scalarInt("SELECT COUNT(*) FROM sync_contract_local_batches WHERE resolution_batch_id IS NOT NULL;"), 0)
+        XCTAssertEqual(try raw.scalarInt("SELECT COUNT(*) FROM sync_contract_batches;"), 1)
+        raw.close()
+        _ = try await f.store.replaceGeneralConflict(review, authorize: {})
+        let pending = try await f.store.claimNextGeneralContract(localProjectID: f.local)
+        XCTAssertEqual(pending.request.orderedIntents[0].objectValue?["payload"]?.objectValue?["content"], .string(""))
+        await f.store.close()
+    }
+
+    func testConflictChainRejectsOtherDocumentAndChangedPathWithoutConsumingRows() async throws {
+        for changesPath in [false, true] {
+            let f = try await fixture(), initial = try await conflictReview(f)
+            let batch = LocalMutationBatch(batchID: UUID(), projectID: f.local, localTransactionID: nil, mutations: [
+                .documentSnapshot(operationID: UUID(), documentID: .init(rawValue: changesPath ? f.document : UUID()),
+                    relativePath: .init(rawValue: changesPath ? "다른이름.txt" : "문서.txt"), content: "다음",
+                    contentHash: SHA256ContentHasher().sha256(for: Data("다음".utf8)), localSaveGeneration: 2, isDeleted: false)])
+            try await enqueue(batch, f)
+            do { _ = try await refreshedReview(f, previous: initial); XCTFail("unsupported chain") } catch {}
+            let status = try await f.store.generalQueueStatus(localProjectID: f.local)
+            XCTAssertEqual(status.pendingCount, 2); XCTAssertEqual(status.attentionCount, 1)
+            await f.store.close()
+        }
+    }
+
+    func testConflictChainRejectsChangedPinAndNeverTruncatesPastFiftyRecords() async throws {
+        let f = try await fixture(), initial = try await conflictReview(f)
+        for _ in 0..<49 { try await enqueue(save(f, content: "이어 쓴 원고"), f) }
+        let review = try await refreshedReview(f, previous: initial)
+        XCTAssertEqual(review.local.records.count, 50)
+        let raw = try RawSQLite(url: f.url)
+        try raw.execute("UPDATE sync_contract_local_batches SET migration_epoch = migration_epoch + 1 WHERE queue_id = (SELECT MAX(queue_id) FROM sync_contract_local_batches);")
+        do { _ = try await refreshedReview(f, previous: initial); XCTFail("changed pin") } catch {}
+        try raw.execute("UPDATE sync_contract_local_batches SET migration_epoch = migration_epoch - 1 WHERE queue_id = (SELECT MAX(queue_id) FROM sync_contract_local_batches);")
+        raw.close()
+        try await enqueue(save(f, content: "51번째 저장"), f)
+        do { _ = try await refreshedReview(f, previous: initial); XCTFail("must not silently truncate") } catch {}
+        do { _ = try await f.store.replaceGeneralConflict(review, authorize: {}); XCTFail("stale selection") } catch {}
+        let status = try await f.store.generalQueueStatus(localProjectID: f.local)
+        XCTAssertEqual(status.pendingCount, 51)
+        await f.store.close()
+    }
+
+    func testConflictArchiveNeverFollowsResolutionLinkIntoAnotherProject() async throws {
+        let f = try await fixture(), initial = try await conflictReview(f)
+        let follower = save(f, content: "최근 보관본")
+        try await enqueue(follower, f)
+        let review = try await refreshedReview(f, previous: initial)
+        let newID = try await f.store.replaceGeneralConflict(review, authorize: {})
+        let otherLocal = ProjectID(rawValue: UUID()), otherServer = UUID(), otherBatch = UUID()
+        try await f.store.save(.connected(localProjectID: otherLocal, serverProjectID: otherServer,
+            kind: .existingServerProject, projectName: "다른 합성 작품", ownerSubject: UUID()))
+        let raw = try RawSQLite(url: f.url)
+        try raw.execute("""
+            INSERT INTO sync_contract_batches(batch_id, local_project_id, project_id, request_json, batch_payload_sha256,
+                status, attempts, created_at, updated_at, superseded_by, resolution_json)
+            VALUES ('\(otherBatch.uuidString.lowercased())', '\(otherLocal.rawValue.uuidString.lowercased())', '\(otherServer.uuidString.lowercased())',
+                '{}', '\(String(repeating: "a", count: 64))', 'completed', 0, 'synthetic', 'synthetic', '\(newID.uuidString.lowercased())', '{"remote":"foreign"}');
+            UPDATE sync_contract_local_batches SET resolution_batch_id = '\(otherBatch.uuidString.lowercased())'
+            WHERE batch_id = '\(follower.batchID.uuidString.lowercased())';
+            """)
+        raw.close()
+        do { _ = try await f.store.generalRecoveryDetail(localProjectID: f.local, batchID: follower.batchID); XCTFail("foreign recovery record") } catch {}
+        let page = try await f.store.generalRecoveryPage(localProjectID: f.local, after: nil)
+        XCTAssertFalse(page.rows.contains { $0.batchID == follower.batchID })
+        XCTAssertTrue(page.rows.contains { $0.batchID == initial.local.detail.row.batchID })
+        await f.store.close()
+    }
+
+    func testV13ResolutionHistorySurvivesV14Migration() async throws {
+        let f = try await fixture(), review = try await conflictReview(f)
+        _ = try await f.store.replaceGeneralConflict(review, authorize: {})
+        let before = try await f.store.generalRecoveryDetail(localProjectID: f.local, batchID: review.local.detail.row.batchID)
+        await f.store.close()
+        let raw = try RawSQLite(url: f.url)
+        try raw.execute("DROP INDEX sync_contract_local_parent; ALTER TABLE sync_contract_local_batches DROP COLUMN parent_batch_id; ALTER TABLE sync_contract_local_batches DROP COLUMN local_resolution_json; DELETE FROM schema_migrations WHERE version=16; DROP INDEX sync_contract_local_dispatch_order; ALTER TABLE sync_contract_local_batches DROP COLUMN dispatch_order; ALTER TABLE sync_contract_local_batches DROP COLUMN resolution_batch_id; DELETE FROM schema_migrations WHERE version >= 14; PRAGMA user_version = 13;")
+        raw.close()
+        guard case .available(let reopened) = await SyncV2Store.open(at: f.url) else { return XCTFail("V13 migration") }
+        let archived = try await reopened.generalRecoveryDetail(localProjectID: f.local, batchID: review.local.detail.row.batchID)
+        XCTAssertEqual(archived.sourceJSON, before.sourceJSON); XCTAssertEqual(archived.resolutionJSON, before.resolutionJSON)
+        XCTAssertEqual(archived.row.requestStatus, "superseded")
+        await reopened.close()
+    }
+
+    func testConflictSelectionPreservesOriginalAndResumesWithNewIDsAndRevision() async throws {
+        let f = try await fixture(), review = try await conflictReview(f, content: "e\u{301}\r\n선택한 원고")
+        let originalID = review.local.detail.row.batchID
+        let newID = try await f.store.replaceGeneralConflict(review, authorize: {})
+        XCTAssertNotEqual(newID, originalID)
+        let archived = try await f.store.generalRecoveryDetail(localProjectID: f.local, batchID: originalID)
+        XCTAssertEqual(archived.sourceJSON, review.local.detail.sourceJSON)
+        XCTAssertEqual(archived.requestJSON, review.local.detail.requestJSON)
+        XCTAssertEqual(archived.responseJSON, review.local.detail.responseJSON)
+        XCTAssertEqual(archived.row.requestStatus, "superseded")
+        let resolution = try JSONDecoder().decode(SyncV2JSON.self, from: Data(try XCTUnwrap(archived.resolutionJSON).utf8))
+        XCTAssertEqual(resolution.objectValue?["remote"], review.remote)
+        let queue = try await f.store.uploadQueueSnapshot(localProjectID: f.local)
+        XCTAssertEqual(queue.pendingCount, 1); XCTAssertEqual(queue.conflictCount, 0)
+        let pending = try await f.store.claimNextGeneralContract(localProjectID: f.local)
+        XCTAssertEqual(pending.request.batchID, newID)
+        let intent = pending.request.orderedIntents[0].objectValue!
+        XCTAssertEqual(intent["base_revision"], .int(2))
+        XCTAssertEqual(Data(intent["payload"]!.objectValue!["content"]!.stringValue!.utf8), Data(review.savedContent.utf8))
+        XCTAssertNotEqual(intent["operation_id"], try JSONDecoder().decode(SyncV2JSON.self, from: Data(archived.requestJSON!.utf8)).objectValue?["ordered_intents"]?.arrayValue?[0].objectValue?["operation_id"])
+        try await f.store.completeContractStructure(pending, response: response(pending))
+        let raw = try RawSQLite(url: f.url)
+        XCTAssertEqual(try raw.scalarInt("SELECT server_revision FROM sync_documents;"), 3)
+        XCTAssertEqual(try raw.scalarInt("SELECT COUNT(*) FROM sync_contract_operations WHERE status = 'conflict';"), 1)
+        raw.close(); await f.store.close()
+        guard case .available(let reopened) = await SyncV2Store.open(at: f.url) else { return XCTFail("reopen") }
+        let history = try await reopened.generalRecoveryPage(localProjectID: f.local, after: nil)
+        XCTAssertEqual(history.rows.map(\.batchID), [originalID]); XCTAssertFalse(history.rows[0].isQueueHead)
+        await reopened.close()
+    }
+
+    func testConflictSelectionRejectsNewFollowerAndKeepsOriginalConflict() async throws {
+        let f = try await fixture(), review = try await conflictReview(f)
+        try await enqueue(save(f, content: "비교 뒤 추가 저장"), f)
+        do { _ = try await f.store.replaceGeneralConflict(review, authorize: {}); XCTFail("must reject follower") } catch {}
+        let status = try await f.store.generalQueueStatus(localProjectID: f.local)
+        XCTAssertEqual(status.pendingCount, 2); XCTAssertEqual(status.attentionCount, 1)
+        let original = try await f.store.generalRecoveryDetail(localProjectID: f.local, batchID: review.local.detail.row.batchID)
+        XCTAssertNil(original.resolutionJSON); XCTAssertEqual(original.requestJSON, review.local.detail.requestJSON)
+        await f.store.close()
+    }
+
+    func testConflictReviewRejectsStructuralAndOtherDocumentChanges() async throws {
+        let f = try await fixture(), review = try await conflictReview(f)
+        for key in ["name", "parent_folder_id", "structure_revision", "is_deleted", "project_id"] {
+            var remote = review.remote.objectValue!; remote[key] = .string("changed")
+            XCTAssertThrowsError(try SyncV2GeneralConflictReview(local: review.local, remote: .object(remote),
+                remoteBaseline: review.remoteBaseline, context: review.context, authorizationFingerprint: "test"))
+        }
+        var unrelated = review.remoteBaseline.documents[0].objectValue!; unrelated["document_id"] = .string(UUID().uuidString.lowercased())
+        XCTAssertThrowsError(try SyncV2GeneralConflictReview(local: review.local, remote: review.remote,
+            remoteBaseline: .init(folders: [], documents: review.remoteBaseline.documents + [.object(unrelated)], treeOrders: []),
+            context: review.context, authorizationFingerprint: "test"))
+        await f.store.close()
+    }
+
+    private final class ResolutionAuthorizationProbe: @unchecked Sendable {
+        let lock = NSLock()
+        var calls = 0
+        func check() throws {
+            let count = lock.withLock { calls += 1; return calls }
+            if count == 2 { throw SyncV2GeneralConflictError.changed }
+        }
+    }
+
+    func testConflictSelectionRollsBackWhenAuthorizationExpiresAtCommit() async throws {
+        let f = try await fixture(), review = try await conflictReview(f)
+        let probe = ResolutionAuthorizationProbe()
+        do { _ = try await f.store.replaceGeneralConflict(review, authorize: { try probe.check() }); XCTFail("must rollback") } catch {}
+        let raw = try RawSQLite(url: f.url)
+        XCTAssertEqual(try raw.scalarInt("SELECT COUNT(*) FROM sync_contract_batches;"), 1)
+        XCTAssertEqual(try raw.scalarInt("SELECT COUNT(*) FROM sync_contract_local_batches;"), 1)
+        XCTAssertEqual(try raw.scalarInt("SELECT server_revision FROM sync_documents;"), 1)
+        XCTAssertEqual(try raw.scalarText("SELECT status FROM sync_contract_batches;"), "conflict")
+        raw.close(); await f.store.close()
+    }
+
+    func testConflictSelectionCannotApplyTwiceOrAgainstNewAccount() async throws {
+        let f = try await fixture(), review = try await conflictReview(f)
+        let foreign = try SyncV2GeneralConflictReview(local: review.local, remote: review.remote, remoteBaseline: review.remoteBaseline,
+            context: .init(localProjectID: f.local, serverProjectID: f.server, accountID: UUID()), authorizationFingerprint: "test")
+        do { _ = try await f.store.replaceGeneralConflict(foreign, authorize: {}); XCTFail("foreign account") } catch {}
+        _ = try await f.store.replaceGeneralConflict(review, authorize: {})
+        do { _ = try await f.store.replaceGeneralConflict(review, authorize: {}); XCTFail("duplicate selection") } catch {}
+        let raw = try RawSQLite(url: f.url)
+        XCTAssertEqual(try raw.scalarInt("SELECT COUNT(*) FROM sync_contract_batches;"), 2)
+        raw.close(); await f.store.close()
+    }
+
+    func testV12ConflictMigratesWithoutChangingRequestOrAttempts() async throws {
+        let f = try await fixture(), review = try await conflictReview(f)
+        await f.store.close()
+        let raw = try RawSQLite(url: f.url)
+        try raw.execute("DROP INDEX sync_contract_local_parent; ALTER TABLE sync_contract_local_batches DROP COLUMN parent_batch_id; ALTER TABLE sync_contract_local_batches DROP COLUMN local_resolution_json; DELETE FROM schema_migrations WHERE version=16; DROP INDEX sync_contract_local_dispatch_order; ALTER TABLE sync_contract_local_batches DROP COLUMN dispatch_order; ALTER TABLE sync_contract_local_batches DROP COLUMN resolution_batch_id; ALTER TABLE sync_contract_batches DROP COLUMN superseded_by; ALTER TABLE sync_contract_batches DROP COLUMN resolution_json; DELETE FROM schema_migrations WHERE version >= 13; PRAGMA user_version = 12;")
+        raw.close()
+        guard case .available(let reopened) = await SyncV2Store.open(at: f.url) else { return XCTFail("migration") }
+        let detail = try await reopened.generalRecoveryDetail(localProjectID: f.local, batchID: review.local.detail.row.batchID)
+        XCTAssertEqual(detail.requestJSON, review.local.detail.requestJSON); XCTAssertNil(detail.resolutionJSON)
+        let version = try await reopened.schemaVersion(); XCTAssertEqual(version, SyncV2Store.currentSchemaVersion)
+        await reopened.close()
+    }
+
+    func testRecoveryReviewIncludesBlockedHeadAndFollowersWithoutClaiming() async throws {
+        let f = try await fixture()
+        let firstBatch = save(f, content: "충돌 원고"), secondBatch = save(f, content: "다음 원고")
+        try await enqueue(firstBatch, f); try await enqueue(secondBatch, f)
+        let first = try await f.store.claimNextGeneralContract(localProjectID: f.local)
+        await f.store.failContractStructure(first, error: SyncV2ContractError("REVISION_CONFLICT"), response: nil)
+        let before = try await f.store.uploadQueueSnapshot(localProjectID: f.local)
+        let page = try await f.store.generalRecoveryPage(localProjectID: f.local, after: nil)
+        XCTAssertEqual(page.rows.map(\.batchID), [firstBatch.batchID, secondBatch.batchID])
+        XCTAssertEqual(page.rows.first?.statusText, "충돌 확인 필요")
+        XCTAssertEqual(page.rows.last?.statusText, "앞선 변경의 완료를 기다리는 중")
+        XCTAssertTrue(page.rows.first?.isQueueHead == true); XCTAssertNil(page.nextCursor)
+        let detail = try await f.store.generalRecoveryDetail(localProjectID: f.local, batchID: firstBatch.batchID)
+        XCTAssertEqual(try detail.manuscripts().map(\.content), ["충돌 원고"])
+        let archive = try XCTUnwrap(JSONSerialization.jsonObject(with: detail.exportData()) as? [String: Any])
+        XCTAssertEqual(archive["sourceJSON"] as? String, detail.sourceJSON)
+        XCTAssertEqual(archive["requestJSON"] as? String, try first.request.json.canonicalJSON())
+        XCTAssertEqual(archive["sourceSHA256"] as? String, SHA256ContentHasher().sha256(for: Data(detail.sourceJSON.utf8)).rawValue)
+        let after = try await f.store.uploadQueueSnapshot(localProjectID: f.local)
+        XCTAssertEqual(before, after)
+        let raw = try RawSQLite(url: f.url)
+        XCTAssertEqual(try raw.scalarInt("SELECT attempts FROM sync_contract_batches;"), 1)
+        XCTAssertEqual(try raw.scalarInt("SELECT COUNT(*) FROM sync_contract_batches;"), 1)
+        await f.store.close()
+    }
+
+    func testRecoveryReviewPagesWithoutLosingEqualTimestampRowsAndSeparatesProjects() async throws {
+        let f = try await fixture()
+        var ids: [UUID] = []
+        for i in 0..<53 {
+            let batch = save(f, content: "저장 \(i)"); ids.append(batch.batchID); try await enqueue(batch, f)
+        }
+        let first = try await f.store.generalRecoveryPage(localProjectID: f.local, after: nil)
+        XCTAssertEqual(first.rows.count, 50)
+        let second = try await f.store.generalRecoveryPage(localProjectID: f.local, after: try XCTUnwrap(first.nextCursor))
+        XCTAssertEqual(first.rows.map(\.batchID) + second.rows.map(\.batchID), ids)
+        XCTAssertNil(second.nextCursor)
+        let other = ProjectID(rawValue: UUID())
+        let empty = try await f.store.generalRecoveryPage(localProjectID: other, after: nil)
+        XCTAssertTrue(empty.rows.isEmpty)
+        do { _ = try await f.store.generalRecoveryDetail(localProjectID: other, batchID: ids[0]); XCTFail("다른 작품 노출") } catch {}
+        await f.store.close()
+    }
+
+    func testRecoveryReviewExcludesCompletedAndRetainsQueuedTextAfterRestart() async throws {
+        let f = try await fixture()
+        let first = save(f, content: "완료됨"), second = save(f, content: "재실행 후 꺼낼 원고")
+        try await enqueue(first, f); try await enqueue(second, f)
+        let pending = try await f.store.claimNextGeneralContract(localProjectID: f.local)
+        try await f.store.completeContractStructure(pending, response: response(pending))
+        await f.store.close()
+        guard case .available(let store) = await SyncV2Store.open(at: f.url) else { return XCTFail("재실행 실패") }
+        let page = try await store.generalRecoveryPage(localProjectID: f.local, after: nil)
+        XCTAssertEqual(page.rows.map(\.batchID), [second.batchID])
+        XCTAssertTrue(page.rows[0].isQueueHead)
+        do { _ = try await store.generalRecoveryDetail(localProjectID: f.local, batchID: first.batchID); XCTFail("완료된 이전 상태 노출") } catch {}
+        let detail = try await store.generalRecoveryDetail(localProjectID: f.local, batchID: second.batchID)
+        XCTAssertEqual(try detail.manuscripts()[0].content, "재실행 후 꺼낼 원고")
+        XCTAssertNil(detail.requestJSON)
+        await store.close()
+    }
+
+    func testRecoveryReviewRejectsTamperedContentAndForeignSourceIdentity() async throws {
+        let f = try await fixture()
+        let batch = save(f, content: "검증할 원고"); try await enqueue(batch, f)
+        let detail = try await f.store.generalRecoveryDetail(localProjectID: f.local, batchID: batch.batchID)
+        for source in [detail.sourceJSON.replacingOccurrences(of: "검증할 원고", with: "바뀐 원고"),
+                       detail.sourceJSON.replacingOccurrences(of: f.local.rawValue.uuidString, with: UUID().uuidString)] {
+            XCTAssertThrowsError(try SyncV2GeneralRecoveryDetail(localProjectID: f.local, serverProjectID: f.server,
+                row: detail.row, sourceJSON: source, requestJSON: nil, responseJSON: nil))
+        }
+        let raw = try RawSQLite(url: f.url)
+        XCTAssertEqual(try raw.scalarText("SELECT status FROM sync_contract_local_batches;"), "waiting")
+        await f.store.close()
+    }
+
+    func testRecoveryTextPreservesEmptyAndUnicodeBytesAndUsesSafeUniqueFilename() async throws {
+        let f = try await fixture()
+        for body in ["", "e\u{301}\r\n첫 줄\n둘째 줄 📝"] {
+            let batch = save(f, content: body); try await enqueue(batch, f)
+            let detail = try await f.store.generalRecoveryDetail(localProjectID: f.local, batchID: batch.batchID)
+            let text = try XCTUnwrap(detail.manuscripts().first)
+            XCTAssertEqual(Data(text.content.utf8), Data(body.utf8))
+            XCTAssertEqual(text.filename, "saved-manuscript-" + text.operationID.uuidString.lowercased() + ".txt")
+            XCTAssertFalse(text.filename.contains("/"))
+        }
+        await f.store.close()
+    }
+
+    func testLostReceiptAfterRestartCompletesWithoutReclaimAndNextSaveUsesAcknowledgedBase() async throws {
+        let f = try await fixture()
+        try await enqueue(save(f, content: "적용된 첫 저장"), f)
+        try await enqueue(save(f, content: "보존할 다음 저장"), f)
+        let beforeClaim = try await f.store.recoverableGeneralContract(localProjectID: f.local)
+        XCTAssertNil(beforeClaim)
+        let first = try await f.store.claimNextGeneralContract(localProjectID: f.local)
+        let receipt = try makeGeneralCommitReceiptForTesting(first, accountID: f.binding.ownerSubject!, response: response(first))
+        await f.store.close()
+        guard case .available(let reopened) = await SyncV2Store.open(at: f.url) else { return XCTFail("재실행 실패") }
+        try await reopened.recoverInterruptedWork()
+        let recoverable = try await reopened.recoverableGeneralContract(localProjectID: f.local)
+        XCTAssertEqual(recoverable, first)
+        let raw = try RawSQLite(url: f.url)
+        try await reopened.recoverGeneralContract(first, receipt: receipt, accountID: f.binding.ownerSubject!, authorize: {})
+        XCTAssertEqual(try raw.scalarInt("SELECT MAX(attempts) FROM sync_contract_batches;"), 1)
+        XCTAssertEqual(try raw.scalarInt("SELECT server_revision FROM sync_documents;"), 2)
+        let second = try await reopened.claimNextGeneralContract(localProjectID: f.local)
+        XCTAssertEqual(second.request.orderedIntents[0].objectValue?["base_revision"], .int(2))
+        XCTAssertEqual(second.request.orderedIntents[0].objectValue?["payload"]?.objectValue?["content"], .string("보존할 다음 저장"))
+        try await reopened.completeContractStructure(second, response: response(second))
+        try await reopened.recoverGeneralContract(first, receipt: receipt, accountID: f.binding.ownerSubject!, authorize: {})
+        XCTAssertEqual(try raw.scalarInt("SELECT server_revision FROM sync_documents;"), 3)
+        XCTAssertEqual(try raw.scalarText("SELECT base_content FROM sync_documents;"), "보존할 다음 저장")
+        await reopened.close()
+    }
+
+    func testLostAtomicReceiptRestoresFolderAndOrderBaselinesTogether() async throws {
+        let f = try await fixture(), folderID = UUID()
+        try await f.store.applyTreeOrderSnapshotBaselines(localProjectID: f.local, serverProjectID: f.server,
+            treeOrders: [.init(treeOrderID: UUID(), parentFolderID: nil, children: [f.document], revision: 4, updatedAt: Date())])
+        let doc = DocumentNode(id: .init(rawValue: f.document), projectID: f.local, kind: .text, parentID: nil,
+            relativePath: .init(rawValue: "문서.txt"), userOrder: 0, modifiedAt: Date(), contentHash: nil)
+        let folder = DocumentNode(id: .init(rawValue: folderID), projectID: f.local, kind: .folder, parentID: nil,
+            relativePath: .init(rawValue: "복구할 폴더"), userOrder: 1, modifiedAt: Date(), contentHash: nil)
+        let batch = LocalMutationBatch(batchID: UUID(), projectID: f.local, localTransactionID: UUID(), kind: .structureChange,
+            mutations: [.folderSnapshot(operationID: UUID(), folderID: folder.id, parentFolderID: nil, name: "복구할 폴더", isDeleted: false),
+                .treeOrder(operationID: UUID(), content: "{}", generation: 1)], structureSnapshot: [doc, folder])
+        try await enqueue(batch, f)
+        let pending = try await f.store.claimNextGeneralContract(localProjectID: f.local)
+        try await f.store.recoverInterruptedWork()
+        let receipt = try makeGeneralCommitReceiptForTesting(pending, accountID: f.binding.ownerSubject!, response: makeGeneralCommitResponseForTesting(pending))
+        try await f.store.recoverGeneralContract(pending, receipt: receipt, accountID: f.binding.ownerSubject!, authorize: {})
+        let raw = try RawSQLite(url: f.url)
+        XCTAssertEqual(try raw.scalarInt("SELECT COUNT(*) FROM sync_folders WHERE server_revision = 1;"), 1)
+        XCTAssertEqual(try raw.scalarInt("SELECT COUNT(*) FROM sync_tree_orders WHERE server_revision IN (1,5);"), 2)
+        XCTAssertEqual(try raw.scalarInt("SELECT COUNT(*) FROM sync_contract_operations WHERE status = 'completed';"), 3)
+        XCTAssertEqual(try raw.scalarInt("SELECT attempts FROM sync_contract_batches;"), 1)
+        let queue = try await f.store.uploadQueueSnapshot(localProjectID: f.local)
+        XCTAssertEqual(queue.pendingCount, 0)
+        await f.store.close()
+    }
+
+    func testReceiptMismatchNeverCompletesOrRewritesTheStoredRequest() async throws {
+        let f = try await fixture()
+        try await enqueue(save(f, content: "보존할 요청"), f)
+        let pending = try await f.store.claimNextGeneralContract(localProjectID: f.local)
+        try await f.store.recoverInterruptedWork()
+        let valid = try makeGeneralCommitReceiptForTesting(pending, accountID: f.binding.ownerSubject!, response: response(pending))
+        var invalid: [SyncV2GeneralCommitReceipt] = []
+        for key in ["batch_id", "project_id", "writer_user_id", "writer_device_id", "client_build_id", "request_sha256", "batch_payload_sha256", "contract_version", "canonical_contract_sha256", "sync_protocol_version", "client_capabilities", "project_sync_mode", "migration_epoch"] {
+            var batch = valid.batch.objectValue!; batch[key] = .null
+            invalid.append(.init(batch: .object(batch), result: valid.result))
+        }
+        for key in ["batch_id", "response_sha256", "applied"] {
+            var result = valid.result.objectValue!; result[key] = .null
+            invalid.append(.init(batch: valid.batch, result: .object(result)))
+        }
+        var partial = response(pending).objectValue!; partial["results"] = .array([])
+        invalid.append(try makeGeneralCommitReceiptForTesting(pending, accountID: f.binding.ownerSubject!, response: .object(partial)))
+        for receipt in invalid {
+            do { try await f.store.recoverGeneralContract(pending, receipt: receipt, accountID: f.binding.ownerSubject!, authorize: {}); XCTFail("불일치 수용") } catch {}
+        }
+        let preserved = try await f.store.recoverableGeneralContract(localProjectID: f.local)
+        XCTAssertEqual(preserved, pending)
+        let raw = try RawSQLite(url: f.url)
+        XCTAssertEqual(try raw.scalarInt("SELECT server_revision FROM sync_documents;"), 1)
+        XCTAssertEqual(try raw.scalarText("SELECT status FROM sync_contract_local_batches;"), "materialized")
+        await f.store.close()
+    }
+
+    func testReceiptAuthorizationLossRollsBackAllLocalAcknowledgementWrites() async throws {
+        let f = try await fixture()
+        try await enqueue(save(f, content: "원자적 확인"), f)
+        let pending = try await f.store.claimNextGeneralContract(localProjectID: f.local)
+        try await f.store.recoverInterruptedWork()
+        let receipt = try makeGeneralCommitReceiptForTesting(pending, accountID: f.binding.ownerSubject!, response: response(pending))
+        let checks = SyncV2ContractEpoch()
+        do {
+            try await f.store.recoverGeneralContract(pending, receipt: receipt, accountID: f.binding.ownerSubject!, authorize: {
+                checks.advance()
+                if checks.value == 2 { throw SyncV2ContractStructureError.gateClosed }
+            })
+            XCTFail("관문 변경을 커밋함")
+        } catch {}
+        XCTAssertEqual(checks.value, 2)
+        let raw = try RawSQLite(url: f.url)
+        XCTAssertEqual(try raw.scalarInt("SELECT server_revision FROM sync_documents;"), 1)
+        XCTAssertEqual(try raw.scalarText("SELECT status FROM sync_contract_batches;"), "ready")
+        XCTAssertEqual(try raw.scalarText("SELECT status FROM sync_contract_operations;"), "pending")
+        XCTAssertEqual(try raw.scalarText("SELECT status FROM sync_contract_local_batches;"), "materialized")
+        await f.store.close()
+    }
+
+    func testGeneralResumeBaselineUsesPersistedServerValuesAndDoesNotClaim() async throws {
+        let f = try await fixture()
+        try await enqueue(save(f, content: "아직 보내지 않은 원고"), f)
+        let baseline = try await f.store.generalResumeBaseline(localProjectID: f.local)
+        XCTAssertEqual(baseline.documents, [.object([
+            "document_id": .string(f.document.uuidString.lowercased()), "project_id": .string(f.server.uuidString.lowercased()),
+            "relative_path": .string("문서.txt"), "revision": .int(1), "parent_folder_id": .null,
+            "name": .string("문서.txt"), "structure_revision": .int(3), "is_deleted": .bool(false)])])
+        let raw = try RawSQLite(url: f.url)
+        XCTAssertEqual(try raw.scalarInt("SELECT COUNT(*) FROM sync_contract_batches;"), 0)
+        XCTAssertEqual(try raw.scalarText("SELECT base_content FROM sync_documents;"), "처음")
+        await f.store.close()
+        guard case .available(let reopened) = await SyncV2Store.open(at: f.url) else { return XCTFail("재실행 실패") }
+        let restored = try await reopened.generalResumeBaseline(localProjectID: f.local)
+        XCTAssertEqual(restored, baseline)
+        await reopened.close()
+    }
+
+    func testGeneralResumeBaselineRejectsMissingStructureMetadata() async throws {
+        let f = try await fixture(metadata: false)
+        try await enqueue(save(f, content: "보존 원고"), f)
+        do { _ = try await f.store.generalResumeBaseline(localProjectID: f.local); XCTFail("기준 없는 승격") } catch {}
+        await f.store.close()
+    }
+
+    func testGeneralResumeBaselineRequiresPendingGeneralSource() async throws {
+        let f = try await fixture()
+        do { _ = try await f.store.generalResumeBaseline(localProjectID: f.local); XCTFail("일반 큐 없는 승인") } catch {}
+        await f.store.close()
+    }
+
+    func testRapidSavesUsePreviousAcknowledgedRevisionAndKeepNewerContentPending() async throws {
+        let f = try await fixture()
+        try await enqueue(save(f, content: "첫 저장"), f)
+        try await enqueue(save(f, content: "둘째 저장"), f)
+        let raw = try RawSQLite(url: f.url)
+        XCTAssertEqual(try raw.scalarInt("SELECT COUNT(*) FROM sync_contract_batches;"), 0)
+        let projects = try await f.store.readyLocalProjectIDs(now: Date())
+        XCTAssertTrue(projects.contains(f.local))
+        let first = try await f.store.claimNextGeneralContract(localProjectID: f.local)
+        XCTAssertEqual(first.request.orderedIntents[0].objectValue?["base_revision"], .int(1))
+        try await f.store.completeContractStructure(first, response: response(first))
+        let queue = try await f.store.uploadQueueSnapshot(localProjectID: f.local)
+        XCTAssertEqual(queue.pendingCount, 1)
+        let second = try await f.store.claimNextGeneralContract(localProjectID: f.local)
+        XCTAssertEqual(second.request.orderedIntents[0].objectValue?["base_revision"], .int(2))
+        XCTAssertEqual(second.request.orderedIntents[0].objectValue?["payload"]?.objectValue?["content"], .string("둘째 저장"))
+        try await f.store.completeContractStructure(second, response: response(second))
+        // 첫 응답이 중복 도착해도 더 최신 기준선은 유지해야 한다.
+        try await f.store.completeContractStructure(first, response: response(first))
+        XCTAssertEqual(try raw.scalarText("SELECT base_content FROM sync_documents;"), "둘째 저장")
+        XCTAssertEqual(try raw.scalarInt("SELECT COUNT(*) FROM sync_operations;"), 0)
+        await f.store.close()
+    }
+
+    func testRestartAndResponseLossReuseExactlyTheStoredRequest() async throws {
+        let f = try await fixture()
+        try await enqueue(save(f, content: "유실 응답"), f)
+        let first = try await f.store.claimNextGeneralContract(localProjectID: f.local)
+        await f.store.close()
+        guard case .available(let reopened) = await SyncV2Store.open(at: f.url) else { return XCTFail("재실행 실패") }
+        try await reopened.recoverInterruptedWork()
+        let retry = try await reopened.claimNextGeneralContract(localProjectID: f.local)
+        XCTAssertEqual(retry, first)
+        try await reopened.completeContractStructure(retry, response: response(retry))
+        await reopened.close()
+    }
+
+    func testPartialResponseDoesNotAdvanceBaselineAndSchedulesBackoff() async throws {
+        let f = try await fixture()
+        try await enqueue(save(f, content: "보존할 본문"), f)
+        let pending = try await f.store.claimNextGeneralContract(localProjectID: f.local)
+        var invalid = response(pending).objectValue!; invalid["results"] = .array([])
+        do { try await f.store.completeContractStructure(pending, response: .object(invalid)); XCTFail("부분 응답을 완료함") } catch {}
+        await f.store.failContractStructure(pending, error: SyncV2ContractError.partialBatchResponse, response: .object(invalid))
+        let raw = try RawSQLite(url: f.url)
+        XCTAssertEqual(try raw.scalarInt("SELECT server_revision FROM sync_documents;"), 1)
+        XCTAssertEqual(try raw.scalarText("SELECT status FROM sync_contract_batches;"), "ready")
+        let date = try await f.store.nextRetryDate(localProjectID: f.local)
+        XCTAssertNotNil(date)
+        let ready = try await f.store.generalContractReadyProjects(now: Date())
+        XCTAssertFalse(ready.contains(f.local))
+        await f.store.close()
+    }
+
+    func testReusedBatchIDWithDifferentSourceIsRejected() async throws {
+        let f = try await fixture(), id = UUID(), op = UUID()
+        let batch = save(f, content: "원본", batchID: id, operationID: op)
+        try await enqueue(batch, f); try await enqueue(batch, f)
+        do { try await enqueue(save(f, content: "다른 값", batchID: id, operationID: op), f); XCTFail("ID 재사용") } catch {}
+        let raw = try RawSQLite(url: f.url)
+        XCTAssertEqual(try raw.scalarInt("SELECT COUNT(*) FROM sync_contract_local_batches;"), 1)
+        await f.store.close()
+    }
+
+    func testMissingStructureMetadataPreservesSourceWithoutLegacyFallback() async throws {
+        let f = try await fixture(metadata: false)
+        try await enqueue(save(f, content: "로컬 원본"), f)
+        do { _ = try await f.store.claimNextGeneralContract(localProjectID: f.local); XCTFail("구조 revision 추정") } catch {}
+        let queue = try await f.store.uploadQueueSnapshot(localProjectID: f.local)
+        XCTAssertEqual(queue.blockedCount, 1)
+        let raw = try RawSQLite(url: f.url)
+        XCTAssertEqual(try raw.scalarInt("SELECT COUNT(*) FROM sync_contract_batches;"), 0)
+        XCTAssertEqual(try raw.scalarInt("SELECT COUNT(*) FROM sync_operations;"), 0)
+        XCTAssertTrue(try raw.scalarText("SELECT source_json FROM sync_contract_local_batches;").contains("로컬 원본"))
+        await f.store.close()
+    }
+
+    func testSameRevisionManifestSuppliesMissingContractMetadata() async throws {
+        let f = try await fixture(metadata: false)
+        try await f.store.adoptContractManifestMetadata(localProjectID: f.local, serverProjectID: f.server, entries: [
+            SyncV2RemoteDocumentManifestEntry(documentID: f.document, relativePath: "문서.txt", revision: 1,
+                isDeleted: false, deletedAt: nil, updatedAt: Date(), name: "문서.txt", structureRevision: 7)
+        ])
+        try await enqueue(save(f, content: "새 본문"), f)
+        let pending = try await f.store.claimNextGeneralContract(localProjectID: f.local)
+        XCTAssertEqual(pending.request.orderedIntents[0].objectValue?["payload"]?.objectValue?["structure_revision"], .int(7))
+        await f.store.close()
+    }
+
+    func testGeneralClaimDoesNotConsumeManualOrPreparedBatches() async throws {
+        let f = try await fixture()
+        do { _ = try await f.store.claimNextGeneralContract(localProjectID: f.local); XCTFail("일반 원본 없이 claim") }
+        catch { XCTAssertEqual(error as? SyncV2ContractStructureError, .noReadyBatch) }
+        try await enqueue(save(f, content: "일반"), f)
+        do { _ = try await f.store.claimNextContractStructure(localProjectID: f.local); XCTFail("수동 경로가 일반 배치를 소비함") }
+        catch { XCTAssertEqual(error as? SyncV2ContractStructureError, .noReadyBatch) }
+        await f.store.close()
+    }
+    func testSixQueuedFolderRenamesUseAcknowledgedRevisions() async throws {
+        let f = try await fixture(), folderID = UUID()
+        try await f.store.applyFolderSnapshotBaselines(localProjectID: f.local, serverProjectID: f.server,
+            folders: [.init(folderID: folderID, parentFolderID: nil, name: "폴더0", revision: 1, isDeleted: false, updatedAt: Date())], excluding: [])
+        try await f.store.applyTreeOrderSnapshotBaselines(localProjectID: f.local, serverProjectID: f.server,
+            treeOrders: [.init(treeOrderID: UUID(), parentFolderID: nil, children: [f.document, folderID], revision: 1, updatedAt: Date()),
+                .init(treeOrderID: UUID(), parentFolderID: folderID, children: [], revision: 1, updatedAt: Date())])
+        let doc = DocumentNode(id: .init(rawValue: f.document), projectID: f.local, kind: .text, parentID: nil,
+            relativePath: .init(rawValue: "문서.txt"), userOrder: 0, modifiedAt: Date(), contentHash: nil)
+        for index in 1...6 {
+            let folder = DocumentNode(id: .init(rawValue: folderID), projectID: f.local, kind: .folder, parentID: nil,
+                relativePath: .init(rawValue: "폴더\(index)"), userOrder: 1, modifiedAt: Date(), contentHash: nil)
+            let batch = LocalMutationBatch(batchID: UUID(), projectID: f.local, localTransactionID: UUID(), kind: .structureChange,
+                mutations: [.folderSnapshot(operationID: UUID(), folderID: folder.id, parentFolderID: nil, name: "폴더\(index)", isDeleted: false),
+                    .treeOrder(operationID: UUID(), content: "{}", generation: UInt64(index))], structureSnapshot: [doc, folder])
+            try await enqueue(batch, f)
+        }
+        for index in 1...6 {
+            let pending = try await f.store.claimNextGeneralContract(localProjectID: f.local)
+            XCTAssertEqual(pending.request.orderedIntents.count, 1)
+            XCTAssertEqual(pending.request.orderedIntents[0].objectValue?["base_revision"], .int(index))
+            XCTAssertEqual(pending.request.orderedIntents[0].objectValue?["payload"]?.objectValue?["name"], .string("폴더\(index)"))
+            try await f.store.completeContractStructure(pending, response: response(pending, document: false))
+        }
+        let raw = try RawSQLite(url: f.url)
+        XCTAssertEqual(try raw.scalarText("SELECT name FROM sync_folders;"), "폴더6")
+        XCTAssertEqual(try raw.scalarInt("SELECT server_revision FROM sync_folders;"), 7)
+        await f.store.close()
+    }
+
+    func testDocumentRenameUsesStructureRevisionAndPreservesContentRevision() async throws {
+        let f = try await fixture()
+        try await f.store.applyTreeOrderSnapshotBaselines(localProjectID: f.local, serverProjectID: f.server,
+            treeOrders: [.init(treeOrderID: UUID(), parentFolderID: nil, children: [f.document], revision: 2, updatedAt: Date())])
+        let node = DocumentNode(id: .init(rawValue: f.document), projectID: f.local, kind: .text, parentID: nil,
+            relativePath: .init(rawValue: "새 제목.txt"), userOrder: 0, modifiedAt: Date(), contentHash: nil)
+        let batch = LocalMutationBatch(batchID: UUID(), projectID: f.local, localTransactionID: UUID(), kind: .structureChange,
+            mutations: [.documentSnapshot(operationID: UUID(), documentID: node.id, relativePath: node.relativePath,
+                content: "처음", contentHash: SHA256ContentHasher().sha256(for: Data("처음".utf8)), localSaveGeneration: 0, isDeleted: false),
+                .treeOrder(operationID: UUID(), content: "{}", generation: 1)], structureSnapshot: [node])
+        try await enqueue(batch, f)
+        let pending = try await f.store.claimNextGeneralContract(localProjectID: f.local)
+        XCTAssertEqual(pending.request.orderedIntents[0].objectValue?["base_revision"], .int(3))
+        XCTAssertEqual(pending.request.orderedIntents[0].objectValue?["intent_kind"], .string("rename"))
+        try await f.store.completeContractStructure(pending, response: response(pending, document: false))
+        let raw = try RawSQLite(url: f.url)
+        XCTAssertEqual(try raw.scalarInt("SELECT server_revision FROM sync_documents;"), 1)
+        XCTAssertEqual(try raw.scalarInt("SELECT structure_revision FROM sync_documents;"), 4)
+        XCTAssertEqual(try raw.scalarText("SELECT base_content FROM sync_documents;"), "처음")
+        await f.store.close()
+    }
+
+    func testSnapshotCannotReplacePendingGeneralSave() async throws {
+        let f = try await fixture()
+        try await enqueue(save(f, content: "아직 전송하지 않은 원고"), f)
+        let snapshot = SyncV2RemoteDocumentSnapshot(documentID: f.document, relativePath: "문서.txt", content: "다른 기기",
+            revision: 2, isDeleted: false, deletedAt: nil, updatedAt: Date(), name: "문서.txt", structureRevision: 3)
+        let applied = try await f.store.applySnapshotBaseline(localProjectID: f.local, serverProjectID: f.server, snapshot: snapshot, expectedRevision: 1)
+        XCTAssertFalse(applied)
+        let state = try await f.store.snapshotState(localProjectID: f.local, serverProjectID: f.server, documentID: f.document)
+        XCTAssertTrue(state?.hasActiveOperation == true)
+        await f.store.close()
+    }
+
+    func testNewFolderAndIDOrdersAreOneAtomicRequest() async throws {
+        let f = try await fixture(), folderID = UUID()
+        try await f.store.applyTreeOrderSnapshotBaselines(localProjectID: f.local, serverProjectID: f.server,
+            treeOrders: [.init(treeOrderID: UUID(), parentFolderID: nil, children: [f.document], revision: 4, updatedAt: Date())])
+        let doc = DocumentNode(id: .init(rawValue: f.document), projectID: f.local, kind: .text, parentID: nil,
+            relativePath: .init(rawValue: "문서.txt"), userOrder: 0, modifiedAt: Date(), contentHash: nil)
+        let folder = DocumentNode(id: .init(rawValue: folderID), projectID: f.local, kind: .folder, parentID: nil,
+            relativePath: .init(rawValue: "새 폴더"), userOrder: 1, modifiedAt: Date(), contentHash: nil)
+        let trash = DocumentNode(id: .init(rawValue: UUID()), projectID: f.local, kind: .folder, parentID: nil,
+            relativePath: BinderFixedCategory.trash.relativePath, userOrder: 8, modifiedAt: Date(), contentHash: nil)
+        let batch = LocalMutationBatch(batchID: UUID(), projectID: f.local, localTransactionID: UUID(), kind: .structureChange,
+            mutations: [.folderSnapshot(operationID: UUID(), folderID: folder.id, parentFolderID: nil, name: "새 폴더", isDeleted: false),
+                .treeOrder(operationID: UUID(), content: "{}", generation: 1)], structureSnapshot: [doc, folder, trash])
+        try await enqueue(batch, f)
+        let protected = try await f.store.foldersWithPendingOperations(localProjectID: f.local)
+        XCTAssertTrue(protected.contains(folderID), "wire 생성 전의 새 폴더도 pull에서 보호한다")
+        let baseline = try await f.store.generalResumeBaseline(localProjectID: f.local)
+        XCTAssertTrue(baseline.folders.isEmpty, "아직 서버에 없는 폴더를 기준에 넣지 않는다")
+        XCTAssertEqual(baseline.treeOrders.first?.objectValue?["children"], .array([.string(f.document.uuidString.lowercased())]))
+        let pending = try await f.store.claimNextGeneralContract(localProjectID: f.local)
+        XCTAssertEqual(pending.request.orderedIntents.count, 3)
+        XCTAssertFalse(try pending.request.json.canonicalJSON().contains(trash.id.rawValue.uuidString.lowercased()))
+        XCTAssertEqual(pending.request.orderedIntents[0].objectValue?["intent_kind"], .string("create"))
+        try await f.store.completeContractStructure(pending, response: response(pending, document: false))
+        let queue = try await f.store.uploadQueueSnapshot(localProjectID: f.local)
+        XCTAssertEqual(queue.pendingCount, 0)
+        let raw = try RawSQLite(url: f.url)
+        XCTAssertEqual(try raw.scalarInt("SELECT COUNT(*) FROM sync_folders;"), 1)
+        XCTAssertEqual(try raw.scalarInt("SELECT COUNT(*) FROM sync_tree_orders;"), 2)
+        let released = try await f.store.foldersWithPendingOperations(localProjectID: f.local)
+        XCTAssertTrue(released.isEmpty, "완료된 일반 소스는 수신을 막지 않는다")
+        await f.store.close()
+    }
+
+    func testContractPinChangeDoesNotMaterializeAnOldLocalBatchUnderNewMetadata() async throws {
+        let f = try await fixture()
+        try await enqueue(save(f, content: "고정 계약 보존"), f)
+        let raw = try RawSQLite(url: f.url)
+        try raw.execute("UPDATE sync_contract_local_batches SET contract_version = '0.1.0';")
+        do { _ = try await f.store.claimNextGeneralContract(localProjectID: f.local); XCTFail("계약 재해석") } catch {}
+        XCTAssertEqual(try raw.scalarInt("SELECT COUNT(*) FROM sync_contract_batches;"), 0)
+        XCTAssertEqual(try raw.scalarText("SELECT status FROM sync_contract_local_batches;"), "blocked")
+        await f.store.close()
+    }
+
+}
+
+
+extension SyncV2StoreTests {
+    func testReceiveGuardDirectClaimsRecoveryAndRetryPreserveDatabaseBytes() async throws {
+        let url = try databaseURL(), context = QueueAPIContext()
+        let store = try await connectedStore(at: url, context: context)
+        let ids = (0..<4).map { _ in UUID() }
+        for id in ids {
+            _ = try await store.enqueue(context.batch(mutations: [context.documentMutation(operationID: id, documentID: UUID(), relativePath: "원고/\(id.uuidString).txt")]))
+        }
+        await store.close()
+        let raw = try RawSQLite(url: url)
+        for (id, status) in zip(ids, ["pending", "retry_wait", "inflight", "conflict"]) {
+            try raw.execute("UPDATE sync_operations SET status = '\(status)', attempts = 3 WHERE operation_id = '\(id.uuidString.lowercased())';")
+        }
+        raw.close()
+        let before = SHA256.hash(data: try Data(contentsOf: url))
+        for _ in 0..<2 {
+            let policy = ReceiveValidationPolicy(enabled: true, configuration: nil)
+            try await ReceiveValidationPolicy.$override.withValue(policy) {
+                let reopened = try await openStore(at: url)
+                do { try await reopened.recoverInterruptedWork(); XCTFail() } catch {}
+                do { try await reopened.makeRetryWaitOperationsReady(); XCTFail() } catch {}
+                do { _ = try await reopened.claimReadyOperations(limit: 10, now: Date()); XCTFail() } catch {}
+                do { _ = try await reopened.claimReadyFolderOperations(limit: 10, now: Date()); XCTFail() } catch {}
+                do { _ = try await reopened.claimNextGeneralContract(localProjectID: context.localProjectID); XCTFail() } catch {}
+                await reopened.close()
+            }
+            let after = SHA256.hash(data: try Data(contentsOf: url))
+            XCTAssertEqual(before, after, "protected synthetic DB bytes changed")
+            XCTAssertEqual(policy.denialCount, 5)
+        }
+        print("ReceiveGuard synthetic SQLite SHA256: " + before.map { String(format: "%02x", $0) }.joined())
+    }
 }

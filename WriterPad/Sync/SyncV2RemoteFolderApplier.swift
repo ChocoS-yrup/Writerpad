@@ -167,6 +167,7 @@ actor SyncV2RemoteFolderApplier: SyncV2RemoteFolderApplying {
         deletionMode: NonEmptyDeletionMode
     ) async -> SyncV2RemoteFolderApplyReport {
         var report = SyncV2RemoteFolderApplyReport()
+        guard (try? ReceiveValidationPolicy.current.requireLocalApplication(local: localProjectID)) != nil else { return report }
         guard !remote.isEmpty else { return report }
         guard
             let root = try? await workspaceLocator.workspaceRoot(
@@ -278,22 +279,22 @@ actor SyncV2RemoteFolderApplier: SyncV2RemoteFolderApplying {
                     throw CocoaError(.fileNoSuchFile)
                 }
             } else {
-                try fileManager.createDirectory(
+                try ReceiveValidationPolicy.current.mutate { try fileManager.createDirectory(
                     at: destinationURL.deletingLastPathComponent(),
                     withIntermediateDirectories: true
-                )
+                ) }
                 if fileManager.fileExists(atPath: sourceURL.path) {
-                    try fileManager.moveItem(
+                    try ReceiveValidationPolicy.current.mutate { try fileManager.moveItem(
                         at: sourceURL,
                         to: destinationURL
-                    )
+                    ) }
                 } else {
                     // 빈 폴더는 디스크에 없을 수 있다. 그래도 메타데이터는
                     // 옮겨야 화면에서 폴더가 둘로 보이지 않는다.
-                    try fileManager.createDirectory(
+                    try ReceiveValidationPolicy.current.mutate { try fileManager.createDirectory(
                         at: destinationURL,
                         withIntermediateDirectories: true
-                    )
+                    ) }
                 }
             }
         } catch {
@@ -370,10 +371,10 @@ actor SyncV2RemoteFolderApplier: SyncV2RemoteFolderApplying {
         }
         let destinationURL = url(root: root, path: path)
         do {
-            try fileManager.createDirectory(
+            try ReceiveValidationPolicy.current.mutate { try fileManager.createDirectory(
                 at: destinationURL,
                 withIntermediateDirectories: true
-            )
+            ) }
         } catch {
             report.rejectedFolderIDs.insert(folderID)
             report.rejectedNames.append(
@@ -393,7 +394,7 @@ actor SyncV2RemoteFolderApplier: SyncV2RemoteFolderApplying {
             parentID: parentID,
             relativePath: path,
             userOrder: 0,
-            modifiedAt: Date(),
+            modifiedAt: GeneralValidationRuntimeValues.current?.date ?? Date(),
             contentHash: nil
         )
         guard (try? await documentRepository.save(node)) != nil else {
@@ -469,7 +470,7 @@ actor SyncV2RemoteFolderApplier: SyncV2RemoteFolderApplying {
                 return documents
             }
             do {
-                try fileManager.removeItem(at: target)
+                try ReceiveValidationPolicy.current.mutate { try fileManager.removeItem(at: target) }
             } catch {
                 report.rejectedFolderIDs.insert(folderID)
                 report.rejectedNames.append(

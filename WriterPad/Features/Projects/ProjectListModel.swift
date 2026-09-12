@@ -2,6 +2,47 @@ import Foundation
 import SwiftUI
 
 @MainActor
+final class ProjectBackupExportModel: ObservableObject {
+    @Published private(set) var isWorking = false
+    @Published private(set) var savedPackageURL: URL?
+    @Published private(set) var errorMessage: String?
+    private let coordinator: any ProjectBackupCreating
+
+    init(coordinator: any ProjectBackupCreating) {
+        self.coordinator = coordinator
+    }
+
+    func save(projectID: ProjectID, in folder: URL) async {
+        guard !isWorking else { return }
+        isWorking = true
+        savedPackageURL = nil
+        errorMessage = nil
+        defer { isWorking = false }
+        let scoped = folder.startAccessingSecurityScopedResource()
+        defer { if scoped { folder.stopAccessingSecurityScopedResource() } }
+        // 사용자 작품 제목을 파일명으로 변환하지 않고 충돌 없는 새 폴더를
+        // 만든다. 기존 백업은 어떤 이름이더라도 덮어쓰지 않는다.
+        let package = folder.appendingPathComponent(
+            "WriterPad-백업-\(UUID().uuidString.lowercased())", isDirectory: true
+        )
+        do {
+            try Task.checkCancellation()
+            let receipt = try await coordinator.createBackup(for: projectID, at: package)
+            savedPackageURL = receipt.packageURL
+        } catch is CancellationError {
+            // 취소는 외부 보관 성공으로 표시하지 않는다.
+        } catch {
+            errorMessage = error.localizedDescription
+        }
+    }
+
+    func present(error: Error) {
+        guard (error as NSError).code != NSUserCancelledError else { return }
+        errorMessage = error.localizedDescription
+    }
+}
+
+@MainActor
 final class ProjectListModel: ObservableObject {
     @Published private(set) var projects: [ManagedProject] = []
     @Published var selectedProjectID: ProjectID?

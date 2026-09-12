@@ -378,14 +378,17 @@ protocol SyncV2CommitClienting: Sendable {
 
 actor LiveSyncV2CommitTransport: SyncV2CommitTransporting {
     private let client: SupabaseClient
+    private let receiveClients: ReceiveValidationSDKClients?
 
-    init(client: SupabaseClient) {
-        self.client = client
+    init(client: SupabaseClient, receiveClients: ReceiveValidationSDKClients? = nil) {
+        self.client = client; self.receiveClients = receiveClients
     }
 
     func commitDocument(
         parameters: SyncV2CommitDocumentParameters
     ) async throws -> SyncV2CommitDocumentResult {
+        try ReceiveValidationPolicy.current.requireBodyCommit(parameters)
+        let client = try ReceiveValidationSDKClients.operationClient(client, pool: receiveClients)
         do {
             let response: PostgrestResponse<SyncV2CommitDocumentResult> =
                 try await client
@@ -418,6 +421,7 @@ actor LiveSyncV2CommitTransport: SyncV2CommitTransporting {
     func commitFolder(
         parameters: SyncV2CommitFolderParameters
     ) async throws -> SyncV2CommitFolderResult {
+        try ReceiveValidationPolicy.current.requireSending()
         do {
             let response: PostgrestResponse<SyncV2CommitFolderResult> =
                 try await client
@@ -458,6 +462,7 @@ actor SyncV2Client: SyncV2CommitClienting {
     func commitDocument(
         _ parameters: SyncV2CommitDocumentParameters
     ) async throws -> SyncV2CommitDocumentResult {
+        try ReceiveValidationPolicy.current.requireBodyCommit(parameters)
         guard Self.isValid(parameters) else {
             throw SyncV2ClientError.remote(
                 code: .invalidArgument,
@@ -490,6 +495,7 @@ actor SyncV2Client: SyncV2CommitClienting {
     func commitFolder(
         _ parameters: SyncV2CommitFolderParameters
     ) async throws -> SyncV2CommitFolderResult {
+        try ReceiveValidationPolicy.current.requireSending()
         guard Self.isValid(parameters) else {
             throw SyncV2ClientError.remote(
                 code: .invalidArgument,

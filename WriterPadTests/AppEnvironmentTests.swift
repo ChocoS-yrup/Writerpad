@@ -6,6 +6,37 @@ import XCTest
 
 final class AppEnvironmentTests: XCTestCase {
     @MainActor
+    func testStartupFailurePreservesSyntheticFilesAndRetryEntersNormalEnvironment() throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        let manuscript = root.appendingPathComponent("synthetic.txt")
+        let database = root.appendingPathComponent("unreadable.store")
+        let text = Data("복구 시험용 합성 문장".utf8)
+        let bytes = Data("합성 저장소 파일".utf8)
+        try text.write(to: manuscript)
+        try bytes.write(to: database)
+        var attempts = 0
+        let recoveredEnvironment = try AppEnvironment.testing()
+        let startup = WriterPadStartupModel {
+            attempts += 1
+            if attempts == 1 { throw CocoaError(.fileReadCorruptFile) }
+            return recoveredEnvironment
+        }
+        XCTAssertTrue(startup.failed)
+        XCTAssertNil(startup.environment)
+        XCTAssertEqual(try Data(contentsOf: manuscript), text)
+        XCTAssertEqual(try Data(contentsOf: database), bytes)
+        startup.retry()
+        XCTAssertFalse(startup.failed)
+        XCTAssertTrue(startup.environment === recoveredEnvironment)
+        startup.retry()
+        XCTAssertEqual(attempts, 2)
+        XCTAssertEqual(try Data(contentsOf: manuscript), text)
+        XCTAssertEqual(try Data(contentsOf: database), bytes)
+    }
+
+    @MainActor
     func testWriterPadCommandActionsUpdatesInPlaceWithoutReplacingFocusedIdentity() {
         let actions = WriterPadCommandActions()
         let identity = ObjectIdentifier(actions)
@@ -5335,3 +5366,29 @@ extension AppEnvironmentTests {
         XCTAssertEqual(f.model.cursor, f.originalCursor, "자신의 저장이 서버에서 돌아온 경우는 원격 본문 변경이 아니다")
     }
 }
+
+
+#if WRITERPAD_RECEIVE_VALIDATION
+final class ReceiveValidationBuildSelectionTests: XCTestCase {
+    func testFreshCompiledProcessWithGlobalAndGateTrueDoesNotStartCloudWork() async throws {
+        let policy = ReceiveValidationPolicy.built
+        XCTAssertTrue(policy.enabled)
+        XCTAssertFalse(policy.sendingAllowed)
+        XCTAssertThrowsError(try policy.authorization())
+        let defaults = UserDefaults(suiteName: "receive-guard-synthetic-" + UUID().uuidString)!
+        defaults.set(true, forKey: GlobalSyncPreference.storageKey)
+        let project = ProjectID(rawValue: UUID())
+        ContractPathGate.setOpen(true, for: project, in: defaults)
+        XCTAssertTrue(ContractPathGate.isOpen(for: project, in: defaults))
+        XCTAssertFalse(GlobalSyncPreference.isEnabled(in: defaults))
+        XCTAssertTrue(defaults.bool(forKey: GlobalSyncPreference.storageKey))
+        let authentication = CloudStartupAuthenticationSpy()
+        let identity = CloudStartupDeviceIdentitySpy()
+        await WriterPadCloudStartup.start(syncEnabled: true, authenticationService: authentication,
+            deviceIdentityService: identity, syncDispatcher: nil, backgroundSyncCoordinator: nil)
+        let restores = await authentication.restoreCallCount(), prepares = await identity.prepareCallCount()
+        XCTAssertEqual([restores, prepares], [0, 0])
+        print("ReceiveGuard independent process context: " + policy.process.uuidString)
+    }
+}
+#endif

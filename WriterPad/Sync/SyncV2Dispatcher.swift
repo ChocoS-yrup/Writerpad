@@ -987,14 +987,28 @@ actor SyncV2ProjectUploadPullCoordinator {
 }
 
 actor SyncV2Dispatcher {
+    enum ProjectScope: Sendable {
+        case all
+        case only(Set<ProjectID>)
+
+        func contains(_ projectID: ProjectID) -> Bool {
+            switch self {
+            case .all: return true
+            case let .only(projectIDs): return projectIDs.contains(projectID)
+            }
+        }
+    }
+
     private struct ProjectLane {
         let generation: UUID
         let task: Task<Void, Never>
     }
 
     private let store: any SyncV2DispatchStoring
+    private let contractSender: (any SyncV2GeneralContractSending)?
     private let client: any SyncV2CommitClienting
     private let maximumConcurrentDocuments: Int
+    private let projectScope: ProjectScope
     private let retryPolicy: SyncV2RetryPolicy
     private let randomUnit: @Sendable () -> Double
     private let networkMonitor: SyncV2NetworkRecoveryMonitor
@@ -1017,6 +1031,8 @@ actor SyncV2Dispatcher {
     init(
         store: any SyncV2DispatchStoring,
         client: any SyncV2CommitClienting,
+        contractSender: (any SyncV2GeneralContractSending)? = nil,
+        projectScope: ProjectScope = .all,
         maximumConcurrentDocuments: Int = 3,
         retryPolicy: SyncV2RetryPolicy = .default,
         randomUnit: @escaping @Sendable () -> Double = {
@@ -1035,6 +1051,8 @@ actor SyncV2Dispatcher {
     ) {
         self.store = store
         self.client = client
+        self.contractSender = contractSender
+        self.projectScope = projectScope
         self.maximumConcurrentDocuments = max(
             1,
             maximumConcurrentDocuments
@@ -1051,6 +1069,7 @@ actor SyncV2Dispatcher {
     }
 
     func start() async {
+        guard ReceiveValidationPolicy.current.sendingAllowed else { return }
         guard !isStarted else { return }
         isStarted = true
         await wakeup?.install(id: wakeupID) { [weak self] in
@@ -1063,7 +1082,11 @@ actor SyncV2Dispatcher {
         ) { [weak self] in
             Task { await self?.newOperationsEnqueued() }
         }
-        try? await store.recoverInterruptedWork()
+        // Recovery rewrites queues across all projects. A restricted dispatcher
+        // preserves interrupted work until a separately scoped recovery exists.
+        if case .all = projectScope {
+            try? await store.recoverInterruptedWork()
+        }
         networkMonitor.start { [weak self] in
             Task {
                 await self?.networkRecovered()
@@ -1139,7 +1162,10 @@ actor SyncV2Dispatcher {
 
     /// NWPathMonitor가 unsatisfied/requiresConnection에서 satisfied로 바뀔 때만 호출된다.
     func networkRecovered() async {
-        await networkRecoveryHub?.signal()
+        guard ReceiveValidationPolicy.current.sendingAllowed else { return }
+        if case .all = projectScope {
+            await networkRecoveryHub?.signal()
+        }
         await immediateRetryOpportunity()
     }
 
@@ -1149,12 +1175,14 @@ actor SyncV2Dispatcher {
 
     /// 자동 테스트가 고정 시각으로 한 cycle을 끝까지 비울 수 있는 결정적 진입점이다.
     func dispatchReadyOperations(now: Date) async {
+        guard ReceiveValidationPolicy.current.sendingAllowed else { return }
         guard let projectIDs = try? await store.readyLocalProjectIDs(
             now: now
         ) else { return }
         let orderedProjectIDs = prioritized(projectIDs)
         let store = self.store
         let client = self.client
+        let contractSender = self.contractSender
         let retryPolicy = self.retryPolicy
         let randomUnit = self.randomUnit
         let leaseManager = self.leaseManager
@@ -1174,6 +1202,7 @@ actor SyncV2Dispatcher {
                             : 1,
                         store: store,
                         client: client,
+                        contractSender: contractSender,
                         retryPolicy: retryPolicy,
                         randomUnit: randomUnit,
                         leaseManager: leaseManager,
@@ -1189,9 +1218,15 @@ actor SyncV2Dispatcher {
     }
 
     private func immediateRetryOpportunity() async {
-        try? await store.makeRetryWaitOperationsReady(
-            localProjectID: nil
-        )
+        guard ReceiveValidationPolicy.current.sendingAllowed else { return }
+        switch projectScope {
+        case .all:
+            try? await store.makeRetryWaitOperationsReady(localProjectID: nil)
+        case let .only(projectIDs):
+            for projectID in projectIDs {
+                try? await store.makeRetryWaitOperationsReady(localProjectID: projectID)
+            }
+        }
         await refreshProjectLanesAndSchedule()
     }
 
@@ -1212,6 +1247,7 @@ actor SyncV2Dispatcher {
     }
 
     private func startProjectLane(_ localProjectID: ProjectID) {
+        guard projectScope.contains(localProjectID) else { return }
         let generation = UUID()
         let limit =
             localProjectID == activeLocalProjectID
@@ -1224,6 +1260,7 @@ actor SyncV2Dispatcher {
                 limit: limit,
                 store: self.store,
                 client: self.client,
+                contractSender: self.contractSender,
                 retryPolicy: self.retryPolicy,
                 randomUnit: self.randomUnit,
                 leaseManager: self.leaseManager,
@@ -1266,6 +1303,7 @@ actor SyncV2Dispatcher {
     private func prioritized(
         _ projectIDs: [ProjectID]
     ) -> [ProjectID] {
+        let projectIDs = projectIDs.filter { projectScope.contains($0) }
         guard let activeLocalProjectID,
               projectIDs.contains(activeLocalProjectID) else {
             return projectIDs
@@ -1279,6 +1317,7 @@ actor SyncV2Dispatcher {
         limit: Int,
         store: any SyncV2DispatchStoring,
         client: any SyncV2CommitClienting,
+        contractSender: (any SyncV2GeneralContractSending)?,
         retryPolicy: SyncV2RetryPolicy,
         randomUnit: @escaping @Sendable () -> Double,
         leaseManager: (any EditLeaseManaging)?,
@@ -1289,6 +1328,10 @@ actor SyncV2Dispatcher {
             SyncV2ProjectUploadPullCoordinator?,
         now: @escaping @Sendable () -> Date
     ) async -> Bool {
+        guard ReceiveValidationPolicy.current.sendingAllowed else { return false }
+        if let contractSender, await contractSender.handlesProject(localProjectID) {
+            return await contractSender.drainGeneralContract(localProjectID: localProjectID)
+        }
         let uploadPermit:
             SyncV2ProjectUploadPullCoordinator.UploadPermit?
         if let uploadPullCoordinator {
@@ -1417,14 +1460,14 @@ actor SyncV2Dispatcher {
     }
 
     private func scheduleNextRetry() async {
-        guard isStarted,
-              scheduledWake == nil,
-              let date = try? await store.nextRetryDate(
-                  localProjectID: nil
-              ) else {
-            return
-        }
-        let delay = max(0, date.timeIntervalSinceNow)
+        guard isStarted, scheduledWake == nil else { return }
+        // The general sender's retry date spans all projects. Restricted runs
+        // require an explicit retry opportunity instead of this global timer.
+        guard case .all = projectScope else { return }
+        let storedDate = try? await store.nextRetryDate(localProjectID: nil)
+        let generalDate = await contractSender?.nextGeneralRetryDate()
+        guard let date = [storedDate, generalDate].compactMap({ $0 }).min() else { return }
+        let delay = max(5, date.timeIntervalSinceNow)
         let nanoseconds = UInt64(
             min(delay, TimeInterval(UInt64.max) / 1_000_000_000)
                 * 1_000_000_000
@@ -1895,6 +1938,7 @@ final class SyncV2NetworkRecoveryMonitor: @unchecked Sendable {
     }
 
     func start(recoveryHandler: @escaping @Sendable () -> Void) {
+        guard ReceiveValidationPolicy.current.sendingAllowed else { return }
         lock.lock()
         guard !isRunning else {
             lock.unlock()

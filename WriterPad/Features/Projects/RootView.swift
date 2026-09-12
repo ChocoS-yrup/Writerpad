@@ -17,6 +17,7 @@ struct RootView: View {
             exporter: environment.exporter,
             backupStore: environment.backupStore,
             backupPolicyStore: environment.backupPolicyStore,
+            projectBackupCoordinator: environment.projectBackupCoordinator,
             restoreCoordinator: environment.restoreCoordinator,
             workspaceStateRepository: environment.workspaceStateRepository,
             futureChangeNotifier: environment.futureChangeNotifier,
@@ -34,6 +35,7 @@ struct RootView: View {
             handshakeService: environment.handshakeService,
             contractStructureSender: environment.contractStructureSender,
             snapshotPuller: environment.snapshotPullService,
+            serverProjectCatalog: environment.serverProjectCatalog,
             isDarkMode: $isDarkMode,
             smartPairsEnabled: $smartPairsEnabled
         )

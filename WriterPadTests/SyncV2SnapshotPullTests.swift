@@ -1,9 +1,162 @@
 import Foundation
+import SwiftData
 import UIKit
 import XCTest
 @testable import WriterPad
 
 final class SyncV2SnapshotPullTests: XCTestCase {
+    func testGeneralScopeStopsOtherProjectBeforeSnapshotFetchOrApply() async throws {
+        let local = ProjectID(rawValue: UUID()), server = UUID(), document = UUID()
+        let client = GeneralScopeSnapshotSpy(snapshot: makeSnapshot(id: document, revision: 1))
+        let applier = SnapshotApplierSpy()
+        let service = SyncV2SnapshotPullService(client: client, stateStore: SnapshotStateStoreStub(states: [:]), localApplier: applier, mergeStore: SnapshotMergeStoreSpy())
+        let scope = GeneralSyncValidationScope(restricted: true, selection: .init(local: local, server: server, documents: [document], reviewedRPCs: []))
+        try await GeneralSyncValidationScope.$override.withValue(scope) {
+            for pair in [(ProjectID(rawValue: UUID()), server), (local, UUID())] {
+                do { _ = try await service.pull(localProjectID: pair.0, serverProjectID: pair.1); XCTFail("excluded pull started") } catch {}
+            }
+            let rejectedCalls = await client.calls, rejectedApplies = await applier.appliedIDs()
+            XCTAssertEqual(rejectedCalls, 0); XCTAssertTrue(rejectedApplies.isEmpty)
+            let result = try await service.pull(localProjectID: local, serverProjectID: server)
+            XCTAssertEqual(result.appliedSnapshots.map(\.documentID), [document])
+        }
+    }
+
+    /// 첫 계약 뒤의 역방향 후보는 순서 행을 새로 만들지 않고 revision 1→2로
+    /// 전진시킨다. 실제 작품 대신 합성 원고와 실제 두 저장소로 이 경계를 검증한다.
+    func testClosedGateReceivesThirdEmptyVolumeAndExistingOrderRevisionTwo() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("reverse-contract-\(UUID())")
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let metadataURL = root.appendingPathComponent("metadata.store")
+        let databaseURL = root.appendingPathComponent("sync.sqlite3")
+        let repository = SwiftDataMetadataRepository(modelContainer:
+            try WriterPadMetadataStore.makeContainer(isStoredInMemoryOnly: false, storeURL: metadataURL))
+        guard case let .available(store) = await SyncV2Store.open(at: databaseURL) else {
+            return XCTFail("격리 SQLite를 열지 못했습니다.")
+        }
+        let projectID = ProjectID(rawValue: UUID()), serverID = UUID(), ownerID = UUID()
+        let now = Date(timeIntervalSince1970: 1_800_000_000)
+        try await repository.save(Project(id: projectID, name: "역방향 합성 시험", createdAt: now, modifiedAt: now))
+        try await store.save(.connected(localProjectID: projectID, serverProjectID: serverID,
+            kind: .existingServerProject, projectName: "역방향 합성 시험", ownerSubject: ownerID))
+        try await store.markFolderMigrationCompleted(localProjectID: projectID)
+        let suite = "reverse-contract-\(UUID())"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        defer { defaults.removePersistentDomain(forName: suite) }
+        XCTAssertFalse(ContractPathGate.isOpen(for: projectID, in: defaults))
+
+        let workspace = root.appendingPathComponent("workspace")
+        let locator = SnapshotWorkspaceLocator(root: workspace)
+        var folderIDs: [String: DocumentID] = [:]
+        var folders: [SyncV2RemoteFolder] = []
+        let folderPaths = ["메인"] + BinderFixedCategory.allCases.map { $0.relativePath.rawValue }
+            + ["메인/원고/1권", "메인/원고/2권"]
+        for (index, path) in folderPaths.enumerated() {
+            let id = DocumentID(rawValue: UUID())
+            let parent = folderIDs[path.split(separator: "/").dropLast().joined(separator: "/")]
+            folderIDs[path] = id
+            try FileManager.default.createDirectory(at: workspace.appendingPathComponent(path), withIntermediateDirectories: true)
+            try await repository.save(DocumentNode(id: id, projectID: projectID, kind: .folder,
+                parentID: parent, relativePath: .init(rawValue: path), userOrder: index,
+                modifiedAt: now, contentHash: nil))
+            folders.append(.init(folderID: id.rawValue, parentFolderID: parent?.rawValue,
+                name: String(path.split(separator: "/").last!), revision: 1, isDeleted: false, updatedAt: now))
+        }
+        let parent = try XCTUnwrap(folderIDs["메인/원고"])
+        let first = try XCTUnwrap(folderIDs["메인/원고/1권"])
+        let second = try XCTUnwrap(folderIDs["메인/원고/2권"])
+        var snapshots: [SyncV2RemoteDocumentSnapshot] = []
+        var bodies: [String: Data] = [:]
+        for index in 1...25 {
+            let path = String(format: "메인/원고/1권/%03d화.txt", index)
+            let body = "합성 원고 \(index) — 실제 본문을 사용하지 않습니다."
+            let id = DocumentID(rawValue: UUID()), data = Data(body.utf8)
+            bodies[path] = data
+            try data.write(to: workspace.appendingPathComponent(path))
+            try await repository.save(DocumentNode(id: id, projectID: projectID, kind: .text,
+                parentID: first, relativePath: .init(rawValue: path), userOrder: index,
+                modifiedAt: now, contentHash: SHA256ContentHasher().sha256(for: data)))
+            snapshots.append(makeSnapshot(id: id.rawValue, path: path, content: body, revision: 7))
+        }
+        // 계약 행보다 숫자가 큰 LEGACY 문서도 새 폴더를 없애거나 계약 장부를
+        // 이전 자식 집합으로 되돌리는 근거로 쓰여서는 안 된다.
+        snapshots.append(makeSnapshot(id: syncV2UUIDv5(namespace: serverID, name: syncV2TreeOrderPath), path: syncV2TreeOrderPath,
+            content: "{\"tree_order\":{\"메인/원고\":[\"1권\",\"2권\"]},\"version\":1}", revision: 999))
+        let orderID = UUID()
+        func service(repository: SwiftDataMetadataRepository, store: SyncV2Store,
+                     folders: [SyncV2RemoteFolder], children: [UUID], revision: Int64) -> SyncV2SnapshotPullService {
+            SyncV2SnapshotPullService(client: SnapshotClientStub(snapshots: snapshots, folders: folders,
+                treeOrders: [.init(treeOrderID: orderID, parentFolderID: parent.rawValue,
+                    children: children, revision: revision, updatedAt: now)]),
+                stateStore: store,
+                localApplier: LocalSyncV2SnapshotApplier(documentRepository: repository, workspaceLocator: locator),
+                mergeStore: LocalSyncV2SnapshotMergeStore(workspaceLocator: locator),
+                folderApplier: SyncV2RemoteFolderApplier(documentRepository: repository, workspaceLocator: locator),
+                folderDocuments: repository)
+        }
+        _ = try await service(repository: repository, store: store, folders: folders,
+            children: [first.rawValue, second.rawValue], revision: 1).pull(localProjectID: projectID, serverProjectID: serverID)
+        let before = try await repository.documents(in: projectID)
+        XCTAssertEqual(before.count, 37)
+        let baseline = try await store.storedTreeOrder(localProjectID: projectID, parentFolderID: parent.rawValue)
+        XCTAssertEqual(baseline?.serverRevision, 1)
+
+        let third = DocumentID(rawValue: UUID())
+        folders.append(.init(folderID: third.rawValue, parentFolderID: parent.rawValue,
+            name: "3권", revision: 1, isDeleted: false, updatedAt: now))
+        let children = [first.rawValue, second.rawValue, third.rawValue]
+        let incoming = service(repository: repository, store: store, folders: folders, children: children, revision: 2)
+        for _ in 0..<2 {
+            let report = try await incoming.pull(localProjectID: projectID, serverProjectID: serverID)
+            XCTAssertTrue(report.contractStructureBaselineReady, "수신 승인 근거: \(report)")
+            let order = try await store.storedTreeOrder(localProjectID: projectID, parentFolderID: parent.rawValue)
+            XCTAssertEqual(order?.serverRevision, 2)
+            XCTAssertEqual(order?.children, children)
+        }
+        let after = try await repository.documents(in: projectID)
+        XCTAssertEqual(after.count, before.count + 1)
+        for node in before {
+            let kept = try XCTUnwrap(after.first { $0.id == node.id })
+            XCTAssertEqual(kept.relativePath, node.relativePath)
+            XCTAssertEqual(kept.parentID, node.parentID)
+            XCTAssertEqual(kept.kind, node.kind)
+            XCTAssertEqual(kept.userOrder, node.userOrder)
+            XCTAssertEqual(kept.contentHash, node.contentHash)
+        }
+        let newNode = try XCTUnwrap(after.first { $0.id == third })
+        XCTAssertEqual(newNode.parentID, parent)
+        XCTAssertEqual(newNode.kind, .folder)
+        XCTAssertEqual(newNode.relativePath.rawValue.precomposedStringWithCanonicalMapping, "메인/원고/3권")
+        XCTAssertFalse(after.contains { $0.parentID == third })
+        for (path, data) in bodies {
+            XCTAssertEqual(try Data(contentsOf: workspace.appendingPathComponent(path)), data)
+        }
+        XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath: workspace.appendingPathComponent("메인/원고/3권").path), [])
+        let queue = try await store.uploadQueueSnapshot(localProjectID: projectID)
+        XCTAssertEqual(queue, .idle)
+        XCTAssertFalse(ContractPathGate.isOpen(for: projectID, in: defaults))
+        await store.close()
+
+        // 같은 서버 snapshot을 다시 받는 것과 저장소 재열기를 한 시나리오로
+        // 확인한다. 실기기 프로세스 재시작이나 네트워크 재연결 시험은 아니다.
+        guard case let .available(reopenedStore) = await SyncV2Store.open(at: databaseURL) else {
+            return XCTFail("격리 SQLite 재열기 실패")
+        }
+        let reopenedRepository = SwiftDataMetadataRepository(modelContainer:
+            try WriterPadMetadataStore.makeContainer(isStoredInMemoryOnly: false, storeURL: metadataURL))
+        _ = try await service(repository: reopenedRepository, store: reopenedStore, folders: folders,
+            children: children, revision: 2).pull(localProjectID: projectID, serverProjectID: serverID)
+        let reopenedNodes = try await reopenedRepository.documents(in: projectID)
+        XCTAssertEqual(Set(reopenedNodes.map(\.id)), Set(after.map(\.id)))
+        let restoredOrder = try await reopenedStore.storedTreeOrder(localProjectID: projectID, parentFolderID: parent.rawValue)
+        XCTAssertEqual(restoredOrder?.children, children)
+        XCTAssertEqual(restoredOrder?.serverRevision, 2)
+        let restoredQueue = try await reopenedStore.uploadQueueSnapshot(localProjectID: projectID)
+        XCTAssertEqual(restoredQueue, .idle)
+        await reopenedStore.close()
+    }
+
     func testPullDiagnosticsKeepsOneIDAndReportsAggregateStages()
         async throws {
         let recorder = SyncV2PullDiagnosticRecorder()
@@ -908,8 +1061,13 @@ final class SyncV2SnapshotPullTests: XCTestCase {
     /// 빈 서버 작품을 두 기기가 동시에 채우면 같은 초기 TXT가
     /// 다른 UUID로 두 번 등록될 수 있다. 경로·본문이 같고 편집·백업이
     /// 없는 초기 snapshot만 서버 UUID를 채택해 구조 추돌을 풀어야 한다.
-    func testEquivalentInitialDocumentAdoptsServerIdentityWithoutRewritingTXT()
-        async throws {
+    func testBoundaryReceiveApplierNeverReplacesEquivalentInitialIdentity() async throws {
+        try await exerciseEquivalentLocalIdentity(receiveGuard: true)
+    }
+    func testEquivalentInitialDocumentAdoptsServerIdentityWithoutRewritingTXT() async throws {
+        try await exerciseEquivalentLocalIdentity(receiveGuard: false)
+    }
+    private func exerciseEquivalentLocalIdentity(receiveGuard: Bool) async throws {
         let root = FileManager.default.temporaryDirectory
             .appendingPathComponent("WriterPad-Identity-Adoption-\(UUID())")
         defer { try? FileManager.default.removeItem(at: root) }
@@ -970,6 +1128,19 @@ final class SyncV2SnapshotPullTests: XCTestCase {
             content: "",
             revision: 1
         )
+        if receiveGuard {
+            let policy = ReceiveValidationPolicy(enabled: true, configuration: nil)
+            let changed = await ReceiveValidationPolicy.$override.withValue(policy) {
+                await applier.replaceEquivalentLocalDocumentIdentity(localProjectID: projectID,
+                    localDocumentID: localID.rawValue, snapshot: snapshot)
+            }
+            XCTAssertFalse(changed)
+            let after = try await repository.documents(in: projectID)
+            XCTAssertEqual(after.sorted { $0.id.rawValue.uuidString < $1.id.rawValue.uuidString },
+                [main, volume, local].sorted { $0.id.rawValue.uuidString < $1.id.rawValue.uuidString })
+            XCTAssertEqual(try Data(contentsOf: fileURL), originalData)
+            return
+        }
         let stateStore = EquivalentIdentityStateStoreStub(
             remoteDocumentID: remoteID,
             path: relativePath
@@ -7426,6 +7597,33 @@ final class SyncV2SnapshotPullTests: XCTestCase {
     }
 
     @MainActor
+    func testReceiveGuardSceneActivationCannotStartAutomaticAuthenticationDuringLogin() async throws {
+        let policy = ReceiveValidationPolicy(enabled: true, configuration: .init(version: 1, revision: UUID(),
+            endpoint: ReceiveValidationPolicy.Configuration.staging, accountID: UUID()))
+        let authentication = ObservableWorkspaceAuthenticationStub(state: .localOnly)
+        let puller = WorkspacePullerStub()
+        let model = makeLifecycleModel(puller: puller, realtime: nil, authentication: authentication)
+        try await ReceiveValidationPolicy.$override.withValue(policy) {
+            _ = try policy.beginAuthentication(foreground: true, endpoint: ReceiveValidationPolicy.Configuration.staging)
+            await model.start(sceneIsActive: false, editingGuards: { [:] }) { _ in }
+            await model.updateSceneActivity(true)
+            await authentication.setState(.restoring)
+            for _ in 0..<100 { await Task.yield() }
+            try await Task.sleep(for: .milliseconds(100))
+            let observers = await authentication.observerCount()
+            let restores = await authentication.restoreCallCount()
+            let pulls = await puller.count()
+            await authentication.setState(.signedOut(.noStoredSession))
+            await model.updateSceneActivity(false)
+            await model.stop()
+            XCTAssertEqual(observers, 0, "guarded scene must not subscribe an automatic authentication observer")
+            XCTAssertEqual(restores, 0, "manual login must not be superseded by workspace restore")
+            XCTAssertEqual(pulls, 0)
+            XCTAssertFalse(policy.sendingAllowed)
+        }
+    }
+
+    @MainActor
     private func makeLifecycleModel(
         puller: any SyncV2SnapshotPulling,
         realtime: (any SyncV2RealtimeTriggering)?,
@@ -9135,6 +9333,7 @@ private actor WorkspaceAuthenticationStub: AuthenticationServicing {
 
 private actor ObservableWorkspaceAuthenticationStub:
     AuthenticationServicing {
+    private var restoreCalls = 0
     private var state: AuthenticationState
     private var observers: [
         UUID: AsyncStream<AuthenticationState>.Continuation
@@ -9145,7 +9344,8 @@ private actor ObservableWorkspaceAuthenticationStub:
     }
 
     func currentState() -> AuthenticationState { state }
-    func restoreSession() -> AuthenticationState { state }
+    func restoreSession() -> AuthenticationState { restoreCalls += 1; return state }
+    func restoreCallCount() -> Int { restoreCalls }
     // 이 관찰 더블은 refresh와 restore를 의도적으로 구분하지 않는다.
     func refreshSession(force: Bool) -> AuthenticationState {
         _ = force
@@ -10596,4 +10796,13 @@ extension SyncV2SnapshotPullTests {
         catch { XCTAssertTrue(error is CancellationError) }
         _ = try await service.pull(localProjectID: local, serverProjectID: server)
     }
+}
+
+private actor GeneralScopeSnapshotSpy: SyncV2SnapshotClienting {
+    let snapshot: SyncV2RemoteDocumentSnapshot
+    private(set) var calls = 0
+    init(snapshot: SyncV2RemoteDocumentSnapshot) { self.snapshot = snapshot }
+    func fetchDocuments(projectID: UUID) -> [SyncV2RemoteDocumentSnapshot] { calls += 1; return [snapshot] }
+    func fetchFolders(projectID: UUID) -> [SyncV2RemoteFolder] { calls += 1; return [] }
+    func fetchTreeOrders(projectID: UUID) -> [SyncV2RemoteTreeOrder] { calls += 1; return [] }
 }

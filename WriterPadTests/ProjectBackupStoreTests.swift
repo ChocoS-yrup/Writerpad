@@ -4,6 +4,96 @@ import XCTest
 
 final class ProjectBackupStoreTests: XCTestCase {
     @MainActor
+    func testExportModelFailureAndCancellationNeverReportExternalSuccess() async throws {
+        struct FailingCreator: ProjectBackupCreating {
+            let cancels: Bool
+            func createBackup(for projectID: ProjectID, at packageURL: URL) async throws -> ProjectBackupReceipt {
+                if cancels { throw CancellationError() }
+                throw CocoaError(.fileWriteOutOfSpace)
+            }
+        }
+        let destination = FileManager.default.temporaryDirectory
+        for cancels in [false, true] {
+            let model = ProjectBackupExportModel(coordinator: FailingCreator(cancels: cancels))
+            await model.save(projectID: ProjectID(rawValue: UUID()), in: destination)
+            XCTAssertFalse(model.isWorking)
+            XCTAssertNil(model.savedPackageURL)
+            XCTAssertEqual(model.errorMessage == nil, cancels)
+        }
+    }
+
+    func testExternalCopyPreservesExistingTargetAndCleansCancelledStaging() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let source = root.appendingPathComponent("source")
+        let destination = root.appendingPathComponent("existing")
+        let manifest = ProjectBackupManifest(formatVersion: 1,
+            project: .init(uuid: UUID().uuidString.lowercased(), title: "합성 작품"), nodes: [])
+        try writePackage(manifest, payloads: [:], at: source)
+        try FileManager.default.createDirectory(at: destination, withIntermediateDirectories: true)
+        let sentinel = destination.appendingPathComponent("keep.txt")
+        try Data("보존".utf8).write(to: sentinel)
+        let store = ProjectBackupStore()
+        do {
+            _ = try await store.copyBackup(at: source, to: destination)
+            XCTFail("기존 대상 덮어쓰기")
+        } catch {
+            XCTAssertEqual(error as? ProjectBackupError, .destinationAlreadyExists)
+        }
+        XCTAssertEqual(try Data(contentsOf: sentinel), Data("보존".utf8))
+        let cancelled = root.appendingPathComponent("cancelled")
+        let task = Task {
+            withUnsafeCurrentTask { $0?.cancel() }
+            return try await store.copyBackup(at: source, to: cancelled)
+        }
+        do {
+            _ = try await task.value
+            XCTFail("취소된 내보내기 성공")
+        } catch is CancellationError {} catch { XCTFail("\(error)") }
+        XCTAssertFalse(FileManager.default.fileExists(atPath: cancelled.path))
+        XCTAssertEqual(Set(try FileManager.default.contentsOfDirectory(atPath: root.path)), Set(["source", "existing"]))
+    }
+
+    @MainActor
+    func testCoordinatorRejectsTreeChangedWhileAcquiringSnapshotLocks() async throws {
+        actor ChangingDocuments: DocumentRepository {
+            let nodes: [DocumentNode]
+            var reads = 0
+            init(nodes: [DocumentNode]) { self.nodes = nodes }
+            func documents(in projectID: ProjectID) async throws -> [DocumentNode] {
+                reads += 1
+                return reads == 1 ? nodes : []
+            }
+            func document(id: DocumentID) async throws -> DocumentNode? { nil }
+            func save(_ document: DocumentNode) async throws { throw CancellationError() }
+            func removeMetadata(id: DocumentID) async throws { throw CancellationError() }
+        }
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let resolver = ProjectPathResolver(projectsRootURL: root.appendingPathComponent("Projects"))
+        let paths = try resolver.createStandardStructure(forProjectNamed: "변경 합성 작품")
+        let container = try WriterPadMetadataStore.makeContainer(isStoredInMemoryOnly: true)
+        let repository = SwiftDataMetadataRepository(modelContainer: container)
+        let date = Date(timeIntervalSince1970: 1_700_000_000)
+        let id = ProjectID(rawValue: UUID())
+        try await repository.save(Project(id: id, name: "변경 합성 작품", createdAt: date, modifiedAt: date))
+        let documents = ChangingDocuments(nodes: [node(DocumentID(rawValue: UUID()), id, .folder, nil, "메인", 0, date)])
+        let coordinator = ProjectBackupCoordinator(projectRepository: repository,
+            documentRepository: documents,
+            workspaceLocator: RepositoryProjectWorkspaceLocator(projectRepository: repository, pathResolver: resolver))
+        let before = try tree(at: paths.workspaceRootURL)
+        let package = root.appendingPathComponent("external")
+        do {
+            _ = try await coordinator.createBackup(for: id, at: package)
+            XCTFail("잠그지 못한 변경 트리를 보관하면 안 됩니다.")
+        } catch {
+            XCTAssertEqual(error as? ProjectBackupError, .sourceChanged)
+        }
+        XCTAssertFalse(FileManager.default.fileExists(atPath: package.path))
+        XCTAssertEqual(try tree(at: paths.workspaceRootURL), before)
+    }
+
+    @MainActor
     func testFreshProjectBackupIncludesCreationTimeTrashIdentity() async throws {
         let fileManager = FileManager.default
         let root = fileManager.temporaryDirectory.appendingPathComponent(UUID().uuidString)

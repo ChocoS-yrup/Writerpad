@@ -174,9 +174,10 @@ protocol EditLeaseTransporting: Sendable {
 
 actor LiveEditLeaseTransport: EditLeaseTransporting {
     private let client: SupabaseClient
+    private let receiveClients: ReceiveValidationSDKClients?
 
-    init(client: SupabaseClient) {
-        self.client = client
+    init(client: SupabaseClient, receiveClients: ReceiveValidationSDKClients? = nil) {
+        self.client = client; self.receiveClients = receiveClients
     }
 
     func acquire(
@@ -207,6 +208,13 @@ actor LiveEditLeaseTransport: EditLeaseTransporting {
         _ name: String,
         parameters: Parameters
     ) async throws -> Result {
+        if ReceiveValidationPolicy.current.enabled {
+            try ReceiveValidationPolicy.current.requireBody()
+            var request = URLRequest(url: URL(string: ReceiveValidationPolicy.Configuration.staging + "/rest/v1/rpc/" + name)!)
+            request.httpMethod = "POST"; request.httpBody = try JSONEncoder().encode(parameters)
+            _ = try ReceiveValidationPolicy.current.authorize(request)
+        }
+        let client = try ReceiveValidationSDKClients.operationClient(client, pool: receiveClients)
         do {
             let response: PostgrestResponse<Result> = try await client
                 .rpc(name, params: parameters)
@@ -327,14 +335,18 @@ actor EditLeaseClient: EditLeaseClienting {
         deviceID: UUID,
         leaseToken: UUID
     ) async throws -> Bool {
+        let scope = GeneralSyncValidationScope.current
+        try scope.require(document: documentID)
         do {
-            return try await transport.release(
+            let result = try await transport.release(
                 ReleaseEditLeaseParameters(
                     documentID: documentID,
                     deviceID: deviceID,
                     leaseToken: leaseToken
                 )
             )
+            try scope.require(document: documentID)
+            return result
         } catch let error as SyncV2CommitTransportError {
             throw SyncV2Client.classify(error)
         } catch let error as SyncV2ClientError {
@@ -354,6 +366,8 @@ actor EditLeaseClient: EditLeaseClienting {
         documentID: UUID,
         deviceID: UUID
     ) async throws -> EditLeaseInspectionResult {
+        let scope = GeneralSyncValidationScope.current
+        try scope.require(document: documentID)
         do {
             let result = try await transport.inspect(
                 InspectEditLeaseParameters(
@@ -361,6 +375,7 @@ actor EditLeaseClient: EditLeaseClienting {
                     deviceID: deviceID
                 )
             )
+            try scope.require(document: documentID)
             guard result.documentID == documentID else {
                 throw SyncV2ClientError.invalidResponse
             }
@@ -385,8 +400,11 @@ actor EditLeaseClient: EditLeaseClienting {
         deviceID: UUID,
         operation: () async throws -> EditLeaseMutationResult
     ) async throws -> EditLeaseMutationResult {
+        let scope = GeneralSyncValidationScope.current
+        try scope.require(document: documentID)
         do {
             let result = try await operation()
+            try scope.require(document: documentID)
             guard
                 result.documentID == documentID,
                 result.deviceID == deviceID
@@ -465,6 +483,7 @@ extension EditLeaseManaging {
         documentID: UUID,
         serverRevision: Int64
     ) async {
+        guard ReceiveValidationPolicy.current.sendingAllowed else { return }
         _ = (documentID, serverRevision)
     }
 
@@ -615,7 +634,7 @@ actor EditLeaseManager: EditLeaseManaging {
     func beginEditing(
         documentID: UUID
     ) async -> EditLeaseDisplayState {
-        guard isEnabled() else { return .localOnly }
+        guard ReceiveValidationPolicy.current.sendingAllowed, isEnabled() else { return .localOnly }
         let deviceID: UUID
         do {
             let identifier = try await deviceIdentityProvider
@@ -688,7 +707,7 @@ actor EditLeaseManager: EditLeaseManaging {
     func refreshEditing(
         documentID: UUID
     ) async -> EditLeaseDisplayState {
-        guard isEnabled() else { return .localOnly }
+        guard ReceiveValidationPolicy.current.sendingAllowed, isEnabled() else { return .localOnly }
         let identifier: DeviceIdentifier
         do {
             identifier = try await deviceIdentityProvider
@@ -733,7 +752,7 @@ actor EditLeaseManager: EditLeaseManaging {
         documentID: UUID,
         serverRevision: Int64
     ) async {
-        guard isEnabled(), serverRevision > 0 else { return }
+        guard ReceiveValidationPolicy.current.sendingAllowed, isEnabled(), serverRevision > 0 else { return }
         let identifier: DeviceIdentifier
         do {
             identifier = try await deviceIdentityProvider.currentIdentifier()
@@ -832,6 +851,8 @@ actor EditLeaseManager: EditLeaseManaging {
         deviceID: UUID,
         baseRevision: Int64
     ) async throws -> UUID? {
+        try GeneralSyncValidationScope.current.require(document: documentID)
+        try ReceiveValidationPolicy.current.requireSending()
         guard baseRevision > 0 else { return nil }
         let key = LeaseKey(documentID: documentID, deviceID: deviceID)
         if entries[key] == nil {
@@ -962,6 +983,7 @@ actor EditLeaseManager: EditLeaseManaging {
     }
 
     func releaseAll() async {
+        guard ReceiveValidationPolicy.current.sendingAllowed else { return }
         let keys = Array(entries.keys)
         for key in keys {
             await releaseAndRemove(key)
@@ -978,6 +1000,7 @@ actor EditLeaseManager: EditLeaseManaging {
     }
 
     private func validToken(for key: LeaseKey) async throws -> UUID {
+        try GeneralSyncValidationScope.current.require(document: key.documentID)
         if let entry = entries[key],
            let token = entry.token,
            let expiresAt = entry.expiresAt,
@@ -1071,6 +1094,7 @@ actor EditLeaseManager: EditLeaseManaging {
     }
 
     private func heartbeat(_ key: LeaseKey) async {
+        guard ReceiveValidationPolicy.current.sendingAllowed else { return }
         guard
             let entry = entries[key],
             entry.activeReferences > 0,
@@ -1259,7 +1283,7 @@ actor EditLeaseManager: EditLeaseManaging {
         let entry = entries.removeValue(forKey: key)
         cancelTasks(for: key)
         publish(.localOnly, documentID: key.documentID)
-        guard let token = entry?.token else { return }
+        guard ReceiveValidationPolicy.current.sendingAllowed, let token = entry?.token else { return }
         let client = self.client
         Task {
             _ = try? await client.release(

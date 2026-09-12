@@ -101,6 +101,7 @@ enum ProjectBackupError: Error, Equatable, LocalizedError {
     case unexpectedPackageEntry(String)
     case invalidDocumentEntry(String)
     case fileVerificationFailed(String)
+    case sourceChanged
 
     var errorDescription: String? {
         switch self {
@@ -109,7 +110,7 @@ enum ProjectBackupError: Error, Equatable, LocalizedError {
         case .packageMissing:
             "WriterPad 백업 패키지를 찾을 수 없습니다."
         case .destinationAlreadyExists:
-            "복원 대상 경로가 이미 존재합니다. 빈 폴더에도 덮어쓰지 않습니다."
+            "백업 또는 복원 대상 경로가 이미 존재합니다. 빈 폴더에도 덮어쓰지 않습니다."
         case .destinationInsideSource:
             "백업 원본 안에는 백업 또는 복원 대상을 만들 수 없습니다."
         case .inconsistentProjectID:
@@ -124,6 +125,8 @@ enum ProjectBackupError: Error, Equatable, LocalizedError {
             "문서 백업 정보가 완전하지 않습니다: \(uuid)"
         case let .fileVerificationFailed(uuid):
             "문서 백업의 크기 또는 SHA-256이 일치하지 않습니다: \(uuid)"
+        case .sourceChanged:
+            "백업 준비 중 작품이 변경되었습니다. 저장·동기화가 끝난 뒤 다시 시도해 주세요."
         }
     }
 }
@@ -133,39 +136,73 @@ enum ProjectBackupCoordinatorError: Error, Equatable {
 }
 
 /// 로컬 UUID 메타데이터와 실제 집필모드 경로를 독립 프로젝트 백업에 연결한다.
-actor ProjectBackupCoordinator {
+protocol ProjectBackupCreating: Sendable {
+    func createBackup(for projectID: ProjectID, at packageURL: URL) async throws -> ProjectBackupReceipt
+}
+
+actor ProjectBackupCoordinator: ProjectBackupCreating {
     private let projectRepository: any ProjectRepository
     private let documentRepository: any DocumentRepository
     private let workspaceLocator: any ProjectWorkspaceLocating
     private let backupStore: ProjectBackupStore
+    private let mutationGate: SyncV2DocumentMutationGate
 
     init(
         projectRepository: any ProjectRepository,
         documentRepository: any DocumentRepository,
         workspaceLocator: any ProjectWorkspaceLocating,
-        backupStore: ProjectBackupStore = ProjectBackupStore()
+        backupStore: ProjectBackupStore = ProjectBackupStore(),
+        mutationGate: SyncV2DocumentMutationGate = SyncV2DocumentMutationGate()
     ) {
         self.projectRepository = projectRepository
         self.documentRepository = documentRepository
         self.workspaceLocator = workspaceLocator
         self.backupStore = backupStore
+        self.mutationGate = mutationGate
     }
 
     func createBackup(
         for projectID: ProjectID,
         at packageURL: URL
     ) async throws -> ProjectBackupReceipt {
-        guard let project = try await projectRepository.project(id: projectID) else {
-            throw ProjectBackupCoordinatorError.missingProject(projectID)
-        }
         let documents = try await documentRepository.documents(in: projectID)
         let workspace = try await workspaceLocator.workspaceRoot(for: projectID)
-        return try await backupStore.createBackup(
-            project: project,
-            documents: documents,
-            workspaceURL: workspace,
-            packageURL: packageURL
-        )
+        let sourceContainer = workspace.deletingLastPathComponent().resolvingSymlinksInPath()
+        let destination = packageURL.standardizedFileURL.resolvingSymlinksInPath()
+        guard destination != sourceContainer,
+              !destination.path.hasPrefix(sourceContainer.path + "/") else {
+            throw ProjectBackupError.destinationInsideSource
+        }
+        let temporaryRoot = FileManager.default.temporaryDirectory
+            .appendingPathComponent("WriterPad-ProjectBackup-\(UUID().uuidString)")
+        let snapshotURL = temporaryRoot.appendingPathComponent("snapshot")
+        defer { try? FileManager.default.removeItem(at: temporaryRoot) }
+        // 외부 파일 제공자의 대기는 저장 잠금 밖에서 처리한다. 로컬 원고와
+        // 구조를 함께 잠근 동안만 불변 패키지를 만들고, 잠금 대기 중 새로
+        // 생긴 문서는 잠그지 못했으므로 이번 시도를 중단한다.
+        let identifiers = documents.map { $0.id.rawValue }
+            + [syncV2ProjectStructureMutationID(projectID)]
+        _ = try await mutationGate.withCriticalSections(documentIDs: identifiers) { [self] in
+            guard let project = try await projectRepository.project(id: projectID) else {
+                throw ProjectBackupCoordinatorError.missingProject(projectID)
+            }
+            let current = try await documentRepository.documents(in: projectID)
+            guard Set(current.map(\.id)) == Set(documents.map(\.id)),
+                  try await workspaceLocator.workspaceRoot(for: projectID) == workspace else {
+                throw ProjectBackupError.sourceChanged
+            }
+            let receipt = try await backupStore.createBackup(
+                project: project, documents: current,
+                workspaceURL: workspace, packageURL: snapshotURL
+            )
+            guard try await projectRepository.project(id: projectID) == project,
+                  try await documentRepository.documents(in: projectID) == current else {
+                throw ProjectBackupError.sourceChanged
+            }
+            try Task.checkCancellation()
+            return receipt
+        }
+        return try await backupStore.copyBackup(at: snapshotURL, to: destination)
     }
 
     func restoreBackup(
@@ -233,6 +270,7 @@ actor ProjectBackupStore {
             )
             var entries: [ProjectBackupManifest.Node] = []
             for document in documents {
+                try Task.checkCancellation()
                 entries.append(
                     try backupEntry(
                         for: document,
@@ -255,14 +293,53 @@ actor ProjectBackupStore {
             // 여기서 먼저 막는다. 그러지 않으면 사용자는 복원하려는 날에야
             // 그 백업이 쓸 수 없다는 것을 안다.
             try validateManifest(manifest)
+            // 파일 앱처럼 앱의 잠금을 거치지 않는 변경도 가능한 범위에서
+            // 검출한다. 검증 실패 시 외부에 성공 패키지를 남기지 않는다.
+            for (document, entry) in zip(documents, entries) where document.kind == .text {
+                try Task.checkCancellation()
+                let sourceURL = try sourceURL(for: document, in: source)
+                let data = try Data(contentsOf: sourceURL)
+                guard data.count == entry.bytes,
+                      hasher.sha256(for: data).rawValue == entry.sha256 else {
+                    throw ProjectBackupError.sourceChanged
+                }
+            }
             let encoder = JSONEncoder()
             encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
             try encoder.encode(manifest).write(
                 to: staging.appendingPathComponent(Self.manifestFileName),
                 options: [.atomic]
             )
+            try Task.checkCancellation()
             try fileManager.moveItem(at: staging, to: package)
             return ProjectBackupReceipt(packageURL: package, manifest: manifest)
+        } catch {
+            try? fileManager.removeItem(at: staging)
+            throw error
+        }
+    }
+
+    /// 외부 저장이 완료되고 복원 검증까지 통과한 패키지만 최종 이름으로 공개한다.
+    func copyBackup(at sourceURL: URL, to destinationURL: URL) throws -> ProjectBackupReceipt {
+        let manifest = try validatedManifest(at: sourceURL)
+        guard !fileManager.fileExists(atPath: destinationURL.path) else {
+            throw ProjectBackupError.destinationAlreadyExists
+        }
+        guard !contains(destinationURL.resolvingSymlinksInPath(),
+                        in: sourceURL.resolvingSymlinksInPath()) else {
+            throw ProjectBackupError.destinationInsideSource
+        }
+        let staging = destinationURL.deletingLastPathComponent()
+            .appendingPathComponent(".writerpad-export-\(UUID().uuidString).partial")
+        do {
+            try Task.checkCancellation()
+            try fileManager.copyItem(at: sourceURL, to: staging)
+            guard try validatedManifest(at: staging) == manifest else {
+                throw ProjectBackupError.sourceChanged
+            }
+            try Task.checkCancellation()
+            try fileManager.moveItem(at: staging, to: destinationURL)
+            return ProjectBackupReceipt(packageURL: destinationURL, manifest: manifest)
         } catch {
             try? fileManager.removeItem(at: staging)
             throw error
@@ -391,11 +468,7 @@ actor ProjectBackupStore {
             )
         }
 
-        let data = try Data(
-            contentsOf: sourceWorkspace.appendingPathComponent(
-                document.relativePath.rawValue
-            )
-        )
+        let data = try Data(contentsOf: sourceURL(for: document, in: sourceWorkspace))
         let hash = hasher.sha256(for: data).rawValue
         try data.write(
             to: backupWorkspace.appendingPathComponent(uuid),
@@ -411,6 +484,17 @@ actor ProjectBackupStore {
             bytes: data.count,
             sha256: hash
         )
+    }
+
+    private func sourceURL(for document: DocumentNode, in workspace: URL) throws -> URL {
+        let resolver = ProjectPathResolver(projectsRootURL: workspace.deletingLastPathComponent())
+        let url = try resolver.validatedURL(for: document.relativePath, in: workspace)
+        let values = try url.resourceValues(forKeys: [.isDirectoryKey, .isRegularFileKey, .isSymbolicLinkKey])
+        guard values.isSymbolicLink != true,
+              document.kind == .text ? values.isRegularFile == true : values.isDirectory == true else {
+            throw ProjectBackupError.sourceChanged
+        }
+        return url
     }
 
     private func verifyFiles(

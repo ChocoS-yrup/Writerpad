@@ -13,6 +13,8 @@ protocol SyncV2SnapshotPulling: Sendable {
 }
 
 protocol SyncV2SnapshotStateStoring: Sendable {
+    func adoptContractManifestMetadata(localProjectID: ProjectID, serverProjectID: UUID,
+        entries: [SyncV2RemoteDocumentManifestEntry]) async throws
     /// 변경 없는 pull의 SQLite 반복 조회를 줄이기 위한 선택적
     /// fast path다. `nil`은 batch 미지원을 뜻하고, 빈 Dictionary는
     /// 요청한 ID들의 로컬 기준선이 모두 없음을 뜻한다.
@@ -67,6 +69,8 @@ protocol SyncV2SnapshotStateStoring: Sendable {
 }
 
 extension SyncV2SnapshotStateStoring {
+    func adoptContractManifestMetadata(localProjectID: ProjectID, serverProjectID: UUID,
+        entries: [SyncV2RemoteDocumentManifestEntry]) async throws {}
     func snapshotStates(
         localProjectID: ProjectID,
         serverProjectID: UUID,
@@ -189,6 +193,7 @@ actor SyncV2SnapshotPullService: SyncV2SnapshotPulling {
         }
         defer { activeProjects.remove(localProjectID) }
         try Task.checkCancellation()
+        try ReceiveValidationPolicy.current.requireApplication(local: localProjectID, server: serverProjectID)
         // 내부 async let 네트워크 요청까지 실제로 종료한 다음에 슬롯을 돌려준다.
         let context = await contractContext(localProjectID, serverProjectID)
         let token = context.flatMap { contractStructureAuthority?.beginBaseline($0) }
@@ -198,6 +203,7 @@ actor SyncV2SnapshotPullService: SyncV2SnapshotPulling {
             let report = try await performPull(localProjectID: localProjectID,
                 serverProjectID: serverProjectID, editingGuards: editingGuards)
             try Task.checkCancellation()
+        try ReceiveValidationPolicy.current.requireApplication(local: localProjectID, server: serverProjectID)
             if let context, let token {
                 contractStructureAuthority?.finishBaseline(context, token: token, allowed: report.contractStructureBaselineReady)
             }
@@ -205,7 +211,7 @@ actor SyncV2SnapshotPullService: SyncV2SnapshotPulling {
             return report
         } catch {
             if let context, let token { contractStructureAuthority?.finishBaseline(context, token: token, allowed: false) }
-            SyncV2RecoveryDiagnostics.record(stage: .baselinePull, event: .failed, projectID: localProjectID, operationID: diagnosticID)
+            SyncV2RecoveryDiagnostics.record(stage: .baselinePull, event: (error is ReceiveValidationPolicy.Denied || error is CancellationError) ? .superseded : .failed, projectID: localProjectID, operationID: diagnosticID)
             throw error
         }
     }
@@ -214,6 +220,15 @@ actor SyncV2SnapshotPullService: SyncV2SnapshotPulling {
         localProjectID: ProjectID, serverProjectID: UUID,
         editingGuards: [UUID: SyncV2EditingGuard]
     ) async throws -> SyncV2SnapshotPullReport {
+        // Validate and freeze all rows before the first local preparation or baseline
+        // mutation. Every manifest/hydration call below reads this same value.
+        let client: any SyncV2SnapshotClienting
+        if ReceiveValidationPolicy.bodyRun != nil {
+            client = try await BodyValidationSnapshot.capture(from: self.client,
+                localProjectID: localProjectID, serverProjectID: serverProjectID)
+        } else {
+            client = self.client
+        }
         let pullStartedAt = DispatchTime.now().uptimeNanoseconds
         SyncV2PullDiagnostics.record(
             stage: "snapshot-service",
@@ -234,6 +249,7 @@ actor SyncV2SnapshotPullService: SyncV2SnapshotPulling {
         )
         let manifest = try await manifestRequest
         try Task.checkCancellation()
+        try ReceiveValidationPolicy.current.requireApplication(local: localProjectID, server: serverProjectID)
         SyncV2PullDiagnostics.record(
             stage: "document-manifest",
             phase: "available-to-service",
@@ -245,6 +261,9 @@ actor SyncV2SnapshotPullService: SyncV2SnapshotPulling {
             $0.relativePath != syncV2TreeOrderPath
                 && $0.relativePath != syncV2TrashPurgePath
         }
+        try ReceiveValidationPolicy.current.requireApplication(local: localProjectID, server: serverProjectID)
+        try await stateStore.adoptContractManifestMetadata(localProjectID: localProjectID,
+            serverProjectID: serverProjectID, entries: ordinaryEntries)
         if let leaseManager {
             for entry in ordinaryEntries {
                 if entry.isDeleted {
@@ -268,6 +287,7 @@ actor SyncV2SnapshotPullService: SyncV2SnapshotPulling {
         try await mutationGate.withCriticalSection(
             documentID: syncV2ProjectStructureMutationID(localProjectID)
         ) { [self] in
+            try ReceiveValidationPolicy.current.requireApplication(local: localProjectID, server: serverProjectID)
             await localApplier.preparePull(
                 localProjectID: localProjectID,
                 remoteLiveDocumentPaths: remoteLiveDocumentPaths
@@ -303,6 +323,7 @@ actor SyncV2SnapshotPullService: SyncV2SnapshotPulling {
             // 실패는 값으로 남겨 폴더 판정만 보류시킨다.
             let fetchedFolders = await foldersRequest
             guard let folders = fetchedFolders else {
+                try ReceiveValidationPolicy.current.requireApplication(local: localProjectID, server: serverProjectID)
                 await localApplier.prepareRemoteFolders(
                     localProjectID: localProjectID,
                     projection: .unavailable(code: "FOLDER_FETCH_FAILED")
@@ -313,6 +334,7 @@ actor SyncV2SnapshotPullService: SyncV2SnapshotPulling {
             let stage = try await mutationGate.withCriticalSection(
                 documentID: syncV2ProjectStructureMutationID(localProjectID)
             ) { [self] in
+            try ReceiveValidationPolicy.current.requireApplication(local: localProjectID, server: serverProjectID)
                 let folderDocuments =
                     (try? await self.folderDocuments?.documents(
                         in: localProjectID
@@ -322,6 +344,7 @@ actor SyncV2SnapshotPullService: SyncV2SnapshotPulling {
                         remote: folders,
                         documents: folderDocuments
                     )
+                try ReceiveValidationPolicy.current.requireApplication(local: localProjectID, server: serverProjectID)
                 await localApplier.prepareRemoteFolders(
                     localProjectID: localProjectID,
                     projection: .known(Set(serverFolderIDsByPath.keys))
@@ -360,12 +383,14 @@ actor SyncV2SnapshotPullService: SyncV2SnapshotPulling {
                 let blockedFolderIDs = Set(
                     blockedServerFolderIDs.map(DocumentID.init(rawValue:))
                 )
+                try ReceiveValidationPolicy.current.requireApplication(local: localProjectID, server: serverProjectID)
                 let report = await folderApplier
                     .stageRemoteFoldersDeferringNonEmptyDeletions(
                     localProjectID: localProjectID,
                     remote: folders,
                     blockedFolderIDs: blockedFolderIDs
                 )
+                try ReceiveValidationPolicy.current.requireApplication(local: localProjectID, server: serverProjectID)
                 try await stateStore.applyFolderSnapshotBaselines(
                     localProjectID: localProjectID,
                     serverProjectID: serverProjectID,
@@ -399,6 +424,7 @@ actor SyncV2SnapshotPullService: SyncV2SnapshotPulling {
             // 이 작품에는 폴더 모형이 없다. 보류가 아니라 "없음"이므로 옛
             // tree_order 이름 추측을 그대로 쓴다. 보류로 두면 폴더 동기화가
             // 없던 시절 작품에서 폴더가 하나도 안 보이게 된다.
+            try ReceiveValidationPolicy.current.requireApplication(local: localProjectID, server: serverProjectID)
             await localApplier.prepareRemoteFolders(
                 localProjectID: localProjectID,
                 projection: .unsupported
@@ -417,6 +443,7 @@ actor SyncV2SnapshotPullService: SyncV2SnapshotPulling {
         let treeOrderApplyStartedAt =
             DispatchTime.now().uptimeNanoseconds
         if !treeOrders.isEmpty {
+            try ReceiveValidationPolicy.current.requireApplication(local: localProjectID, server: serverProjectID)
             try await stateStore.applyTreeOrderSnapshotBaselines(
                 localProjectID: localProjectID,
                 serverProjectID: serverProjectID,
@@ -485,6 +512,7 @@ actor SyncV2SnapshotPullService: SyncV2SnapshotPulling {
         var hydrationTargets: [UUID] = []
         for entry in orderedEntries {
             try Task.checkCancellation()
+        try ReceiveValidationPolicy.current.requireApplication(local: localProjectID, server: serverProjectID)
             guard let prefetchedStates else {
                 SyncV2Diagnostics.hydrationRequired(
                     documentID: entry.documentID,
@@ -568,6 +596,7 @@ actor SyncV2SnapshotPullService: SyncV2SnapshotPulling {
         }
         for entry in orderedEntries {
             try Task.checkCancellation()
+        try ReceiveValidationPolicy.current.requireApplication(local: localProjectID, server: serverProjectID)
             // 본문 없이 결론이 난 문서는 여기서 끝난다. 판정은 본문을 한 번도
             // 보지 않는 기존 경로와 같은 규칙을 쓴다.
             if let resolved = resolvedOutcomes[entry.documentID] {
@@ -657,6 +686,7 @@ actor SyncV2SnapshotPullService: SyncV2SnapshotPulling {
             let timed = try await mutationGate.withCriticalSections(
                 documentIDs: lockedDocumentIDs
             ) { [self] in
+            try ReceiveValidationPolicy.current.requireApplication(local: localProjectID, server: serverProjectID)
                 let processStartedAt =
                     DispatchTime.now().uptimeNanoseconds
                 let processed = try await process(
@@ -764,6 +794,7 @@ actor SyncV2SnapshotPullService: SyncV2SnapshotPulling {
             let finalReport = try await mutationGate.withCriticalSection(
                 documentID: syncV2ProjectStructureMutationID(localProjectID)
             ) { [self] in
+            try ReceiveValidationPolicy.current.requireApplication(local: localProjectID, server: serverProjectID)
                 let latestDocuments = try await folderDocuments?.documents(
                     in: localProjectID
                 ) ?? []
@@ -790,6 +821,7 @@ actor SyncV2SnapshotPullService: SyncV2SnapshotPulling {
                         remoteFolders: folders,
                         blockedFolderIDs: latestBlockedFolderIDs
                     )
+                try ReceiveValidationPolicy.current.requireApplication(local: localProjectID, server: serverProjectID)
                 let report = await folderApplier
                     .finalizeDeferredFolderDeletions(
                         localProjectID: localProjectID,
@@ -801,6 +833,7 @@ actor SyncV2SnapshotPullService: SyncV2SnapshotPulling {
                 let finalExclusions = baselineExclusions
                     .union(latestBlockedServerFolderIDs)
                     .union(report.rejectedFolderIDs.map(\.rawValue))
+                try ReceiveValidationPolicy.current.requireApplication(local: localProjectID, server: serverProjectID)
                 try await stateStore.applyFolderSnapshotBaselines(
                     localProjectID: localProjectID,
                     serverProjectID: serverProjectID,
@@ -939,6 +972,7 @@ actor SyncV2SnapshotPullService: SyncV2SnapshotPulling {
         measurement: ProcessMeasurement
     ) async throws -> ProcessedSnapshot {
         try Task.checkCancellation()
+        try ReceiveValidationPolicy.current.requireApplication(local: localProjectID, server: serverProjectID)
         let hiddenPath: String? = switch snapshot.relativePath {
         case syncV2TreeOrderPath: syncV2TreeOrderPath
         case syncV2TrashPurgePath: syncV2TrashPurgePath
@@ -986,7 +1020,8 @@ actor SyncV2SnapshotPullService: SyncV2SnapshotPulling {
                 appliedSnapshot: nil
             )
         }
-        if let equivalentLocalDocumentID,
+        if ReceiveValidationPolicy.current.sendingAllowed,
+           let equivalentLocalDocumentID,
            !editing.isOpen,
            !editing.isDirty,
            !editing.isComposing,
@@ -1004,6 +1039,7 @@ actor SyncV2SnapshotPullService: SyncV2SnapshotPulling {
                localDocumentID: equivalentLocalDocumentID,
                snapshot: snapshot
            ) {
+            try ReceiveValidationPolicy.current.requireApplication(local: localProjectID, server: serverProjectID)
             await mergeStore.resolve(
                 localProjectID: localProjectID,
                 documentID: snapshot.documentID
@@ -1115,6 +1151,7 @@ actor SyncV2SnapshotPullService: SyncV2SnapshotPulling {
                         )
                     }
                     do {
+                        try ReceiveValidationPolicy.current.requireApplication(local: localProjectID, server: serverProjectID)
                         try await localApplier.apply(
                             localProjectID: localProjectID,
                             snapshot: snapshot
@@ -1147,10 +1184,12 @@ actor SyncV2SnapshotPullService: SyncV2SnapshotPulling {
                             rejectedName: rejectedName
                         )
                     }
+                    try ReceiveValidationPolicy.current.requireApplication(local: localProjectID, server: serverProjectID)
                     await localApplier.finish(
                         localProjectID: localProjectID,
                         documentID: snapshot.documentID
                     )
+                    try ReceiveValidationPolicy.current.requireApplication(local: localProjectID, server: serverProjectID)
                     await mergeStore.resolve(
                         localProjectID: localProjectID,
                         documentID: snapshot.documentID
@@ -1166,11 +1205,13 @@ actor SyncV2SnapshotPullService: SyncV2SnapshotPulling {
                 }
                 if snapshot.relativePath == syncV2TrashPurgePath {
                     do {
+                        try ReceiveValidationPolicy.current.requireApplication(local: localProjectID, server: serverProjectID)
                         try await localApplier.applyTrashPurge(
                             localProjectID: localProjectID,
                             snapshot: snapshot,
                             eligibleDocumentIDs: eligibleDocumentIDs
                         )
+                        try ReceiveValidationPolicy.current.requireApplication(local: localProjectID, server: serverProjectID)
                         await localApplier.finish(
                             localProjectID: localProjectID,
                             documentID: snapshot.documentID
@@ -1212,6 +1253,7 @@ actor SyncV2SnapshotPullService: SyncV2SnapshotPulling {
                    (try? SyncV2TrashPurgePayload(
                        strictContent: snapshot.content
                    )) != nil {
+                    try ReceiveValidationPolicy.current.requireApplication(local: localProjectID, server: serverProjectID)
                     await mergeStore.resolve(
                         localProjectID: localProjectID,
                         documentID: snapshot.documentID
@@ -1247,6 +1289,7 @@ actor SyncV2SnapshotPullService: SyncV2SnapshotPulling {
 
         do {
             try Task.checkCancellation()
+        try ReceiveValidationPolicy.current.requireApplication(local: localProjectID, server: serverProjectID)
             if snapshot.isDeleted,
                effectivePurgeState.purgedRevisions[
                    snapshot.documentID
@@ -1254,12 +1297,14 @@ actor SyncV2SnapshotPullService: SyncV2SnapshotPulling {
                 // purge가 먼저 닫은 tombstone은 baseline만 전진시키고
                 // 휴지통 사본을 다시 만들지 않는다.
             } else if snapshot.relativePath == syncV2TrashPurgePath {
+                try ReceiveValidationPolicy.current.requireApplication(local: localProjectID, server: serverProjectID)
                 try await localApplier.applyTrashPurge(
                     localProjectID: localProjectID,
                     snapshot: snapshot,
                     eligibleDocumentIDs: eligibleDocumentIDs
                 )
             } else {
+                try ReceiveValidationPolicy.current.requireApplication(local: localProjectID, server: serverProjectID)
                 try await localApplier.apply(
                     localProjectID: localProjectID,
                     snapshot: snapshot
@@ -1294,6 +1339,7 @@ actor SyncV2SnapshotPullService: SyncV2SnapshotPulling {
             )
         }
 
+        try ReceiveValidationPolicy.current.requireApplication(local: localProjectID, server: serverProjectID)
         let committed = try await stateStore.applySnapshotBaseline(
             localProjectID: localProjectID,
             serverProjectID: serverProjectID,
@@ -1301,6 +1347,7 @@ actor SyncV2SnapshotPullService: SyncV2SnapshotPulling {
             expectedRevision: state?.serverRevision
         )
         guard committed else {
+            try ReceiveValidationPolicy.current.requireApplication(local: localProjectID, server: serverProjectID)
             await localApplier.rollback(
                 localProjectID: localProjectID,
                 documentID: snapshot.documentID
@@ -1320,12 +1367,14 @@ actor SyncV2SnapshotPullService: SyncV2SnapshotPulling {
                 appliedSnapshot: nil
             )
         }
+        try ReceiveValidationPolicy.current.requireApplication(local: localProjectID, server: serverProjectID)
         await localApplier.finish(
             localProjectID: localProjectID,
             documentID: snapshot.documentID
         )
         // 이전 pull이 경로 충돌 marker를 남겼더라도 이번 snapshot을
         // 실제 파일과 baseline에 모두 적용했으면 해결된 것이다.
+        try ReceiveValidationPolicy.current.requireApplication(local: localProjectID, server: serverProjectID)
         await mergeStore.resolve(
             localProjectID: localProjectID,
             documentID: snapshot.documentID

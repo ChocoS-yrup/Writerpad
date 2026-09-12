@@ -221,7 +221,7 @@ actor LocalSyncV2SnapshotMergeStore: SyncV2SnapshotMergeStoring {
         )
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.sortedKeys]
-        try encoder.encode(candidate).write(to: url, options: [.atomic])
+        try ReceiveValidationPolicy.current.mutate(local: candidate.localProjectID) { try encoder.encode(candidate).write(to: url, options: [.atomic]) }
     }
 
     func resolve(
@@ -231,13 +231,13 @@ actor LocalSyncV2SnapshotMergeStore: SyncV2SnapshotMergeStoring {
         guard let root = try? await workspaceLocator.workspaceRoot(
             for: localProjectID
         ) else { return }
-        try? FileManager.default.removeItem(
+        try? ReceiveValidationPolicy.current.mutate(local: localProjectID) { try FileManager.default.removeItem(
             at: root.appendingPathComponent(
                 Self.prefix
                     + documentID.uuidString.lowercased()
                     + Self.suffix
             )
-        )
+        ) }
     }
 }
 
@@ -458,6 +458,7 @@ actor LocalSyncV2SnapshotApplier: SyncV2LocalSnapshotApplying {
         localDocumentID: UUID,
         snapshot: SyncV2RemoteDocumentSnapshot
     ) async -> Bool {
+        guard ReceiveValidationPolicy.current.sendingAllowed else { return false }
         guard await equivalentLocalDocumentID(
             localProjectID: localProjectID,
             snapshot: snapshot
@@ -526,6 +527,7 @@ actor LocalSyncV2SnapshotApplier: SyncV2LocalSnapshotApplying {
         localProjectID: ProjectID,
         snapshot: SyncV2RemoteDocumentSnapshot
     ) async throws {
+        try ReceiveValidationPolicy.current.requireLocalApplication(local: localProjectID)
         if snapshot.relativePath == syncV2TrashPurgePath {
             let payload = try SyncV2TrashPurgePayload(
                 strictContent: snapshot.content
@@ -701,10 +703,10 @@ actor LocalSyncV2SnapshotApplier: SyncV2LocalSnapshotApplying {
             )
             let encoder = JSONEncoder()
             encoder.outputFormatting = [.sortedKeys]
-            try encoder.encode(marker).write(
+            try ReceiveValidationPolicy.current.mutate { try encoder.encode(marker).write(
                 to: markerURL,
                 options: [.atomic]
-            )
+            ) }
         }
         if let placeholderFolder {
             try await removeTreeOrderPlaceholder(
@@ -722,8 +724,8 @@ actor LocalSyncV2SnapshotApplier: SyncV2LocalSnapshotApplying {
                 + "-pull-\(UUID().uuidString.lowercased())"
                 + LocalDocumentStore.temporarySuffix
         )
-        try writer.writeTemporaryFile(data: data, at: temporary)
-        try writer.replaceItem(at: destination, with: temporary)
+        try ReceiveValidationPolicy.current.mutate { try writer.writeTemporaryFile(data: data, at: temporary) }
+        try ReceiveValidationPolicy.current.mutate { try writer.replaceItem(at: destination, with: temporary) }
 
         let hash = hasher.sha256(for: data)
         let contentChanged = previousContent.map { $0 != data } ?? (current?.contentHash != hash)
@@ -752,7 +754,7 @@ actor LocalSyncV2SnapshotApplier: SyncV2LocalSnapshotApplying {
             ).standardizedFileURL
             if oldURL.path.hasPrefix(rootPrefix),
                fileManager.fileExists(atPath: oldURL.path) {
-                try fileManager.removeItem(at: oldURL)
+                try ReceiveValidationPolicy.current.mutate { try fileManager.removeItem(at: oldURL) }
             }
         }
     }
@@ -832,7 +834,7 @@ actor LocalSyncV2SnapshotApplier: SyncV2LocalSnapshotApplying {
                 throw SyncV2LocalSnapshotApplyError
                     .pathOccupiedByDifferentDocument
             }
-            try fileManager.removeItem(at: url)
+            try ReceiveValidationPolicy.current.mutate { try fileManager.removeItem(at: url) }
         } else if !recoveringSameSnapshot {
             throw SyncV2LocalSnapshotApplyError
                 .pathOccupiedByDifferentDocument
@@ -956,6 +958,7 @@ actor LocalSyncV2SnapshotApplier: SyncV2LocalSnapshotApplying {
         snapshot: SyncV2RemoteDocumentSnapshot,
         eligibleDocumentIDs: Set<UUID>
     ) async throws {
+        try ReceiveValidationPolicy.current.requireLocalApplication(local: localProjectID)
         guard
             !snapshot.isDeleted,
             snapshot.relativePath == syncV2TrashPurgePath
@@ -1104,10 +1107,10 @@ actor LocalSyncV2SnapshotApplier: SyncV2LocalSnapshotApplying {
             documentID: marker.snapshot.documentID,
             root: root
         )
-        try fileManager.createDirectory(
+        try ReceiveValidationPolicy.current.mutate { try fileManager.createDirectory(
             at: stage,
             withIntermediateDirectories: true
-        )
+        ) }
         for item in items where item.document.kind == .text {
             if let stagedName = item.stagedFileName {
                 try stageTrashPurgeFile(
@@ -1143,7 +1146,7 @@ actor LocalSyncV2SnapshotApplier: SyncV2LocalSnapshotApplying {
             else {
                 throw SyncV2LocalSnapshotApplyError.invalidHierarchy
             }
-            try fileManager.removeItem(at: url)
+            try ReceiveValidationPolicy.current.mutate { try fileManager.removeItem(at: url) }
         }
 
         for item in items.sorted(by: {
@@ -1152,10 +1155,10 @@ actor LocalSyncV2SnapshotApplier: SyncV2LocalSnapshotApplying {
         }) {
             try await documentRepository.removeMetadata(id: item.document.id)
         }
-        try appliedState.write(
+        try ReceiveValidationPolicy.current.mutate { try appliedState.write(
             to: trashPurgeStateURL(root: root),
             options: [.atomic]
-        )
+        ) }
     }
 
     private func stageTrashPurgeFile(
@@ -1167,7 +1170,7 @@ actor LocalSyncV2SnapshotApplier: SyncV2LocalSnapshotApplying {
         let destinationExists = fileManager.fileExists(atPath: destination.path)
         switch (sourceExists, destinationExists) {
         case (true, false):
-            try fileManager.moveItem(at: source, to: destination)
+            try ReceiveValidationPolicy.current.mutate { try fileManager.moveItem(at: source, to: destination) }
         case (false, true):
             guard expected else {
                 throw SyncV2LocalSnapshotApplyError.invalidHierarchy
@@ -1280,10 +1283,10 @@ actor LocalSyncV2SnapshotApplier: SyncV2LocalSnapshotApplying {
                 throw SyncV2LocalSnapshotApplyError.unsafePath
             }
             if !existed {
-                try fileManager.createDirectory(
+                try ReceiveValidationPolicy.current.mutate { try fileManager.createDirectory(
                     at: destination,
                     withIntermediateDirectories: false
-                )
+                ) }
             }
 
             let identifier = DocumentID(
@@ -1520,10 +1523,10 @@ actor LocalSyncV2SnapshotApplier: SyncV2LocalSnapshotApplying {
                     recovery.document.relativePath.rawValue
                 ).standardizedFileURL
                 if recovery.createdDirectory {
-                    try fileManager.createDirectory(
+                    try ReceiveValidationPolicy.current.mutate { try fileManager.createDirectory(
                         at: url,
                         withIntermediateDirectories: false
-                    )
+                    ) }
                 }
                 try await documentRepository.save(recovery.document)
             }
@@ -1714,12 +1717,12 @@ actor LocalSyncV2SnapshotApplier: SyncV2LocalSnapshotApplying {
                 continue
             }
             if fileManager.fileExists(atPath: sourceURL.path) {
-                try fileManager.moveItem(at: sourceURL, to: destinationURL)
+                try ReceiveValidationPolicy.current.mutate { try fileManager.moveItem(at: sourceURL, to: destinationURL) }
             } else {
-                try fileManager.createDirectory(
+                try ReceiveValidationPolicy.current.mutate { try fileManager.createDirectory(
                     at: destinationURL,
                     withIntermediateDirectories: false
-                )
+                ) }
             }
             // 식별자를 그대로 들고 옮긴다. 새로 계산하면 같은 폴더가 다른
             // 폴더가 되어, 서버 폴더 기록과 짝이 끊기고 받는 기기에 둘로 보인다.
@@ -1822,7 +1825,7 @@ actor LocalSyncV2SnapshotApplier: SyncV2LocalSnapshotApplying {
             try await documentRepository.removeMetadata(id: destination.id)
             try await documentRepository.save(movedSource)
             if sourceExists {
-                try fileManager.removeItem(at: sourceURL)
+                try ReceiveValidationPolicy.current.mutate { try fileManager.removeItem(at: sourceURL) }
             }
         } catch {
             // 파일 본문은 처음부터 새 디렉터리에 그대로 있다. 메타데이터만
@@ -1834,10 +1837,10 @@ actor LocalSyncV2SnapshotApplier: SyncV2LocalSnapshotApplying {
             }
             if sourceExists,
                !fileManager.fileExists(atPath: sourceURL.path) {
-                try? fileManager.createDirectory(
+                try? ReceiveValidationPolicy.current.mutate { try fileManager.createDirectory(
                     at: sourceURL,
                     withIntermediateDirectories: false
-                )
+                ) }
             }
             throw error
         }
@@ -2244,7 +2247,7 @@ actor LocalSyncV2SnapshotApplier: SyncV2LocalSnapshotApplying {
         )
         switch (sourceExists, destinationExists) {
         case (true, false):
-            try fileManager.moveItem(at: sourceURL, to: destinationURL)
+            try ReceiveValidationPolicy.current.mutate { try fileManager.moveItem(at: sourceURL, to: destinationURL) }
         case (false, true):
             guard (try? Data(contentsOf: destinationURL)) == previousContent else {
                 throw SyncV2LocalSnapshotApplyError
@@ -2392,10 +2395,10 @@ actor LocalSyncV2SnapshotApplier: SyncV2LocalSnapshotApplying {
             }
             if relocatesMaterializedTombstone,
                fileManager.fileExists(atPath: currentURL.path) {
-                try fileManager.removeItem(at: currentURL)
+                try ReceiveValidationPolicy.current.mutate { try fileManager.removeItem(at: currentURL) }
             }
         } else if relocatesMaterializedTombstone {
-            try fileManager.moveItem(at: currentURL, to: destinationURL)
+            try ReceiveValidationPolicy.current.mutate { try fileManager.moveItem(at: currentURL, to: destinationURL) }
         } else {
             let temporary = destinationURL.deletingLastPathComponent()
                 .appendingPathComponent(
@@ -2405,8 +2408,8 @@ actor LocalSyncV2SnapshotApplier: SyncV2LocalSnapshotApplying {
                         + UUID().uuidString.lowercased()
                         + LocalDocumentStore.temporarySuffix
                 )
-            try writer.writeTemporaryFile(data: data, at: temporary)
-            try writer.replaceItem(at: destinationURL, with: temporary)
+            try ReceiveValidationPolicy.current.mutate { try writer.writeTemporaryFile(data: data, at: temporary) }
+            try ReceiveValidationPolicy.current.mutate { try writer.replaceItem(at: destinationURL, with: temporary) }
         }
         try writeTrashRecord(record, root: root)
         let siblings = documents.filter { $0.parentID == trash.id }
@@ -2439,38 +2442,41 @@ actor LocalSyncV2SnapshotApplier: SyncV2LocalSnapshotApplying {
         guard let root = try? await workspaceLocator.workspaceRoot(
             for: localProjectID
         ) else { return }
+        await ReceiveValidationPolicy.beforeMutation("applier.finish")
         let markerURL = recoveryMarkerURL(
             documentID: documentID,
             root: root
         )
         if let marker = recoveryMarker(at: markerURL),
            marker.snapshot.relativePath == syncV2TrashPurgePath {
-            try? fileManager.removeItem(
+            try? ReceiveValidationPolicy.current.mutate(local: localProjectID) { try fileManager.removeItem(
                 at: trashPurgeStageURL(
                     documentID: documentID,
                     root: root
                 )
-            )
-            try? fileManager.removeItem(at: markerURL)
+            ) }
+            try? ReceiveValidationPolicy.current.mutate(local: localProjectID) { try fileManager.removeItem(at: markerURL) }
             return
         }
         if let marker = recoveryMarker(at: markerURL),
            !marker.snapshot.isDeleted,
            let previous = marker.previousDocument,
            case .trashed = previous.deletionStatus {
-            try? fileManager.removeItem(
+            try? ReceiveValidationPolicy.current.mutate(local: localProjectID) { try fileManager.removeItem(
                 at: trashRecordURL(documentID: previous.id, root: root)
-            )
+            ) }
         }
-        try? fileManager.removeItem(
+        try? ReceiveValidationPolicy.current.mutate(local: localProjectID) { try fileManager.removeItem(
             at: markerURL
-        )
+        ) }
     }
 
     func rollback(
         localProjectID: ProjectID,
         documentID: UUID
     ) async {
+        if ReceiveValidationPolicy.current.enabled,
+           (try? ReceiveValidationPolicy.current.mutate {}) == nil { return }
         guard
             let root = try? await workspaceLocator.workspaceRoot(
                 for: localProjectID
@@ -2534,22 +2540,22 @@ actor LocalSyncV2SnapshotApplier: SyncV2LocalSnapshotApplying {
                 ), current.relativePath == appliedPath {
                     try await documentRepository.removeMetadata(id: current.id)
                 }
-                try fileManager.removeItem(at: appliedURL)
-                try fileManager.createDirectory(
+                try ReceiveValidationPolicy.current.mutate { try fileManager.removeItem(at: appliedURL) }
+                try ReceiveValidationPolicy.current.mutate { try fileManager.createDirectory(
                     at: appliedURL,
                     withIntermediateDirectories: false
-                )
+                ) }
                 try await documentRepository.save(placeholder)
                 await rollbackCreatedFolders(
                     marker.createdFolders ?? [],
                     root: root
                 )
-                try? fileManager.removeItem(
+                try? ReceiveValidationPolicy.current.mutate { try fileManager.removeItem(
                     at: recoveryMarkerURL(
                         documentID: documentID,
                         root: root
                     )
-                )
+                ) }
                 return
             }
             if let previousDocument = marker.previousDocument,
@@ -2565,20 +2571,20 @@ actor LocalSyncV2SnapshotApplier: SyncV2LocalSnapshotApplying {
                             + "-rollback-\(UUID().uuidString.lowercased())"
                             + LocalDocumentStore.temporarySuffix
                     )
-                try writer.writeTemporaryFile(
+                try ReceiveValidationPolicy.current.mutate { try writer.writeTemporaryFile(
                     data: previousContent,
                     at: temporary
-                )
-                try writer.replaceItem(
+                ) }
+                try ReceiveValidationPolicy.current.mutate { try writer.replaceItem(
                     at: previousURL,
                     with: temporary
-                )
+                ) }
                 try await documentRepository.save(previousDocument)
                 if previousURL != appliedURL {
-                    try? fileManager.removeItem(at: appliedURL)
+                    try? ReceiveValidationPolicy.current.mutate { try fileManager.removeItem(at: appliedURL) }
                 }
             } else if marker.previousDocument == nil {
-                try? fileManager.removeItem(at: appliedURL)
+                try? ReceiveValidationPolicy.current.mutate { try fileManager.removeItem(at: appliedURL) }
                 try await documentRepository.removeMetadata(
                     id: DocumentID(rawValue: documentID)
                 )
@@ -2589,12 +2595,12 @@ actor LocalSyncV2SnapshotApplier: SyncV2LocalSnapshotApplying {
                 marker.createdFolders ?? [],
                 root: root
             )
-            try? fileManager.removeItem(
+            try? ReceiveValidationPolicy.current.mutate { try fileManager.removeItem(
                 at: recoveryMarkerURL(
                     documentID: documentID,
                     root: root
                 )
-            )
+            ) }
         } catch {
             // marker를 남겨 다음 복구가 동일한 보상 작업을 재개하게 한다.
         }
@@ -2615,12 +2621,12 @@ actor LocalSyncV2SnapshotApplier: SyncV2LocalSnapshotApplying {
                 marker.createdFolders ?? [],
                 root: root
             )
-            try? fileManager.removeItem(
+            try? ReceiveValidationPolicy.current.mutate { try fileManager.removeItem(
                 at: recoveryMarkerURL(
                     documentID: marker.snapshot.documentID,
                     root: root
                 )
-            )
+            ) }
         } catch {
             // marker를 남겨 다음 pull 또는 복구가 원래 순서를 다시 적용한다.
         }
@@ -2647,10 +2653,10 @@ actor LocalSyncV2SnapshotApplier: SyncV2LocalSnapshotApplying {
                     folder.document.relativePath.rawValue
                 ).standardizedFileURL
                 if !fileManager.fileExists(atPath: url.path) {
-                    try fileManager.createDirectory(
+                    try ReceiveValidationPolicy.current.mutate { try fileManager.createDirectory(
                         at: url,
                         withIntermediateDirectories: true
-                    )
+                    ) }
                 }
             }
             for item in items where item.document.kind == .text {
@@ -2661,7 +2667,7 @@ actor LocalSyncV2SnapshotApplier: SyncV2LocalSnapshotApplying {
                     ).standardizedFileURL
                     if fileManager.fileExists(atPath: source.path),
                        !fileManager.fileExists(atPath: destination.path) {
-                        try fileManager.moveItem(at: source, to: destination)
+                        try ReceiveValidationPolicy.current.mutate { try fileManager.moveItem(at: source, to: destination) }
                     }
                 }
                 if item.hadTrashRecord,
@@ -2673,7 +2679,7 @@ actor LocalSyncV2SnapshotApplier: SyncV2LocalSnapshotApplying {
                     )
                     if fileManager.fileExists(atPath: source.path),
                        !fileManager.fileExists(atPath: destination.path) {
-                        try fileManager.moveItem(at: source, to: destination)
+                        try ReceiveValidationPolicy.current.mutate { try fileManager.moveItem(at: source, to: destination) }
                     }
                 }
             }
@@ -2688,18 +2694,18 @@ actor LocalSyncV2SnapshotApplier: SyncV2LocalSnapshotApplying {
             let currentState = try? Data(contentsOf: stateURL)
             if currentState == marker.trashPurgeAppliedState {
                 if let previous = marker.trashPurgePreviousState {
-                    try previous.write(to: stateURL, options: [.atomic])
+                    try ReceiveValidationPolicy.current.mutate { try previous.write(to: stateURL, options: [.atomic]) }
                 } else if fileManager.fileExists(atPath: stateURL.path) {
-                    try fileManager.removeItem(at: stateURL)
+                    try ReceiveValidationPolicy.current.mutate { try fileManager.removeItem(at: stateURL) }
                 }
             }
-            try? fileManager.removeItem(at: stage)
-            try? fileManager.removeItem(
+            try? ReceiveValidationPolicy.current.mutate { try fileManager.removeItem(at: stage) }
+            try? ReceiveValidationPolicy.current.mutate { try fileManager.removeItem(
                 at: recoveryMarkerURL(
                     documentID: marker.snapshot.documentID,
                     root: root
                 )
-            )
+            ) }
         } catch {
             // stage와 marker를 남겨 다음 pull이 같은 복구를 재개한다.
         }
@@ -2733,7 +2739,7 @@ actor LocalSyncV2SnapshotApplier: SyncV2LocalSnapshotApplying {
                 try? await documentRepository.removeMetadata(id: current.id)
             }
             if recovery.createdDirectory {
-                try? fileManager.removeItem(at: url)
+                try? ReceiveValidationPolicy.current.mutate { try fileManager.removeItem(at: url) }
             }
         }
     }
@@ -2772,25 +2778,25 @@ actor LocalSyncV2SnapshotApplier: SyncV2LocalSnapshotApplying {
                             + UUID().uuidString.lowercased()
                             + LocalDocumentStore.temporarySuffix
                     )
-                try writer.writeTemporaryFile(
+                try ReceiveValidationPolicy.current.mutate { try writer.writeTemporaryFile(
                     data: previousContent,
                     at: temporary
-                )
-                try writer.replaceItem(at: originalURL, with: temporary)
+                ) }
+                try ReceiveValidationPolicy.current.mutate { try writer.replaceItem(at: originalURL, with: temporary) }
             }
             try await documentRepository.save(previous)
             if (try? Data(contentsOf: tombstoneURL)) == previousContent {
-                try? fileManager.removeItem(at: tombstoneURL)
+                try? ReceiveValidationPolicy.current.mutate { try fileManager.removeItem(at: tombstoneURL) }
             }
-            try? fileManager.removeItem(
+            try? ReceiveValidationPolicy.current.mutate { try fileManager.removeItem(
                 at: trashRecordURL(documentID: previous.id, root: root)
-            )
-            try? fileManager.removeItem(
+            ) }
+            try? ReceiveValidationPolicy.current.mutate { try fileManager.removeItem(
                 at: recoveryMarkerURL(
                     documentID: previous.id.rawValue,
                     root: root
                 )
-            )
+            ) }
         } catch {
             // marker와 두 사본 중 적어도 하나를 남겨 다음 복구가 이어받는다.
         }
@@ -2837,32 +2843,32 @@ actor LocalSyncV2SnapshotApplier: SyncV2LocalSnapshotApplying {
                                 + UUID().uuidString.lowercased()
                                 + LocalDocumentStore.temporarySuffix
                         )
-                    try writer.writeTemporaryFile(
+                    try ReceiveValidationPolicy.current.mutate { try writer.writeTemporaryFile(
                         data: previousContent,
                         at: temporary
-                    )
-                    try writer.replaceItem(
+                    ) }
+                    try ReceiveValidationPolicy.current.mutate { try writer.replaceItem(
                         at: previousURL,
                         with: temporary
-                    )
+                    ) }
                 }
             }
             try await documentRepository.save(previous)
-            try fileManager.removeItem(at: destinationURL)
+            try ReceiveValidationPolicy.current.mutate { try fileManager.removeItem(at: destinationURL) }
             if marker.tombstoneRepairHadTrashRecord != true {
-                try? fileManager.removeItem(
+                try? ReceiveValidationPolicy.current.mutate { try fileManager.removeItem(
                     at: trashRecordURL(
                         documentID: previous.id,
                         root: root
                     )
-                )
+                ) }
             }
-            try? fileManager.removeItem(
+            try? ReceiveValidationPolicy.current.mutate { try fileManager.removeItem(
                 at: recoveryMarkerURL(
                     documentID: previous.id.rawValue,
                     root: root
                 )
-            )
+            ) }
         } catch {
             // 생성 사본과 marker를 남겨 다음 복구가 같은 보상 작업을 재개한다.
         }
@@ -2904,7 +2910,7 @@ actor LocalSyncV2SnapshotApplier: SyncV2LocalSnapshotApplying {
     ) throws {
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.sortedKeys]
-        try encoder.encode(marker).write(to: url, options: [.atomic])
+        try ReceiveValidationPolicy.current.mutate { try encoder.encode(marker).write(to: url, options: [.atomic]) }
     }
 
     private func tombstoneDestinationPath(
@@ -2998,10 +3004,10 @@ actor LocalSyncV2SnapshotApplier: SyncV2LocalSnapshotApplying {
     ) throws {
         let encoder = JSONEncoder()
         encoder.dateEncodingStrategy = .iso8601
-        try encoder.encode(record).write(
+        try ReceiveValidationPolicy.current.mutate { try encoder.encode(record).write(
             to: trashRecordURL(documentID: record.documentID, root: root),
             options: [.atomic]
-        )
+        ) }
     }
 
     private func trashRecordURL(

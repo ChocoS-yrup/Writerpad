@@ -19,8 +19,11 @@ struct ProjectWorkspaceView: View {
     @State private var deletedListTarget: ManagedProject?
     @State private var isSelectingImportFolder = false
     @State private var isSelectingBackupPackage = false
+    @State private var backupTarget: ManagedProject?
     @State private var isShowingSettings = false
     @State private var isShowingDeletedProjects = false
+    @State private var isShowingServerCatalog = false
+    private let serverProjectCatalog: ServerProjectCatalogService?
     private let binderRepository: any BinderRepository
     private let binderCommands: any BinderCommanding
     private let documentRepository: any DocumentRepository
@@ -29,6 +32,7 @@ struct ProjectWorkspaceView: View {
     private let exporter: any Exporting
     private let backupStore: any BackupStoring
     private let backupPolicyStore: any BackupPolicyStoring
+    private let projectBackupCoordinator: ProjectBackupCoordinator
     private let restoreCoordinator: DocumentRestoreCoordinator
     private let workspaceStateRepository: any WorkspaceStateRepository
     private let futureChangeNotifier: any FutureChangeNotifying
@@ -61,6 +65,7 @@ struct ProjectWorkspaceView: View {
         exporter: any Exporting,
         backupStore: any BackupStoring,
         backupPolicyStore: any BackupPolicyStoring,
+        projectBackupCoordinator: ProjectBackupCoordinator,
         restoreCoordinator: DocumentRestoreCoordinator,
         workspaceStateRepository: any WorkspaceStateRepository,
         futureChangeNotifier: any FutureChangeNotifying,
@@ -78,6 +83,7 @@ struct ProjectWorkspaceView: View {
         handshakeService: SyncV2HandshakeService? = nil,
         contractStructureSender: SyncV2ContractStructureSender? = nil,
         snapshotPuller: (any SyncV2SnapshotPulling)? = nil,
+        serverProjectCatalog: ServerProjectCatalogService? = nil,
         isDarkMode: Binding<Bool>,
         smartPairsEnabled: Binding<Bool>
     ) {
@@ -89,6 +95,7 @@ struct ProjectWorkspaceView: View {
         self.exporter = exporter
         self.backupStore = backupStore
         self.backupPolicyStore = backupPolicyStore
+        self.projectBackupCoordinator = projectBackupCoordinator
         self.restoreCoordinator = restoreCoordinator
         self.workspaceStateRepository = workspaceStateRepository
         self.futureChangeNotifier = futureChangeNotifier
@@ -105,6 +112,7 @@ struct ProjectWorkspaceView: View {
         self.handshakeService = handshakeService
         self.contractStructureSender = contractStructureSender
         self.snapshotPuller = snapshotPuller
+        self.serverProjectCatalog = serverProjectCatalog
         _isDarkMode = isDarkMode
         _smartPairsEnabled = smartPairsEnabled
         _model = StateObject(
@@ -140,6 +148,7 @@ struct ProjectWorkspaceView: View {
                         conflictResolutionService:
                             conflictResolutionService,
                         conflictRecoveryStore: conflictRecoveryStore,
+                        generalRecoveryReader: contractStructureSender,
                         snapshotPullService: snapshotPullService,
                         realtimeTrigger: realtimeTrigger,
                         editLeaseManager: editLeaseManager,
@@ -173,6 +182,13 @@ struct ProjectWorkspaceView: View {
             guard !Task.isCancelled else { return }
             await handshakeService?.updateSceneActivity(scenePhase == .active)
         }
+        .sheet(isPresented: $isShowingServerCatalog, onDismiss: {
+            Task { await model.load(opensLastProject: false) }
+        }) {
+            if let serverProjectCatalog {
+                ServerProjectCatalogView(service: serverProjectCatalog, authentication: authenticationService)
+            }
+        }
         .sheet(isPresented: $isShowingSettings) {
             AppearanceSettingsView(
                 isDarkMode: $isDarkMode,
@@ -203,6 +219,9 @@ struct ProjectWorkspaceView: View {
                     Task { await model.permanentlyDelete(project) }
                 }
             )
+        }
+        .sheet(item: $backupTarget) { project in
+            ProjectBackupCreationView(project: project, coordinator: projectBackupCoordinator)
         }
         .background(appBackground)
         .task {
@@ -394,7 +413,13 @@ struct ProjectWorkspaceView: View {
                     .disabled(!isEditingProjects || model.isWorking)
                     .accessibilityIdentifier("writerpad.deleted-projects")
 
-                    Button("Windows 작품 가져오기", systemImage: "square.and.arrow.down") {
+                    Button("서버 작품 가져오기", systemImage: "icloud.and.arrow.down") {
+                        isShowingServerCatalog = true
+                    }
+                    .disabled(model.isWorking || serverProjectCatalog == nil)
+                    .accessibilityIdentifier("writerpad.server-project-catalog")
+
+                    Button("Windows 폴더 가져오기", systemImage: "square.and.arrow.down") {
                         isSelectingImportFolder = true
                     }
                     .disabled(model.isWorking)
@@ -550,6 +575,11 @@ struct ProjectWorkspaceView: View {
 
     @ViewBuilder
     private func projectContextMenu(_ project: ManagedProject) -> some View {
+        Button("원고·구조 백업…", systemImage: "externaldrive.badge.plus") {
+            backupTarget = project
+        }
+        .disabled(model.isWorking)
+        .accessibilityIdentifier("writerpad.create-project-backup")
         Button("이름 변경", systemImage: "pencil") {
             beginProjectRename(project)
         }
@@ -583,5 +613,73 @@ struct ProjectWorkspaceView: View {
         Task {
             await model.rename(target, to: submittedName)
         }
+    }
+}
+
+private struct ProjectBackupCreationView: View {
+    @Environment(\.dismiss) private var dismiss
+    let project: ManagedProject
+    @StateObject private var model: ProjectBackupExportModel
+    @State private var isSelectingDestination = false
+    @State private var exportTask: Task<Void, Never>?
+
+    init(project: ManagedProject, coordinator: ProjectBackupCoordinator) {
+        self.project = project
+        _model = StateObject(wrappedValue: ProjectBackupExportModel(coordinator: coordinator))
+    }
+
+    var body: some View {
+        NavigationStack {
+            Form {
+                Section(project.name) {
+                    Text("저장된 원고와 구조를 새 백업 폴더로 보관합니다. 원본 작품 밖의 iCloud Drive·외장 저장소 등의 위치를 선택하세요.")
+                }
+                Section("포함되는 자료") {
+                    Text("활성·휴지통 TXT 원고, 캐릭터·설정집·메모장 등의 등록된 TXT 자료, 빈 폴더, 제목, 부모 관계, 순서와 UUID")
+                }
+                Section("포함되지 않는 자료") {
+                    Text("설정 JSON·별도 첨부 파일, 과거 자동저장·복원전·충돌 백업, 커서·창 배치·접힘 상태, 휴지통의 원래 위치·삭제 시각, 앱 환경 설정")
+                    Text("로그인 정보와 서버 연결·송신 기록은 포함하지 않습니다.")
+                }
+                Section("복원 방법") {
+                    Text("작품 목록의 ‘WriterPad 백업 복원’에서 생성된 백업 폴더를 선택합니다. UUID를 유지하며, 같은 UUID 또는 이름의 작품이 있으면 덮어쓰지 않고 중단합니다. 서버에는 자동 연결하지 않습니다.")
+                    Text("휴지통 원고는 휴지통으로 복원됩니다. 원래 위치 정보가 없어 원하는 폴더로 직접 옮겨야 할 수 있습니다.")
+                }
+                Section {
+                    if model.isWorking {
+                        ProgressView("백업을 검증하고 저장하는 중…")
+                        Button("취소", role: .cancel) { exportTask?.cancel() }
+                    } else {
+                        Button("보관 위치 선택…", systemImage: "folder") {
+                            isSelectingDestination = true
+                        }
+                        .accessibilityIdentifier("writerpad.project-backup-destination")
+                    }
+                    if let url = model.savedPackageURL {
+                        Label("선택한 위치에 백업을 저장했습니다.", systemImage: "checkmark.circle")
+                        Text(url.lastPathComponent).font(.caption).textSelection(.enabled)
+                    }
+                    if let error = model.errorMessage {
+                        Text(error).foregroundStyle(.red)
+                    }
+                }
+            }
+            .navigationTitle("원고·구조 백업")
+            .toolbar {
+                ToolbarItem(placement: .confirmationAction) {
+                    Button("닫기") { dismiss() }.disabled(model.isWorking)
+                }
+            }
+        }
+        .interactiveDismissDisabled(model.isWorking)
+        .fileImporter(isPresented: $isSelectingDestination, allowedContentTypes: [.folder]) { result in
+            switch result {
+            case let .success(folder):
+                exportTask = Task { await model.save(projectID: project.id, in: folder) }
+            case let .failure(error):
+                model.present(error: error)
+            }
+        }
+        .onDisappear { exportTask?.cancel() }
     }
 }
