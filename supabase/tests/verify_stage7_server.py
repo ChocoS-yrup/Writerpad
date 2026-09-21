@@ -30,6 +30,8 @@ STORAGE_V2_NAME = "20260813063251_sync_contract_0_3_0_storage_name_v2.sql"
 CORRECTIVE_NAME = "20260814182850_rpc_auth_error_envelope_corrective.sql"
 HANDSHAKE_NAME = "20260820113209_authenticated_sync_handshake.sql"
 RESTORE_HANDSHAKE_NAME = "20260825000000_restore_deployed_sync_handshake.sql"
+TRASH_PURGE_NAME = "20260910053721_general_contract_trash_purge.sql"
+CONTROL_DOCUMENTS_NAME = "20260910072310_contract_migration_control_documents.sql"
 SOURCE_CATALOG_DIGEST = (
     "6c71ff36a90993dc327557b4a1a64c0dfb27b347134ed89e7f126dae76c6ff9a"
 )
@@ -40,6 +42,10 @@ IMMUTABLE_MIGRATION_DIGESTS = {
     STORAGE_V2_NAME: "77b3e4ca9537d42207cb16b407be4490adc1cda4dbf2054316cc8f775139c66a",
     RESTORE_HANDSHAKE_NAME: (
         "48c7b34749687851a233ffe2683b938347c311ff7c4c19ddefa2b74faf349fd4"
+    ),
+    TRASH_PURGE_NAME: "d26bea7678028e50cbbafa1d871923918f84baa63ab061bc92db8cc3844592e4",
+    CONTROL_DOCUMENTS_NAME: (
+        "81ccd40b3d5dec672e4d287c1e278155500ef539f626a90d0b71336646cf69a3"
     ),
 }
 
@@ -75,8 +81,9 @@ def main() -> None:
     require(
         [path.name for path in sql_paths]
         == [BASELINE_NAME, FOUNDATION_NAME, RPC_NAME, STORAGE_V2_NAME,
-            CORRECTIVE_NAME, HANDSHAKE_NAME, RESTORE_HANDSHAKE_NAME],
-        "the server chain must end with the deployed handshake restoration migration",
+            CORRECTIVE_NAME, HANDSHAKE_NAME, RESTORE_HANDSHAKE_NAME,
+            TRASH_PURGE_NAME, CONTROL_DOCUMENTS_NAME],
+        "the server chain must match the exact reviewed migration order",
     )
     for name, expected in IMMUTABLE_MIGRATION_DIGESTS.items():
         require(sha256(MIGRATIONS / name) == expected, f"historical migration changed: {name}")
@@ -88,6 +95,10 @@ def main() -> None:
     handshake = (MIGRATIONS / HANDSHAKE_NAME).read_text(encoding="utf-8")
     restored_handshake = (
         MIGRATIONS / RESTORE_HANDSHAKE_NAME
+    ).read_text(encoding="utf-8")
+    trash_purge = (MIGRATIONS / TRASH_PURGE_NAME).read_text(encoding="utf-8")
+    control_documents = (
+        MIGRATIONS / CONTROL_DOCUMENTS_NAME
     ).read_text(encoding="utf-8")
     workflow = WORKFLOW.read_text(encoding="utf-8")
 
@@ -202,6 +213,32 @@ def main() -> None:
         workflow.count(f"supabase/migrations/{RESTORE_HANDSHAKE_NAME}") == 4,
         "CI must apply and safely re-run the deployed handshake restoration",
     )
+
+    for marker in (
+        "private.apply_contract_trash_purge",
+        "(v_payload->'version')::text is distinct from '1'",
+        "v_marker.storage_name_key is not null",
+        "private.enforce_document_write_boundary",
+        "revoke all on function private.apply_contract_trash_purge",
+    ):
+        require(marker in trash_purge, f"trash-purge guard missing: {marker}")
+
+    for marker in (
+        "private.is_contract_migration_control_document",
+        "__antigravity__/tree-order.json",
+        "__antigravity__/trash-purge.json",
+        "INVALID_CONTROL_DOCUMENT",
+        "revoke all on function public.validate_project_sync_migration",
+        "grant execute on function public.complete_project_sync_migration",
+    ):
+        require(marker in control_documents,
+                f"migration-control guard missing: {marker}")
+
+    for name in (TRASH_PURGE_NAME, CONTROL_DOCUMENTS_NAME):
+        require(
+            workflow.count(f"supabase/migrations/{name}") == 4,
+            f"CI must apply and safely re-run the reviewed migration: {name}",
+        )
 
     for guard in (
         "LEGACY_EPOCH_0", "CONTRACT_BATCH", "CONTRACT_NOT_ALLOWED",
