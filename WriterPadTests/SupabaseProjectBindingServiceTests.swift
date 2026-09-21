@@ -207,6 +207,37 @@ final class SupabaseProjectBindingServiceTests: XCTestCase {
         XCTAssertEqual(calls[1].batchKind, .windowsImport)
     }
 
+    func testFailedInitialSnapshotIsNotReportedConnectedAndRecoversOnLookup()
+        async {
+        let project = makeProject(
+            id: "00000000-0000-0000-0000-000000000496",
+            name: "중단 복구"
+        )
+        let recorder = InitialSyncRecorderSpy(
+            results: [
+                .localSavedButNotQueued(reason: "injected"),
+                .queued(operationIDs: [UUID()]),
+            ]
+        )
+        let fixture = makeFixture(
+            projects: [project],
+            initialSyncRecorder: recorder
+        )
+
+        let first = await fixture.service.createServerProject(for: project.id)
+
+        XCTAssertEqual(first, .failed(.initialSnapshotNotQueued))
+        let storedAfterFailure = await fixture.store.binding(for: project.id)
+        XCTAssertNotNil(storedAfterFailure)
+
+        // 앱 재시작/dispatcher 뒤 coordinator가 수행하는 binding 조회가
+        // 별도 사용자 재호출 없이 남은 initial handoff를 복구한다.
+        let recovered = await fixture.service.currentBinding(for: project.id)
+        XCTAssertEqual(recovered?.localProjectID, project.id)
+        let calls = await recorder.calls()
+        XCTAssertEqual(calls.count, 2)
+    }
+
     private func serverDocument(
         path: String,
         isDeleted: Bool = false
@@ -678,6 +709,15 @@ private actor BindingSnapshotClientStub: SyncV2SnapshotClienting {
         if shouldFail { throw BindingSnapshotClientStubError() }
         return documents.first { $0.documentID == documentID }
     }
+
+    /// 이 대역은 계약 순서를 다루지 않는다. 비어 있다고 답하는 것이 아니라
+    /// 다루지 않음을 여기 적어 둔다 — 기본 구현에 기대면 전달자 누락이 성공으로
+    /// 보인다.
+    func fetchTreeOrders(
+        projectID: UUID
+    ) async throws -> [SyncV2RemoteTreeOrder] {
+        []
+    }
 }
 
 private actor InitialSyncRecorderSpy: InitialProjectSyncRecording {
@@ -688,6 +728,11 @@ private actor InitialSyncRecorderSpy: InitialProjectSyncRecording {
     }
 
     private var values: [Call] = []
+    private var results: [DurableRecordResult]
+
+    init(results: [DurableRecordResult] = []) {
+        self.results = results
+    }
 
     func recordInitialSnapshot(
         projectID: ProjectID,
@@ -701,7 +746,10 @@ private actor InitialSyncRecorderSpy: InitialProjectSyncRecording {
                 batchKind: batchKind
             )
         )
-        return .queued(operationIDs: [])
+        guard !results.isEmpty else {
+            return .queued(operationIDs: [])
+        }
+        return results.removeFirst()
     }
 
     func calls() -> [Call] {
@@ -812,5 +860,31 @@ private actor EnsureProjectTransportStub: EnsureProjectTransporting {
 
     func callCount() -> Int {
         parameters.count
+    }
+}
+
+
+extension SupabaseProjectBindingServiceTests {
+    func testReceiveGuardBindingLookupDoesNotEnqueueInitialSnapshotOrEnsure() async throws {
+        let project = makeProject(id: "00000000-0000-4000-8000-000000000499", name: "합성 기존 연결")
+        let recorder = InitialSyncRecorderSpy()
+        let fixture = makeFixture(projects: [project], initialSyncRecorder: recorder)
+        let binding = ProjectSyncBinding.connected(localProjectID: project.id, serverProjectID: UUID(),
+            kind: .newServerProject, projectName: project.name, ownerSubject: fixture.userID)
+        try await fixture.store.save(binding)
+        let policy = ReceiveValidationPolicy(enabled: true, configuration: nil)
+        await ReceiveValidationPolicy.$override.withValue(policy) {
+            let current = await fixture.service.currentBinding(for: project.id)
+            let all = await fixture.service.connectedBindings()
+            XCTAssertEqual(current, binding)
+            XCTAssertEqual(all, [binding])
+            _ = await fixture.service.createServerProject(for: project.id)
+        }
+        let requests = await fixture.transport.receivedParameters()
+        let calls = await recorder.calls()
+        let after = await fixture.store.binding(for: project.id)
+        XCTAssertTrue(requests.isEmpty)
+        XCTAssertTrue(calls.isEmpty)
+        XCTAssertEqual(after, binding)
     }
 }

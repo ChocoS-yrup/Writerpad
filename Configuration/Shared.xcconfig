@@ -3,3 +3,10 @@
 
 WRITERPAD_SUPABASE_URL =
 WRITERPAD_SUPABASE_PUBLISHABLE_KEY =
+
+// 계보/구성마다 앱 컨테이너를 가르기 위한 값이다.
+// 같은 번들 ID를 쓰면 iOS가 같은 컨테이너를 주고, 두 빌드가 같은
+// sync-v2.sqlite3 하나를 공유한다. 스키마 번호는 올라가기만 하므로
+// 높은 쪽을 한 번 설치하면 낮은 쪽 빌드가 전부 막힌다.
+WRITERPAD_BUNDLE_SUFFIX =
+WRITERPAD_DISPLAY_NAME = ChocoS

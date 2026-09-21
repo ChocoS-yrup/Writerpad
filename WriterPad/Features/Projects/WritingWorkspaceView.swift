@@ -2,6 +2,118 @@ import Foundation
 import SwiftUI
 import UIKit
 
+struct WorkspaceSceneActivityGate: Equatable, Sendable {
+    private(set) var nextAppearanceID: UInt64 = 0
+    private var activeAppearanceID: UInt64?
+    private var latestActivity: Bool?
+    private var hasStarted = false
+
+    mutating func beginAppearance(
+        initialActivity: Bool
+    ) -> UInt64? {
+        guard activeAppearanceID == nil else { return nil }
+        let observedActiveBeforeFirstAppearance =
+            nextAppearanceID == 0 && latestActivity == true
+        nextAppearanceID &+= 1
+        activeAppearanceID = nextAppearanceID
+        latestActivity =
+            observedActiveBeforeFirstAppearance || initialActivity
+        hasStarted = false
+        return nextAppearanceID
+    }
+
+    func isCurrentAppearance(_ appearanceID: UInt64) -> Bool {
+        activeAppearanceID == appearanceID
+    }
+
+    mutating func observe(_ active: Bool) -> Bool? {
+        guard activeAppearanceID != nil else {
+            // 첫 화면 구성에서는 SwiftUI의 scene task가 onAppear보다
+            // 먼저 active를 전달할 수 있다. 이 한 번만 보존하되, 이전
+            // appearance의 늦은 통지를 다음 진입에 넘기지는 않는다.
+            if nextAppearanceID == 0, active {
+                latestActivity = true
+            }
+            return nil
+        }
+        latestActivity = active
+        return hasStarted ? active : nil
+    }
+
+    mutating func finishStarting(
+        appearanceID: UInt64
+    ) -> Bool? {
+        guard activeAppearanceID == appearanceID else { return nil }
+        hasStarted = true
+        return latestActivity
+    }
+
+    mutating func endAppearance() {
+        activeAppearanceID = nil
+        latestActivity = nil
+        hasStarted = false
+    }
+}
+
+@MainActor
+final class WorkspaceLifecycleCoordinator {
+    private var sceneActivityGate = WorkspaceSceneActivityGate()
+    private var lifecycleTask: Task<Void, Never>?
+
+    @discardableResult
+    func appear(
+        initialActivity: Bool,
+        prepare: @escaping @MainActor () async -> Void,
+        updateActivity: @escaping @MainActor (Bool) async -> Void
+    ) -> Task<Void, Never>? {
+        guard let appearanceID = sceneActivityGate.beginAppearance(
+            initialActivity: initialActivity
+        ) else { return nil }
+        return enqueue {
+            guard self.sceneActivityGate.isCurrentAppearance(appearanceID)
+            else { return }
+            await prepare()
+            guard let active = self.sceneActivityGate.finishStarting(
+                appearanceID: appearanceID
+            ) else { return }
+            await updateActivity(active)
+        }
+    }
+
+    @discardableResult
+    func observeSceneActivity(
+        _ active: Bool,
+        updateActivity: @escaping @MainActor (Bool) async -> Void
+    ) -> Task<Void, Never>? {
+        guard let active = sceneActivityGate.observe(active)
+        else { return nil }
+        // 저장이나 편집 잠금 해제로 이전 전환이 지연되어도, 뒤늦게
+        // 끝난 inactive가 최신 active의 동기화를 정지시키지 않게 한다.
+        // SwiftUI scene task의 취소와도 분리해 이미 받은 전환을 보존한다.
+        return enqueue { await updateActivity(active) }
+    }
+
+    @discardableResult
+    func disappear(
+        stop: @escaping @MainActor () async -> Void
+    ) -> Task<Void, Never> {
+        sceneActivityGate.endAppearance()
+        return enqueue(stop)
+    }
+
+    private func enqueue(
+        _ operation: @escaping @MainActor () async -> Void
+    ) -> Task<Void, Never> {
+        let predecessor = lifecycleTask
+        let task = Task { @MainActor in
+            _ = await predecessor?.value
+            await operation()
+        }
+        lifecycleTask = task
+        return task
+    }
+}
+
 struct WritingWorkspaceShell: View {
     @Environment(\.colorScheme) private var colorScheme
     @Environment(\.scenePhase) private var scenePhase
@@ -38,6 +150,8 @@ struct WritingWorkspaceShell: View {
     let futureChangeNotifier: any FutureChangeNotifying
     let conflictResolutionService:
         (any SyncV2ConflictResolving)?
+    let conflictRecoveryStore: ConflictRecoveryStore?
+    let generalRecoveryReader: (any SyncV2GeneralRecoveryReading)?
     private let storageCoordinator: WorkspaceStorageCoordinator
     @Binding var isShowingSettings: Bool
     @Binding var smartPairsEnabled: Bool
@@ -54,6 +168,7 @@ struct WritingWorkspaceShell: View {
     @State private var liveBinderWidth: CGFloat?
     @State private var binderContentStateOverrides: [DocumentID: BinderTextContentState] = [:]
     @State private var binderSnapshotRefreshGeneration: UInt64 = 0
+    @State private var binderOpenDocumentIDs: Set<DocumentID> = []
     /// 방향 관찰자가 첫 값을 전달하기 전에는 분할을 노출하지 않는 안전한 기본값을 사용한다.
     @State private var usesCompactLayout = true
     /// 사용자가 선택한 분할 선호다. 세로·좁은 창에서는 표시만 숨기고 이 값은 보존한다.
@@ -67,6 +182,9 @@ struct WritingWorkspaceShell: View {
     @State private var conflictResolutionRoute:
         ConflictResolutionRoute?
     @State private var conflictResolutionErrorMessage: String?
+    @State private var isShowingConflictRecovery = false
+    @State private var isShowingGeneralRecovery = false
+    @State private var conflictRecoveryCount = 0
     @State private var isLoadingConflictResolution = false
     @State private var binderErrorMessage: String?
     @State private var isBinderOrdering = false
@@ -86,6 +204,8 @@ struct WritingWorkspaceShell: View {
     @State private var isProjectSearching = false
     @State private var projectSearchGeneration: UInt64 = 0
     @State private var projectSearchTask: Task<Void, Never>?
+    @State private var workspaceLifecycle = WorkspaceLifecycleCoordinator()
+    @State private var writerPadCommandActions = WriterPadCommandActions()
 
     init(
         project: ManagedProject,
@@ -105,6 +225,8 @@ struct WritingWorkspaceShell: View {
         syncDispatcher: SyncV2Dispatcher? = nil,
         conflictResolutionService:
             (any SyncV2ConflictResolving)? = nil,
+        conflictRecoveryStore: ConflictRecoveryStore? = nil,
+        generalRecoveryReader: (any SyncV2GeneralRecoveryReading)? = nil,
         snapshotPullService: SyncV2SnapshotPullService? = nil,
         realtimeTrigger: (any SyncV2RealtimeTriggering)? = nil,
         editLeaseManager: (any EditLeaseManaging)? = nil,
@@ -125,6 +247,8 @@ struct WritingWorkspaceShell: View {
         self.restoreCoordinator = restoreCoordinator
         self.futureChangeNotifier = futureChangeNotifier
         self.conflictResolutionService = conflictResolutionService
+        self.conflictRecoveryStore = conflictRecoveryStore
+        self.generalRecoveryReader = generalRecoveryReader
         self.storageCoordinator = WorkspaceStorageCoordinator(
             projectID: project.id,
             binderRepository: repository,
@@ -143,6 +267,23 @@ struct WritingWorkspaceShell: View {
                 projectBindingService: projectBindingService,
                 requestDispatchRetry: {
                     await syncDispatcher?.userRequestedRetry()
+                },
+                readStalledFolderChanges: { localProjectID in
+                    await syncDispatcher?.stalledFolderChanges(
+                        localProjectID: localProjectID
+                    ) ?? []
+                },
+                uploadPullCoordinator:
+                    syncDispatcher?.uploadPullCoordinator,
+                readUploadQueueSnapshot: { localProjectID in
+                    await syncDispatcher?.uploadQueueSnapshot(
+                        localProjectID: localProjectID
+                    )
+                },
+                isBootstrapPullAllowed: { localProjectID in
+                    await syncDispatcher?.isBootstrapPullAllowed(
+                        localProjectID: localProjectID
+                    ) ?? false
                 }
             )
         )
@@ -195,6 +336,7 @@ struct WritingWorkspaceShell: View {
                                     || usesCompactLayoutForCurrentSize,
                                 refreshGeneration:
                                     binderSnapshotRefreshGeneration,
+                                openDocumentIDs: binderOpenDocumentIDs,
                                 contentStateOverrides: binderContentStateOverrides,
                                 onSelection: { node in
                                     Task { await handleBinderSelection(node) }
@@ -305,34 +447,71 @@ struct WritingWorkspaceShell: View {
         .toolbarBackground(appBackground, for: .navigationBar)
         .toolbarBackground(.visible, for: .navigationBar)
         .navigationBarTitleDisplayMode(.inline)
-        .focusedSceneValue(
-            \.writerPadCommandActions,
-            WriterPadCommandActions(
-                perform: handleEditorCommand,
-                canToggleEditorPane: shouldPresentSplit && !usesCompactLayout
-            )
-        )
+        .focusedSceneValue(writerPadCommandActions)
         .onAppear {
+            updateWriterPadCommandActions()
             applyAutosaveDelaySetting(autosaveDelayMilliseconds)
-            Task {
-                await restoreWorkspaceIfNeeded()
-                await workspaceSyncModel.start(
-                    sceneIsActive: scenePhase == .active,
-                    editingGuards: currentSyncEditingGuards,
-                    applyOpenSnapshot: applyOpenServerSnapshot
+            let diagnosticsContext =
+                SyncV2PullDiagnostics.makeWorkspaceEntryContext(
+                    localProjectID: project.id
                 )
-                await updateSceneActivity(scenePhase == .active)
-            }
+            workspaceLifecycle.appear(
+                initialActivity: scenePhase == .active,
+                prepare: {
+                    await SyncV2PullDiagnostics.withContext(
+                        diagnosticsContext
+                    ) {
+                        SyncV2PullDiagnostics.record(
+                            stage: "workspace-entry",
+                            phase: "started"
+                        )
+                        let restoreStartedAt =
+                            DispatchTime.now().uptimeNanoseconds
+                        await restoreWorkspaceIfNeeded()
+                        SyncV2PullDiagnostics.record(
+                            stage: "workspace-restore",
+                            phase: "finished",
+                            startedAtNanoseconds: restoreStartedAt
+                        )
+                        let syncStartAt =
+                            DispatchTime.now().uptimeNanoseconds
+                        await workspaceSyncModel.start(
+                            sceneIsActive: false,
+                            editingGuards: currentSyncEditingGuards,
+                            applyOpenSnapshots: applyOpenServerSnapshots
+                        )
+                        SyncV2PullDiagnostics.record(
+                            stage: "workspace-sync-start",
+                            phase: "finished",
+                            startedAtNanoseconds: syncStartAt
+                        )
+                    }
+                },
+                updateActivity: updateSceneActivity
+            )
         }
         .onChange(of: autosaveDelayMilliseconds) { _, milliseconds in
             applyAutosaveDelaySetting(milliseconds)
         }
-        .onChange(of: scenePhase) { _, phase in
-            Task { await updateSceneActivity(phase == .active) }
+        .onChange(of: isSplitPreferred) { _, _ in
+            updateWriterPadCommandActions()
+        }
+        .onChange(of: usesCompactLayout) { _, _ in
+            updateWriterPadCommandActions()
+        }
+        .onChange(of: syncEditingGuardSignature) { _, _ in
+            notifySyncEditingGuardsChanged()
+        }
+        .task(id: scenePhase) {
+            guard !Task.isCancelled else { return }
+            workspaceLifecycle.observeSceneActivity(
+                scenePhase == .active,
+                updateActivity: updateSceneActivity
+            )
         }
         .onDisappear {
             projectSearchTask?.cancel()
-            Task {
+            workspaceLifecycle.disappear {
                 await workspaceSyncModel.stop()
                 await leftEditorModel.releaseEditLease()
                 await rightEditorModel.releaseEditLease()
@@ -371,6 +550,35 @@ struct WritingWorkspaceShell: View {
                 }
             )
         }
+        .sheet(isPresented: $isShowingGeneralRecovery) {
+            if let generalRecoveryReader {
+                GeneralSyncRecoveryView(projectID: project.id, projectName: project.name, reader: generalRecoveryReader,
+                    saveLocalSelection: { review, content, authorize in
+                        let writer = GeneralSyncConflictLocalWriter(projectID: project.id, repository: documentRepository,
+                            store: documentStore, editors: [leftEditorModel, rightEditorModel], notifier: futureChangeNotifier)
+                        let operation = try await writer.save(review, content: content, authorize: authorize)
+                        binderContentStateOverrides[.init(rawValue: review.documentID)] = content.isEmpty ? .empty : .written
+                        binderSnapshotRefreshGeneration &+= 1
+                        return operation
+                    }, validateStructureLocal: { review in
+                        try await MainActor.run {
+                            guard !leftEditorModel.hasUnsavedChanges, !rightEditorModel.hasUnsavedChanges,
+                                  !leftEditorModel.isComposing, !rightEditorModel.isComposing else { throw SyncV2GeneralConflictError.changed }
+                        }
+                        let documents = try await documentRepository.documents(in: project.id)
+                        let current = documents.map(LocalStructureSnapshotNode.init).filter(\.isIncludedInTree)
+                        guard Set(current.map(\.id)) == Set(review.savedNodes.map(\.id)),
+                              current.allSatisfy({ node in review.savedNodes.contains(node) }) else { throw SyncV2GeneralConflictError.changed }
+                        // UI 저장 이후 외부에서 바뀐 TXT도 선택 직전에 다시 보호한다.
+                        for body in review.remoteDocuments {
+                            guard let fields = body.objectValue, let id = fields["document_id"]?.stringValue.flatMap(UUID.init(uuidString:)),
+                                  let node = documents.first(where: { $0.id.rawValue == id }), let expected = fields["content"]?.stringValue else { throw SyncV2GeneralConflictError.changed }
+                            let actual = try await documentStore.loadText(for: node)
+                            guard Data(actual.utf8) == Data(expected.utf8) else { throw SyncV2GeneralConflictError.changed }
+                        }
+                    })
+            }
+        }
         .sheet(item: $conflictResolutionRoute) { route in
             ConflictResolutionView(
                 route: route,
@@ -382,6 +590,23 @@ struct WritingWorkspaceShell: View {
                     )
                 }
             )
+        }
+        .sheet(isPresented: $isShowingConflictRecovery) {
+            if let conflictRecoveryStore {
+                ConflictRecoveryView(
+                    projectID: project.id,
+                    store: conflictRecoveryStore,
+                    documentRepository: documentRepository,
+                    onChanged: {
+                        binderSnapshotRefreshGeneration &+= 1
+                        Task { await refreshConflictRecoveryCount() }
+                    }
+                )
+            }
+        }
+        .task { await refreshConflictRecoveryCount() }
+        .onChange(of: workspaceSyncModel.state) { _, _ in
+            Task { await refreshConflictRecoveryCount() }
         }
         .alert(item: $notice) { notice in
             Alert(
@@ -464,6 +689,15 @@ struct WritingWorkspaceShell: View {
                     .accessibilityLabel(pane == .left ? "왼쪽 편집기" : "오른쪽 편집기")
                     .accessibilityValue(pane == activePane ? "활성" : "비활성")
                 Spacer(minLength: 8)
+                if model.isReadOnly {
+                    Label("읽기 전용", systemImage: "lock.fill")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: true, vertical: false)
+                        .accessibilityIdentifier(
+                            "writerpad.editor-read-only-\(pane.rawValue)"
+                        )
+                }
                 if let leaseStatus = leaseStatus(for: model.editLeaseState) {
                     Label(leaseStatus.text, systemImage: leaseStatus.symbol)
                         .font(.caption)
@@ -530,7 +764,11 @@ struct WritingWorkspaceShell: View {
                     undoRequest: model.undoRequest,
                     redoRequest: model.redoRequest,
                     isActive: pane == activePane,
+                    isReadOnly: model.isReadOnly,
                     appearance: editorAppearance,
+                    placeholder: model.isReadOnly
+                        ? "휴지통 문서는 수정 할 수 없습니다."
+                        : "빈 문서입니다. 바로 입력을 시작하세요.",
                     searchHighlightRanges: searchHighlightRanges(for: model, pane: pane),
                     currentSearchHighlightRange: currentSearchHighlightRange(
                         for: model,
@@ -733,6 +971,19 @@ struct WritingWorkspaceShell: View {
             )
 
             Menu {
+                if generalRecoveryReader != nil {
+                    Button("동기화 보관본", systemImage: "arrow.triangle.2.circlepath") {
+                        Task {
+                            guard !leftEditorModel.isComposing, !rightEditorModel.isComposing,
+                                  await leftEditorModel.saveNow(), await rightEditorModel.saveNow() else {
+                                notice = .localSaveFailure
+                                return
+                            }
+                            isShowingGeneralRecovery = true
+                        }
+                    }
+                    .accessibilityIdentifier("writerpad.general-sync-recovery")
+                }
                 Button("설정", systemImage: "gearshape") {
                     isShowingSettings = true
                 }
@@ -744,6 +995,22 @@ struct WritingWorkspaceShell: View {
                 .accessibilityIdentifier("writerpad.manuscript-export")
                 Button("백업") { Task { await presentBackupHistory() } }
                     .accessibilityIdentifier("writerpad.backup-history")
+                    .disabled(activeEditorModel.isReadOnly)
+                if conflictRecoveryStore != nil {
+                    Button {
+                        isShowingConflictRecovery = true
+                    } label: {
+                        if conflictRecoveryCount > 0 {
+                            Label(
+                                "충돌 복구 백업 (\(conflictRecoveryCount))",
+                                systemImage: "archivebox.badge.exclamationmark"
+                            )
+                        } else {
+                            Label("충돌 복구 백업", systemImage: "archivebox")
+                        }
+                    }
+                    .accessibilityIdentifier("writerpad.conflict-recovery")
+                }
                 Button("작품 전체 검색", systemImage: "doc.text.magnifyingglass") {
                     presentProjectSearch()
                 }
@@ -1022,6 +1289,7 @@ struct WritingWorkspaceShell: View {
     }
 
     private func presentBackupHistory() async {
+        guard !activeEditorModel.isReadOnly else { return }
         guard let documentID = activeEditorModel.currentDocumentID else {
             notice = .backupRequiresDocument
             return
@@ -1037,6 +1305,20 @@ struct WritingWorkspaceShell: View {
         } catch {
             notice = .contentReadFailure
         }
+    }
+
+    @MainActor
+    private func refreshConflictRecoveryCount() async {
+        guard let conflictRecoveryStore else {
+            conflictRecoveryCount = 0
+            return
+        }
+        let packages = try? await conflictRecoveryStore.packages(
+            localProjectID: project.id
+        )
+        conflictRecoveryCount = packages?.filter {
+            $0.state != .discarded && $0.payloadDeletedAt == nil
+        }.count ?? 0
     }
 
     private func shouldUseCompactLayout(
@@ -1331,6 +1613,13 @@ struct WritingWorkspaceShell: View {
         case .nextChapter:
             Task { await selectAdjacentChapter(offset: 1) }
         }
+    }
+
+    private func updateWriterPadCommandActions() {
+        writerPadCommandActions.update(
+            perform: handleEditorCommand,
+            canToggleEditorPane: isSplitPreferred && !usesCompactLayout
+        )
     }
 
     private func presentDocumentSearch() {
@@ -1854,6 +2143,7 @@ struct WritingWorkspaceShell: View {
             if state != savedState {
                 try await storageCoordinator.saveWorkspaceState(state)
             }
+            binderOpenDocumentIDs = openDocumentIDs(in: state)
         } catch {
             notice = .workspaceStateFailure
         }
@@ -1870,41 +2160,64 @@ struct WritingWorkspaceShell: View {
 
     private func currentSyncEditingGuards()
         -> [UUID: SyncV2EditingGuard] {
-        var result: [UUID: SyncV2EditingGuard] = [:]
-        for model in [leftEditorModel, rightEditorModel] {
-            guard let documentID = model.currentDocumentID?.rawValue else {
-                continue
-            }
-            let previous = result[documentID] ?? .closed
-            result[documentID] = SyncV2EditingGuard(
-                isOpen: true,
-                isDirty: previous.isDirty || model.hasUnsavedChanges,
-                isComposing:
-                    previous.isComposing || model.isComposing
-            )
-        }
-        return result
+        SyncEditingGuardCollector.collect(
+            left: SyncEditingPaneState(
+                documentID: leftEditorModel.currentDocumentID,
+                isDirty: leftEditorModel.hasUnsavedChanges,
+                isComposing: leftEditorModel.isComposing
+            ),
+            right: SyncEditingPaneState(
+                documentID: rightEditorModel.currentDocumentID,
+                isDirty: rightEditorModel.hasUnsavedChanges,
+                isComposing: rightEditorModel.isComposing
+            ),
+            showsSplit: shouldPresentSplit,
+            activePaneIsLeft: activePane == .left
+        )
     }
 
-    private func applyOpenServerSnapshot(
-        _ snapshot: SyncV2RemoteDocumentSnapshot
+    private var syncEditingGuardSignature: SyncEditingGuardSignature {
+        SyncEditingGuardSignature(
+            leftDocumentID: leftEditorModel.currentDocumentID,
+            rightDocumentID: rightEditorModel.currentDocumentID,
+            leftDirty: leftEditorModel.hasUnsavedChanges,
+            rightDirty: rightEditorModel.hasUnsavedChanges,
+            leftComposing: leftEditorModel.isComposing,
+            rightComposing: rightEditorModel.isComposing,
+            showsSplit: shouldPresentSplit,
+            activePaneIsLeft: activePane == .left
+        )
+    }
+
+    private func notifySyncEditingGuardsChanged() {
+        Task {
+            await workspaceSyncModel.editingGuardsDidChange()
+        }
+    }
+
+    private func applyOpenServerSnapshots(
+        _ snapshots: [SyncV2RemoteDocumentSnapshot]
     ) {
+        guard !snapshots.isEmpty else { return }
+        for snapshot in snapshots {
+            applyRemoteBinderContentState(
+                snapshot,
+                to: &binderContentStateOverrides
+            )
+            let documentID = DocumentID(rawValue: snapshot.documentID)
+            _ = leftEditorModel.applyRemoteSnapshotIfClean(
+                documentID: documentID,
+                content: snapshot.content,
+                relativePath: snapshot.relativePath
+            )
+            _ = rightEditorModel.applyRemoteSnapshotIfClean(
+                documentID: documentID,
+                content: snapshot.content,
+                relativePath: snapshot.relativePath
+            )
+        }
+        // 한 번의 pull이 여러 문서를 적용해도 바인더 구조 조회는 한 번만 한다.
         binderSnapshotRefreshGeneration &+= 1
-        applyRemoteBinderContentState(
-            snapshot,
-            to: &binderContentStateOverrides
-        )
-        let documentID = DocumentID(rawValue: snapshot.documentID)
-        _ = leftEditorModel.applyRemoteSnapshotIfClean(
-            documentID: documentID,
-            content: snapshot.content,
-            relativePath: snapshot.relativePath
-        )
-        _ = rightEditorModel.applyRemoteSnapshotIfClean(
-            documentID: documentID,
-            content: snapshot.content,
-            relativePath: snapshot.relativePath
-        )
     }
 
     private func presentConflictResolution() async {
@@ -2084,6 +2397,13 @@ struct WritingWorkspaceShell: View {
             )
         }
         try await storageCoordinator.saveWorkspaceState(state)
+        binderOpenDocumentIDs = openDocumentIDs(in: state)
+    }
+
+    private func openDocumentIDs(
+        in state: EditorWorkspaceState
+    ) -> Set<DocumentID> {
+        Set([state.left.documentID, state.right?.documentID].compactMap { $0 })
     }
 
     private var editorAppearance: EditorAppearanceSettings {
@@ -2098,6 +2418,47 @@ struct WritingWorkspaceShell: View {
             isBold: editorBold,
             typewriterScrolling: editorTypewriterScrolling
         )
+    }
+}
+
+private struct SyncEditingGuardSignature: Equatable {
+    let leftDocumentID: DocumentID?
+    let rightDocumentID: DocumentID?
+    let leftDirty: Bool
+    let rightDirty: Bool
+    let leftComposing: Bool
+    let rightComposing: Bool
+    let showsSplit: Bool
+    let activePaneIsLeft: Bool
+}
+
+struct SyncEditingPaneState: Equatable {
+    let documentID: DocumentID?
+    let isDirty: Bool
+    let isComposing: Bool
+}
+
+enum SyncEditingGuardCollector {
+    static func collect(
+        left: SyncEditingPaneState,
+        right: SyncEditingPaneState,
+        showsSplit: Bool,
+        activePaneIsLeft: Bool
+    ) -> [UUID: SyncV2EditingGuard] {
+        let panes = showsSplit
+            ? [left, right]
+            : [activePaneIsLeft ? left : right]
+        var result: [UUID: SyncV2EditingGuard] = [:]
+        for pane in panes {
+            guard let documentID = pane.documentID?.rawValue else { continue }
+            let previous = result[documentID] ?? .closed
+            result[documentID] = SyncV2EditingGuard(
+                isOpen: true,
+                isDirty: previous.isDirty || pane.isDirty,
+                isComposing: previous.isComposing || pane.isComposing
+            )
+        }
+        return result
     }
 }
 
@@ -2129,6 +2490,14 @@ private struct SaveStatusBadge: View {
     let onRetry: () -> Void
     let onResolveConflict: (() -> Void)?
 
+    private func recordRecoveryPresentation(_ label: String) {
+        let event: SyncV2RecoveryDiagnostics.Event
+        if label == "서버 동기화됨" { event = .uiSynced }
+        else if label == "서버 재연결 중" { event = .uiReconnecting }
+        else { event = .changed }
+        SyncV2RecoveryDiagnostics.record(stage: .presentation, event: event)
+    }
+
     private var presentation: WorkspaceSyncStatusPresentation {
         WorkspaceSyncStatusReducer.presentation(
             saveState: state,
@@ -2145,6 +2514,9 @@ private struct SaveStatusBadge: View {
             badgeLabel
         }
         .buttonStyle(.plain)
+        .onChange(of: presentation.label, initial: true) { _, label in
+            recordRecoveryPresentation(label)
+        }
         .popover(isPresented: $isShowingDetail) {
             VStack(alignment: .leading, spacing: 12) {
                 Label(

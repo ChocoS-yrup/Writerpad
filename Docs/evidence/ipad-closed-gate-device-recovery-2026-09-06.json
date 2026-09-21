@@ -1,0 +1,53 @@
+{
+  "collected_at_kst": "2026-09-06T11:21:05+09:00",
+  "device_model": "iPad Pro 11-inch (M4)",
+  "bundle_id": "com.chocos.writerpad.debug",
+  "installed_commit": "ab893843562e06e14f400d99e18870f1a97c3703",
+  "installed_binary_sha256_from_install_receipt": "426fc13fa198fd1a5e71c3ae2969b8953aea6ad80f4341dd1c34936243ff0e88",
+  "binary_independently_rehashed_on_device_this_turn": false,
+  "user_report": {
+    "raw_time_marks": [
+      "11:17:40",
+      "11:18:35"
+    ],
+    "time_mark_meanings": {
+      "11:17:40": "시험 안내에서 기록한 현재 시각",
+      "11:18:35": "사용자가 기록한 연결을 되살린 시각"
+    },
+    "approximate_recovery_seconds": 5,
+    "A_and_B_preserved_after_restart": true,
+    "preservation_evidence": "user observation; manuscript content not read",
+    "clock_alignment_note": "사용자 연결 복구 기록 11:18:35와 기기 network available 11:18:26 사이 약 9초 차이가 있다. 원인은 미확정이며 두 시각을 합쳐 지연을 계산하지 않았다. 6.771초는 같은 세션 uptime 차이다."
+  },
+  "logs": [
+    {
+      "filename": "recovery.jsonl",
+      "bytes": 163721,
+      "sha256": "76d00387031ebf65468226092f2dfac7827b065e42414bf23dad2fa87048358b"
+    }
+  ],
+  "log_entries": 672,
+  "sessions": 2,
+  "json_schema_allowed_fields_only": true,
+  "rotation_file_present": false,
+  "network_available_kst": "2026-09-06T11:18:26+09:00",
+  "ui_synced_after_network_kst": "2026-09-06T11:18:33+09:00",
+  "network_available_to_ui_synced_seconds": 6.771,
+  "legacy_drain_after_network_seconds": 6.335,
+  "new_session_first_log_kst": "2026-09-06T11:19:20+09:00",
+  "ui_synced_after_restart_kst": "2026-09-06T11:19:21+09:00",
+  "new_session_first_log_to_ui_synced_seconds": 1.437,
+  "authentication_restore_seconds": 0.537,
+  "restart_handshake_seconds": 0.201,
+  "gate_read_at_kst": "2026-09-06T11:21:29+09:00",
+  "stored_gate_keys": 0,
+  "open_gate_count": 0,
+  "contract_upload_events_in_collected_log": 0,
+  "assessment": "Observed ordinary offline-to-online recovery and restart recovered to synced UI; A/B preservation confirmed by user. No 30-120s recovery delay reproduced in this trial.",
+  "limitations": [
+    "Legacy drain finished is a cycle event, not an individual RPC receipt.",
+    "No manuscript content or server document_versions queried.",
+    "Historical delay cause remains unestablished.",
+    "This tests installed ab89384; later durable-transition changes remain uncommitted and uninstalled."
+  ]
+}

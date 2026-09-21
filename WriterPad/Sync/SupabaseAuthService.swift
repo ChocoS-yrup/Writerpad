@@ -25,6 +25,10 @@ struct ValidatedAuthSession: Equatable, Sendable {
 
 enum SupabaseAuthTransportError: Error, Equatable, Sendable {
     case invalidCredentials
+    case weakPassword
+    case accountAlreadyExists
+    case signUpDisabled
+    case emailNotConfirmed
     case sessionExpired
     case refreshTokenRevoked
     case refreshTokenReused
@@ -32,7 +36,14 @@ enum SupabaseAuthTransportError: Error, Equatable, Sendable {
     case serverRejected
 }
 
+enum SupabaseSignUpResult: Equatable, Sendable {
+    case authenticated(ValidatedAuthSession)
+    case confirmationRequired(email: String?)
+}
+
 protocol SupabaseAuthTransporting: Sendable {
+    func signUp(email: String, password: String) async throws
+        -> SupabaseSignUpResult
     func signIn(email: String, password: String) async throws
         -> ValidatedAuthSession
     func restore(tokens: StoredSessionTokens) async throws
@@ -42,29 +53,86 @@ protocol SupabaseAuthTransporting: Sendable {
     func signOut() async throws
 }
 
+/// 취소를 무시하는 SDK 호출도 실제 종료될 때까지 인증 슬롯을 점유한다.
+/// 새 로그인/로그아웃은 그 뒤에 실행되어 늦은 복원이 SDK 세션을 덮지 않는다.
+actor SerializedSupabaseAuthTransport: SupabaseAuthTransporting {
+    private let base: any SupabaseAuthTransporting
+    private var busy = false
+    private var waiters: [CheckedContinuation<Void, Never>] = []
+
+    init(_ base: any SupabaseAuthTransporting) { self.base = base }
+
+    private func run<T: Sendable>(_ operation: @Sendable () async throws -> T) async throws -> T {
+        if busy { await withCheckedContinuation { waiters.append($0) } }
+        else { busy = true }
+        defer {
+            if waiters.isEmpty { busy = false }
+            else { waiters.removeFirst().resume() }
+        }
+        try Task.checkCancellation()
+        return try await operation()
+    }
+    func signUp(email: String, password: String) async throws -> SupabaseSignUpResult {
+        try await run { try await self.base.signUp(email: email, password: password) }
+    }
+    func signIn(email: String, password: String) async throws -> ValidatedAuthSession {
+        try await run { try await self.base.signIn(email: email, password: password) }
+    }
+    func restore(tokens: StoredSessionTokens) async throws -> ValidatedAuthSession {
+        try await run { try await self.base.restore(tokens: tokens) }
+    }
+    func refresh(tokens: StoredSessionTokens) async throws -> ValidatedAuthSession {
+        try await run { try await self.base.refresh(tokens: tokens) }
+    }
+    func signOut() async throws { try await run { try await self.base.signOut() } }
+}
+
 actor LiveSupabaseAuthTransport: SupabaseAuthTransporting {
     private let client: SupabaseClient
+    private let receiveClients: ReceiveValidationSDKClients?
 
-    init(client: SupabaseClient) {
+    init(client: SupabaseClient, receiveClients: ReceiveValidationSDKClients? = nil) {
+        self.receiveClients = receiveClients
         self.client = client
+    }
+
+    func signUp(
+        email: String,
+        password: String
+    ) async throws -> SupabaseSignUpResult {
+        try ReceiveValidationPolicy.current.requireSending()
+        do {
+            let response = try await client.auth.signUp(
+                email: email,
+                password: password
+            )
+            if let session = response.session {
+                return .authenticated(validated(session))
+            }
+            return .confirmationRequired(email: response.user.email)
+        } catch {
+            throw Self.map(error, isRestore: false)
+        }
     }
 
     func signIn(
         email: String,
         password: String
     ) async throws -> ValidatedAuthSession {
+        let client = try ReceiveValidationSDKClients.operationClient(client, pool: receiveClients)
         do {
             return validated(
                 try await client.auth.signIn(email: email, password: password)
             )
         } catch {
-            throw map(error, isRestore: false)
+            throw Self.map(error, isRestore: false)
         }
     }
 
     func restore(
         tokens: StoredSessionTokens
     ) async throws -> ValidatedAuthSession {
+        let client = try ReceiveValidationSDKClients.operationClient(client, pool: receiveClients)
         do {
             // setSession refreshes an expired access token and calls /user for an
             // unexpired token, so a cached user alone can never authenticate.
@@ -75,13 +143,14 @@ actor LiveSupabaseAuthTransport: SupabaseAuthTransporting {
                 )
             )
         } catch {
-            throw map(error, isRestore: true)
+            throw Self.map(error, isRestore: true)
         }
     }
 
     func refresh(
         tokens: StoredSessionTokens
     ) async throws -> ValidatedAuthSession {
+        let client = try ReceiveValidationSDKClients.operationClient(client, pool: receiveClients)
         do {
             return validated(
                 try await client.auth.refreshSession(
@@ -89,15 +158,16 @@ actor LiveSupabaseAuthTransport: SupabaseAuthTransporting {
                 )
             )
         } catch {
-            throw map(error, isRestore: true)
+            throw Self.map(error, isRestore: true)
         }
     }
 
     func signOut() async throws {
+        try ReceiveValidationPolicy.current.requireSending()
         do {
             try await client.auth.signOut()
         } catch {
-            throw map(error, isRestore: false)
+            throw Self.map(error, isRestore: false)
         }
     }
 
@@ -111,7 +181,7 @@ actor LiveSupabaseAuthTransport: SupabaseAuthTransporting {
         )
     }
 
-    private func map(
+    static func map(
         _ error: any Error,
         isRestore: Bool
     ) -> SupabaseAuthTransportError {
@@ -125,19 +195,28 @@ actor LiveSupabaseAuthTransport: SupabaseAuthTransporting {
                 return .refreshTokenReused
             case .invalidCredentials:
                 return isRestore ? .refreshTokenRevoked : .invalidCredentials
+            case .weakPassword:
+                return .weakPassword
+            case .emailExists, .userAlreadyExists:
+                return .accountAlreadyExists
+            case .signupDisabled, .emailProviderDisabled:
+                return .signUpDisabled
+            case .emailNotConfirmed:
+                return .emailNotConfirmed
             default:
+                if case let .api(_, _, _, response) = authError,
+                   response.statusCode == 429 || response.statusCode >= 500 {
+                    return .networkUnavailable
+                }
                 return .serverRejected
             }
         }
-        if let urlError = error as? URLError,
-           urlError.code != .userAuthenticationRequired {
-            return .networkUnavailable
+        switch LiveSyncV2HandshakeTransport.classify(error) {
+        case .networkUnavailable, .timedOut: return .networkUnavailable
+        case .authenticationRequired: return isRestore ? .refreshTokenRevoked : .invalidCredentials
+        default: return .serverRejected
         }
-        let nsError = error as NSError
-        if nsError.domain == NSURLErrorDomain {
-            return .networkUnavailable
-        }
-        return .serverRejected
+
     }
 }
 
@@ -156,10 +235,21 @@ enum AuthenticationSignOutReason: Equatable, Sendable {
 
 enum AuthenticationFailure: Equatable, Sendable {
     case configurationUnavailable
+    case validationAuthorizationEnded
     case invalidCredentials
+    case weakPassword
+    case accountAlreadyExists
+    case signUpDisabled
+    case emailNotConfirmed
     case networkUnavailable
     case keychainAccess
     case serverRejected
+}
+
+enum AuthenticationSignUpResult: Equatable, Sendable {
+    case authenticated(AuthenticatedAccount)
+    case confirmationRequired(maskedEmail: String?)
+    case failed(AuthenticationFailure)
 }
 
 enum AuthenticationState: Equatable, Sendable {
@@ -178,12 +268,17 @@ enum AuthenticationState: Equatable, Sendable {
 }
 
 protocol AuthenticationServicing: Sendable {
+    var contractEpoch: SyncV2ContractEpoch? { get }
     func currentState() async -> AuthenticationState
+    func generalValidationBearer() async throws -> String
     func stateUpdates() async -> AsyncStream<AuthenticationState>
     @discardableResult
     func restoreSession() async -> AuthenticationState
     @discardableResult
     func refreshSession(force: Bool) async -> AuthenticationState
+    @discardableResult
+    func signUp(email: String, password: String) async
+        -> AuthenticationSignUpResult
     @discardableResult
     func signIn(email: String, password: String) async -> AuthenticationState
     @discardableResult
@@ -191,8 +286,17 @@ protocol AuthenticationServicing: Sendable {
 }
 
 extension AuthenticationServicing {
+    func generalValidationBearer() async throws -> String { throw GeneralValidationFailure.denied }
+    var contractEpoch: SyncV2ContractEpoch? { nil }
     func stateUpdates() async -> AsyncStream<AuthenticationState> {
         AsyncStream { $0.finish() }
+    }
+
+    func signUp(
+        email: String,
+        password: String
+    ) async -> AuthenticationSignUpResult {
+        .failed(.serverRejected)
     }
 }
 
@@ -201,6 +305,7 @@ typealias AuthenticationSleep =
 typealias AuthenticationNow = @Sendable () -> Date
 
 actor SupabaseAuthService: AuthenticationServicing {
+    nonisolated let contractEpoch: SyncV2ContractEpoch? = SyncV2ContractEpoch()
     private struct ActiveRestore {
         let operationID: UUID
         let task: Task<AuthenticationState, Never>
@@ -219,6 +324,7 @@ actor SupabaseAuthService: AuthenticationServicing {
     private var state: AuthenticationState = .localOnly {
         didSet {
             guard oldValue != state else { return }
+            SyncV2RecoveryDiagnostics.record(stage: .authentication, event: state.isAuthenticated ? .available : .unavailable, operationID: activeOperationID)
             stateObservers.values.forEach { $0.yield(state) }
         }
     }
@@ -245,7 +351,7 @@ actor SupabaseAuthService: AuthenticationServicing {
             try await ContinuousClock().sleep(for: $0)
         }
     ) {
-        self.transport = transport
+        self.transport = transport.map { SerializedSupabaseAuthTransport($0) }
         self.sessionStore = sessionStore
         self.restoreTimeout = restoreTimeout
         self.refreshMargin = refreshMargin
@@ -256,6 +362,15 @@ actor SupabaseAuthService: AuthenticationServicing {
 
     func currentState() -> AuthenticationState {
         state
+    }
+    /// Only the in-memory session already verified through the real login flow.
+    /// Reading this value never restores credentials or refreshes a token.
+    func generalValidationBearer() async throws -> String {
+        guard case let .authenticated(account) = state,
+              let session = validationSession, let expires = session.expiresAt,
+              expires > now(), !session.accessToken.isEmpty else { throw GeneralValidationFailure.denied }
+        try ReceiveValidationPolicy.current.requireRead(account: account.userID)
+        return "Bearer " + session.accessToken
     }
 
     func stateUpdates() async -> AsyncStream<AuthenticationState> {
@@ -274,6 +389,7 @@ actor SupabaseAuthService: AuthenticationServicing {
 
     @discardableResult
     func restoreSession() async -> AuthenticationState {
+        guard !ReceiveValidationPolicy.current.enabled || (try? ReceiveValidationPolicy.current.authorization()) != nil else { return state }
         if state.isAuthenticated {
             return await refreshSession(force: false)
         }
@@ -292,6 +408,7 @@ actor SupabaseAuthService: AuthenticationServicing {
 
         let operationID = beginOperation()
         state = .restoring
+        let originatingTicket = validationTicket
         let task = Task { [weak self] in
             guard let self else {
                 return AuthenticationState.unavailable(
@@ -300,7 +417,8 @@ actor SupabaseAuthService: AuthenticationServicing {
             }
             return await self.performRestore(
                 transport: transport,
-                operationID: operationID
+                operationID: operationID,
+                originatingTicket: originatingTicket
             )
         }
         activeRestore = ActiveRestore(
@@ -329,6 +447,7 @@ actor SupabaseAuthService: AuthenticationServicing {
 
     @discardableResult
     func refreshSession(force: Bool) async -> AuthenticationState {
+        guard !ReceiveValidationPolicy.current.enabled || (try? ReceiveValidationPolicy.current.authorization()) != nil else { return state }
         if let activeRefresh {
             return await activeRefresh.task.value
         }
@@ -340,7 +459,7 @@ actor SupabaseAuthService: AuthenticationServicing {
         if let activeRestore {
             return await activeRestore.task.value
         }
-        if !force {
+        if !force && !ReceiveValidationPolicy.current.enabled {
             guard let sessionExpiresAt else { return state }
             if sessionExpiresAt.timeIntervalSince(now()) > refreshMargin {
                 return state
@@ -352,13 +471,15 @@ actor SupabaseAuthService: AuthenticationServicing {
         }
 
         let operationID = beginOperation()
+        let originatingTicket = validationTicket
         let task = Task { [weak self] in
             guard let self else {
                 return AuthenticationState.unavailable(.serverRejected)
             }
             return await self.performRefresh(
                 transport: transport,
-                operationID: operationID
+                operationID: operationID,
+                originatingTicket: originatingTicket
             )
         }
         activeRefresh = ActiveRestore(
@@ -374,11 +495,12 @@ actor SupabaseAuthService: AuthenticationServicing {
 
     private func performRefresh(
         transport: any SupabaseAuthTransporting,
-        operationID: UUID
+        operationID: UUID,
+        originatingTicket: ReceiveValidationPolicy.Ticket?
     ) async -> AuthenticationState {
         let storedTokens: StoredSessionTokens
         do {
-            guard let tokens = try await sessionStore.load() else {
+            guard let tokens = try await loadTokensForAuthentication() else {
                 guard isCurrent(operationID) else { return state }
                 state = .signedOut(.noStoredSession)
                 return state
@@ -393,7 +515,9 @@ actor SupabaseAuthService: AuthenticationServicing {
         let race = AuthenticationRestoreRace()
         let transportTask = Task {
             do {
-                let session = try await transport.refresh(tokens: storedTokens)
+                let session = try await ReceiveValidationPolicy.$operation.withValue(originatingTicket) {
+                    try await transport.refresh(tokens: storedTokens)
+                }
                 await race.resolve(.success(session))
             } catch let error as SupabaseAuthTransportError {
                 await race.resolve(.failure(error))
@@ -431,11 +555,12 @@ actor SupabaseAuthService: AuthenticationServicing {
 
     private func performRestore(
         transport: any SupabaseAuthTransporting,
-        operationID: UUID
+        operationID: UUID,
+        originatingTicket: ReceiveValidationPolicy.Ticket?
     ) async -> AuthenticationState {
         let storedTokens: StoredSessionTokens
         do {
-            guard let tokens = try await sessionStore.load() else {
+            guard let tokens = try await loadTokensForAuthentication() else {
                 guard isCurrent(operationID) else { return state }
                 state = .signedOut(.noStoredSession)
                 return state
@@ -451,9 +576,9 @@ actor SupabaseAuthService: AuthenticationServicing {
         let race = AuthenticationRestoreRace()
         let transportTask = Task {
             do {
-                let session = try await transport.restore(
-                    tokens: storedTokens
-                )
+                let session = try await ReceiveValidationPolicy.$operation.withValue(originatingTicket) {
+                    try await transport.restore(tokens: storedTokens)
+                }
                 await race.resolve(.success(session))
             } catch let error as SupabaseAuthTransportError {
                 await race.resolve(.failure(error))
@@ -489,11 +614,76 @@ actor SupabaseAuthService: AuthenticationServicing {
     }
 
     @discardableResult
+    func signUp(
+        email: String,
+        password: String
+    ) async -> AuthenticationSignUpResult {
+        guard ReceiveValidationPolicy.current.sendingAllowed else { return .failed(.configurationUnavailable) }
+        cancelActiveAuthenticationTasks()
+        guard let transport else {
+            state = .unavailable(.configurationUnavailable)
+            return .failed(.configurationUnavailable)
+        }
+        let normalizedEmail = email.trimmingCharacters(
+            in: .whitespacesAndNewlines
+        )
+        guard !normalizedEmail.isEmpty, !password.isEmpty else {
+            state = .unavailable(.invalidCredentials)
+            return .failed(.invalidCredentials)
+        }
+
+        let operationID = beginOperation()
+        state = .restoring
+        do {
+            let result = try await transport.signUp(
+                email: normalizedEmail,
+                password: password
+            )
+            guard isCurrent(operationID) else {
+                return .failed(.serverRejected)
+            }
+            switch result {
+            case let .authenticated(session):
+                let accepted = await accept(
+                    session,
+                    operationID: operationID
+                )
+                if case let .authenticated(account) = accepted {
+                    return .authenticated(account)
+                }
+                if case let .unavailable(failure) = accepted {
+                    return .failed(failure)
+                }
+                return .failed(.serverRejected)
+            case let .confirmationRequired(email):
+                state = .signedOut(.noStoredSession)
+                return .confirmationRequired(
+                    maskedEmail: Self.masked(email ?? normalizedEmail)
+                )
+            }
+        } catch let error as SupabaseAuthTransportError {
+            guard isCurrent(operationID) else {
+                return .failed(.serverRejected)
+            }
+            let failure = failure(for: error)
+            state = .unavailable(failure)
+            return .failed(failure)
+        } catch {
+            guard isCurrent(operationID) else {
+                return .failed(.serverRejected)
+            }
+            state = .unavailable(.serverRejected)
+            return .failed(.serverRejected)
+        }
+    }
+
+    @discardableResult
     func signIn(
         email: String,
         password: String
     ) async -> AuthenticationState {
         cancelActiveAuthenticationTasks()
+        guard !ReceiveValidationPolicy.current.enabled || (try? ReceiveValidationPolicy.current.authorization()) != nil else { return state }
         guard let transport else {
             state = .unavailable(.configurationUnavailable)
             return state
@@ -507,11 +697,11 @@ actor SupabaseAuthService: AuthenticationServicing {
         }
 
         let operationID = beginOperation()
+        state = .restoring
         do {
-            let session = try await transport.signIn(
-                email: email,
-                password: password
-            )
+            let session = try await ReceiveValidationPolicy.$operation.withValue(validationTicket) {
+                try await transport.signIn(email: email, password: password)
+            }
             guard isCurrent(operationID) else { return state }
             return await accept(session, operationID: operationID)
         } catch let error as SupabaseAuthTransportError {
@@ -527,6 +717,14 @@ actor SupabaseAuthService: AuthenticationServicing {
 
     @discardableResult
     func signOut() async -> AuthenticationState {
+        if ReceiveValidationPolicy.current.enabled {
+            ReceiveValidationPolicy.current.invalidate()
+            validationSession = nil
+            cancelActiveAuthenticationTasks()
+            contractEpoch?.advance()
+            state = .signedOut(.userInitiated)
+            return state
+        }
         cancelActiveAuthenticationTasks()
         let operationID = beginOperation()
         state = .signedOut(.userInitiated)
@@ -549,6 +747,18 @@ actor SupabaseAuthService: AuthenticationServicing {
         _ session: ValidatedAuthSession,
         operationID: UUID
     ) async -> AuthenticationState {
+        guard isCurrent(operationID) else { return state }
+        if ReceiveValidationPolicy.current.enabled {
+            do {
+                return try ReceiveValidationPolicy.current.withVerifiedAccount(session.userID, ticket: validationTicket) {
+                    validationSession = .init(accessToken: session.accessToken, refreshToken: session.refreshToken, expiresAt: session.expiresAt)
+                    contractEpoch?.advance()
+                    state = .authenticated(AuthenticatedAccount(userID: session.userID, maskedEmail: Self.masked(session.email)))
+                    sessionExpiresAt = session.expiresAt
+                    return state
+                }
+            } catch { state = .unavailable(.configurationUnavailable); return state }
+        }
         do {
             try await sessionStore.save(
                 StoredSessionTokens(
@@ -567,6 +777,8 @@ actor SupabaseAuthService: AuthenticationServicing {
         }
         guard isCurrent(operationID) else { return state }
 
+        contractEpoch?.advance()
+        let wasAuthenticated = state.isAuthenticated
         state = .authenticated(
             AuthenticatedAccount(
                 userID: session.userID,
@@ -574,6 +786,10 @@ actor SupabaseAuthService: AuthenticationServicing {
             )
         )
         sessionExpiresAt = session.expiresAt
+        if wasAuthenticated {
+            // 같은 계정의 토큰 갱신도 새 인증 수명이다.
+            stateObservers.values.forEach { $0.yield(state) }
+        }
         refreshRetryTask?.cancel()
         refreshRetryTask = nil
         scheduleAutomaticRefresh()
@@ -584,6 +800,7 @@ actor SupabaseAuthService: AuthenticationServicing {
         _ error: SupabaseAuthTransportError,
         operationID: UUID
     ) async -> AuthenticationState {
+        guard isCurrent(operationID) else { return state }
         let reason: AuthenticationSignOutReason?
         switch error {
         case .sessionExpired:
@@ -595,12 +812,19 @@ actor SupabaseAuthService: AuthenticationServicing {
         case .networkUnavailable:
             state = .unavailable(.networkUnavailable)
             return state
-        case .invalidCredentials, .serverRejected:
+        case .invalidCredentials, .weakPassword, .accountAlreadyExists,
+             .signUpDisabled, .emailNotConfirmed, .serverRejected:
             reason = nil
         }
 
         guard let reason else {
             state = .unavailable(.serverRejected)
+            return state
+        }
+        if ReceiveValidationPolicy.current.enabled {
+            // End the loading state without deleting the preserved session.
+            // A new foreground login can recover; sending remains locked.
+            state = .signedOut(reason)
             return state
         }
         do {
@@ -625,6 +849,14 @@ actor SupabaseAuthService: AuthenticationServicing {
         switch error {
         case .invalidCredentials:
             .invalidCredentials
+        case .weakPassword:
+            .weakPassword
+        case .accountAlreadyExists:
+            .accountAlreadyExists
+        case .signUpDisabled:
+            .signUpDisabled
+        case .emailNotConfirmed:
+            .emailNotConfirmed
         case .networkUnavailable:
             .networkUnavailable
         case .sessionExpired, .refreshTokenRevoked, .refreshTokenReused,
@@ -646,13 +878,24 @@ actor SupabaseAuthService: AuthenticationServicing {
         return "\(first)***@\(domain)"
     }
 
+    private var validationSession: StoredSessionTokens?
+    private var validationTicket: ReceiveValidationPolicy.Ticket?
+    private func loadTokensForAuthentication() async throws -> StoredSessionTokens? {
+        if ReceiveValidationPolicy.current.enabled, let validationSession { return validationSession }
+        return try await sessionStore.load()
+    }
+
     private func beginOperation() -> UUID {
+        validationTicket = try? ReceiveValidationPolicy.current.authorization()
+        contractEpoch?.advance()
         let operationID = UUID()
         activeOperationID = operationID
+        SyncV2RecoveryDiagnostics.record(stage: .authentication, event: .started, operationID: operationID)
         return operationID
     }
 
     private func scheduleAutomaticRefresh() {
+        guard ReceiveValidationPolicy.current.sendingAllowed else { return }
         automaticRefreshTask?.cancel()
         guard let sessionExpiresAt else { return }
         let delay = max(
@@ -672,9 +915,12 @@ actor SupabaseAuthService: AuthenticationServicing {
     }
 
     private func scheduleRefreshRetry() {
+        guard ReceiveValidationPolicy.current.sendingAllowed else { return }
         guard refreshRetryTask == nil else { return }
         let sleep = self.sleep
         let refreshRetryDelay = self.refreshRetryDelay
+        SyncV2RecoveryDiagnostics.record(stage: .authentication, event: .retryScheduled, operationID: activeOperationID,
+            retryAt: now().addingTimeInterval(Double(refreshRetryDelay.components.seconds)))
         refreshRetryTask = Task { [weak self] in
             do {
                 try await sleep(refreshRetryDelay)
@@ -704,8 +950,17 @@ actor SupabaseAuthService: AuthenticationServicing {
     }
 
     private func isCurrent(_ operationID: UUID) -> Bool {
-        let isCurrent = activeOperationID == operationID
+        let isCurrent = activeOperationID == operationID && (!ReceiveValidationPolicy.current.enabled
+            || ((try? ReceiveValidationPolicy.current.authorization()) == validationTicket && validationTicket != nil))
         if !isCurrent {
+            // A revoked grant must reject the result and finish this operation's
+            // loading state. A newer operation or explicit sign-out owns its own state.
+            if activeOperationID == operationID,
+               ReceiveValidationPolicy.current.enabled,
+               state == .restoring || state.isAuthenticated {
+                contractEpoch?.advance()
+                state = .unavailable(.validationAuthorizationEnded)
+            }
             SyncV2Diagnostics.supersededAuthOperation(
                 operationID: operationID,
                 activeOperationID: activeOperationID

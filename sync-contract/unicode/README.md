@@ -1,13 +1,10 @@
 # Frozen Unicode tables
 
-Three implementations have to produce the same `storage-name-v2` collision key
+Three implementations have to produce the same `storage-name-v1` collision key
 byte for byte: Postgres, the Windows client, and the iPad client. None of them
-may derive assignment, exclusion, or casefold behavior from whatever Unicode
-data its runtime happens to carry. Platform NFKC and canonical combining class
-remain bounded by the contract's pre- and post-normalization rejection rules.
+may derive that key from whatever Unicode data its runtime happens to carry.
 
-These files are the normative contract origin. Implementations copy or generate
-their lookup structures from these assets and verify the canonical digests.
+These files are the origin. Everything else is generated from them.
 
 ## Why these exist
 
@@ -32,7 +29,7 @@ Moving the tables here makes the server's approach the contract's approach.
 
 | File | What it is |
 |---|---|
-| `casefold-15.0.0.json` | Full default case folding, 1,530 mappings. The `storage-name-v2` folding step. |
+| `casefold-15.0.0.json` | Full default case folding, 1,530 mappings. The `storage-name-v1` folding step. |
 | `assigned-baseline-14.0.0.json` | The scalars a storage name may contain, 698 ranges / 282,230 scalars. |
 | `excluded-scalars.json` | Assigned scalars that still may not appear in a name (Private Use, tags, variation selector supplement). |
 | `assigned-15.0.0.json` | Unicode 15.0.0 assigned ranges, 707 ranges. Describes what the deployed server already does. |
@@ -73,14 +70,14 @@ Keep these files LF. `generate_casefold_sql.py` refuses to run if it finds a CR.
 ## Consumers
 
 ```
-sync-contract/unicode/*.json           <- normative origin
-  -> a new server migration in the server stage
-  -> the iPad client in its implementation stage
-  -> the Windows client in its implementation stage
+sync-contract/unicode/*.json           <- origin
+  -> supabase/migrations/20260811010000_sync_contract_0_1_0_foundation.sql
+       via supabase/scripts/generate_casefold_sql.py
+  -> WriterPad/Sync/SyncV2UnicodeCasefold.swift
+  -> the Windows client's own table
 ```
 
-The already-applied foundation migration remains historical evidence and must
-not be rewritten. Its existing casefold rows can be checked separately with:
+To confirm the deployed migration still matches the assets:
 
 ```
 python3 supabase/scripts/generate_casefold_sql.py --check \
@@ -90,10 +87,11 @@ python3 supabase/scripts/generate_casefold_sql.py --check \
 That migration is already applied and must not change. The check exists to prove
 the flip to JSON did not alter a single byte of it.
 
-## Release boundary
+## Not yet referenced by protocol.json
 
-Contract `0.3.0` references the baseline, exclusion, and casefold files and
-locks all four canonical digests. This contract PR does not modify a client,
-server, migration, allowlist, or deployed database. Clients must not switch to
-the new contract pin until the server stage has added and deployed the matching
-allowlist entry.
+`protocol.json` still pins `storage_name_unicode: 15.0.0` and does not mention
+these files. Wiring them in, adding their digests to `contract-lock.json`, and
+bumping `contract_version` all belong to the storage-name revision, which is
+still under review with the Windows session. Adding those now would move
+`canonical_contract_sha256` ahead of the server's allowlist and fail every write
+with `CONTRACT_DIGEST_MISMATCH`.

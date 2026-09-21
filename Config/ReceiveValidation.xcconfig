@@ -1,0 +1,2 @@
+// Explicit future Debug Staging candidate selection; no runtime switch.
+OTHER_SWIFT_FLAGS = $(inherited) -DWRITERPAD_RECEIVE_VALIDATION

@@ -1,1 +1,4 @@
 supabase/migrations/*.sql text eol=lf
+# 배포본 원문 dump는 CRLF/LF 혼합까지 증거 바이트다. 정규화하지 않고
+# diff --check가 원문 줄끝을 수정 대상으로 오인하지 않게 한다.
+supabase/_dump/*.sql -whitespace

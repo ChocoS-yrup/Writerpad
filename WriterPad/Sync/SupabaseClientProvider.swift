@@ -6,13 +6,19 @@ protocol SupabaseClientProviding: AnyObject {
     var isConfigured: Bool { get }
     func makeAuthTransport() -> (any SupabaseAuthTransporting)?
     func makeProjectBindingTransport() -> (any EnsureProjectTransporting)?
+    func makeServerCatalogTransport() -> (any ServerProjectCatalogTransporting)?
     func makeSyncV2Client() -> SyncV2Client?
+    func makeHandshakeTransport() -> (any SyncV2HandshakeTransporting)?
+    func makeAtomicStructureTransport() -> (any SyncV2AtomicStructureTransporting)?
     func makeSnapshotClient() -> SyncV2SnapshotClient?
     func makeRealtimeTrigger() -> (any SyncV2RealtimeTriggering)?
     func makeEditLeaseClient() -> EditLeaseClient?
 }
 
 extension SupabaseClientProviding {
+    func makeServerCatalogTransport() -> (any ServerProjectCatalogTransporting)? { nil }
+    func makeHandshakeTransport() -> (any SyncV2HandshakeTransporting)? { nil }
+    func makeAtomicStructureTransport() -> (any SyncV2AtomicStructureTransporting)? { nil }
     func makeSnapshotClient() -> SyncV2SnapshotClient? { nil }
     func makeRealtimeTrigger() -> (any SyncV2RealtimeTriggering)? { nil }
 }
@@ -43,9 +49,78 @@ final class EphemeralAuthLocalStorage: AuthLocalStorage, @unchecked Sendable {
     }
 }
 
+#if DEBUG
+final class SyncV2URLSessionMetricsDelegate:
+    NSObject,
+    URLSessionTaskDelegate,
+    @unchecked Sendable {
+    func urlSession(
+        _ session: URLSession,
+        task: URLSessionTask,
+        didFinishCollecting metrics: URLSessionTaskMetrics
+    ) {
+        _ = session
+        guard
+            let request = task.originalRequest ?? task.currentRequest,
+            let rawPullID = request.value(
+                forHTTPHeaderField: SyncV2PullDiagnostics.pullIDHeader
+            ),
+            let pullID = UUID(uuidString: rawPullID),
+            let origin = request.value(
+                forHTTPHeaderField: SyncV2PullDiagnostics.pullOriginHeader
+            ),
+            let stage = request.value(
+                forHTTPHeaderField: SyncV2PullDiagnostics.pullStageHeader
+            ),
+            let rawStartedAt = request.value(
+                forHTTPHeaderField: SyncV2PullDiagnostics.pullStartHeader
+            ),
+            let pullStartedAt = UInt64(rawStartedAt)
+        else { return }
+
+        let transactions = metrics.transactionMetrics
+        let firstFetch = transactions.compactMap(\.fetchStartDate).min()
+        let firstResponse = transactions.compactMap(\.responseStartDate).min()
+        let lastResponse = transactions.compactMap(\.responseEndDate).max()
+        let ttfb = Self.milliseconds(from: firstFetch, to: firstResponse)
+        let receive = Self.milliseconds(
+            from: firstResponse,
+            to: lastResponse
+        )
+        let networkBytes = transactions.reduce(Int64(0)) {
+            $0 + $1.countOfResponseBodyBytesReceived
+        }
+        let decodedBytes = transactions.reduce(Int64(0)) {
+            $0 + $1.countOfResponseBodyBytesAfterDecoding
+        }
+        SyncV2PullDiagnostics.recordNetworkMetrics(
+            pullID: pullID,
+            origin: origin,
+            stage: stage,
+            pullStartedAtNanoseconds: pullStartedAt,
+            taskMilliseconds: metrics.taskInterval.duration * 1_000,
+            ttfbMilliseconds: ttfb,
+            receiveMilliseconds: receive,
+            networkBytes: networkBytes,
+            decodedBytes: decodedBytes,
+            transactionCount: transactions.count
+        )
+    }
+
+    private static func milliseconds(
+        from start: Date?,
+        to end: Date?
+    ) -> Double {
+        guard let start, let end else { return -1 }
+        return max(0, end.timeIntervalSince(start) * 1_000)
+    }
+}
+#endif
+
 final class SupabaseClientProvider: SupabaseClientProviding {
     let configurationState: SupabaseConfigurationState
     private let client: SupabaseClient?
+    private let receiveClients: ReceiveValidationSDKClients?
     private let realtimeSubscriptionGate =
         SyncV2RealtimeConnectGate()
 
@@ -54,25 +129,44 @@ final class SupabaseClientProvider: SupabaseClientProviding {
     }
 
     func makeAuthTransport() -> (any SupabaseAuthTransporting)? {
-        client.map(LiveSupabaseAuthTransport.init(client:))
+        client.map { LiveSupabaseAuthTransport(client: $0, receiveClients: receiveClients) }
     }
 
     func makeProjectBindingTransport() -> (any EnsureProjectTransporting)? {
         client.map(LiveEnsureProjectTransport.init(client:))
     }
 
+    func makeServerCatalogTransport() -> (any ServerProjectCatalogTransporting)? {
+        guard case let .configured(configuration) = configurationState else { return nil }
+        return client.map { LiveServerProjectCatalogTransport(client: $0, endpointID: configuration.url.absoluteString, receiveClients: receiveClients) }
+    }
+
     func makeSyncV2Client() -> SyncV2Client? {
         client.map {
             SyncV2Client(
-                transport: LiveSyncV2CommitTransport(client: $0)
+                transport: LiveSyncV2CommitTransport(client: $0, receiveClients: receiveClients)
             )
         }
+    }
+
+    /// 전송만 만든다. `SyncV2HandshakeService`는 답을 메모리에 들고 있어서, 부를
+    /// 때마다 새로 만들면 들고 있던 답이 매번 사라진다. 서비스를 하나 만들어 두는
+    /// 것은 이것을 쓰는 쪽의 몫이다.
+    func makeHandshakeTransport() -> (any SyncV2HandshakeTransporting)? {
+        guard case .configured(let configuration) = configurationState else { return nil }
+        return client.map { LiveSyncV2HandshakeTransport(client: $0, configuration: configuration, receiveClients: receiveClients) }
+    }
+
+    func makeAtomicStructureTransport() ->
+        (any SyncV2AtomicStructureTransporting)? {
+        guard case .configured(let configuration) = configurationState else { return nil }
+        return client.map { LiveSyncV2AtomicStructureTransport(client: $0, configuration: configuration) }
     }
 
     func makeSnapshotClient() -> SyncV2SnapshotClient? {
         client.map {
             SyncV2SnapshotClient(
-                transport: LiveSyncV2SnapshotTransport(client: $0)
+                transport: LiveSyncV2SnapshotTransport(client: $0, receiveClients: receiveClients)
             )
         }
     }
@@ -89,7 +183,7 @@ final class SupabaseClientProvider: SupabaseClientProviding {
     func makeEditLeaseClient() -> EditLeaseClient? {
         client.map {
             EditLeaseClient(
-                transport: LiveEditLeaseTransport(client: $0)
+                transport: LiveEditLeaseTransport(client: $0, receiveClients: receiveClients)
             )
         }
     }
@@ -111,6 +205,19 @@ final class SupabaseClientProvider: SupabaseClientProviding {
         switch configuration {
         case .success(let value):
             configurationState = .configured(value)
+            receiveClients = ReceiveValidationPolicy.current.enabled ? ReceiveValidationSDKClients(configuration: value, policy: .current) : nil
+#if DEBUG
+            let session = (ReceiveValidationPolicy.current.enabled || GeneralSyncValidationScope.current.restricted || GeneralValidationExecution.current != nil) ? ReceiveValidationURLProtocol.session() : URLSession(
+                configuration: .default,
+                delegate: SyncV2URLSessionMetricsDelegate(),
+                delegateQueue: nil
+            )
+            let globalOptions = SupabaseClientOptions.GlobalOptions(
+                session: session
+            )
+#else
+            let globalOptions = SupabaseClientOptions.GlobalOptions()
+#endif
             client = SupabaseClient(
                 supabaseURL: value.url,
                 supabaseKey: value.publishableKey,
@@ -119,12 +226,46 @@ final class SupabaseClientProvider: SupabaseClientProviding {
                         storage: EphemeralAuthLocalStorage(),
                         autoRefreshToken: false,
                         emitLocalSessionAsInitialSession: true
-                    )
+                    ),
+                    global: globalOptions
                 )
             )
         case .failure(let error):
             configurationState = .unavailable(error)
             client = nil
+            receiveClients = nil
         }
+    }
+}
+
+/// Ephemeral SDK state is shared by authentication/catalog/snapshot only within one grant.
+/// SDK callbacks use the client's immutable session; they never consult TaskLocal/current grant.
+final class ReceiveValidationSDKClients: @unchecked Sendable {
+    private let configuration: SupabasePublicConfiguration
+    private let policy: ReceiveValidationPolicy
+    private let lock = NSLock()
+    private var cached: (ReceiveValidationPolicy.Ticket, SupabaseClient)?
+    init(configuration: SupabasePublicConfiguration, policy: ReceiveValidationPolicy) {
+        self.configuration = configuration; self.policy = policy
+    }
+    func client(ticket: ReceiveValidationPolicy.Ticket?) throws -> SupabaseClient {
+        guard let ticket else { throw ReceiveValidationPolicy.Denied.locked }
+        return try ReceiveValidationPolicy.$operation.withValue(ticket) {
+            _ = try policy.authorization()
+            return lock.withLock {
+                if GeneralValidationExecution.current == nil, let cached, cached.0 == ticket { return cached.1 }
+                let client = SupabaseClient(supabaseURL: configuration.url, supabaseKey: configuration.publishableKey,
+                    options: .init(auth: .init(storage: EphemeralAuthLocalStorage(), autoRefreshToken: false,
+                                              emitLocalSessionAsInitialSession: true),
+                        global: .init(session: ReceiveValidationURLProtocol.session(policy: policy, ticket: ticket))))
+                if GeneralValidationExecution.current == nil { cached = (ticket, client) }
+                return client
+            }
+        }
+    }
+    static func operationClient(_ fallback: SupabaseClient, pool: ReceiveValidationSDKClients?) throws -> SupabaseClient {
+        guard ReceiveValidationPolicy.current.enabled else { return fallback }
+        guard let pool else { throw ReceiveValidationPolicy.Denied.locked }
+        return try pool.client(ticket: ReceiveValidationPolicy.operation)
     }
 }

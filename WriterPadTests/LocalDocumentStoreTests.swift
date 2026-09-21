@@ -415,6 +415,89 @@ final class LocalDocumentStoreTests: XCTestCase {
         }
     }
 
+    func testComparedSaveChecksLatestTXTAfterEarlierSaveCompletes() async throws {
+        let workspace = try LocalDocumentTestWorkspace.create()
+        defer { workspace.remove() }
+        try Data("비교 원고".utf8).write(to: workspace.fileURL)
+        let updater = BlockingMetadataUpdater()
+        let store = makeStore(workspace, updater: updater)
+        let first = Task { try await store.save(workspace.request(text: "뒤늦은 저장", generation: 1)) }
+        for _ in 0..<400 {
+            if await updater.hasEnteredFirstUpdate() { break }
+            try await Task.sleep(for: .milliseconds(5))
+        }
+        let entered = await updater.hasEnteredFirstUpdate(); XCTAssertTrue(entered)
+        let second = Task {
+            try await store.saveCompared(.init(projectID: workspace.projectID, documentID: workspace.documentID,
+                relativePath: workspace.relativePath, text: "서버 채택", generation: 2,
+                expectedCurrentContentHash: SHA256ContentHasher().sha256(for: Data("비교 원고".utf8))), authorize: {})
+        }
+        await updater.releaseFirstUpdate(); _ = try await first.value
+        do { _ = try await second.value; XCTFail("changed TXT") }
+        catch { XCTAssertEqual(error as? LocalDocumentStoreError, .comparedContentChanged) }
+        XCTAssertEqual(try Data(contentsOf: workspace.fileURL), Data("뒤늦은 저장".utf8))
+        let receipts = await updater.receipts; XCTAssertEqual(receipts.count, 1)
+    }
+
+    func testComparedSaveRoundTripsExactBytesAndRejectsAuthorizationBeforeReplacement() async throws {
+        let workspace = try LocalDocumentTestWorkspace.create()
+        defer { workspace.remove() }
+        let updater = RecordingMetadataUpdater()
+        let store = makeStore(workspace, updater: updater)
+        var previous = "비교 원고"
+        try Data(previous.utf8).write(to: workspace.fileURL)
+        for (index, content) in ["", "e\u{301}\r\n병합 👩‍💻"].enumerated() {
+            _ = try await store.saveCompared(.init(projectID: workspace.projectID, documentID: workspace.documentID,
+                relativePath: workspace.relativePath, text: content, generation: UInt64(index + 1),
+                expectedCurrentContentHash: SHA256ContentHasher().sha256(for: Data(previous.utf8))), authorize: {})
+            XCTAssertEqual(try Data(contentsOf: workspace.fileURL), Data(content.utf8)); previous = content
+        }
+        do {
+            _ = try await store.saveCompared(.init(projectID: workspace.projectID, documentID: workspace.documentID,
+                relativePath: workspace.relativePath, text: "차단할 본문", generation: 3,
+                expectedCurrentContentHash: SHA256ContentHasher().sha256(for: Data(previous.utf8))), authorize: { throw CancellationError() })
+            XCTFail("authorization")
+        } catch { XCTAssertTrue(error is CancellationError) }
+        XCTAssertEqual(try Data(contentsOf: workspace.fileURL), Data(previous.utf8))
+        let receipts = await updater.receipts; XCTAssertEqual(receipts.count, 2)
+    }
+
+    private actor ComparedSaveLocator: ProjectWorkspaceLocating {
+        let root: URL
+        private var continuation: CheckedContinuation<Void, Never>?
+        init(root: URL) { self.root = root }
+        func workspaceRoot(for projectID: ProjectID) async -> URL {
+            await withCheckedContinuation { continuation = $0 }
+            return root
+        }
+        func waiting() -> Bool { continuation != nil }
+        func release() { continuation?.resume(); continuation = nil }
+    }
+
+    func testCancelledComparedSaveCannotReplaceTXTAfterSuspendedLookupResumes() async throws {
+        let workspace = try LocalDocumentTestWorkspace.create()
+        defer { workspace.remove() }
+        try Data("취소 전 원고".utf8).write(to: workspace.fileURL)
+        let locator = ComparedSaveLocator(root: workspace.root)
+        let updater = RecordingMetadataUpdater()
+        let store = LocalDocumentStore(workspaceLocator: locator, metadataUpdater: updater)
+        let task = Task {
+            try await store.saveCompared(.init(projectID: workspace.projectID, documentID: workspace.documentID,
+                relativePath: workspace.relativePath, text: "늦게 도착한 선택", generation: 1,
+                expectedCurrentContentHash: SHA256ContentHasher().sha256(for: Data("취소 전 원고".utf8))), authorize: {})
+        }
+        for _ in 0..<400 {
+            if await locator.waiting() { break }
+            try await Task.sleep(for: .milliseconds(5))
+        }
+        let waiting = await locator.waiting(); XCTAssertTrue(waiting)
+        task.cancel(); await locator.release()
+        do { _ = try await task.value; XCTFail("취소 뒤 저장 금지") }
+        catch { XCTAssertTrue(error is CancellationError) }
+        XCTAssertEqual(try Data(contentsOf: workspace.fileURL), Data("취소 전 원고".utf8))
+        let receipts = await updater.receipts; XCTAssertTrue(receipts.isEmpty)
+    }
+
     private func makeStore(
         _ workspace: LocalDocumentTestWorkspace,
         updater: any DocumentFileMetadataUpdating,

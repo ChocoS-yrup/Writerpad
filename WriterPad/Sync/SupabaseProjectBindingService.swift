@@ -207,6 +207,7 @@ actor LiveEnsureProjectTransport: EnsureProjectTransporting {
     func ensureProject(
         parameters: EnsureProjectParameters
     ) async throws -> EnsuredServerProject {
+        try ReceiveValidationPolicy.current.requireSending()
         do {
             let response: PostgrestResponse<EnsuredServerProject> =
                 try await client
@@ -280,6 +281,7 @@ enum ProjectBindingFailure: Equatable, Sendable {
     case networkUnavailable
     case invalidServerResponse
     case serverRejected
+    case initialSnapshotNotQueued
     case notBound
 }
 
@@ -304,11 +306,12 @@ struct NoOpInitialProjectSyncRecorder: InitialProjectSyncRecording {
         batchKind: DurableLocalBatchKind
     ) async -> DurableRecordResult {
         _ = batchKind
-        return .localOnly
+        return .notNeeded
     }
 }
 
 protocol ProjectBindingServicing: Sendable {
+    var contractEpoch: SyncV2ContractEpoch? { get }
     func bindingUpdates(
         for localProjectID: ProjectID
     ) async -> AsyncStream<ProjectSyncBinding?>
@@ -331,6 +334,7 @@ protocol ProjectBindingServicing: Sendable {
 }
 
 extension ProjectBindingServicing {
+    var contractEpoch: SyncV2ContractEpoch? { nil }
     func bindingUpdates(
         for localProjectID: ProjectID
     ) async -> AsyncStream<ProjectSyncBinding?> {
@@ -353,12 +357,15 @@ extension ProjectBindingServicing {
 }
 
 actor SupabaseProjectBindingService: ProjectBindingServicing {
+    nonisolated let contractEpoch: SyncV2ContractEpoch?
+    private let handshakeInvalidated: @Sendable () -> Void
     private let transport: (any EnsureProjectTransporting)?
     private let bindingStore: any ProjectBindingStoring
     private let projectRepository: any ProjectRepository
     private let authenticationService: any AuthenticationServicing
     private let initialSyncRecorder: any InitialProjectSyncRecording
     private let snapshotClient: (any SyncV2SnapshotClienting)?
+    private let bindingIsVisible: @Sendable (ProjectID) async -> Bool
     private var bindingObservers: [
         ProjectID: [UUID: AsyncStream<ProjectSyncBinding?>.Continuation]
     ] = [:]
@@ -370,7 +377,10 @@ actor SupabaseProjectBindingService: ProjectBindingServicing {
         authenticationService: any AuthenticationServicing,
         initialSyncRecorder: any InitialProjectSyncRecording =
             NoOpInitialProjectSyncRecorder(),
-        snapshotClient: (any SyncV2SnapshotClienting)? = nil
+        snapshotClient: (any SyncV2SnapshotClienting)? = nil,
+        bindingIsVisible: @escaping @Sendable (ProjectID) async -> Bool = { _ in true },
+        contractEpoch: SyncV2ContractEpoch = SyncV2ContractEpoch(),
+        handshakeInvalidated: @escaping @Sendable () -> Void = {}
     ) {
         self.transport = transport
         self.bindingStore = bindingStore
@@ -378,15 +388,26 @@ actor SupabaseProjectBindingService: ProjectBindingServicing {
         self.authenticationService = authenticationService
         self.initialSyncRecorder = initialSyncRecorder
         self.snapshotClient = snapshotClient
+        self.bindingIsVisible = bindingIsVisible
+        self.contractEpoch = contractEpoch
+        self.handshakeInvalidated = handshakeInvalidated
     }
 
     func currentBinding(
         for localProjectID: ProjectID
     ) async -> ProjectSyncBinding? {
+        guard await bindingIsVisible(localProjectID) else { return nil }
         guard await bindingStore.availability() == .available else {
             return nil
         }
-        return try? await bindingStore.binding(for: localProjectID)
+        guard let binding = try? await bindingStore.binding(
+            for: localProjectID
+        ) else {
+            return nil
+        }
+        guard await prepareInitialSnapshotIfNeeded(for: binding),
+              await bindingIsVisible(localProjectID) else { return nil }
+        return binding
     }
 
     func bindingUpdates(
@@ -412,8 +433,16 @@ actor SupabaseProjectBindingService: ProjectBindingServicing {
         guard await bindingStore.availability() == .available else {
             return []
         }
-        return (try? await bindingStore.allBindings())?
+        let bindings = (try? await bindingStore.allBindings())?
             .filter { $0.serverProjectID != nil } ?? []
+        var prepared: [ProjectSyncBinding] = []
+        for binding in bindings {
+            guard await bindingIsVisible(binding.localProjectID) else { continue }
+            if await prepareInitialSnapshotIfNeeded(for: binding) {
+                prepared.append(binding)
+            }
+        }
+        return prepared
     }
 
     func createServerProject(
@@ -481,6 +510,8 @@ actor SupabaseProjectBindingService: ProjectBindingServicing {
     func disconnect(
         localProjectID: ProjectID
     ) async -> ProjectBindingResult {
+        contractEpoch?.beginTransition()
+        defer { contractEpoch?.endTransition(); handshakeInvalidated() }
         guard await bindingStore.availability() == .available else {
             return .failed(.bindingStoreUnavailable)
         }
@@ -543,6 +574,9 @@ actor SupabaseProjectBindingService: ProjectBindingServicing {
         serverProjectID: UUID,
         kind: ProjectBindingKind
     ) async -> ProjectBindingResult {
+        guard ReceiveValidationPolicy.current.sendingAllowed else { return .failed(.configurationUnavailable) }
+        contractEpoch?.beginTransition()
+        defer { contractEpoch?.endTransition(); handshakeInvalidated() }
         guard let transport else {
             return .failed(.configurationUnavailable)
         }
@@ -637,19 +671,43 @@ actor SupabaseProjectBindingService: ProjectBindingServicing {
         )
         do {
             try await bindingStore.save(binding)
-            if kind == .newServerProject || kind == .windowsImport {
-                _ = await initialSyncRecorder.recordInitialSnapshot(
-                    projectID: localProjectID,
-                    projectName: name,
-                    batchKind: kind == .windowsImport
-                        ? .windowsImport
-                        : .projectBinding
-                )
+            guard await prepareInitialSnapshotIfNeeded(for: binding) else {
+                return .failed(.initialSnapshotNotQueued)
             }
             publish(binding, localProjectID: localProjectID)
             return .connected(binding)
         } catch {
             return .failed(storeFailure(error))
+        }
+    }
+
+    /// Native identity 연결은 초기 batch가 durable queue에 들어가기 전까지 다른
+    /// coordinator에 노출하지 않는다. 앱 재시작 때 current/allBindings 조회가
+    /// marker 또는 binding 직후 중단을 자동으로 재개한다.
+    private func prepareInitialSnapshotIfNeeded(
+        for binding: ProjectSyncBinding
+    ) async -> Bool {
+        guard ReceiveValidationPolicy.current.sendingAllowed else { return true }
+        let batchKind: DurableLocalBatchKind
+        switch binding.kind {
+        case .newServerProject:
+            batchKind = .projectBinding
+        case .windowsImport:
+            batchKind = .windowsImport
+        case .localOnly, .existingServerProject:
+            return true
+        }
+        let result = await initialSyncRecorder.recordInitialSnapshot(
+            projectID: binding.localProjectID,
+            projectName: binding.projectName,
+            batchKind: batchKind
+        )
+        switch result {
+        case .queued, .notNeeded:
+            return true
+        case .serverSizeLimitExceeded, .localOnly,
+             .localSavedButNotQueued:
+            return false
         }
     }
 
@@ -661,6 +719,7 @@ actor SupabaseProjectBindingService: ProjectBindingServicing {
         _ binding: ProjectSyncBinding?,
         localProjectID: ProjectID
     ) {
+        contractEpoch?.advance()
         bindingObservers[localProjectID]?.values.forEach {
             $0.yield(binding)
         }

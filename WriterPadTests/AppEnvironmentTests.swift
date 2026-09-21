@@ -6,6 +6,78 @@ import XCTest
 
 final class AppEnvironmentTests: XCTestCase {
     @MainActor
+    func testStartupFailurePreservesSyntheticFilesAndRetryEntersNormalEnvironment() throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        let manuscript = root.appendingPathComponent("synthetic.txt")
+        let database = root.appendingPathComponent("unreadable.store")
+        let text = Data("복구 시험용 합성 문장".utf8)
+        let bytes = Data("합성 저장소 파일".utf8)
+        try text.write(to: manuscript)
+        try bytes.write(to: database)
+        var attempts = 0
+        let recoveredEnvironment = try AppEnvironment.testing()
+        let startup = WriterPadStartupModel {
+            attempts += 1
+            if attempts == 1 { throw CocoaError(.fileReadCorruptFile) }
+            return recoveredEnvironment
+        }
+        XCTAssertTrue(startup.failed)
+        XCTAssertNil(startup.environment)
+        XCTAssertEqual(try Data(contentsOf: manuscript), text)
+        XCTAssertEqual(try Data(contentsOf: database), bytes)
+        startup.retry()
+        XCTAssertFalse(startup.failed)
+        XCTAssertTrue(startup.environment === recoveredEnvironment)
+        startup.retry()
+        XCTAssertEqual(attempts, 2)
+        XCTAssertEqual(try Data(contentsOf: manuscript), text)
+        XCTAssertEqual(try Data(contentsOf: database), bytes)
+    }
+
+    @MainActor
+    func testWriterPadCommandActionsUpdatesInPlaceWithoutReplacingFocusedIdentity() {
+        let actions = WriterPadCommandActions()
+        let identity = ObjectIdentifier(actions)
+        var receivedCommands: [WriterPadEditorCommand] = []
+
+        actions.update(
+            perform: { receivedCommands.append($0) },
+            canToggleEditorPane: false
+        )
+        actions.perform(.save)
+        actions.update(
+            perform: { receivedCommands.append($0) },
+            canToggleEditorPane: true
+        )
+        actions.perform(.nextChapter)
+
+        XCTAssertEqual(ObjectIdentifier(actions), identity)
+        XCTAssertEqual(receivedCommands, [.save, .nextChapter])
+        XCTAssertTrue(actions.canToggleEditorPane)
+    }
+
+    func testCloudStartupDoesNotRestoreAuthenticationWhenSyncIsDisabled()
+        async {
+        let authentication = CloudStartupAuthenticationSpy()
+        let identity = CloudStartupDeviceIdentitySpy()
+
+        await WriterPadCloudStartup.start(
+            syncEnabled: false,
+            authenticationService: authentication,
+            deviceIdentityService: identity,
+            syncDispatcher: nil,
+            backgroundSyncCoordinator: nil
+        )
+
+        let restoreCalls = await authentication.restoreCallCount()
+        let prepareCalls = await identity.prepareCallCount()
+        XCTAssertEqual(restoreCalls, 0)
+        XCTAssertEqual(prepareCalls, 1)
+    }
+
+    @MainActor
     func testWorkspaceStorageCoordinatorFindsAndRestoresManuscriptState() async throws {
         let environment = try AppEnvironment.testing()
         let project = try await environment.projectManager.createProject(
@@ -61,6 +133,53 @@ final class AppEnvironmentTests: XCTestCase {
     }
 
     @MainActor
+    func testChapterNavigationKeepsTitledChaptersInOrderAcrossVolumes() async throws {
+        let environment = try AppEnvironment.testing()
+        let project = try await environment.projectManager.createProject(
+            named: "제목 회차 이동"
+        )
+        _ = try await environment.binderRepository.rootNodes(in: project.id)
+        for _ in 0..<2 {
+            _ = try await environment.binderCommands.addNewVolume(
+                projectID: project.id
+            )
+        }
+        let coordinator = WorkspaceStorageCoordinator(
+            projectID: project.id,
+            binderRepository: environment.binderRepository,
+            documentRepository: environment.documentRepository,
+            workspaceStateRepository: environment.workspaceStateRepository
+        )
+        let original = try await coordinator.manuscriptTextNodes()
+        XCTAssertEqual(original.count, 50)
+        guard original.count == 50 else { return }
+
+        // 첫 화·연속 회차·권 경계·마지막 화에 제목을 붙여도
+        // 단축키가 소비하는 목록에서 빠지거나 순서가 바뀌면 안 된다.
+        for index in [0, 1, 24, 25, 49] {
+            _ = try await environment.binderCommands.renameChapter(
+                documentID: original[index].id,
+                titleSuffix: "이야기의 시작 🌙",
+                projectID: project.id
+            )
+        }
+
+        let renamed = try await coordinator.manuscriptTextNodes()
+        XCTAssertEqual(renamed.map(\.id), original.map(\.id))
+        let lastChapter = try await coordinator.lastManuscriptChapterNumber()
+        XCTAssertEqual(lastChapter, 50)
+
+        // 제목을 지운 뒤에도 일반 회차와 제목 회차가 섞인 순서를 유지한다.
+        _ = try await environment.binderCommands.renameChapter(
+            documentID: original[1].id,
+            titleSuffix: "",
+            projectID: project.id
+        )
+        let mixed = try await coordinator.manuscriptTextNodes()
+        XCTAssertEqual(mixed.map(\.id), original.map(\.id))
+    }
+
+    @MainActor
     func testProjectListModelRespectsLastProjectLaunchPreference() async throws {
         let environment = try AppEnvironment.testing()
         let first = try await environment.projectManager.createProject(named: "첫 작품")
@@ -80,6 +199,48 @@ final class AppEnvironmentTests: XCTestCase {
         )
         await libraryModel.load(opensLastProject: false)
         XCTAssertNil(libraryModel.selectedProjectID)
+    }
+
+    @MainActor
+    func testProjectListModelRestoresWriterPadBackupThroughProductManager() async throws {
+        let environment = try AppEnvironment.testing()
+        let project = try await environment.projectManager.createProject(
+            named: "제품 복원 진입점"
+        )
+        let package = FileManager.default.temporaryDirectory.appendingPathComponent(
+            "WriterPad-ModelRestore-\(UUID().uuidString)",
+            isDirectory: true
+        )
+        defer { try? FileManager.default.removeItem(at: package) }
+        _ = try await environment.projectBackupCoordinator.createBackup(
+            for: project.id,
+            at: package
+        )
+
+        let pending = try await environment.projectManager.prepareDeletion(id: project.id)
+        try await environment.projectManager.confirmDeletion(pending)
+        let deleted = try await environment.projectManager.prepareMoveToDeletedList(
+            id: project.id
+        )
+        _ = try await environment.projectManager.moveToDeletedList(deleted)
+        let permanent = try await environment.projectManager.preparePermanentDeletion(
+            id: project.id
+        )
+        _ = try await environment.projectManager.permanentlyDelete(permanent)
+
+        let model = ProjectListModel(
+            projectManager: environment.projectManager,
+            projectImporter: environment.projectImporter
+        )
+        await model.restoreBackup(at: package)
+
+        XCTAssertNil(model.errorMessage)
+        XCTAssertEqual(model.selectedProjectID, project.id)
+        XCTAssertEqual(model.selectedProject?.name, "제품 복원 진입점")
+        XCTAssertEqual(
+            model.importSuccessMessage,
+            "‘제품 복원 진입점’ WriterPad 백업을 복원했습니다."
+        )
     }
 
     @MainActor
@@ -112,6 +273,38 @@ final class AppEnvironmentTests: XCTestCase {
 
         XCTAssertNotNil(model.selectedProjectID)
         XCTAssertEqual(model.selectedProject?.name, "binding 대기 작품")
+    }
+
+    @MainActor
+    func testProjectListModelReportsNameConflictWithDeletedList() async throws {
+        let environment = try AppEnvironment.testing()
+        let deleted = try await environment.projectManager.createProject(
+            named: "삭제 목록 중복 작품"
+        )
+        let pending = try await environment.projectManager.prepareDeletion(
+            id: deleted.id
+        )
+        try await environment.projectManager.confirmDeletion(pending)
+        let deletedListConfirmation = try await environment.projectManager
+            .prepareMoveToDeletedList(id: deleted.id)
+        _ = try await environment.projectManager.moveToDeletedList(
+            deletedListConfirmation
+        )
+
+        let model = ProjectListModel(
+            projectManager: environment.projectManager,
+            projectImporter: environment.projectImporter
+        )
+        await model.load(opensLastProject: false)
+        await model.create(named: "삭제 목록 중복 작품")
+
+        XCTAssertEqual(
+            model.errorMessage,
+            "삭제 목록에 같은 이름의 작품이 존재합니다."
+        )
+        XCTAssertTrue(model.selectedProjectID == nil)
+        XCTAssertEqual(model.libraryProjects.count, 0)
+        XCTAssertEqual(model.deletedProjects.count, 1)
     }
 
     @MainActor
@@ -216,6 +409,54 @@ final class AppEnvironmentTests: XCTestCase {
 
     func testNoOpFutureNotifierAcceptsLocalEvents() async {
         await NoOpFutureChangeNotifier().record(.appLaunched)
+    }
+
+    @MainActor
+    func testAddNewVolumeUsesCurrentManuscriptIdentityWhenTappedNodeIsStale()
+        async throws {
+        let environment = try AppEnvironment.testing()
+        let project = try await environment.projectManager.createProject(
+            named: "새 권 오래된 UUID"
+        )
+        let model = BinderViewModel(
+            repository: environment.binderRepository,
+            commands: environment.binderCommands
+        )
+        await model.load(projectID: project.id)
+        let currentManuscript = try XCTUnwrap(
+            model.roots.first { $0.fixedCategory == .manuscript }
+        )
+        let staleManuscript = BinderNode(
+            id: DocumentID(rawValue: UUID()),
+            projectID: currentManuscript.projectID,
+            kind: currentManuscript.kind,
+            relativePath: currentManuscript.relativePath,
+            displayName: currentManuscript.displayName,
+            fixedCategory: currentManuscript.fixedCategory,
+            userOrder: currentManuscript.userOrder,
+            contentState: currentManuscript.contentState,
+            isExpanded: currentManuscript.isExpanded
+        )
+
+        let firstChapter = await model.addNewVolume(in: staleManuscript)
+
+        XCTAssertNotNil(firstChapter)
+        XCTAssertNil(model.errorMessage)
+        XCTAssertEqual(firstChapter?.relativePath.rawValue, "메인/원고/1권/001화.txt")
+        let documents = try await environment.documentRepository.documents(
+            in: project.id
+        )
+        let volumeDocuments = documents.filter {
+            $0.relativePath.rawValue.hasPrefix("메인/원고/1권")
+        }
+        XCTAssertEqual(volumeDocuments.count, 26)
+        let refreshedRoots = try await environment.binderRepository.rootNodes(
+            in: project.id
+        )
+        XCTAssertTrue(
+            refreshedRoots.first { $0.fixedCategory == .manuscript }?
+                .isExpanded == true
+        )
     }
 
     func testEditorExternalTrackerDistinguishesDocumentVersionAndComposition() {
@@ -344,6 +585,40 @@ final class AppEnvironmentTests: XCTestCase {
                 )
             )
         }
+    }
+
+    func testHiddenSplitPaneIsExcludedFromSyncEditingGuards() {
+        let leftID = DocumentID(rawValue: UUID())
+        let hiddenRightID = DocumentID(rawValue: UUID())
+        let left = SyncEditingPaneState(
+            documentID: leftID,
+            isDirty: false,
+            isComposing: false
+        )
+        let right = SyncEditingPaneState(
+            documentID: hiddenRightID,
+            isDirty: false,
+            isComposing: false
+        )
+
+        let singlePane = SyncEditingGuardCollector.collect(
+            left: left,
+            right: right,
+            showsSplit: false,
+            activePaneIsLeft: true
+        )
+        XCTAssertEqual(Set(singlePane.keys), [leftID.rawValue])
+
+        let visibleSplit = SyncEditingGuardCollector.collect(
+            left: left,
+            right: right,
+            showsSplit: true,
+            activePaneIsLeft: true
+        )
+        XCTAssertEqual(
+            Set(visibleSplit.keys),
+            [leftID.rawValue, hiddenRightID.rawValue]
+        )
     }
 
     func testLandscapeDevicePresentsSplitOnlyAtSufficientWidth() {
@@ -2604,15 +2879,36 @@ final class AppEnvironmentTests: XCTestCase {
             statisticsSleep: { duration in try await clock.sleep(for: duration) }
         )
 
+        var wakeCount = 0
         for count in 1...9 {
+            let sleeps = clock.sleepCount()
             model.updateText(String(repeating: "가", count: count))
-            // 가상 시간을 45ms 진행시킨 뒤, 그때 깨어난 계산이 끝날 때까지
-            // 기다렸다가 다음 자판을 친다. 다음 입력이 계산을 취소하는 경합이
-            // 사라져 몇 번 계산되는지가 시간 계산만으로 정해진다.
-            clock.advance(by: .milliseconds(45))
-            await settleStatistics(in: model)
+            // 예약된 계산이 가상 시계에 대기를 걸기 전에 시간을 돌리면 그 대기는
+            // 이미 지나간 마감을 잡아 영영 깨어나지 못한다. 등록을 확인한 뒤에만
+            // 45ms를 진행시키고, 그때 깨어난 계산이 끝나야 다음 자판을 친다.
+            // 다음 입력이 계산을 취소하는 경합이 사라져 몇 번 계산되는지가 시간
+            // 계산만으로 정해진다.
+            let registration = await clock.waitForSleep(after: sleeps)
+            guard registration != .timedOut else {
+                XCTFail("통계 계산 sleep 등록이 제한시간 안에 오지 않았다.")
+                return
+            }
+            let woken = clock.advance(by: .milliseconds(45))
+            wakeCount += woken
+            if woken > 0 || registration == .completedWithoutSuspending {
+                await model.awaitStatisticsForTesting()
+            }
         }
 
+        // 이 시험이 재려던 것은 "가상 시계를 돌리면 예약된 계산이 깨어난다"였다.
+        // 대기가 등록되기 전에 시간을 돌리면 마감이 함께 밀려 한 번도 깨어나지
+        // 못하고, 그래도 최대 지연을 넘긴 뒤의 즉시 계산 덕에 아래 단언들은
+        // 통과해버린다. 그 잠복 결함을 여기서 붙잡는다.
+        XCTAssertGreaterThan(
+            wakeCount,
+            0,
+            "가상 시계를 돌린 것이 예약된 계산을 깨워야 한다."
+        )
         XCTAssertGreaterThan(
             model.statisticsCalculationCount,
             0,
@@ -2620,9 +2916,17 @@ final class AppEnvironmentTests: XCTestCase {
         )
         XCTAssertGreaterThan(model.statistics.characterCount, 0)
 
-        clock.advance(by: .seconds(1))
-        try await waitForStatistics(9, in: model)
+        let pending = clock.advance(by: .seconds(1))
+        XCTAssertGreaterThan(
+            pending,
+            0,
+            "마지막 입력의 통계 계산이 예약되어 있어야 한다."
+        )
+        if pending > 0 {
+            await model.awaitStatisticsForTesting()
+        }
 
+        XCTAssertEqual(model.statistics.characterCount, 9)
         XCTAssertLessThanOrEqual(
             model.statisticsCalculationCount,
             2,
@@ -2630,19 +2934,43 @@ final class AppEnvironmentTests: XCTestCase {
         )
     }
 
-    /// 깨어난 통계 계산은 별도 우선순위에서 돌므로 결과가 반영될 때까지
-    /// 기다린다. 몇 번 계산할지는 가상 시계가 이미 정했고, 기다리는 동안 새
-    /// 입력이 들어오지 않으므로 취소 경합이 없다. 즉 이 대기는 결과를 바꾸지
-    /// 않고 반영만 기다린다.
-    @MainActor
-    private func settleStatistics(in model: EditorSessionModel) async {
-        let before = model.statisticsCalculationCount
-        let clock = ContinuousClock()
-        let deadline = clock.now.advanced(by: .milliseconds(200))
-        while model.statisticsCalculationCount == before,
-              clock.now < deadline {
-            try? await clock.sleep(for: .milliseconds(5))
+    func testVirtualStatisticsClockReportsSuspendedSleep() async throws {
+        let clock = VirtualStatisticsClock(
+            registrationBackstop: .milliseconds(50)
+        )
+        let previous = clock.sleepCount()
+        let sleeper = Task {
+            try await clock.sleep(for: .seconds(1))
         }
+
+        let registration = await clock.waitForSleep(after: previous)
+
+        XCTAssertEqual(registration, .suspended)
+        XCTAssertEqual(clock.advance(by: .seconds(1)), 1)
+        try await sleeper.value
+    }
+
+    func testVirtualStatisticsClockReportsCompletionWithoutSuspending()
+        async throws {
+        let clock = VirtualStatisticsClock(
+            registrationBackstop: .milliseconds(50)
+        )
+        let previous = clock.sleepCount()
+
+        try await clock.sleep(for: .zero)
+        let registration = await clock.waitForSleep(after: previous)
+
+        XCTAssertEqual(registration, .completedWithoutSuspending)
+    }
+
+    func testVirtualStatisticsClockReportsRegistrationTimeout() async {
+        let clock = VirtualStatisticsClock(
+            registrationBackstop: .milliseconds(5)
+        )
+
+        let registration = await clock.waitForSleep(after: clock.sleepCount())
+
+        XCTAssertEqual(registration, .timedOut)
     }
 
     @MainActor
@@ -3410,6 +3738,152 @@ final class AppEnvironmentTests: XCTestCase {
 
         XCTAssertEqual(model.text, "저장 전 초안 👩‍💻")
         XCTAssertEqual(model.cursor, TextCursorState(location: 4, selectionLength: 2))
+    }
+
+    @MainActor
+    func testTrashedDocumentOpensReadOnlyWithoutSavingMutations()
+        async throws {
+        let environment = try AppEnvironment.testing()
+        let project = try await environment.projectManager.createProject(
+            named: "휴지통 읽기 전용"
+        )
+        let roots = try await environment.binderRepository.rootNodes(in: project.id)
+        let notes = try XCTUnwrap(
+            roots.first { $0.fixedCategory == .notes }
+        )
+        let created = try await environment.binderCommands.create(
+            kind: .text,
+            named: "버려진 문서",
+            in: notes.id,
+            projectID: project.id
+        )
+        let loadedActiveDocument = try await environment.documentRepository
+            .document(id: created.affectedDocumentID)
+        let activeDocument = try XCTUnwrap(
+            loadedActiveDocument
+        )
+        _ = try await environment.localDocumentStore.save(
+            DocumentSaveRequest(
+                projectID: project.id,
+                documentID: activeDocument.id,
+                relativePath: activeDocument.relativePath,
+                text: "읽기만 할 본문\n두 번째 줄",
+                generation: 1
+            )
+        )
+        _ = try await environment.binderCommands.moveToTrash(
+            documentID: activeDocument.id,
+            projectID: project.id
+        )
+        let loadedTrashedDocument = try await environment.documentRepository
+            .document(id: activeDocument.id)
+        let trashedDocument = try XCTUnwrap(
+            loadedTrashedDocument
+        )
+        let node = BinderNode(
+            id: trashedDocument.id,
+            projectID: project.id,
+            kind: .text,
+            relativePath: trashedDocument.relativePath,
+            displayName: "버려진 문서",
+            fixedCategory: nil,
+            userOrder: trashedDocument.userOrder,
+            contentState: .written,
+            isExpanded: false
+        )
+        let model = EditorSessionModel(
+            documentRepository: environment.documentRepository,
+            documentStore: environment.localDocumentStore,
+            workspaceStateRepository: environment.workspaceStateRepository
+        )
+
+        await model.select(node)
+
+        XCTAssertTrue(model.isReadOnly)
+        XCTAssertEqual(model.currentText, "읽기만 할 본문\n두 번째 줄")
+        XCTAssertEqual(model.focusRequest, 0)
+        model.updateText("바꾸면 안 됨")
+        XCTAssertEqual(model.currentText, "읽기만 할 본문\n두 번째 줄")
+        XCTAssertFalse(model.hasUnsavedChanges)
+        XCTAssertNil(
+            model.automaticRebaseSnapshot(
+                documentID: trashedDocument.id
+            )
+        )
+        let didSave = await model.saveNow()
+        XCTAssertTrue(didSave)
+        let storedText = try await environment.localDocumentStore.loadText(
+            for: trashedDocument
+        )
+        XCTAssertEqual(
+            storedText,
+            "읽기만 할 본문\n두 번째 줄"
+        )
+
+        _ = try await environment.binderCommands.restoreFromTrash(
+            documentID: trashedDocument.id,
+            toFolderID: nil,
+            projectID: project.id
+        )
+        let loadedRestoredDocument = try await environment.documentRepository
+            .document(id: trashedDocument.id)
+        let restoredDocument = try XCTUnwrap(loadedRestoredDocument)
+        let restoredNode = BinderNode(
+            id: restoredDocument.id,
+            projectID: project.id,
+            kind: .text,
+            relativePath: restoredDocument.relativePath,
+            displayName: "버려진 문서",
+            fixedCategory: nil,
+            userOrder: restoredDocument.userOrder,
+            contentState: .written,
+            isExpanded: false
+        )
+
+        await model.select(restoredNode)
+
+        XCTAssertFalse(model.isReadOnly)
+        model.updateText("복원 후에는 편집 가능")
+        XCTAssertTrue(model.hasUnsavedChanges)
+        let didSaveRestoredDocument = await model.saveNow()
+        XCTAssertTrue(didSaveRestoredDocument)
+        let restoredText = try await environment.localDocumentStore.loadText(
+            for: restoredDocument
+        )
+        XCTAssertEqual(
+            restoredText,
+            "복원 후에는 편집 가능"
+        )
+    }
+
+    @MainActor
+    func testReadOnlyNativeEditorDisablesEditingButKeepsScrolling() {
+        let textView = SmartTextView()
+        let editor = iPadTextEditor(
+            text: .constant(""),
+            documentID: DocumentID(rawValue: UUID()),
+            externalVersion: 1,
+            selection: .constant(.start),
+            focusRequest: 1,
+            isActive: true,
+            isReadOnly: true,
+            placeholder: "휴지통 문서는 수정 할 수 없습니다."
+        )
+        let coordinator = editor.makeCoordinator()
+        textView.delegate = coordinator
+
+        coordinator.applyExternalState(to: textView)
+
+        XCTAssertFalse(textView.isEditable)
+        XCTAssertFalse(textView.isSelectable)
+        XCTAssertTrue(textView.isScrollEnabled)
+        XCTAssertTrue(textView.isUserInteractionEnabled)
+        XCTAssertEqual(textView.text, "")
+        XCTAssertEqual(
+            textView.placeholderText,
+            "휴지통 문서는 수정 할 수 없습니다."
+        )
+        XCTAssertEqual(textView.accessibilityValue, "읽기 전용")
     }
 
     @MainActor
@@ -4339,6 +4813,43 @@ private actor AlwaysAuthenticatedService: AuthenticationServicing {
     func signOut() -> AuthenticationState { .signedOut(.userInitiated) }
 }
 
+private actor CloudStartupAuthenticationSpy: AuthenticationServicing {
+    private var restoreCalls = 0
+
+    func restoreCallCount() -> Int { restoreCalls }
+    func currentState() -> AuthenticationState { .signedOut(.noStoredSession) }
+    func restoreSession() -> AuthenticationState {
+        restoreCalls += 1
+        return .signedOut(.noStoredSession)
+    }
+    func refreshSession(force: Bool) -> AuthenticationState {
+        _ = force
+        return .signedOut(.noStoredSession)
+    }
+    func signIn(
+        email: String,
+        password: String
+    ) -> AuthenticationState {
+        _ = email
+        _ = password
+        return .signedOut(.noStoredSession)
+    }
+    func signOut() -> AuthenticationState { .signedOut(.userInitiated) }
+}
+
+private actor CloudStartupDeviceIdentitySpy: DeviceIdentityProviding {
+    private var prepareCalls = 0
+
+    func prepareCallCount() -> Int { prepareCalls }
+    func currentState() -> DeviceIdentityState { .uninitialized }
+    func currentIdentifier() async throws -> DeviceIdentifier {
+        throw DeviceIdentityFailure.keychainAccess
+    }
+    func prepareIdentity() async {
+        prepareCalls += 1
+    }
+}
+
 private actor DelayedNewProjectBindingService: ProjectBindingServicing {
     private var createContinuation:
         CheckedContinuation<ProjectBindingResult, Never>?
@@ -4561,6 +5072,15 @@ private actor ScriptedSyncHandoffDocumentStore: LocalDocumentStoring {
 
 /// 테스트가 직접 시간을 돌리는 시계다. `advance`가 불릴 때만 시각이 흐르고,
 /// 그때 마감이 지난 대기만 깨운다. 실제 시계와 달리 기계 부하에 흔들리지 않는다.
+///
+/// 대기가 등록되기 전에 시간을 돌리면 그 대기는 이미 지나간 마감을 잡아 영영
+/// 깨어나지 못한다. `waitForSleep`으로 등록을 확인한 뒤에 돌려야 한다.
+private enum VirtualSleepRegistration: Equatable, Sendable {
+    case suspended
+    case completedWithoutSuspending
+    case timedOut
+}
+
 private final class VirtualStatisticsClock: @unchecked Sendable {
     private struct Waiter {
         let id: UInt64
@@ -4568,11 +5088,25 @@ private final class VirtualStatisticsClock: @unchecked Sendable {
         let continuation: CheckedContinuation<Void, Error>
     }
 
+    private struct SleepObserver {
+        let id: UInt64
+        let continuation: CheckedContinuation<Void, Never>
+    }
+
     private let lock = NSLock()
     private let base = ContinuousClock().now
+    private let registrationBackstop: Duration
     private var elapsed: Duration = .zero
     private var waiters: [Waiter] = []
     private var nextWaiterID: UInt64 = 0
+    private var sleepCallCount = 0
+    private var didLastSleepSuspend = false
+    private var sleepObservers: [SleepObserver] = []
+    private var nextObserverID: UInt64 = 0
+
+    init(registrationBackstop: Duration = .seconds(10)) {
+        self.registrationBackstop = registrationBackstop
+    }
 
     func now() -> ContinuousClock.Instant {
         lock.lock()
@@ -4580,7 +5114,50 @@ private final class VirtualStatisticsClock: @unchecked Sendable {
         return base.advanced(by: elapsed)
     }
 
-    func advance(by duration: Duration) {
+    /// 지금까지 접수된 `sleep` 호출 수다. `waitForSleep`의 기준점으로 쓴다.
+    func sleepCount() -> Int {
+        lock.withLock { sleepCallCount }
+    }
+
+    /// `previous` 이후의 새 `sleep`이 실제로 멈췄는지, 멈추지 않고 끝났는지,
+    /// 등록 자체가 제한시간 안에 오지 않았는지를 서로 다른 값으로 돌려준다.
+    func waitForSleep(after previous: Int) async -> VirtualSleepRegistration {
+        if let didSuspend = sleepOutcome(after: previous) {
+            return didSuspend ? .suspended : .completedWithoutSuspending
+        }
+        let id: UInt64 = lock.withLock {
+            nextObserverID += 1
+            return nextObserverID
+        }
+        await withCheckedContinuation {
+            (continuation: CheckedContinuation<Void, Never>) in
+            let alreadyArrived: Bool = lock.withLock {
+                guard sleepCallCount <= previous else { return true }
+                sleepObservers.append(
+                    SleepObserver(id: id, continuation: continuation)
+                )
+                return false
+            }
+            if alreadyArrived {
+                continuation.resume()
+                return
+            }
+            Task {
+                try? await ContinuousClock().sleep(
+                    for: self.registrationBackstop
+                )
+                self.resumeSleepObserver(id)
+            }
+        }
+        guard let didSuspend = sleepOutcome(after: previous) else {
+            return .timedOut
+        }
+        return didSuspend ? .suspended : .completedWithoutSuspending
+    }
+
+    /// 깨운 대기 수를 돌려준다. 0이면 이번 진행으로는 아무 계산도 깨어나지 않는다.
+    @discardableResult
+    func advance(by duration: Duration) -> Int {
         lock.lock()
         elapsed += duration
         let due = waiters.filter { $0.deadline <= elapsed }
@@ -4589,10 +5166,14 @@ private final class VirtualStatisticsClock: @unchecked Sendable {
         for waiter in due {
             waiter.continuation.resume()
         }
+        return due.count
     }
 
     func sleep(for duration: Duration) async throws {
-        guard duration > .zero else { return }
+        guard duration > .zero else {
+            noteSleep(didSuspend: false)
+            return
+        }
         let (deadline, id): (Duration, UInt64) = lock.withLock {
             nextWaiterID += 1
             return (elapsed + duration, nextWaiterID)
@@ -4602,6 +5183,7 @@ private final class VirtualStatisticsClock: @unchecked Sendable {
                 lock.lock()
                 if elapsed >= deadline {
                     lock.unlock()
+                    noteSleep(didSuspend: false)
                     continuation.resume()
                     return
                 }
@@ -4613,6 +5195,7 @@ private final class VirtualStatisticsClock: @unchecked Sendable {
                     )
                 )
                 lock.unlock()
+                noteSleep(didSuspend: true)
             }
         } onCancel: {
             // 취소된 대기만 깨운다. 마감 시각이 같은 대기가 여럿일 수 있으므로
@@ -4627,4 +5210,185 @@ private final class VirtualStatisticsClock: @unchecked Sendable {
             }
         }
     }
+
+    private func sleepOutcome(after previous: Int) -> Bool? {
+        lock.withLock {
+            sleepCallCount > previous ? didLastSleepSuspend : nil
+        }
+    }
+
+    /// `sleep` 호출이 접수되었음을 기록하고, 기다리던 시험을 깨운다.
+    private func noteSleep(didSuspend: Bool) {
+        let observers: [SleepObserver] = lock.withLock {
+            sleepCallCount += 1
+            didLastSleepSuspend = didSuspend
+            let pending = sleepObservers
+            sleepObservers.removeAll()
+            return pending
+        }
+        for observer in observers {
+            observer.continuation.resume()
+        }
+    }
+
+    private func resumeSleepObserver(_ id: UInt64) {
+        let matched: [SleepObserver] = lock.withLock {
+            let found = sleepObservers.filter { $0.id == id }
+            sleepObservers.removeAll { $0.id == id }
+            return found
+        }
+        for observer in matched {
+            observer.continuation.resume()
+        }
+    }
 }
+
+extension AppEnvironmentTests {
+    @MainActor
+    private struct RemoteCursorFixture {
+        let environment: AppEnvironment
+        let model: EditorSessionModel
+        let document: DocumentNode
+        let other: DocumentNode
+        let applier: LocalSyncV2SnapshotApplier
+        let originalText = "첫 문장🙂\n지난 문장\n마지막 문장"
+        let originalCursor = TextCursorState(location: 2, selectionLength: 1)
+
+        func node(_ document: DocumentNode) -> BinderNode {
+            BinderNode(id: document.id, projectID: document.projectID, kind: .text,
+                relativePath: document.relativePath, displayName: document.relativePath.rawValue,
+                fixedCategory: nil, userOrder: document.userOrder, contentState: .written, isExpanded: false)
+        }
+
+        func applyRemote(_ content: String, path: String? = nil, revision: Int64 = 1) async throws {
+            let snapshot = SyncV2RemoteDocumentSnapshot(documentID: document.id.rawValue,
+                relativePath: path ?? document.relativePath.rawValue, content: content, revision: revision,
+                isDeleted: false, deletedAt: nil, updatedAt: Date())
+            try await applier.apply(localProjectID: document.projectID, snapshot: snapshot)
+            await applier.finish(localProjectID: document.projectID, documentID: document.id.rawValue)
+            _ = model.applyRemoteSnapshotIfClean(documentID: document.id, content: content, relativePath: snapshot.relativePath)
+        }
+    }
+
+    @MainActor
+    private func remoteCursorFixture() async throws -> RemoteCursorFixture {
+        let environment = try AppEnvironment.testing()
+        let project = try await environment.projectManager.createProject(named: "원격 본문 커서")
+        _ = try await environment.binderRepository.rootNodes(in: project.id)
+        _ = try await environment.binderCommands.addNewVolume(projectID: project.id)
+        let documents = try await environment.documentRepository.documents(in: project.id)
+            .filter { $0.kind == .text && $0.relativePath.rawValue.contains("/원고/") }
+            .sorted { $0.userOrder < $1.userOrder }
+        let first = try XCTUnwrap(documents.first), other = try XCTUnwrap(documents.dropFirst().first)
+        let localStore = try XCTUnwrap(environment.localDocumentStore as? LocalDocumentStore)
+        let locator = await localStore.workspaceLocator
+        let model = EditorSessionModel(documentRepository: environment.documentRepository,
+            documentStore: environment.localDocumentStore, workspaceStateRepository: environment.workspaceStateRepository)
+        let applier = LocalSyncV2SnapshotApplier(documentRepository: environment.documentRepository, workspaceLocator: locator)
+        let f = RemoteCursorFixture(environment: environment, model: model, document: first, other: other, applier: applier)
+        await model.select(f.node(first))
+        model.updateText(f.originalText)
+        let saved = await model.saveNow()
+        XCTAssertTrue(saved)
+        model.updateCursor(f.originalCursor)
+        let persisted = await model.persistSessionState()
+        XCTAssertTrue(persisted)
+        return f
+    }
+
+    @MainActor
+    func testRemoteChangedClosedDocumentReopensAtEndAndRestoresPersistedEnd() async throws {
+        let f = try await remoteCursorFixture()
+        await f.model.select(f.node(f.other))
+        let remote = f.originalText + "\nWindows에서 이어 쓴 문장👩‍💻"
+        try await f.applyRemote(remote)
+        let expected = TextCursorState(location: UInt(remote.utf16.count), selectionLength: 0)
+        let persisted = try await f.environment.workspaceStateRepository.cursor(for: f.document.id)
+        XCTAssertEqual(persisted, expected)
+        await f.model.select(f.node(f.document))
+        XCTAssertEqual(f.model.currentText, remote)
+        XCTAssertEqual(f.model.cursor, expected, "닫힌 문서의 예전 세션 커서가 끝 위치를 덮어서는 안 된다")
+        let restarted = EditorSessionModel(documentRepository: f.environment.documentRepository,
+            documentStore: f.environment.localDocumentStore, workspaceStateRepository: f.environment.workspaceStateRepository)
+        await restarted.restore(documentID: f.document.id, cursor: persisted)
+        XCTAssertEqual(restarted.cursor, expected)
+    }
+
+    @MainActor
+    func testUnchangedRemoteBodyAndRenamePreserveClosedDocumentCursor() async throws {
+        let f = try await remoteCursorFixture()
+        await f.model.select(f.node(f.other))
+        let renamedPath = (f.document.relativePath.rawValue as NSString).deletingLastPathComponent + "/이름만 변경.txt"
+        try await f.applyRemote(f.originalText, path: renamedPath, revision: 2)
+        let persisted = try await f.environment.workspaceStateRepository.cursor(for: f.document.id)
+        XCTAssertEqual(persisted, f.originalCursor)
+        await f.model.select(f.node(f.document))
+        XCTAssertEqual(f.model.cursor, f.originalCursor)
+        let restarted = EditorSessionModel(documentRepository: f.environment.documentRepository,
+            documentStore: f.environment.localDocumentStore, workspaceStateRepository: f.environment.workspaceStateRepository)
+        await restarted.restore(documentID: f.document.id, cursor: persisted)
+        XCTAssertEqual(restarted.cursor, f.originalCursor)
+    }
+
+    @MainActor
+    func testChangedOpenRemoteBodyMovesToUTF16EndOnlyOnce() async throws {
+        for content in ["새 문장🙂\n끝", "짧음", "", "다른 문장🙂\n지난 문장\n마지막 문장"] {
+            let f = try await remoteCursorFixture()
+            let navigation = f.model.selectionNavigationRequest
+            try await f.applyRemote(content)
+            XCTAssertEqual(f.model.cursor, TextCursorState(location: UInt(content.utf16.count), selectionLength: 0))
+            XCTAssertEqual(f.model.selectionNavigationRequest, navigation + 1)
+            XCTAssertFalse(f.model.hasUnsavedChanges)
+            let chosen = TextCursorState(location: UInt(min(1, content.utf16.count)), selectionLength: 0)
+            f.model.updateCursor(chosen)
+            let persisted = await f.model.persistSessionState()
+            XCTAssertTrue(persisted)
+            try await f.applyRemote(content, revision: 2)
+            XCTAssertEqual(f.model.cursor, chosen, "같은 본문 재조회는 사용자가 옮긴 커서를 되돌리면 안 된다")
+            XCTAssertEqual(f.model.selectionNavigationRequest, navigation + 1)
+            await f.model.select(f.node(f.other))
+            await f.model.select(f.node(f.document))
+            XCTAssertEqual(f.model.cursor, chosen)
+        }
+    }
+
+    @MainActor
+    func testLocalSaveEchoPreservesClosedDocumentCursor() async throws {
+        let f = try await remoteCursorFixture()
+        let localEdit = f.originalText + "\niPad에서 저장한 문장"
+        f.model.updateText(localEdit)
+        f.model.updateCursor(f.originalCursor)
+        let saved = await f.model.saveNow()
+        XCTAssertTrue(saved)
+        await f.model.select(f.node(f.other))
+        try await f.applyRemote(localEdit)
+        await f.model.select(f.node(f.document))
+        XCTAssertEqual(f.model.cursor, f.originalCursor, "자신의 저장이 서버에서 돌아온 경우는 원격 본문 변경이 아니다")
+    }
+}
+
+
+#if WRITERPAD_RECEIVE_VALIDATION
+final class ReceiveValidationBuildSelectionTests: XCTestCase {
+    func testFreshCompiledProcessWithGlobalAndGateTrueDoesNotStartCloudWork() async throws {
+        let policy = ReceiveValidationPolicy.built
+        XCTAssertTrue(policy.enabled)
+        XCTAssertFalse(policy.sendingAllowed)
+        XCTAssertThrowsError(try policy.authorization())
+        let defaults = UserDefaults(suiteName: "receive-guard-synthetic-" + UUID().uuidString)!
+        defaults.set(true, forKey: GlobalSyncPreference.storageKey)
+        let project = ProjectID(rawValue: UUID())
+        ContractPathGate.setOpen(true, for: project, in: defaults)
+        XCTAssertTrue(ContractPathGate.isOpen(for: project, in: defaults))
+        XCTAssertFalse(GlobalSyncPreference.isEnabled(in: defaults))
+        XCTAssertTrue(defaults.bool(forKey: GlobalSyncPreference.storageKey))
+        let authentication = CloudStartupAuthenticationSpy()
+        let identity = CloudStartupDeviceIdentitySpy()
+        await WriterPadCloudStartup.start(syncEnabled: true, authenticationService: authentication,
+            deviceIdentityService: identity, syncDispatcher: nil, backgroundSyncCoordinator: nil)
+        let restores = await authentication.restoreCallCount(), prepares = await identity.prepareCallCount()
+        XCTAssertEqual([restores, prepares], [0, 0])
+        print("ReceiveGuard independent process context: " + policy.process.uuidString)
+    }
+}
+#endif

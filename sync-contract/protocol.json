@@ -1,6 +1,6 @@
 {
   "$schema": "./protocol.schema.json",
-  "contract_version": "0.3.0",
+  "contract_version": "0.2.0",
   "contract_status": "released",
   "canonicalization": {
     "standard": "RFC 8785",
@@ -61,7 +61,7 @@
         "immutable_batch_contract_metadata",
         "operation_attempt_history",
         "operation_state_events",
-        "storage_name_v2",
+        "storage_name_v1",
         "document_commit_v1"
       ],
       "required_server_capabilities": [
@@ -71,7 +71,7 @@
         "folder_tombstones",
         "id_tree_validation",
         "legacy_epoch_zero_adapter",
-        "storage_name_v2",
+        "storage_name_v1",
         "document_commit_v1"
       ],
       "batch_requirement": "required",
@@ -120,11 +120,6 @@
       "scope": "structure",
       "meaning": "Storage-name collision keys use Unicode 15.0.0 NFKC_Casefold and the storage-name-v1 rejection rules."
     },
-    "storage_name_v2": {
-      "since_protocol": 3,
-      "scope": "structure",
-      "meaning": "Storage-name collision keys use frozen assignment, exclusion, and casefold tables plus the storage-name-v2 rejection rules."
-    },
     "document_commit_v1": {
       "since_protocol": 3,
       "scope": "content",
@@ -159,10 +154,6 @@
     "storage_name_v1": {
       "since_protocol": 3,
       "meaning": "The server computes and compares the same storage-name-v1 UTF-8 collision key as clients."
-    },
-    "storage_name_v2": {
-      "since_protocol": 3,
-      "meaning": "The server computes and compares the same frozen-table storage-name-v2 UTF-8 collision key as clients."
     },
     "document_commit_v1": {
       "since_protocol": 3,
@@ -458,7 +449,7 @@
       "Folder parent relationships are acyclic.",
       "Every tombstone retains entity identity and a monotonic revision.",
       "Every ID-based tree reference resolves exactly once.",
-      "No live siblings share the same storage-name-v2 UTF-8 collision key."
+      "No live siblings share the same storage-name-v1 UTF-8 collision key."
     ]
   },
   "minimum_write_protocol": {
@@ -571,34 +562,24 @@
     "structure_barrier_rule": "Except for create, document_commit never changes name, parent_folder_id, or structure_revision. A stale structure_revision is rejected with STRUCTURE_REVISION_CONFLICT."
   },
   "storage_name_normalization": {
-    "algorithm_id": "storage-name-v2",
-    "baseline_unicode_version": "14.0.0",
-    "tables": {
-      "assigned_baseline": "unicode/assigned-baseline-14.0.0.json",
-      "excluded_scalars": "unicode/excluded-scalars.json",
-      "casefold": "unicode/casefold-15.0.0.json"
-    },
+    "algorithm_id": "storage-name-v1",
+    "unicode_version": "15.0.0",
     "input_scope": "one folder or file name segment, never a path",
     "steps": [
-      "Reject any input scalar not covered by assigned-baseline-14.0.0.json with STORAGE_NAME_UNASSIGNED.",
-      "Reject any input scalar covered by excluded-scalars.json with STORAGE_NAME_UNSUPPORTED_SCALAR.",
-      "Before normalization, reject a supplementary-plane scalar immediately followed by a scalar whose canonical combining class is nonzero, or by U+FF9E or U+FF9F, with STORAGE_NAME_INVALID.",
-      "Apply Unicode Normalization Form KC.",
-      "Apply full default case folding per scalar using casefold-15.0.0.json, without locale.",
+      "Reject U+0000, U+0001 through U+001F, U+007F, slash, and backslash.",
+      "Apply Unicode Normalization Form KC using Unicode 15.0.0.",
+      "Apply Unicode 15.0.0 Default Case Folding without locale.",
       "Apply Unicode Normalization Form KC again.",
-      "Reject U+0000 through U+001F, U+007F, slash, and backslash in the normalized result with STORAGE_NAME_INVALID.",
-      "Defensively reject any normalized-result scalar not covered by assigned-baseline-14.0.0.json with STORAGE_NAME_UNASSIGNED.",
       "Remove every trailing U+0020 SPACE or U+002E FULL STOP.",
-      "Reject an empty result, dot, or dot-dot with STORAGE_NAME_INVALID.",
-      "Take the substring before the first U+002E FULL STOP and reject Windows device basenames CON, PRN, AUX, NUL, COM1 through COM9, and LPT1 through LPT9 with STORAGE_NAME_RESERVED.",
+      "Reject an empty result, dot, or dot-dot.",
+      "Take the substring before the first U+002E FULL STOP and reject Windows device basenames CON, PRN, AUX, NUL, COM1 through COM9, and LPT1 through LPT9.",
       "Encode the remaining string as UTF-8; these exact bytes are the sibling collision key."
     ],
-    "separator_policy": "Separators are rejected, not rewritten. The check runs after normalization so scalars that normalize into a separator are also rejected.",
-    "runtime_unicode_policy": "Assignment, exclusion, and case folding use only the frozen contract tables. Platform NFKC is bounded by the pre-normalization adjacency rejection and the defensive post-normalization baseline check.",
+    "separator_policy": "Separators are rejected, not rewritten.",
     "leading_space_policy": "Leading U+0020 is preserved.",
     "internal_space_policy": "Internal Unicode whitespace is preserved subject to NFKC_Casefold.",
     "comparison_policy": "Compare collision-key UTF-8 bytes for exact equality.",
-    "conformance_vectors": "conformance_vectors/storage-name-v2.json"
+    "conformance_vectors": "conformance_vectors/storage-name-v1.json"
   },
   "legacy_migration": {
     "legacy_provenance_kind": "LEGACY_EPOCH_0",
@@ -640,8 +621,6 @@
     "PATH_CONFLICT",
     "STORAGE_NAME_INVALID",
     "STORAGE_NAME_RESERVED",
-    "STORAGE_NAME_UNASSIGNED",
-    "STORAGE_NAME_UNSUPPORTED_SCALAR",
     "CONTENT_DIGEST_MISMATCH",
     "CONTENT_SIZE_MISMATCH",
     "STRUCTURE_REVISION_CONFLICT",
@@ -699,7 +678,7 @@
     },
     {
       "id": "INV-012",
-      "rule": "Sibling storage-name collisions are decided only by exact storage-name-v2 UTF-8 collision-key equality."
+      "rule": "Sibling storage-name collisions are decided only by exact storage-name-v1 UTF-8 collision-key equality."
     },
     {
       "id": "INV-013",

@@ -7,7 +7,9 @@ enum ProjectManagerError: Error, Equatable, LocalizedError, Sendable {
     case deletionAlreadyRequested(ProjectID)
     case deletionNotRequested(ProjectID)
     case projectAlreadyInDeletedList(ProjectID)
+    case projectNameInDeletedList(String)
     case projectNotInDeletedList(ProjectID)
+    case projectAlreadyExists(ProjectID)
     case staleDeletionConfirmation
     case recoveryRequired(String)
     case injectedFailure(recoveryPending: Bool)
@@ -26,8 +28,12 @@ enum ProjectManagerError: Error, Equatable, LocalizedError, Sendable {
             "삭제 대기 중인 작품만 삭제 목록으로 옮길 수 있습니다: \(id.rawValue.uuidString)"
         case let .projectAlreadyInDeletedList(id):
             "이미 삭제 목록에 있는 작품입니다: \(id.rawValue.uuidString)"
+        case .projectNameInDeletedList:
+            "삭제 목록에 같은 이름의 작품이 존재합니다."
         case let .projectNotInDeletedList(id):
             "삭제 목록에 있는 작품만 영구 삭제할 수 있습니다: \(id.rawValue.uuidString)"
+        case let .projectAlreadyExists(id):
+            "같은 UUID의 작품이 이미 존재하여 복원하지 않았습니다: \(id.rawValue.uuidString)"
         case .staleDeletionConfirmation:
             "작품 정보가 바뀌어 삭제 확인을 다시 받아야 합니다."
         case let .recoveryRequired(path):
@@ -41,11 +47,17 @@ enum ProjectManagerError: Error, Equatable, LocalizedError, Sendable {
 }
 
 enum ProjectManagerFaultPoint: Equatable, Sendable {
+    case afterCreationJournalWrite
     case afterStaging
     case afterMetadataSave
     case afterFileMove
     case afterProjectQuarantine
     case afterProjectMetadataRemoval
+    case afterRestoreJournalWrite
+    case afterRestorePackageCopy
+    case afterRestoreStaging
+    case afterRestoreMetadataSave
+    case afterRestoreFileMove
 }
 
 struct ProjectManagerFaultPlan: Equatable, Sendable {
@@ -79,6 +91,7 @@ private struct ProjectTransactionJournal: Codable {
         case create
         case rename
         case delete
+        case restoreBackup = "restore_backup"
     }
 
     enum Phase: String, Codable {
@@ -95,6 +108,9 @@ private struct ProjectTransactionJournal: Codable {
     let oldProject: Project?
     let newProject: Project
     let stagingFolderName: String?
+    let standardNodes: [DocumentNode]?
+    let backupPackageFolderName: String?
+    let backupManifest: ProjectBackupManifest?
 
     private enum CodingKeys: String, CodingKey {
         case transactionID = "transaction_id"
@@ -103,36 +119,73 @@ private struct ProjectTransactionJournal: Codable {
         case oldProject = "old_project"
         case newProject = "new_project"
         case stagingFolderName = "staging_folder_name"
+        case standardNodes = "standard_nodes"
+        case backupPackageFolderName = "backup_package_folder_name"
+        case backupManifest = "backup_manifest"
+    }
+
+    init(
+        transactionID: UUID,
+        kind: Kind,
+        phase: Phase,
+        oldProject: Project?,
+        newProject: Project,
+        stagingFolderName: String?,
+        standardNodes: [DocumentNode]?,
+        backupPackageFolderName: String? = nil,
+        backupManifest: ProjectBackupManifest? = nil
+    ) {
+        self.transactionID = transactionID
+        self.kind = kind
+        self.phase = phase
+        self.oldProject = oldProject
+        self.newProject = newProject
+        self.stagingFolderName = stagingFolderName
+        self.standardNodes = standardNodes
+        self.backupPackageFolderName = backupPackageFolderName
+        self.backupManifest = backupManifest
     }
 }
 
+private struct ProjectBackupRestorePlan: Equatable {
+    let project: Project
+    let nodes: [DocumentNode]
+}
+
 /// 작품 폴더와 SwiftData 메타데이터 사이의 다단계 작업을 직렬화하고 복구한다.
-actor LocalProjectManager: ProjectManaging {
+actor LocalProjectManager: ProjectManaging, ServerProjectReceiving {
+    nonisolated let contractLifecycleEpoch = SyncV2ContractEpoch()
     private static let catalogFileName = ".writerpad-project-catalog.json"
     private static let journalPrefix = ".writerpad-project-transaction-"
     private static let journalSuffix = ".json"
 
     private let projectRepository: any ProjectRepository
+    private let creationMetadataStore: any ProjectCreationMetadataStoring
     private let workspaceStateRepository: any WorkspaceStateRepository
     private let pathResolver: ProjectPathResolver
     private let clock: any AppClock
     private let fileManager: FileManager
     private let faultPlan: ProjectManagerFaultPlan?
+    private let projectBackupStore: ProjectBackupStore
 
     init(
         projectRepository: any ProjectRepository,
+        creationMetadataStore: any ProjectCreationMetadataStoring,
         workspaceStateRepository: any WorkspaceStateRepository,
         pathResolver: ProjectPathResolver,
         clock: any AppClock,
         fileManager: FileManager = .default,
-        faultPlan: ProjectManagerFaultPlan? = nil
+        faultPlan: ProjectManagerFaultPlan? = nil,
+        projectBackupStore: ProjectBackupStore = ProjectBackupStore()
     ) {
         self.projectRepository = projectRepository
+        self.creationMetadataStore = creationMetadataStore
         self.workspaceStateRepository = workspaceStateRepository
         self.pathResolver = pathResolver
         self.clock = clock
         self.fileManager = fileManager
         self.faultPlan = faultPlan
+        self.projectBackupStore = projectBackupStore
     }
 
     func projects() async throws -> [ManagedProject] {
@@ -150,7 +203,11 @@ actor LocalProjectManager: ProjectManaging {
             named: name,
             existingProjects: existingProjects
         ) {
-            return try await requireManagedProject(id: existing.id)
+            let managed = try await requireManagedProject(id: existing.id)
+            if managed.isInDeletedList {
+                throw ProjectManagerError.projectNameInDeletedList(name)
+            }
+            return managed
         }
         try validateFilesystemNameIsAvailable(name, excluding: nil)
 
@@ -161,6 +218,7 @@ actor LocalProjectManager: ProjectManaging {
             createdAt: now,
             modifiedAt: now
         )
+        let standardNodes = makeStandardNodes(projectID: project.id, at: now)
         let transactionID = UUID()
         let stagingFolderName = ".writerpad-create-\(transactionID.uuidString).tmp"
         let stagingURL = pathResolver.projectsRootURL
@@ -172,19 +230,24 @@ actor LocalProjectManager: ProjectManaging {
             phase: .staged,
             oldProject: nil,
             newProject: project,
-            stagingFolderName: stagingFolderName
+            stagingFolderName: stagingFolderName,
+            standardNodes: standardNodes
         )
         let journalURL = transactionJournalURL(transactionID)
 
         do {
+            try writeJournal(journal, to: journalURL)
+            try inject(.afterCreationJournalWrite)
             _ = try pathResolver.createStandardStructure(
                 atProjectContainer: stagingURL,
                 projectName: name
             )
-            try writeJournal(journal, to: journalURL)
             try inject(.afterStaging)
 
-            try await projectRepository.save(project)
+            try await creationMetadataStore.saveProjectCreation(
+                project,
+                standardNodes: standardNodes
+            )
             journal.phase = .metadataSaved
             try writeJournal(journal, to: journalURL)
             try inject(.afterMetadataSave)
@@ -219,6 +282,116 @@ actor LocalProjectManager: ProjectManaging {
                 journalURL: journalURL
             )
             throw error
+        }
+    }
+
+    func restoreProjectBackup(at packageURL: URL) async throws -> ManagedProject {
+        try await recoverPendingTransactions()
+        try ensureProjectsRootExists()
+
+        return try await withSecurityScopedAccess(to: packageURL) {
+            let manifest = try await projectBackupStore.validatedManifest(at: packageURL)
+            let now = clock.now()
+            let plan = try makeRestorePlan(manifest: manifest, at: now)
+            guard try await projectRepository.project(id: plan.project.id) == nil else {
+                throw ProjectManagerError.projectAlreadyExists(plan.project.id)
+            }
+            try validateFilesystemNameIsAvailable(plan.project.name, excluding: nil)
+
+            let transactionID = UUID()
+            let stagingFolderName = ".writerpad-restore-\(transactionID.uuidString).tmp"
+            let packageFolderName = ".writerpad-restore-\(transactionID.uuidString).package"
+            let stagingURL = pathResolver.projectsRootURL.appendingPathComponent(
+                stagingFolderName,
+                isDirectory: true
+            )
+            let stagedPackageURL = pathResolver.projectsRootURL.appendingPathComponent(
+                packageFolderName,
+                isDirectory: true
+            )
+            let finalURL = try pathResolver.standardPaths(
+                forProjectNamed: plan.project.name
+            ).projectContainerURL
+            var journal = ProjectTransactionJournal(
+                transactionID: transactionID,
+                kind: .restoreBackup,
+                phase: .staged,
+                oldProject: nil,
+                newProject: plan.project,
+                stagingFolderName: stagingFolderName,
+                standardNodes: plan.nodes,
+                backupPackageFolderName: packageFolderName,
+                backupManifest: manifest
+            )
+            let journalURL = transactionJournalURL(transactionID)
+
+            do {
+                try writeJournal(journal, to: journalURL)
+                try inject(.afterRestoreJournalWrite)
+                try fileManager.copyItem(at: packageURL, to: stagedPackageURL)
+                let stagedManifest = try await projectBackupStore.validatedManifest(
+                    at: stagedPackageURL
+                )
+                guard stagedManifest == manifest else {
+                    throw ProjectBackupError.invalidManifest(
+                        "앱 내부 staging 복사본이 원본 manifest와 다릅니다."
+                    )
+                }
+                try inject(.afterRestorePackageCopy)
+
+                try materializeRestorePlan(
+                    plan,
+                    packageURL: stagedPackageURL,
+                    stagingURL: stagingURL
+                )
+                try verifyRestoredProject(plan, manifest: manifest, at: stagingURL)
+                try inject(.afterRestoreStaging)
+
+                try await creationMetadataStore.saveProjectCreation(
+                    plan.project,
+                    standardNodes: plan.nodes
+                )
+                journal.phase = .metadataSaved
+                try writeJournal(journal, to: journalURL)
+                try inject(.afterRestoreMetadataSave)
+
+                try fileManager.moveItem(at: stagingURL, to: finalURL)
+                journal.phase = .fileMoved
+                try writeJournal(journal, to: journalURL)
+                try verifyRestoredProject(plan, manifest: manifest, at: finalURL)
+                try inject(.afterRestoreFileMove)
+
+                var catalog = try loadCatalog()
+                appendCatalogEntryIfNeeded(for: plan.project.id, to: &catalog)
+                try saveCatalog(catalog)
+                try await workspaceStateRepository.setLastProjectID(plan.project.id)
+                try removeIfExists(stagedPackageURL)
+                try removeIfExists(journalURL)
+                return try await requireManagedProject(id: plan.project.id)
+            } catch let error as ProjectManagerError {
+                if case .injectedFailure(recoveryPending: true) = error {
+                    throw error
+                }
+                try await rollbackRestoration(
+                    plan: plan,
+                    manifest: manifest,
+                    packageURL: stagedPackageURL,
+                    stagingURL: stagingURL,
+                    finalURL: finalURL,
+                    journalURL: journalURL
+                )
+                throw error
+            } catch {
+                try await rollbackRestoration(
+                    plan: plan,
+                    manifest: manifest,
+                    packageURL: stagedPackageURL,
+                    stagingURL: stagingURL,
+                    finalURL: finalURL,
+                    journalURL: journalURL
+                )
+                throw error
+            }
         }
     }
 
@@ -268,6 +441,9 @@ actor LocalProjectManager: ProjectManaging {
         }
         try validateFilesystemNameIsAvailable(newName, excluding: oldProject.name)
 
+        guard try !ReceivePromotionTransaction.pendingProjectIDs(
+            at: pathResolver.projectsRootURL, fileManager: fileManager
+        ).contains(id) else { throw ProjectManagerError.missingProject(id) }
         let oldURL = try pathResolver.standardPaths(
             forProjectNamed: oldProject.name
         ).projectContainerURL
@@ -285,7 +461,8 @@ actor LocalProjectManager: ProjectManaging {
             phase: .staged,
             oldProject: oldProject,
             newProject: renamed,
-            stagingFolderName: nil
+            stagingFolderName: nil,
+            standardNodes: nil
         )
         let journalURL = transactionJournalURL(transactionID)
 
@@ -327,7 +504,6 @@ actor LocalProjectManager: ProjectManaging {
     }
 
     func reorderProjects(_ orderedIDs: [ProjectID]) async throws -> [ManagedProject] {
-        var catalog = try loadCatalog()
         let managed = try await managedProjectsWithoutRecovery()
         let visibleIDs = Set(managed.filter { !$0.isInDeletedList }.map(\.id))
         guard orderedIDs.count == visibleIDs.count,
@@ -335,6 +511,8 @@ actor LocalProjectManager: ProjectManaging {
         else {
             throw ProjectManagerError.invalidOrder
         }
+        // Keep entries reserved by publication while the metadata read awaited.
+        var catalog = try loadCatalog()
         for (index, id) in orderedIDs.enumerated() {
             guard let entryIndex = catalog.entries.firstIndex(
                 where: { $0.projectID == id }
@@ -362,6 +540,10 @@ actor LocalProjectManager: ProjectManaging {
     }
 
     func confirmDeletion(_ confirmation: ProjectDeletionConfirmation) async throws {
+        // 삭제/복원 도중의 늦은 활성 상태 읽기로 계약 송신을 승인하지 않는다.
+        contractLifecycleEpoch.beginTransition()
+        defer { contractLifecycleEpoch.endTransition() }
+
         let managed = try await requireManagedProject(id: confirmation.projectID)
         guard managed.name == confirmation.expectedName else {
             throw ProjectManagerError.staleDeletionConfirmation
@@ -388,6 +570,10 @@ actor LocalProjectManager: ProjectManaging {
     }
 
     func cancelDeletion(id: ProjectID) async throws {
+        // 삭제/복원 도중의 늦은 활성 상태 읽기로 계약 송신을 승인하지 않는다.
+        contractLifecycleEpoch.beginTransition()
+        defer { contractLifecycleEpoch.endTransition() }
+
         let managed = try await requireManagedProject(id: id)
         guard managed.isDeletionRequested else {
             throw ProjectManagerError.deletionNotRequested(id)
@@ -420,6 +606,10 @@ actor LocalProjectManager: ProjectManaging {
     func moveToDeletedList(
         _ confirmation: ProjectDeletedListConfirmation
     ) async throws -> ManagedProject? {
+        // 삭제/복원 도중의 늦은 활성 상태 읽기로 계약 송신을 승인하지 않는다.
+        contractLifecycleEpoch.beginTransition()
+        defer { contractLifecycleEpoch.endTransition() }
+
         let managed = try await requireManagedProject(id: confirmation.projectID)
         guard managed.name == confirmation.expectedName else {
             throw ProjectManagerError.staleDeletionConfirmation
@@ -445,6 +635,10 @@ actor LocalProjectManager: ProjectManaging {
     }
 
     func restoreFromDeletedList(id: ProjectID) async throws {
+        // 삭제/복원 도중의 늦은 활성 상태 읽기로 계약 송신을 승인하지 않는다.
+        contractLifecycleEpoch.beginTransition()
+        defer { contractLifecycleEpoch.endTransition() }
+
         let managed = try await requireManagedProject(id: id)
         guard managed.isInDeletedList else {
             throw ProjectManagerError.projectNotInDeletedList(id)
@@ -480,6 +674,10 @@ actor LocalProjectManager: ProjectManaging {
     func permanentlyDelete(
         _ confirmation: ProjectPermanentDeletionConfirmation
     ) async throws -> ManagedProject? {
+        // 삭제/복원 도중의 늦은 활성 상태 읽기로 계약 송신을 승인하지 않는다.
+        contractLifecycleEpoch.beginTransition()
+        defer { contractLifecycleEpoch.endTransition() }
+
         let managed = try await requireManagedProject(id: confirmation.projectID)
         guard managed.name == confirmation.expectedName else {
             throw ProjectManagerError.staleDeletionConfirmation
@@ -509,7 +707,8 @@ actor LocalProjectManager: ProjectManaging {
             phase: .staged,
             oldProject: nil,
             newProject: project,
-            stagingFolderName: quarantineFolderName
+            stagingFolderName: quarantineFolderName,
+            standardNodes: nil
         )
         let journalURL = transactionJournalURL(transactionID)
 
@@ -548,6 +747,7 @@ actor LocalProjectManager: ProjectManaging {
     }
 
     func recoverPendingTransactions() async throws {
+        guard ReceiveValidationPolicy.current.sendingAllowed else { return }
         guard fileManager.fileExists(atPath: pathResolver.projectsRootURL.path) else {
             return
         }
@@ -576,8 +776,127 @@ actor LocalProjectManager: ProjectManaging {
                 try await recoverRename(journal, journalURL: url)
             case .delete:
                 try await recoverPermanentDeletion(journal, journalURL: url)
+            case .restoreBackup:
+                try await recoverBackupRestoration(journal, journalURL: url)
             }
         }
+    }
+
+    private func recoverBackupRestoration(
+        _ journal: ProjectTransactionJournal,
+        journalURL: URL
+    ) async throws {
+        guard let stagingFolderName = journal.stagingFolderName,
+              let packageFolderName = journal.backupPackageFolderName,
+              let manifest = journal.backupManifest,
+              let expectedNodes = journal.standardNodes
+        else {
+            throw ProjectManagerError.recoveryRequired(journalURL.path)
+        }
+        let project = journal.newProject
+        let plan = try makeRestorePlan(manifest: manifest, at: project.createdAt)
+        guard plan.project == project, plan.nodes == expectedNodes else {
+            throw ProjectManagerError.recoveryRequired(journalURL.path)
+        }
+
+        let stagingURL = pathResolver.projectsRootURL.appendingPathComponent(
+            stagingFolderName,
+            isDirectory: true
+        )
+        let packageURL = pathResolver.projectsRootURL.appendingPathComponent(
+            packageFolderName,
+            isDirectory: true
+        )
+        let finalURL = try pathResolver.standardPaths(
+            forProjectNamed: project.name
+        ).projectContainerURL
+        var hasStaging = fileManager.fileExists(atPath: stagingURL.path)
+        let hasFinal = fileManager.fileExists(atPath: finalURL.path)
+        guard !(hasStaging && hasFinal) else {
+            throw ProjectManagerError.recoveryRequired(journalURL.path)
+        }
+
+        if hasFinal {
+            try verifyRestoredProject(plan, manifest: manifest, at: finalURL)
+        } else {
+            if hasStaging {
+                do {
+                    try verifyRestoredProject(plan, manifest: manifest, at: stagingURL)
+                } catch {
+                    guard try await projectRepository.project(id: project.id) == nil,
+                          fileManager.fileExists(atPath: packageURL.path)
+                    else {
+                        throw ProjectManagerError.recoveryRequired(journalURL.path)
+                    }
+                    let stagedManifest = try await projectBackupStore.validatedManifest(
+                        at: packageURL
+                    )
+                    guard stagedManifest == manifest else {
+                        throw ProjectManagerError.recoveryRequired(journalURL.path)
+                    }
+                    try removeIfExists(stagingURL)
+                    try materializeRestorePlan(
+                        plan,
+                        packageURL: packageURL,
+                        stagingURL: stagingURL
+                    )
+                    hasStaging = true
+                }
+            }
+            if !hasStaging {
+                guard fileManager.fileExists(atPath: packageURL.path) else {
+                    try await rollbackRestoration(
+                        plan: plan,
+                        manifest: manifest,
+                        packageURL: packageURL,
+                        stagingURL: stagingURL,
+                        finalURL: finalURL,
+                        journalURL: journalURL
+                    )
+                    return
+                }
+                do {
+                    let stagedManifest = try await projectBackupStore.validatedManifest(
+                        at: packageURL
+                    )
+                    guard stagedManifest == manifest else {
+                        throw ProjectBackupError.invalidManifest("복구 staging manifest 불일치")
+                    }
+                    try materializeRestorePlan(
+                        plan,
+                        packageURL: packageURL,
+                        stagingURL: stagingURL
+                    )
+                } catch {
+                    try await rollbackRestoration(
+                        plan: plan,
+                        manifest: manifest,
+                        packageURL: packageURL,
+                        stagingURL: stagingURL,
+                        finalURL: finalURL,
+                        journalURL: journalURL
+                    )
+                    return
+                }
+            }
+            try verifyRestoredProject(plan, manifest: manifest, at: stagingURL)
+            try await creationMetadataStore.saveProjectCreation(
+                project,
+                standardNodes: plan.nodes
+            )
+            try fileManager.moveItem(at: stagingURL, to: finalURL)
+        }
+
+        try await creationMetadataStore.saveProjectCreation(
+            project,
+            standardNodes: plan.nodes
+        )
+        var catalog = try loadCatalog()
+        appendCatalogEntryIfNeeded(for: project.id, to: &catalog)
+        try saveCatalog(catalog)
+        try await workspaceStateRepository.setLastProjectID(project.id)
+        try removeIfExists(packageURL)
+        try removeIfExists(journalURL)
     }
 
     private func recoverCreation(
@@ -596,28 +915,67 @@ actor LocalProjectManager: ProjectManaging {
         let hasStaging = fileManager.fileExists(atPath: stagingURL.path)
         let hasFinal = fileManager.fileExists(atPath: finalURL.path)
         let hasMetadata = try await projectRepository.project(id: project.id) != nil
-
+        guard let standardNodes = journal.standardNodes, !standardNodes.isEmpty,
+              !(hasStaging && hasFinal)
+        else {
+            throw ProjectManagerError.recoveryRequired(journalURL.path)
+        }
         if hasFinal {
-            if hasStaging { try removeIfExists(stagingURL) }
-            if !hasMetadata { try await projectRepository.save(project) }
-            var catalog = try loadCatalog()
-            appendCatalogEntryIfNeeded(for: project.id, to: &catalog)
-            try saveCatalog(catalog)
-            try removeIfExists(journalURL)
-            return
-        }
-        if hasStaging, hasMetadata {
+            guard hasMetadata else {
+                throw ProjectManagerError.recoveryRequired(journalURL.path)
+            }
+            try await creationMetadataStore.saveProjectCreation(
+                project,
+                standardNodes: standardNodes
+            )
+        } else {
+            if !hasStaging {
+                _ = try pathResolver.createStandardStructure(
+                    atProjectContainer: stagingURL,
+                    projectName: project.name
+                )
+            }
+            try await creationMetadataStore.saveProjectCreation(
+                project,
+                standardNodes: standardNodes
+            )
             try fileManager.moveItem(at: stagingURL, to: finalURL)
-            var catalog = try loadCatalog()
-            appendCatalogEntryIfNeeded(for: project.id, to: &catalog)
-            try saveCatalog(catalog)
-            try removeIfExists(journalURL)
-            return
         }
-        if hasStaging { try removeIfExists(stagingURL) }
-        if hasMetadata { try await projectRepository.remove(id: project.id) }
-        try removeCatalogEntry(project.id)
+        var catalog = try loadCatalog()
+        appendCatalogEntryIfNeeded(for: project.id, to: &catalog)
+        try saveCatalog(catalog)
+        try await workspaceStateRepository.setLastProjectID(project.id)
         try removeIfExists(journalURL)
+    }
+
+    private func makeStandardNodes(
+        projectID: ProjectID,
+        at date: Date
+    ) -> [DocumentNode] {
+        let mainID = DocumentID(rawValue: UUID())
+        let main = DocumentNode(
+            id: mainID,
+            projectID: projectID,
+            kind: .folder,
+            parentID: nil,
+            relativePath: BinderHierarchyPolicy.topLevelPath,
+            userOrder: 0,
+            modifiedAt: date,
+            contentHash: nil
+        )
+        let children = BinderFixedCategory.allCases.map { category in
+            DocumentNode(
+                id: DocumentID(rawValue: UUID()),
+                projectID: projectID,
+                kind: .folder,
+                parentID: mainID,
+                relativePath: category.relativePath,
+                userOrder: category.fixedOrder,
+                modifiedAt: date,
+                contentHash: nil
+            )
+        }
+        return [main] + children
     }
 
     private func recoverRename(
@@ -704,9 +1062,22 @@ actor LocalProjectManager: ProjectManaging {
     }
 
     private func managedProjectsWithoutRecovery() async throws -> [ManagedProject] {
-        let projects = try await projectRepository.projects()
+        let promotingBeforeRead = try ReceivePromotionTransaction.pendingProjectIDs(
+            at: pathResolver.projectsRootURL, fileManager: fileManager
+        )
+        let storedProjects = try await projectRepository.projects()
+        // 메타데이터 조회 대기 중 새 수신 journal이 생겨도 공개하지 않는다.
+        let receiving = Set(try receivingJournals().map { $0.project.id })
+        let promoting = try ReceivePromotionTransaction.pendingProjectIDs(
+            at: pathResolver.projectsRootURL, fileManager: fileManager
+        ).union(promotingBeforeRead)
+        // A rollback may remove metadata and its marker while this snapshot awaits.
+        // Hide projects pending at either end of the read until the next refresh.
+        let projects = storedProjects.filter { !receiving.contains($0.id) && !promoting.contains($0.id) }
         var catalog = try loadCatalog()
-        let validIDs = Set(projects.map(\.id))
+        // Publication can have reserved a catalog slot while its marker remains.
+        // A concurrent list refresh must not remove or expose that slot.
+        let validIDs = Set(projects.map(\.id)).union(promoting)
         catalog.entries.removeAll { !validIDs.contains($0.projectID) }
         for project in projects {
             appendCatalogEntryIfNeeded(for: project.id, to: &catalog)
@@ -787,6 +1158,307 @@ actor LocalProjectManager: ProjectManaging {
             return !existing.utf8.elementsEqual(excludedName.utf8)
         }
         try pathResolver.policy.validateUniqueName(name, among: names)
+    }
+
+    private func makeRestorePlan(
+        manifest: ProjectBackupManifest,
+        at date: Date
+    ) throws -> ProjectBackupRestorePlan {
+        guard let rawProjectID = UUID(uuidString: manifest.project.uuid) else {
+            throw ProjectBackupError.invalidManifest("project.uuid")
+        }
+        let projectID = ProjectID(rawValue: rawProjectID)
+        let project = Project(
+            id: projectID,
+            name: manifest.project.title,
+            createdAt: date,
+            modifiedAt: date
+        )
+        let entriesByID = Dictionary(
+            uniqueKeysWithValues: manifest.nodes.map { ($0.uuid, $0) }
+        )
+        let roots = manifest.nodes.filter { $0.parentUUID == nil }
+        guard roots.count == 1, let mainEntry = roots.first,
+              mainEntry.kind == "folder", mainEntry.title == "메인",
+              mainEntry.order == 0
+        else {
+            throw ProjectBackupError.invalidManifest(
+                "루트는 order 0인 메인 폴더 하나여야 합니다."
+            )
+        }
+
+        var pathsByID: [String: RelativeDocumentPath] = [:]
+        var resolving: Set<String> = []
+        func resolvePath(for id: String) throws -> RelativeDocumentPath {
+            if let existing = pathsByID[id] { return existing }
+            guard let entry = entriesByID[id] else {
+                throw ProjectBackupError.invalidManifest("없는 node.uuid: \(id)")
+            }
+            guard resolving.insert(id).inserted else {
+                throw ProjectBackupError.invalidManifest("순환 parent_uuid: \(id)")
+            }
+            let storedName: String
+            if entry.kind == "document" {
+                storedName = try pathResolver.policy.textFileName(
+                    forDisplayName: entry.title
+                )
+            } else {
+                try pathResolver.policy.validateName(entry.title)
+                storedName = entry.title
+            }
+            let rawPath: String
+            if let parentUUID = entry.parentUUID {
+                let parentPath = try resolvePath(for: parentUUID)
+                rawPath = parentPath.rawValue + "/" + storedName
+            } else {
+                rawPath = storedName
+            }
+            let path = RelativeDocumentPath(rawValue: rawPath)
+            try pathResolver.policy.validateRelativePath(path)
+            resolving.remove(id)
+            pathsByID[id] = path
+            return path
+        }
+
+        for id in entriesByID.keys {
+            _ = try resolvePath(for: id)
+        }
+        var normalizedPaths: Set<String> = []
+        for (id, path) in pathsByID {
+            let key = path.rawValue.split(separator: "/").map {
+                pathResolver.policy.collisionKey(for: String($0))
+            }.joined(separator: "/")
+            guard normalizedPaths.insert(key).inserted else {
+                throw ProjectBackupError.invalidManifest(
+                    "복원 저장 이름 충돌: \(id)"
+                )
+            }
+        }
+
+        let requiredStandardPaths = Set(
+            [BinderHierarchyPolicy.topLevelPath.rawValue]
+                + BinderFixedCategory.allCases.map(\.relativePath.rawValue)
+        )
+        let folderPaths = Set(manifest.nodes.compactMap { entry in
+            entry.kind == "folder" ? pathsByID[entry.uuid]?.rawValue : nil
+        })
+        let missingStandardPaths = requiredStandardPaths.subtracting(folderPaths)
+        guard missingStandardPaths.isEmpty else {
+            throw ProjectBackupError.invalidManifest(
+                "표준 identity 노드 누락: \(missingStandardPaths.sorted().joined(separator: ", "))"
+            )
+        }
+
+        let trashPrefix = BinderFixedCategory.trash.relativePath.rawValue + "/"
+        let nodes = try manifest.nodes.map { entry -> DocumentNode in
+            guard let rawID = UUID(uuidString: entry.uuid),
+                  let path = pathsByID[entry.uuid]
+            else {
+                throw ProjectBackupError.invalidManifest("node.uuid: \(entry.uuid)")
+            }
+            let kind: DocumentKind = entry.kind == "folder" ? .folder : .text
+            let deletionStatus: DocumentDeletionStatus = path.rawValue.hasPrefix(trashPrefix)
+                ? .trashed(originalPath: path, deletedAt: date)
+                : .active
+            return DocumentNode(
+                id: DocumentID(rawValue: rawID),
+                projectID: projectID,
+                kind: kind,
+                parentID: entry.parentUUID.flatMap(UUID.init(uuidString:)).map {
+                    DocumentID(rawValue: $0)
+                },
+                relativePath: path,
+                userOrder: entry.order,
+                modifiedAt: date,
+                contentHash: entry.sha256.flatMap(ContentHash.init(rawValue:)),
+                deletionStatus: deletionStatus
+            )
+        }.sorted {
+            let leftDepth = $0.relativePath.rawValue.split(separator: "/").count
+            let rightDepth = $1.relativePath.rawValue.split(separator: "/").count
+            if leftDepth == rightDepth {
+                if $0.parentID == $1.parentID { return $0.userOrder < $1.userOrder }
+                return $0.relativePath.rawValue < $1.relativePath.rawValue
+            }
+            return leftDepth < rightDepth
+        }
+        return ProjectBackupRestorePlan(project: project, nodes: nodes)
+    }
+
+    private func materializeRestorePlan(
+        _ plan: ProjectBackupRestorePlan,
+        packageURL: URL,
+        stagingURL: URL
+    ) throws {
+        let paths = try pathResolver.createStandardStructure(
+            atProjectContainer: stagingURL,
+            projectName: plan.project.name
+        )
+        let payloadRoot = packageURL.appendingPathComponent(
+            ProjectBackupStore.workspaceDirectoryName,
+            isDirectory: true
+        )
+        for node in plan.nodes {
+            let destination = paths.workspaceRootURL.appendingPathComponent(
+                node.relativePath.rawValue,
+                isDirectory: node.kind == .folder
+            )
+            if node.kind == .folder {
+                var isDirectory: ObjCBool = false
+                if fileManager.fileExists(atPath: destination.path, isDirectory: &isDirectory) {
+                    guard isDirectory.boolValue else {
+                        throw ProjectBackupError.invalidManifest(
+                            "폴더 위치에 파일이 있습니다: \(node.relativePath.rawValue)"
+                        )
+                    }
+                } else {
+                    try fileManager.createDirectory(
+                        at: destination,
+                        withIntermediateDirectories: false
+                    )
+                }
+            } else {
+                let source = payloadRoot.appendingPathComponent(
+                    node.id.rawValue.uuidString.lowercased()
+                )
+                let data = try Data(contentsOf: source)
+                try data.write(to: destination, options: [.atomic])
+            }
+        }
+        try writeFallbackTrashRecords(for: plan.nodes, workspaceURL: paths.workspaceRootURL)
+    }
+
+    private func writeFallbackTrashRecords(
+        for nodes: [DocumentNode],
+        workspaceURL: URL
+    ) throws {
+        guard let trash = nodes.first(where: {
+            $0.relativePath == BinderFixedCategory.trash.relativePath
+        }) else { return }
+        let roots = nodes.filter { $0.parentID == trash.id }
+        let encoder = JSONEncoder()
+        encoder.dateEncodingStrategy = .iso8601
+        for node in roots {
+            let record = TrashRecord(
+                documentID: node.id,
+                originalPath: node.relativePath,
+                originalParentID: trash.id,
+                originalUserOrder: node.userOrder,
+                deletedAt: node.modifiedAt
+            )
+            let url = workspaceURL.appendingPathComponent(
+                ".writerpad-trash-" + node.id.rawValue.uuidString.lowercased() + ".json"
+            )
+            try encoder.encode(record).write(to: url, options: [.atomic])
+        }
+    }
+
+    private func verifyRestoredProject(
+        _ plan: ProjectBackupRestorePlan,
+        manifest: ProjectBackupManifest,
+        at projectContainerURL: URL
+    ) throws {
+        let workspaceURL = try pathResolver.standardPaths(
+            atProjectContainer: projectContainerURL,
+            projectName: plan.project.name
+        ).workspaceRootURL
+        let entriesByID = Dictionary(
+            uniqueKeysWithValues: manifest.nodes.map { ($0.uuid, $0) }
+        )
+        let hasher = SHA256ContentHasher()
+        for node in plan.nodes {
+            let url = workspaceURL.appendingPathComponent(
+                node.relativePath.rawValue,
+                isDirectory: node.kind == .folder
+            )
+            var isDirectory: ObjCBool = false
+            guard fileManager.fileExists(atPath: url.path, isDirectory: &isDirectory),
+                  isDirectory.boolValue == (node.kind == .folder)
+            else {
+                throw ProjectBackupError.fileVerificationFailed(
+                    node.id.rawValue.uuidString.lowercased()
+                )
+            }
+            guard node.kind == .text else { continue }
+            let id = node.id.rawValue.uuidString.lowercased()
+            guard let entry = entriesByID[id],
+                  let expectedBytes = entry.bytes,
+                  let expectedHash = entry.sha256
+            else {
+                throw ProjectBackupError.invalidDocumentEntry(id)
+            }
+            let data = try Data(contentsOf: url)
+            guard data.count == expectedBytes,
+                  hasher.sha256(for: data).rawValue == expectedHash
+            else {
+                throw ProjectBackupError.fileVerificationFailed(id)
+            }
+        }
+        if let trash = plan.nodes.first(where: {
+            $0.relativePath == BinderFixedCategory.trash.relativePath
+        }) {
+            let decoder = JSONDecoder()
+            decoder.dateDecodingStrategy = .iso8601
+            for node in plan.nodes where node.parentID == trash.id {
+                let recordURL = workspaceURL.appendingPathComponent(
+                    ".writerpad-trash-"
+                        + node.id.rawValue.uuidString.lowercased()
+                        + ".json"
+                )
+                let record = try decoder.decode(
+                    TrashRecord.self,
+                    from: Data(contentsOf: recordURL)
+                )
+                guard record.documentID == node.id,
+                      record.originalPath == node.relativePath,
+                      record.originalParentID == trash.id
+                else {
+                    throw ProjectBackupError.fileVerificationFailed(
+                        node.id.rawValue.uuidString.lowercased()
+                    )
+                }
+            }
+        }
+    }
+
+    private func rollbackRestoration(
+        plan: ProjectBackupRestorePlan,
+        manifest: ProjectBackupManifest,
+        packageURL: URL,
+        stagingURL: URL,
+        finalURL: URL,
+        journalURL: URL
+    ) async throws {
+        do {
+            if fileManager.fileExists(atPath: finalURL.path) {
+                do {
+                    try verifyRestoredProject(plan, manifest: manifest, at: finalURL)
+                } catch {
+                    throw ProjectManagerError.recoveryRequired(journalURL.path)
+                }
+            }
+            try removeIfExists(packageURL)
+            try removeIfExists(stagingURL)
+            try removeIfExists(finalURL)
+            if try await projectRepository.project(id: plan.project.id) != nil {
+                try await projectRepository.remove(id: plan.project.id)
+            }
+            try removeCatalogEntry(plan.project.id)
+            try removeIfExists(journalURL)
+        } catch {
+            throw ProjectManagerError.recoveryRequired(journalURL.path)
+        }
+    }
+
+    private func withSecurityScopedAccess<T: Sendable>(
+        to url: URL,
+        operation: () async throws -> T
+    ) async throws -> T {
+        let didStart = url.startAccessingSecurityScopedResource()
+        defer {
+            if didStart { url.stopAccessingSecurityScopedResource() }
+        }
+        return try await operation()
     }
 
     private func rollbackCreation(
@@ -907,6 +1579,175 @@ actor LocalProjectManager: ProjectManaging {
         throw ProjectManagerError.injectedFailure(
             recoveryPending: faultPlan.leavesTransactionForRecovery
         )
+    }
+}
+
+extension LocalProjectManager {
+    private static var receivingPrefix: String { ".writerpad-server-receive-" }
+    private func receivingURL(_ id: ProjectID) -> URL {
+        pathResolver.projectsRootURL.appendingPathComponent(Self.receivingPrefix + id.rawValue.uuidString.lowercased() + ".json")
+    }
+
+    func receivingJournals() throws -> [ServerReceivingJournal] {
+        guard fileManager.fileExists(atPath: pathResolver.projectsRootURL.path) else { return [] }
+        let urls = try fileManager.contentsOfDirectory(at: pathResolver.projectsRootURL,
+            includingPropertiesForKeys: [.isSymbolicLinkKey]).filter { $0.lastPathComponent.hasPrefix(Self.receivingPrefix) }
+        return try urls.map { url in
+            guard try url.resourceValues(forKeys: [.isSymbolicLinkKey]).isSymbolicLink != true,
+                  let journal = try? JSONDecoder.writerPad.decode(ServerReceivingJournal.self, from: Data(contentsOf: url)),
+                  journal.version == 1, journal.localIdentityPolicy == "server_uuid_for_new_project",
+                  journal.project.id.rawValue == journal.serverProjectID,
+                  url.lastPathComponent == receivingURL(journal.project.id).lastPathComponent,
+                  !journal.endpoint.isEmpty else { throw ServerCatalogError.interrupted }
+            try pathResolver.policy.validateName(journal.project.name)
+            return journal
+        }
+    }
+
+    func isReceiving(_ id: ProjectID) throws -> Bool {
+        try receivingJournals().contains { $0.project.id == id }
+    }
+
+    func receivedOriginMatches(_ id: ProjectID, scope: ServerCatalogScope) async throws -> Bool {
+        guard let project = try await projectRepository.project(id: id) else { return false }
+        let paths = try pathResolver.standardPaths(forProjectNamed: project.name)
+        let ownerURL = paths.projectContainerURL.appendingPathComponent(".writerpad-server-receive-owner.json")
+        // 기존 수동 binding에는 수신 표식이 없다. 그 ID나 연결을 소급 수정하지 않는다.
+        guard fileManager.fileExists(atPath: ownerURL.path) else { return true }
+        guard try paths.projectContainerURL.resourceValues(forKeys: [.isSymbolicLinkKey]).isSymbolicLink != true,
+              try ownerURL.resourceValues(forKeys: [.isSymbolicLinkKey]).isSymbolicLink != true,
+              let origin = try? JSONDecoder.writerPad.decode(ServerReceivingJournal.self, from: Data(contentsOf: ownerURL)) else {
+            return false
+        }
+        return origin.version == 1 && origin.localIdentityPolicy == "server_uuid_for_new_project"
+            && origin.project.id == id && origin.serverProjectID == id.rawValue
+            && origin.accountID == scope.accountID && origin.endpoint == scope.endpoint
+    }
+
+    func beginReceiving(_ server: ServerCatalogProject, localName: String,
+                        scope: ServerCatalogScope) async throws -> ServerReceivingJournal {
+        try ReceiveValidationPolicy.current.requireRead(account: scope.accountID, endpoint: scope.endpoint, project: server.id)
+        try await recoverPendingTransactions()
+        let journals = try receivingJournals()
+        let journal: ServerReceivingJournal
+        if let existing = journals.first(where: { $0.serverProjectID == server.id }) {
+            guard existing.accountID == scope.accountID, existing.endpoint == scope.endpoint,
+                  existing.project.name == localName else { throw ServerCatalogError.bindingConflict }
+            journal = existing
+        } else {
+            try pathResolver.policy.validateName(localName)
+            try ReceiveValidationPolicy.current.mutate { try ensureProjectsRootExists() }
+            let all = try await projectRepository.projects()
+            guard !all.contains(where: { $0.id.rawValue == server.id }),
+                  !all.contains(where: { pathResolver.policy.collisionKey(for: $0.name) == pathResolver.policy.collisionKey(for: localName) }),
+                  !journals.contains(where: { pathResolver.policy.collisionKey(for: $0.project.name) == pathResolver.policy.collisionKey(for: localName) }) else {
+                throw ServerCatalogError.bindingConflict
+            }
+            try validateFilesystemNameIsAvailable(localName, excluding: nil)
+            // journal의 ISO-8601 정밀도와 저장 메타데이터를 동일하게 고정한다.
+            let now = Date(timeIntervalSince1970: floor(clock.now().timeIntervalSince1970))
+            journal = ServerReceivingJournal(version: 1, localIdentityPolicy: "server_uuid_for_new_project", transactionID: UUID(),
+                project: Project(id: ProjectID(rawValue: server.id), name: localName, createdAt: now, modifiedAt: now),
+                serverProjectID: server.id, accountID: scope.accountID, endpoint: scope.endpoint)
+            // 디스크와 메타데이터보다 먼저 목적 UUID를 고정한다. 재개 중 새 ID를 만들지 않는다.
+            try ReceiveValidationPolicy.current.requireRead(account: scope.accountID, endpoint: scope.endpoint, project: server.id)
+            try ReceiveValidationPolicy.current.mutate { try writeAtomically(journal, to: receivingURL(journal.project.id)) }
+        }
+        let paths = try pathResolver.standardPaths(forProjectNamed: journal.project.name)
+        let ownerURL = paths.projectContainerURL.appendingPathComponent(".writerpad-server-receive-owner.json")
+        if fileManager.fileExists(atPath: paths.projectContainerURL.path) {
+            guard try paths.projectContainerURL.resourceValues(forKeys: [.isSymbolicLinkKey]).isSymbolicLink != true else {
+                throw ServerCatalogError.interrupted
+            }
+            if !fileManager.fileExists(atPath: ownerURL.path) {
+                // journal 직후 빈 디렉터리 생성 중 중단된 경우만 소유 표식을 복구한다.
+                guard try fileManager.contentsOfDirectory(atPath: paths.projectContainerURL.path).isEmpty else {
+                    throw ServerCatalogError.interrupted
+                }
+                try ReceiveValidationPolicy.current.mutate { try writeAtomically(journal, to: ownerURL) }
+            }
+        } else {
+            try ReceiveValidationPolicy.current.mutate { try fileManager.createDirectory(at: paths.projectContainerURL, withIntermediateDirectories: false) }
+            try ReceiveValidationPolicy.current.mutate { try writeAtomically(journal, to: ownerURL) }
+        }
+        guard try ownerURL.resourceValues(forKeys: [.isSymbolicLinkKey]).isSymbolicLink != true,
+              try JSONDecoder.writerPad.decode(ServerReceivingJournal.self, from: Data(contentsOf: ownerURL)) == journal else {
+            throw ServerCatalogError.interrupted
+        }
+        // 일반 신규 생성의 임의 UUID 표준 폴더를 만들지 않는다.
+        if fileManager.fileExists(atPath: paths.workspaceRootURL.path) {
+            guard try paths.workspaceRootURL.resourceValues(forKeys: [.isSymbolicLinkKey]).isSymbolicLink != true else {
+                throw ServerCatalogError.interrupted
+            }
+        }
+        try ReceiveValidationPolicy.current.mutate { try fileManager.createDirectory(at: paths.workspaceRootURL, withIntermediateDirectories: true) }
+        if let existing = try await projectRepository.project(id: journal.project.id) {
+            guard existing == journal.project else { throw ServerCatalogError.interrupted }
+        } else {
+            try ReceiveValidationPolicy.current.requireRead(account: scope.accountID, endpoint: scope.endpoint, project: server.id)
+            try await creationMetadataStore.saveProjectCreation(journal.project, standardNodes: [])
+        }
+        return journal
+    }
+
+    func validateReceiving(_ journal: ServerReceivingJournal) async throws {
+        guard try receivingJournals().contains(journal),
+              try await projectRepository.project(id: journal.project.id) == journal.project else {
+            throw ServerCatalogError.interrupted
+        }
+        let paths = try pathResolver.standardPaths(forProjectNamed: journal.project.name)
+        let ownerURL = paths.projectContainerURL.appendingPathComponent(".writerpad-server-receive-owner.json")
+        guard try paths.projectContainerURL.resourceValues(forKeys: [.isSymbolicLinkKey]).isSymbolicLink != true,
+              try paths.workspaceRootURL.resourceValues(forKeys: [.isSymbolicLinkKey]).isSymbolicLink != true,
+              try ownerURL.resourceValues(forKeys: [.isSymbolicLinkKey]).isSymbolicLink != true,
+              try JSONDecoder.writerPad.decode(ServerReceivingJournal.self, from: Data(contentsOf: ownerURL)) == journal else {
+            throw ServerCatalogError.interrupted
+        }
+    }
+
+    func finishReceiving(_ journal: ServerReceivingJournal,
+                         authorized: @Sendable () -> Bool) async throws -> ManagedProject {
+        try await validateReceiving(journal)
+        await ReceiveValidationPolicy.beforeMutation("receiver.publish")
+        var catalog = try loadCatalog()
+        appendCatalogEntryIfNeeded(for: journal.project.id, to: &catalog)
+        if ReceiveValidationPolicy.current.enabled {
+            guard authorized() else { throw ServerCatalogError.staleContext }
+            return try ReceiveValidationPolicy.current.publish(journal) {
+                try saveCatalog(catalog)
+                try fileManager.removeItem(at: receivingURL(journal.project.id))
+                let entry = catalog.entries.first { $0.projectID == journal.project.id }!
+                return ManagedProject(project: journal.project, userOrder: entry.userOrder, lifecycleState: .active)
+            }
+        }
+        try saveCatalog(catalog)
+        guard authorized() else { throw ServerCatalogError.staleContext }
+        // 마지막 journal 제거가 공개 시점이다. 그 전 실패는 항상 중단 상태로 남는다.
+        try fileManager.removeItem(at: receivingURL(journal.project.id))
+        let entry = catalog.entries.first { $0.projectID == journal.project.id }!
+        return ManagedProject(project: journal.project, userOrder: entry.userOrder, lifecycleState: .active)
+    }
+}
+
+extension LocalProjectManager: ReceivePromotionProjectPublishing {
+    func publishPromotedProject(_ project: Project) async throws -> ManagedProject {
+        try await recoverPendingTransactions()
+        guard try await projectRepository.project(id: project.id) == project else {
+            throw ProjectManagerError.missingProject(project.id)
+        }
+        let projectURL = try pathResolver.standardPaths(
+            forProjectNamed: project.name
+        ).projectContainerURL
+        guard fileManager.fileExists(atPath: projectURL.path) else {
+            throw ProjectManagerError.projectFolderMissing(project.name)
+        }
+        var catalog = try loadCatalog()
+        appendCatalogEntryIfNeeded(for: project.id, to: &catalog)
+        try saveCatalog(catalog)
+        // Return the reserved entry to the transaction without making it
+        // visible to general list/select callers before marker removal.
+        let entry = catalog.entries.first { $0.projectID == project.id }!
+        return ManagedProject(project: project, userOrder: entry.userOrder, lifecycleState: lifecycleState(for: entry))
     }
 }
 

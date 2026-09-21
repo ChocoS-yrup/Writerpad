@@ -1,0 +1,728 @@
+이미 완료된 “iPad 실기기 이름 스캔” 다음 단계부터 정리했습니다.
+
+각 프롬프트 맨 앞에는 이전에 만든 공통 운영 블록을 그대로 붙이세요. `<...SHA>`는 직전 단계 인계표에서 받은 전체 40자리 SHA로 교체해야 합니다. SHA가 아직 없으면 다음 단계를 시작하면 안 됩니다.
+
+---
+
+## 1단계 - Windows의 iPad 실기기 스캔 검토
+
+```text
+이번 단계의 목적은 iPad 실기기 이름 스캔 증거를 Windows 담당자가 정확한 커밋으로 검토하는 것이다. 구현은 수정하지 마라.
+
+검토 대상:
+
+repository: https://github.com/ChocoS-yrup/Writerpad
+branch: codex/ipad-storage-name-v2-device-scan
+commit_sha: e7c9ff479e3f43f269fc22b20887a325e0a8fd2d
+document: Docs/storage-name-v2-ipad-device-scan-2026-08-13.md
+
+반드시 다음을 실행해 정확한 커밋을 확인해라.
+
+git fetch origin
+git show --stat e7c9ff479e3f43f269fc22b20887a325e0a8fd2d
+git show e7c9ff479e3f43f269fc22b20887a325e0a8fd2d:Docs/storage-name-v2-ipad-device-scan-2026-08-13.md
+
+다음을 검토해라.
+
+- base_main_sha와 계약 pin이 맞는가
+- 1,010개 항목과 56,230개 이름 스칼라 집계가 명확한가
+- 베이스라인 밖·제외 스칼라·상위면 스칼라가 모두 0건인가
+- 사용자 파일명과 기기 식별자 원문이 공개되지 않았는가
+- 이 결과가 계약 개정의 데이터 선행 조건만 닫는다는 제한이 적혀 있는가
+
+Windows 저장소 최신 origin/main에서
+codex/windows-review-ipad-storage-name-v2-scan 브랜치를 만들어라.
+
+검토 결과만 docs/ 아래 새 문서로 기록해라. 앱 코드, 계약, 서버, incident 데이터는 수정하지 마라.
+
+검증 후 의도적인 커밋으로 만들고 push한 뒤 정확한 Windows commit SHA가 포함된 인계표를 작성해라. requested_counterpart_action에는 iPad 담당자가 스캔 증거 PR을 검토·병합하도록 적어라.
+
+다음 단계는 시작하지 마라.
+```
+
+---
+
+## 2단계 - iPad 스캔 증거 PR 확정 및 병합
+
+```text
+이번 단계의 목적은 Windows 검토 결과를 확인하고 iPad 실기기 스캔 증거를 main에 도달 가능하게 만드는 것이다.
+
+먼저 Windows 저장소의 다음 인계 커밋을 정확히 읽어라.
+
+repository: https://github.com/ChocoS-yrup/WriterPad_main
+commit_sha: <WINDOWS_SCAN_REVIEW_SHA>
+handoff_document: <WINDOWS_REVIEW_DOCUMENT_PATH>
+
+iPad 증거 커밋:
+
+repository: https://github.com/ChocoS-yrup/Writerpad
+commit_sha: e7c9ff479e3f43f269fc22b20887a325e0a8fd2d
+branch: codex/ipad-storage-name-v2-device-scan
+
+Windows 검토가 승인인지, 조건부 승인인지, 거부인지 확인해라.
+
+수정 요구가 없으면 해당 브랜치에서 새 구현 커밋을 만들지 마라.
+수정 요구가 있으면 증거 문서만 수정하고 새 commit SHA를 만든 뒤 Windows 재검토를 요청해라. force-push는 하지 마라.
+
+상대 검토와 GitHub checks가 모두 통과하면 draft PR을 ready로 전환할 준비를 해라. 병합은 사용자 승인 후에만 실행해라.
+
+병합 후 다음을 보고해라.
+
+- PR URL
+- 최종 증거 commit SHA
+- main의 merge commit SHA
+- 최신 origin/main SHA
+- Windows 검토 commit SHA
+
+계약·서버·클라이언트 구현은 시작하지 마라.
+```
+
+---
+
+## 3단계 - storage-name-v2 계약 후보 동결
+
+```text
+이번 단계의 목적은 storage-name-v2 계약 변경만 하나의 판정 가능한 PR 후보로 만드는 것이다.
+
+반드시 2단계에서 확정된 최신 iPad origin/main에서 시작해라.
+
+base_main_sha: <SCAN_EVIDENCE_MERGE_SHA>
+branch: codex/contract-storage-name-v2
+
+다음 자료를 읽어라.
+
+- 인수인계_유니코드계약개정_20260813.md
+- 계약개정안_storage-name-v2_초안.md
+- Docs/storage-name-v2-ipad-device-scan-2026-08-13.md
+- Windows 검토 commit <WINDOWS_SCAN_REVIEW_SHA>
+- Windows 인계 commit 9313cde92376c3be121fe589f7b52179098bdbfd
+
+기존 feat/sync-v2-structure-recovery 브랜치는 참고 자료로만 읽어라. 브랜치 전체를 merge하거나 광범위하게 cherry-pick하지 마라.
+
+이번 단계에서 허용되는 범위:
+
+- sync-contract/protocol.json
+- 관련 protocol/schema 파일
+- storage-name 적합성 벡터
+- sync-contract/contract-lock.json
+- sync-contract/CHANGELOG.md
+- sync-contract/unicode/ 아래 동결 자산과 설명
+- sync-contract/scripts/verify_contract.py 및 계약 검증 전용 테스트
+- 계약 변경 설명 문서
+
+반드시 다음 설계를 명확히 확정해라.
+
+1. algorithm_id를 storage-name-v2로 변경한다.
+2. 베이스라인 밖 스칼라와 제외 스칼라를 NFKC 전에 거부한다.
+3. 상위면 스칼라 바로 뒤 결합문자 또는 U+FF9E/U+FF9F를 NFKC 전에 거부한다.
+4. 분리자·제어문자 검사는 NFKC 뒤에서 실행한다.
+5. 정규화 뒤 방어적 베이스라인 재검사를 둔다.
+6. storage_name_v1은 이관 기간에 유지한다.
+7. v1 제거는 양쪽 v2 구현과 공유 E2E가 끝난 뒤 별도 계약 단계로 미룬다.
+8. “런타임 Unicode 데이터를 전혀 사용하지 않는다”와 “NFKC는 플랫폼 구현을 쓴다”의 모순을 제거한다.
+9. verify_contract.py가 동결 casefold·baseline·excluded 자산을 직접 검증하도록 한다.
+10. SN-016부터 SN-029까지 추가하되 SN-001부터 SN-015는 변경하지 않는다.
+
+계약 버전은 기존 버전 정책에 따라 결정하고 근거를 기록해라. 임의로 기존 0.2.0을 유지하지 마라.
+
+계약 canonical byte length와 SHA-256을 다시 계산해 lock과 일치시켜라. 계약 commit은 자기 SHA를 포함할 수 없으므로 최종 contract_git_commit은 인계표에 외부 기록하는 기존 방식을 유지해라.
+
+Ubuntu/Windows exact-head와 merge-result 검증이 가능한 상태로 만들고 draft PR을 생성해라.
+
+앱 코드, Supabase migration, 서버 배포, allowlist 운영값, incident 자료는 수정하지 마라.
+
+커밋·push·draft PR·인계표 작성 후 중단해라. Windows 검토 전에는 병합하지 마라.
+```
+
+---
+
+## 4단계 - Windows의 계약 후보 정밀 검토
+
+```text
+이번 단계의 목적은 Windows가 iPad 저장소의 storage-name-v2 계약 후보를 정확한 SHA로 독립 검증하는 것이다. Windows 구현은 아직 변경하지 마라.
+
+검토 대상:
+
+repository: https://github.com/ChocoS-yrup/Writerpad
+commit_sha: <CONTRACT_CANDIDATE_SHA>
+base_main_sha: <CONTRACT_BASE_MAIN_SHA>
+branch: codex/contract-storage-name-v2
+
+다음을 실행해라.
+
+git fetch origin
+git show --stat <CONTRACT_CANDIDATE_SHA>
+git diff <CONTRACT_BASE_MAIN_SHA>..<CONTRACT_CANDIDATE_SHA> --
+git switch --detach <CONTRACT_CANDIDATE_SHA>
+git rev-parse HEAD
+
+Windows의 저장소 밖 임시 Python 3.12 환경에서 계약 검증기를 실행해라.
+
+다음을 확인해라.
+
+- 새 contract_version
+- 새 canonical_contract_sha256와 byte length
+- Unicode 자산의 canonical digest
+- SN-001..SN-015 유지
+- SN-016..SN-029 기대 결과
+- separator 검사가 NFKC 뒤에 있는가
+- supplementary adjacency 검사가 NFKC 앞에 있는가
+- 방어적 베이스라인 재검사가 있는가
+- storage_name_v1과 storage_name_v2 이관 규칙
+- Windows에서 동일하게 구현 가능한가
+- verify_contract.py가 호스트 casefold 결과를 계약 근거로 사용하지 않는가
+- NFKC 런타임 의존 범위가 과장 없이 기록됐는가
+
+Windows 저장소 최신 origin/main에서
+codex/windows-review-storage-name-v2-contract 브랜치를 만들고 검토 결과만 docs/ 문서로 커밋·push해라.
+
+승인 여부와 모든 발견 사항을 정확한 Windows commit SHA로 인계해라. 계약 후보의 의미 변경이 필요하면 승인하지 말고 구체적인 수정 요청을 적어라.
+
+Windows 클라이언트 구현은 시작하지 마라.
+```
+
+---
+
+## 5단계 - 계약 최종 반영과 main 병합
+
+```text
+이번 단계의 목적은 Windows 계약 검토를 반영하고 storage-name-v2 계약을 최종 확정하는 것이다.
+
+정확히 읽을 Windows 검토:
+
+repository: https://github.com/ChocoS-yrup/WriterPad_main
+commit_sha: <WINDOWS_CONTRACT_REVIEW_SHA>
+document: <WINDOWS_CONTRACT_REVIEW_DOCUMENT>
+
+계약 후보:
+
+repository: https://github.com/ChocoS-yrup/Writerpad
+commit_sha: <CONTRACT_CANDIDATE_SHA>
+branch: codex/contract-storage-name-v2
+
+Windows 검토에서 의미 변경 요청이 있으면 계약 브랜치에 별도 수정 커밋을 추가하고 새 SHA를 push해라. 의미가 바뀌었다면 Windows 재검토 없이 병합하지 마라.
+
+검토 승인과 모든 GitHub checks가 확인되면 draft PR을 ready로 전환할 준비를 해라. 사용자 승인 후 병합해라.
+
+병합 후 다음 값을 정확히 보고해라.
+
+- contract_version
+- contract_content_commit
+- contract_git_commit 또는 최종 계약 merge commit
+- canonical_contract_sha256
+- canonical_contract_bytes
+- contract PR URL
+- contract merge SHA
+- storage_name_v1 유지 조건
+- storage_name_v2 적용 조건
+
+서버나 클라이언트 구현은 시작하지 마라.
+```
+
+---
+
+## 6단계 - storage-name-v2 서버 구현
+
+```text
+이번 단계의 목적은 확정된 storage-name-v2 계약의 서버 구현만 추가하는 것이다. 배포는 아직 하지 마라.
+
+최신 iPad origin/main에서 시작해라.
+
+base_main_sha: <CONTRACT_MERGE_SHA>
+contract_git_commit: <CONTRACT_MERGE_SHA>
+contract_version: <NEW_CONTRACT_VERSION>
+canonical_contract_sha256: <NEW_CONTRACT_SHA256>
+branch: codex/server-storage-name-v2
+
+허용 범위:
+
+- 새 Supabase migration 파일
+- server-side 생성 스크립트
+- storage-name-v2 SQL 함수와 동결 범위 테이블
+- allowlist 신규 계약 행의 정의
+- 서버 계약 테스트
+- 서버 구현 인계 문서
+
+규칙:
+
+- 이미 적용된 migration은 절대 수정하지 마라.
+- 기존 storage-name-v1 구현과 기존 allowlist 기록을 삭제하지 마라.
+- 새 migration에서 storage-name-v2를 병렬 추가해라.
+- Unicode 14.0.0 baseline 범위를 새 서버 테이블로 생성해라.
+- PUA·Tags·Variation Selectors Supplement를 거부해라.
+- 상위면 인접 배열과 NFKC 이후 분리자를 계약 순서대로 검사해라.
+- 새 계약 allowlist 항목은 코드상 추가하되 운영 환경 자동 활성화는 하지 마라.
+- 프로젝트 mode를 변경하지 마라.
+- 기존 프로젝트를 승격하지 마라.
+- production이나 staging에 연결하지 마라.
+
+blank database migration chain, 재실행 안전성, rollback, 기존 v1, 신규 v2, 벡터 전체를 검증해라.
+
+커밋·push·draft PR·인계표 작성 후 중단해라.
+```
+
+---
+
+## 7단계 - staging 배포와 서버 계약 검증
+
+```text
+이번 단계의 목적은 병합된 storage-name-v2 서버 구현을 staging에만 적용하고 검증하는 것이다.
+
+필수 입력:
+
+server_merge_sha: <SERVER_MERGE_SHA>
+contract_git_commit: <CONTRACT_MERGE_SHA>
+contract_version: <NEW_CONTRACT_VERSION>
+canonical_contract_sha256: <NEW_CONTRACT_SHA256>
+staging_project_id: <APPROVED_STAGING_PROJECT_ID>
+
+작업 전 다음을 읽기 전용으로 확인해라.
+
+- staging project identity
+- migration ledger
+- 현재 allowlist
+- 기존 프로젝트 mode/epoch
+- 관련 relation과 RPC signature
+- staging에 사용자 또는 incident 데이터가 있는지
+
+읽기 전용 preflight 결과가 예상과 다르면 배포하지 말고 중단해라.
+
+승인된 정식 migration 방식으로 staging에만 적용해라. production은 변경하지 마라.
+
+새 digest는 처음에는 비활성 상태로 등록해라. 합성 사용자와 합성 프로젝트만 이용해 다음을 검증해라.
+
+- storage-name-v1 유지
+- storage-name-v2 신규 벡터
+- 잘못된 digest 거부
+- capability 불일치 거부
+- exact replay
+- rollback
+- document_commit
+- atomic_structure_commit
+
+프로젝트 승격이 필요하면 합성 fixture 프로젝트 하나만 명시적으로 승격해라. 기존 프로젝트는 승격하지 마라.
+
+검증에 성공한 경우에만 새 v2 digest를 staging에서 활성화할 수 있다. 활성화 여부와 최종 enabled row 수를 정확히 기록해라.
+
+test_run_id와 server_project_id가 포함된 운영 인계표를 별도 증거 커밋으로 만들고 push해라.
+
+미해결 incident 프로젝트와 production은 변경하지 마라. 다음 클라이언트 단계는 자동으로 시작하지 마라.
+```
+
+---
+
+## 8단계 - Windows storage-name-v2 클라이언트 구현
+
+```text
+이번 단계의 목적은 Windows 클라이언트의 계약 pin과 storage-name 구현을 v2로 옮기는 것이다.
+
+Windows 저장소 최신 origin/main에서 시작해라.
+
+branch: codex/windows-storage-name-v2-client
+contract_repository: https://github.com/ChocoS-yrup/Writerpad
+contract_git_commit: <CONTRACT_MERGE_SHA>
+contract_version: <NEW_CONTRACT_VERSION>
+canonical_contract_sha256: <NEW_CONTRACT_SHA256>
+server_handoff_commit: <STAGING_SERVER_HANDOFF_SHA>
+
+반드시 계약 merge SHA의 파일을 직접 읽고 구현해라. 계약 내용을 Windows 문서에서 재해석하지 마라.
+
+허용 범위:
+
+- Windows 계약 pin 상수
+- storage-name-v2 정규화
+- client capability
+- 관련 dependency/spec
+- storage-name 및 계약 테스트
+- Windows 인계 문서
+
+구현 요구:
+
+- baseline·excluded·casefold 동결 자산을 계약과 동일한 digest로 사용
+- NFKC 전후 검사 순서 준수
+- SN-001..SN-029 전체 통과
+- storage_name_v2 선언
+- storage_name_v1 제거는 하지 않음
+- unicodedata2가 더 이상 필요 없다면 참조 전수조사 후 spec과 requirements에서 제거
+- 다른 기능이 unicodedata2를 사용한다면 추측해서 제거하지 말고 제한으로 기록
+- incident 이름변경 로직은 수정하지 않음
+- 프로젝트 자동 승격 금지
+- production 연결 금지
+
+커밋·push·draft PR·Windows 인계표 작성 후 중단해라.
+```
+
+---
+
+## 9단계 - iPad storage-name-v2 클라이언트 구현
+
+```text
+이번 단계의 목적은 iPad에 storage-name-v2 계산과 새 계약 pin을 넣는 것이다. 네트워크 배선은 하지 마라.
+
+최신 iPad origin/main에서 시작해라.
+
+branch: codex/ipad-storage-name-v2-client
+contract_git_commit: <CONTRACT_MERGE_SHA>
+contract_version: <NEW_CONTRACT_VERSION>
+canonical_contract_sha256: <NEW_CONTRACT_SHA256>
+server_handoff_commit: <STAGING_SERVER_HANDOFF_SHA>
+
+기존 로컬 feat/sync-v2-structure-recovery 브랜치의 다음 커밋은 참고 자료로만 사용해라.
+
+- 1a5938a
+- 76d494b
+- 8753cde
+- 596bf5b
+
+브랜치 전체를 merge하지 말고 최신 origin/main에 필요한 부분만 의도적으로 옮겨라.
+
+허용 범위:
+
+- iPad 계약 pin과 capability
+- storage-name-v2 구현
+- 동결 casefold/baseline/excluded 소비 코드
+- Xcode 프로젝트 파일 등록
+- storage-name 계약 테스트
+- 관련 인계 문서
+
+반드시 검증할 것:
+
+- SN-001..SN-029
+- Cherokee와 Cyrillic casefold
+- 상위면 안전 통과와 위험 인접 거부
+- U+FE0F 정상 이모지 통과
+- NFKC가 만든 분리자 거부
+- 동결 자산 digest
+- 새 Swift 파일이 실제 compile source에 포함됐는지
+- 계약 pin이 lock 및 계약 merge SHA와 일치하는지
+
+이번 단계에서는 다음을 금지한다.
+
+- commit_document/document_commit 네트워크 전환
+- commit_folder/atomic_structure_commit 전환
+- dispatcher 배선
+- 프로젝트 승격
+- server/allowlist 변경
+- incident 수정
+
+커밋·push·draft PR·인계표 작성 후 중단해라.
+```
+
+---
+
+## 10단계 - Windows가 iPad 클라이언트 검토
+
+```text
+이번 단계의 목적은 Windows 담당자가 iPad storage-name-v2 구현을 정확한 SHA로 검토하는 것이다. 코드는 수정하지 마라.
+
+iPad 검토 대상:
+
+repository: https://github.com/ChocoS-yrup/Writerpad
+commit_sha: <IPAD_STORAGE_V2_SHA>
+base_main_sha: <IPAD_STORAGE_V2_BASE_SHA>
+contract_git_commit: <CONTRACT_MERGE_SHA>
+
+정확한 커밋을 checkout해 변경 파일, 계약 pin, 동결 자산 digest, SN-001..SN-029 결과를 검토해라.
+
+특히 Windows와 iPad가 다음 입력에서 같은 UTF-8 키 또는 오류 코드를 내는지 비교해라.
+
+- U+AB70
+- U+1C80
+- U+FF0F
+- U+2105
+- U+E000
+- U+E0041
+- U+E0100
+- U+1CCD6
+- U+13046 U+0301
+- U+13046 U+FF9E
+- U+13046 U+0061
+- U+1F642 U+FE0F
+
+Windows 저장소에 검토 문서만 커밋·push하고 정확한 SHA로 인계해라. iPad 네트워크 배선이나 Windows 구현 수정은 시작하지 마라.
+```
+
+---
+
+## 11단계 - iPad가 Windows 클라이언트 검토 및 양쪽 병합
+
+```text
+이번 단계의 목적은 iPad 담당자가 Windows storage-name-v2 구현을 정확한 SHA로 검토하고 양쪽 클라이언트 PR의 병합 조건을 확정하는 것이다.
+
+Windows 검토 대상:
+
+repository: https://github.com/ChocoS-yrup/WriterPad_main
+commit_sha: <WINDOWS_STORAGE_V2_SHA>
+base_main_sha: <WINDOWS_STORAGE_V2_BASE_SHA>
+
+Windows의 iPad 검토 인계:
+
+commit_sha: <WINDOWS_IPAD_REVIEW_SHA>
+
+두 저장소의 정확한 커밋과 계약 merge SHA를 비교해라.
+
+다음을 확인해라.
+
+- 계약 pin 일치
+- canonical digest 일치
+- client capability 일치
+- SN-001..SN-029 결과 일치
+- 기존 v1 제거 없음
+- 프로젝트 승격 없음
+- incident 수정 없음
+
+검토 결과를 iPad 저장소의 docs-only 커밋으로 남기고 push해라.
+
+양쪽 검토와 CI가 통과한 경우에만 각 PR을 사용자 승인 후 병합해라. 두 저장소의 최종 merge SHA를 모두 기록해라.
+
+한쪽만 병합된 상태를 공유 종단간 준비 완료로 선언하지 마라. 네트워크 배선은 시작하지 마라.
+```
+
+---
+
+## 12단계 - 마지막 세 이름변경 incident 직접 원인 확인
+
+```text
+이번 단계의 목적은 마지막 세 이름변경 작업이 대기에 남은 사건의 직접 원인을 보존 증거에서 확인하는 것이다. 수정은 하지 마라.
+
+시작 전에 반드시 다음을 확보해라.
+
+- test_run_id
+- server_project_id
+- Windows commit SHA
+- iPad commit SHA
+- client build ID
+- contract_git_commit
+- canonical_contract_sha256
+- 보존 DB 또는 snapshot의 접근 가능한 경로와 SHA-256
+
+증거가 없거나 서로 다른 실행의 자료라면 not-verified로 보고하고 중단해라.
+
+원본 DB, snapshot, 로그는 읽기 전용으로 다뤄라. 복사본이 필요하면 임시 위치에서 digest를 확인한 뒤 사용해라.
+
+다음을 시간순으로 재구성해라.
+
+- 여섯 이름변경 intent
+- operation_id와 batch_id
+- base revision과 structure revision
+- append-only event
+- attempt
+- server response
+- pending/inflight/retry/terminal 상태
+- 마지막 세 작업이 발송 대상에서 빠진 정확한 조건
+
+추측으로 root cause를 확정하지 마라. 직접 증거가 확인되면 파일·row·event와 함께 원인을 적어라.
+
+codex/incident-<test_run_id> 브랜치에는 식별정보를 제거한 증거 문서만 커밋해라. 앱 코드, 서버, 운영 데이터는 수정하지 마라.
+
+직접 원인이 확인되지 않으면 수정 단계는 만들지 말고 중단해라.
+```
+
+---
+
+## 13단계 - iPad protocol 3 전송 기반 구현
+
+```text
+이번 단계의 목적은 iPad protocol 3 전송의 공통 기반을 구현하는 것이다. document와 structure 실제 호출 전환은 아직 하지 마라.
+
+선행 조건:
+
+- 계약 merge SHA: <CONTRACT_MERGE_SHA>
+- server staging handoff SHA: <STAGING_SERVER_HANDOFF_SHA>
+- iPad storage-name-v2 merge SHA: <IPAD_STORAGE_V2_MERGE_SHA>
+- Windows storage-name-v2 merge SHA: <WINDOWS_STORAGE_V2_MERGE_SHA>
+
+최신 iPad origin/main에서
+codex/ipad-protocol3-transport-foundation 브랜치를 만들어라.
+
+이번 단계의 단일 목적:
+
+- immutable batch 메타데이터 8개 필드
+- RFC 8785 제한 부분집합 canonical JSON과 digest
+- server compatibility fail-closed 검사
+- 계약 오류 코드
+- 엄격한 성공·실패 응답 검증
+- append-only event 기반 상태 파생
+
+실제 commit_document/commit_folder 호출을 교체하지 마라.
+앱 기본 동기화 경로를 활성화하지 마라.
+프로젝트 mode를 변경하지 마라.
+
+계약 벡터와 단위 테스트만으로 검증하고 commit·push·draft PR·인계표 작성 후 중단해라.
+```
+
+---
+
+## 14단계 - iPad document_commit 배선
+
+```text
+이번 단계의 목적은 iPad 문서 본문 쓰기만 protocol 3 document_commit으로 전환하는 것이다.
+
+최신 origin/main에서 시작해라.
+
+branch: codex/ipad-document-commit-wiring
+base_main_sha: <PROTOCOL3_FOUNDATION_MERGE_SHA>
+contract_git_commit: <CONTRACT_MERGE_SHA>
+server_staging_handoff: <STAGING_SERVER_HANDOFF_SHA>
+
+허용 범위는 문서 create/update/delete/restore의 요청 생성, durable queue, dispatcher, 응답 반영과 관련 테스트뿐이다.
+
+구조 변경은 atomic_structure_commit으로 아직 전환하지 마라.
+문서 update가 name, parent_folder_id, structure_revision을 바꾸지 못하게 해라.
+빈 본문, content digest, byte count, revision, replay, response loss를 검증해라.
+server compatibility 검사 실패 시 쓰기를 보내지 마라.
+
+staging 검증은 합성 프로젝트만 사용해라.
+기존 프로젝트 승격, production, incident 데이터는 변경하지 마라.
+
+커밋·push·draft PR·인계표 작성 후 중단해라.
+```
+
+---
+
+## 15단계 - iPad atomic_structure_commit 배선
+
+```text
+이번 단계의 목적은 iPad 구조 변경을 atomic_structure_commit으로 전환하는 것이다.
+
+선행 조건:
+
+- document_commit merge SHA: <DOCUMENT_COMMIT_MERGE_SHA>
+- incident analysis SHA: <INCIDENT_ANALYSIS_SHA>
+- incident 직접 원인: verified
+
+incident 직접 원인이 not-verified이면 이 단계를 시작하지 말고 중단해라.
+
+최신 origin/main에서
+codex/ipad-atomic-structure-commit-wiring 브랜치를 만들어라.
+
+폴더·문서 rename, move, delete, restore, reorder를 ordered intent batch로 만들고 한 요청으로 원자 커밋해라.
+
+검증 대상:
+
+- sequence가 1부터 연속
+- batch digest 일치
+- 부분 적용 없음
+- exact replay
+- changed-payload ID reuse 거부
+- 빠른 여섯 이름변경
+- rollback
+- revision/structure revision
+- operation event와 terminal state
+- 앱 재시작 뒤 queue 복구
+
+incident 수정은 확인된 직접 원인 범위만 허용한다. 다른 추정 수정이나 ensure_project, 초기 tree merge를 섞지 마라.
+
+프로젝트 자동 승격과 production 변경은 금지한다.
+
+커밋·push·draft PR·인계표 작성 후 중단해라.
+```
+
+---
+
+## 16단계 - Windows–iPad staging 종단간 검증
+
+```text
+이번 단계의 목적은 양쪽 main에서 도달 가능한 구현으로 staging 공유 종단간 검증을 수행하는 것이다.
+
+반드시 확인할 SHA:
+
+contract_git_commit: <CONTRACT_MERGE_SHA>
+server_merge_sha: <SERVER_MERGE_SHA>
+windows_main_implementation_sha: <WINDOWS_FINAL_MAIN_SHA>
+ipad_main_implementation_sha: <IPAD_FINAL_MAIN_SHA>
+staging_handoff_sha: <STAGING_SERVER_HANDOFF_SHA>
+
+네 SHA가 각각 해당 저장소 main에서 도달 가능하지 않으면 시작하지 마라.
+
+합성 사용자와 전용 합성 프로젝트를 새로 만들어라. 기존 프로젝트를 사용하거나 승격하지 마라.
+
+같은 test_run_id와 server_project_id로 다음을 검증해라.
+
+- Windows 생성 → iPad pull
+- iPad 수정 → Windows pull
+- 한글 NFC/NFD 이름 수렴
+- storage-name-v2 거부 벡터
+- 문서 create/update/delete/restore
+- 빠른 여섯 이름변경 원자 커밋
+- 응답 유실 뒤 replay
+- 앱 재시작 뒤 queue 복구
+- revision conflict
+- tombstone
+- rollback
+- 양쪽 대기 건수 수렴
+
+원본 로그와 DB 증거는 식별정보를 제거해 보존하고 digest를 기록해라.
+
+production은 변경하지 마라. 성공해도 production 완료를 선언하지 마라.
+
+검증 결과를 별도 evidence 브랜치와 정확한 commit SHA로 인계한 뒤 중단해라.
+```
+
+---
+
+## 17단계 - production 배포 준비와 승인 게이트
+
+```text
+이번 단계의 목적은 production 변경 전 읽기 전용 준비 상태를 판정하는 것이다. 승인 전에는 배포하거나 allowlist를 활성화하지 마라.
+
+확인 대상:
+
+- 계약 merge SHA
+- 서버 merge SHA
+- Windows/iPad 최종 main SHA
+- staging E2E evidence SHA
+- production migration ledger
+- production allowlist
+- 현재 프로젝트 mode 분포
+- rollback 및 차단 절차
+- 배포할 최소 client build
+- 사용자 데이터 백업 및 복구 가능성
+
+production을 읽기 전용으로 검사하고 다음을 보고해라.
+
+- 적용할 migration 목록과 SHA-256
+- 신규 allowlist 행
+- enabled 전후 예상 상태
+- 구형 storage_name_v1 클라이언트 허용 조건
+- 실패 시 신규 쓰기 차단 방법
+- 기존 프로젝트를 LEGACY/0으로 유지하는지
+- 운영 검증 test_run_id
+- 아직 not-verified인 항목
+
+명시적인 사용자 승인 없이 migration apply, allowlist enable, 프로젝트 승격, 클라이언트 강제 업데이트를 실행하지 마라.
+
+준비 판정과 실행 계획만 커밋·push하고 중단해라.
+```
+
+---
+
+## 18단계 - production 제한 배포
+
+```text
+이 단계는 17단계 준비 보고에 대한 사용자의 명시적 승인이 있을 때만 실행해라.
+
+승인된 exact SHA와 migration만 production에 적용해라.
+적용 전 파일 SHA-256과 remote migration ledger를 다시 확인해라.
+
+규칙:
+
+- 새 storage-name-v2 계약과 서버 기능만 배포
+- 기존 storage_name_v1 호환 유지
+- 기존 프로젝트 LEGACY/0 유지
+- 자동 승격 금지
+- incident 프로젝트 변경 금지
+- 마지막 세 이름변경 데이터 변경 금지
+- append-only 자료 삭제 금지
+
+allowlist는 승인된 client build와 protocol/capability만 허용하도록 설정해라.
+단계별로 읽기 전용 검증을 수행하고 예상과 다르면 즉시 중단해라.
+
+배포 후에도 실제 기존 프로젝트를 ID_BASED로 승격하지 마라. 먼저 제한된 신규 쓰기와 replay, error rate, digest mismatch를 확인해라.
+
+최종 인계표에는 production server_project_id, migration ledger, allowlist 상태, client build, 검증 결과, rollback 상태를 모두 기록해라.
+
+공유 종단간 검증과 양쪽 main 도달 가능성이 확인되지 않았다면 완료를 선언하지 마라.
+```
+
+`storage_name_v1` 제거는 위 단계에 포함하지 않는 것이 안전합니다. 양쪽 v2 배포와 운영 안정성 확인이 끝난 뒤 별도의 계약 변경 단계로 다뤄야 합니다.

@@ -1,0 +1,73 @@
+{
+  "devices" : [
+    {
+      "architecture" : "arm64",
+      "deviceId" : "39ADD620-67C9-4F0A-8047-C32AC64D448A",
+      "deviceName" : "iPad Pro 13-inch (M5)",
+      "modelName" : "iPad Pro 13-inch (M5)",
+      "osBuildNumber" : "23F77",
+      "osVersion" : "26.5",
+      "platform" : "iOS Simulator"
+    }
+  ],
+  "duration" : "Ran for 1.2 seconds",
+  "durationInSeconds" : 1.2086158990859985,
+  "hasMediaAttachments" : false,
+  "hasPerformanceMetrics" : false,
+  "testDescription" : "Test case with 1 run",
+  "testIdentifier" : "SyncV2HandshakeTests/testC9UnobservedDurableTransitionsDuringStatusReadPreventWrite()",
+  "testIdentifierURL" : "test://com.apple.xcode/WriterPad/WriterPadTests/SyncV2HandshakeTests/testC9UnobservedDurableTransitionsDuringStatusReadPreventWrite",
+  "testName" : "testC9UnobservedDurableTransitionsDuringStatusReadPreventWrite()",
+  "testPlanConfigurations" : [
+    {
+      "configurationId" : "1",
+      "configurationName" : "Test Scheme Action"
+    }
+  ],
+  "testResult" : "Failed",
+  "testRuns" : [
+    {
+      "children" : [
+        {
+          "children" : [
+            {
+              "children" : [
+                {
+                  "name" : "SyncV2HandshakeTests.testC9UnobservedDurableTransitionsDuringStatusReadPreventWrite()",
+                  "nodeType" : "Source Code Reference"
+                }
+              ],
+              "name" : "failed - 미관측 차단·해소 뒤 이전 준비로 송신됨",
+              "nodeType" : "Test Case Run",
+              "result" : "Failed"
+            },
+            {
+              "children" : [
+                {
+                  "name" : "SyncV2HandshakeTests.testC9UnobservedDurableTransitionsDuringStatusReadPreventWrite()",
+                  "nodeType" : "Source Code Reference"
+                }
+              ],
+              "name" : "XCTAssertTrue failed - folder=false, conflict=false",
+              "nodeType" : "Test Case Run",
+              "result" : "Failed"
+            }
+          ],
+          "duration" : "1초",
+          "durationInSeconds" : 1.2086158990859985,
+          "name" : "Test Scheme Action",
+          "nodeIdentifier" : "1",
+          "nodeType" : "Test Plan Configuration",
+          "result" : "Failed"
+        }
+      ],
+      "details" : "iOS Simulator 26.5",
+      "duration" : "1초",
+      "durationInSeconds" : 1.2086158990859985,
+      "name" : "iPad Pro 13-inch (M5)",
+      "nodeIdentifier" : "39ADD620-67C9-4F0A-8047-C32AC64D448A",
+      "nodeType" : "Device",
+      "result" : "Failed"
+    }
+  ]
+}

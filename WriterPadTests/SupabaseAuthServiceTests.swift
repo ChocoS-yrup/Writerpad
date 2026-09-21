@@ -3,6 +3,67 @@ import XCTest
 @testable import WriterPad
 
 final class SupabaseAuthServiceTests: XCTestCase {
+    func testSignUpWithImmediateSessionStoresTokensAndAuthenticates() async {
+        let serverSession = session(email: "new@example.com")
+        let transport = AuthTransportStub(
+            signUpResult: .success(.authenticated(serverSession))
+        )
+        let store = SessionStoreStub()
+        let service = SupabaseAuthService(
+            transport: transport,
+            sessionStore: store
+        )
+
+        let result = await service.signUp(
+            email: "new@example.com",
+            password: "safe-password"
+        )
+
+        XCTAssertEqual(
+            result,
+            .authenticated(
+                AuthenticatedAccount(
+                    userID: serverSession.userID,
+                    maskedEmail: "n***@example.com"
+                )
+            )
+        )
+        let storedTokens = await store.storedTokens()
+        XCTAssertEqual(
+            storedTokens,
+            StoredSessionTokens(
+                accessToken: serverSession.accessToken,
+                refreshToken: serverSession.refreshToken
+            )
+        )
+    }
+
+    func testSignUpRequiringEmailConfirmationDoesNotAuthenticate() async {
+        let store = SessionStoreStub()
+        let service = SupabaseAuthService(
+            transport: AuthTransportStub(
+                signUpResult: .success(
+                    .confirmationRequired(email: "new@example.com")
+                )
+            ),
+            sessionStore: store
+        )
+
+        let result = await service.signUp(
+            email: "new@example.com",
+            password: "safe-password"
+        )
+
+        XCTAssertEqual(
+            result,
+            .confirmationRequired(maskedEmail: "n***@example.com")
+        )
+        let state = await service.currentState()
+        let storedTokens = await store.storedTokens()
+        XCTAssertEqual(state, .signedOut(.noStoredSession))
+        XCTAssertNil(storedTokens)
+    }
+
     func testSuccessfulLoginStoresOnlyReturnedTokensAndMasksEmail() async {
         let serverSession = session(email: "writer@example.com")
         let transport = AuthTransportStub(signInResult: .success(serverSession))
@@ -460,6 +521,7 @@ final class SupabaseAuthServiceTests: XCTestCase {
             var iterator = updates.makeAsyncIterator()
             return (
                 await iterator.next(),
+                await iterator.next(),
                 await iterator.next()
             )
         }
@@ -470,8 +532,9 @@ final class SupabaseAuthServiceTests: XCTestCase {
             password: "password"
         )
         _ = await service.signOut()
-        let (loggedIn, loggedOut) = await observedStates.value
+        let (restoring, loggedIn, loggedOut) = await observedStates.value
 
+        XCTAssertEqual(restoring, .restoring)
         XCTAssertEqual(
             loggedIn,
             .authenticated(
@@ -581,6 +644,7 @@ final class SupabaseAuthServiceTests: XCTestCase {
 private actor SessionStoreStub: SessionTokenStoring {
     private var tokens: StoredSessionTokens?
     private let loadError: KeychainSessionStoreError?
+    private var mutationCount = 0
 
     init(
         tokens: StoredSessionTokens? = nil,
@@ -598,12 +662,16 @@ private actor SessionStoreStub: SessionTokenStoring {
     }
 
     func save(_ tokens: StoredSessionTokens) {
+        mutationCount += 1
         self.tokens = tokens
     }
 
     func delete() {
+        mutationCount += 1
         tokens = nil
     }
+
+    func mutations() -> Int { mutationCount }
 
     func storedTokens() -> StoredSessionTokens? {
         tokens
@@ -611,6 +679,10 @@ private actor SessionStoreStub: SessionTokenStoring {
 }
 
 private actor AuthTransportStub: SupabaseAuthTransporting {
+    private let signUpResult: Result<
+        SupabaseSignUpResult,
+        SupabaseAuthTransportError
+    >
     private let signInResult: Result<
         ValidatedAuthSession,
         SupabaseAuthTransportError
@@ -634,6 +706,10 @@ private actor AuthTransportStub: SupabaseAuthTransporting {
     private var restoreTokens: StoredSessionTokens?
 
     init(
+        signUpResult: Result<
+            SupabaseSignUpResult,
+            SupabaseAuthTransportError
+        > = .failure(.serverRejected),
         signInResult: Result<
             ValidatedAuthSession,
             SupabaseAuthTransportError
@@ -651,6 +727,7 @@ private actor AuthTransportStub: SupabaseAuthTransporting {
         restoreGate: AuthRestoreGate? = nil,
         refreshGate: AuthRestoreGate? = nil
     ) {
+        self.signUpResult = signUpResult
         self.signInResult = signInResult
         self.restoreResult = restoreResult
         self.refreshResult = refreshResult ?? restoreResult
@@ -658,6 +735,15 @@ private actor AuthTransportStub: SupabaseAuthTransporting {
         self.restoreDelay = restoreDelay
         self.restoreGate = restoreGate
         self.refreshGate = refreshGate
+    }
+
+    func signUp(
+        email: String,
+        password: String
+    ) throws -> SupabaseSignUpResult {
+        _ = email
+        _ = password
+        return try signUpResult.get()
     }
 
     func signIn(
@@ -781,5 +867,328 @@ private actor AuthOperationCompletionGate {
     func open() {
         completionContinuation?.resume()
         completionContinuation = nil
+    }
+}
+
+extension SupabaseAuthServiceTests {
+    func testLateRestoreCannotOverlapNewLoginOrOverwriteItsTokens() async throws {
+        for shouldFail in [false, true] {
+            let gate = AuthRestoreGate()
+            let old = session(email: "old@example.com", accessToken: "old-returned-access", refreshToken: "old-returned-refresh")
+            let new = session(email: "new@example.com")
+            let transport = AuthTransportStub(signInResult: .success(new),
+                restoreResult: shouldFail ? .failure(.sessionExpired) : .success(old), restoreGate: gate)
+            let tokens = StoredSessionTokens(accessToken: "old-access", refreshToken: "old-refresh")
+            let store = SessionStoreStub(tokens: tokens)
+            let service = SupabaseAuthService(transport: transport, sessionStore: store)
+            let restore = Task { await service.restoreSession() }
+            for _ in 0..<200 {
+                if await transport.restoreCallCount() == 1 { break }
+                try await Task.sleep(for: .milliseconds(5))
+            }
+            let epoch = service.contractEpoch!.value
+            let login = Task { await service.signIn(email: "new@example.com", password: "test") }
+            try await Task.sleep(for: .milliseconds(30))
+            let before = await transport.signInCallCount()
+            XCTAssertEqual(before, 0, "취소된 복원이 실제 종료되기 전에 SDK 로그인을 겹치지 않는다")
+            XCTAssertGreaterThan(service.contractEpoch!.value, epoch)
+            await gate.open()
+            _ = await restore.value
+            let result = await login.value
+            XCTAssertTrue(result.isAuthenticated)
+            let saved = await store.storedTokens()
+            XCTAssertEqual(saved?.accessToken, new.accessToken)
+            XCTAssertEqual(saved?.refreshToken, new.refreshToken)
+        }
+    }
+
+    func testSameAccountReloginAdvancesAuthenticationEpoch() async {
+        let returned = session(email: "same@example.com")
+        let service = SupabaseAuthService(transport: AuthTransportStub(signInResult: .success(returned)),
+            sessionStore: SessionStoreStub())
+        _ = await service.signIn(email: "same@example.com", password: "test")
+        let first = service.contractEpoch!.value
+        _ = await service.signIn(email: "same@example.com", password: "test")
+        XCTAssertGreaterThan(service.contractEpoch!.value, first)
+    }
+}
+
+
+extension SupabaseAuthServiceTests {
+    func testReceiveGuardAutomaticAuthCallsAndSignOutPreserveStoredTokens() async throws {
+        let tokens = StoredSessionTokens(accessToken: "synthetic-old", refreshToken: "synthetic-old-refresh")
+        let store = SessionStoreStub(tokens: tokens)
+        let transport = AuthTransportStub()
+        let service = SupabaseAuthService(transport: transport, sessionStore: store)
+        let policy = ReceiveValidationPolicy(enabled: true, configuration: nil)
+        await ReceiveValidationPolicy.$override.withValue(policy) {
+            _ = await service.restoreSession()
+            _ = await service.refreshSession(force: true)
+            _ = await service.signIn(email: "synthetic@example.invalid", password: "synthetic")
+            _ = await service.signOut()
+        }
+        let restore = await transport.restoreCallCount(), refresh = await transport.refreshCallCount()
+        let signIn = await transport.signInCallCount(), signOut = await transport.signOutCallCount()
+        let after = await store.storedTokens()
+        XCTAssertEqual([restore, refresh, signIn, signOut], [0, 0, 0, 0])
+        XCTAssertEqual(after, tokens)
+    }
+    func testReceiveGuardVerifiedAccountIsMemoryOnlyAndMismatchNeverPublishes() async throws {
+        let value = session(email: "fixture@example.invalid")
+        for expected in [value.userID, UUID()] {
+            let tokens = StoredSessionTokens(accessToken: "synthetic-old", refreshToken: "synthetic-old-refresh")
+            let store = SessionStoreStub(tokens: tokens)
+            let transport = AuthTransportStub(signInResult: .success(value))
+            let service = SupabaseAuthService(transport: transport, sessionStore: store)
+            let policy = ReceiveValidationPolicy(enabled: true, configuration: .init(version: 1, revision: UUID(),
+                endpoint: ReceiveValidationPolicy.Configuration.staging, accountID: expected))
+            let result = try await ReceiveValidationPolicy.$override.withValue(policy) {
+                _ = try policy.beginAuthentication(foreground: true, endpoint: ReceiveValidationPolicy.Configuration.staging)
+                return await service.signIn(email: "fixture@example.invalid", password: "synthetic")
+            }
+            XCTAssertEqual(result.isAuthenticated, expected == value.userID)
+            let after = await store.storedTokens(), calls = await transport.signInCallCount()
+            XCTAssertEqual(after, tokens)
+            XCTAssertEqual(calls, 1)
+        }
+    }
+}
+
+
+extension SupabaseAuthServiceTests {
+    func testReceiveGuardNewForegroundGrantRevalidatesMemorySessionWithoutReplacingStoredTokens() async throws {
+        let value = session(email: "fixture@example.invalid")
+        let old = StoredSessionTokens(accessToken: "synthetic-preserved", refreshToken: "synthetic-preserved-refresh")
+        let store = SessionStoreStub(tokens: old)
+        let transport = AuthTransportStub(signInResult: .success(value), refreshResult: .success(value))
+        let service = SupabaseAuthService(transport: transport, sessionStore: store)
+        let policy = ReceiveValidationPolicy(enabled: true, configuration: .init(version: 1, revision: UUID(),
+            endpoint: ReceiveValidationPolicy.Configuration.staging, accountID: value.userID))
+        try await ReceiveValidationPolicy.$override.withValue(policy) {
+            _ = try policy.beginAuthentication(foreground: true, endpoint: ReceiveValidationPolicy.Configuration.staging)
+            _ = await service.signIn(email: "fixture@example.invalid", password: "synthetic")
+            policy.invalidate()
+            _ = await service.refreshSession(force: true)
+            let deniedCalls = await transport.refreshCallCount()
+            XCTAssertEqual(deniedCalls, 0)
+            _ = try policy.beginAuthentication(foreground: true, endpoint: ReceiveValidationPolicy.Configuration.staging)
+            _ = await service.restoreSession()
+            try policy.requireRead(account: value.userID)
+        }
+        let calls = await transport.refreshCallCount(), after = await store.storedTokens()
+        XCTAssertEqual(calls, 1)
+        XCTAssertEqual(after, old)
+    }
+}
+
+extension SupabaseAuthServiceTests {
+    func testReceiveGuardRestoreFailuresLeaveLoadingWithoutMutatingStoredSession() async throws {
+        let cases: [(SupabaseAuthTransportError, AuthenticationState)] = [
+            (.networkUnavailable, .unavailable(.networkUnavailable)),
+            (.serverRejected, .unavailable(.serverRejected)),
+            (.sessionExpired, .signedOut(.sessionExpired)),
+            (.refreshTokenRevoked, .signedOut(.refreshTokenRevoked)),
+            (.refreshTokenReused, .signedOut(.refreshTokenReused))
+        ]
+        for (error, expected) in cases {
+            let tokens = StoredSessionTokens(accessToken: "synthetic-preserved", refreshToken: "synthetic-refresh")
+            let store = SessionStoreStub(tokens: tokens)
+            let transport = AuthTransportStub(restoreResult: .failure(error))
+            let service = SupabaseAuthService(transport: transport, sessionStore: store)
+            let policy = ReceiveValidationPolicy(enabled: true, configuration: .init(
+                version: 1, revision: UUID(), endpoint: ReceiveValidationPolicy.Configuration.staging, accountID: UUID()))
+            try await ReceiveValidationPolicy.$override.withValue(policy) {
+                _ = try policy.beginAuthentication(foreground: true, endpoint: ReceiveValidationPolicy.Configuration.staging)
+                let result = await service.restoreSession()
+                let current = await service.currentState()
+                XCTAssertEqual(result, expected, "Failure: \(error)")
+                XCTAssertEqual(current, expected)
+                XCTAssertFalse(policy.sendingAllowed)
+            }
+            let preserved = await store.storedTokens(), mutations = await store.mutations()
+            let calls = await transport.restoreCallCount()
+            XCTAssertEqual(preserved, tokens)
+            XCTAssertEqual(mutations, 0)
+            XCTAssertEqual(calls, 1)
+        }
+    }
+
+    func testReceiveGuardRestoreTimeoutLeavesLoadingAndPreservesStoredSession() async throws {
+        let value = session(email: "fixture@example.invalid")
+        let tokens = StoredSessionTokens(accessToken: "synthetic-preserved", refreshToken: "synthetic-refresh")
+        let store = SessionStoreStub(tokens: tokens)
+        let service = SupabaseAuthService(transport: AuthTransportStub(
+            restoreResult: .success(value), restoreDelay: .seconds(60)), sessionStore: store,
+            restoreTimeout: .seconds(1), sleep: { _ in })
+        let policy = ReceiveValidationPolicy(enabled: true, configuration: .init(
+            version: 1, revision: UUID(), endpoint: ReceiveValidationPolicy.Configuration.staging, accountID: value.userID))
+        try await ReceiveValidationPolicy.$override.withValue(policy) {
+            _ = try policy.beginAuthentication(foreground: true, endpoint: ReceiveValidationPolicy.Configuration.staging)
+            let result = await service.restoreSession()
+            XCTAssertEqual(result, .unavailable(.networkUnavailable))
+            XCTAssertFalse(policy.sendingAllowed)
+        }
+        let preserved = await store.storedTokens(), mutations = await store.mutations()
+        XCTAssertEqual(preserved, tokens)
+        XCTAssertEqual(mutations, 0)
+    }
+
+    func testReceiveGuardRefreshFailureDoesNotKeepAuthenticatedState() async throws {
+        let value = session(email: "fixture@example.invalid")
+        let tokens = StoredSessionTokens(accessToken: "synthetic-preserved", refreshToken: "synthetic-refresh")
+        let store = SessionStoreStub(tokens: tokens)
+        let transport = AuthTransportStub(signInResult: .success(value), refreshResult: .failure(.refreshTokenRevoked))
+        let service = SupabaseAuthService(transport: transport, sessionStore: store)
+        let policy = ReceiveValidationPolicy(enabled: true, configuration: .init(
+            version: 1, revision: UUID(), endpoint: ReceiveValidationPolicy.Configuration.staging, accountID: value.userID))
+        try await ReceiveValidationPolicy.$override.withValue(policy) {
+            _ = try policy.beginAuthentication(foreground: true, endpoint: ReceiveValidationPolicy.Configuration.staging)
+            let login = await service.signIn(email: "fixture@example.invalid", password: "synthetic")
+            XCTAssertTrue(login.isAuthenticated)
+            policy.invalidate()
+            _ = try policy.beginAuthentication(foreground: true, endpoint: ReceiveValidationPolicy.Configuration.staging)
+            let result = await service.restoreSession()
+            XCTAssertEqual(result, .signedOut(.refreshTokenRevoked))
+            XCTAssertThrowsError(try policy.requireRead(account: value.userID))
+            XCTAssertFalse(policy.sendingAllowed)
+        }
+        let preserved = await store.storedTokens(), mutations = await store.mutations()
+        XCTAssertEqual(preserved, tokens)
+        XCTAssertEqual(mutations, 0)
+    }
+
+    func testReceiveGuardExplicitLoginRecoversAfterRestoreFailure() async throws {
+        let value = session(email: "fixture@example.invalid")
+        let tokens = StoredSessionTokens(accessToken: "synthetic-preserved", refreshToken: "synthetic-refresh")
+        let store = SessionStoreStub(tokens: tokens)
+        let service = SupabaseAuthService(transport: AuthTransportStub(
+            signInResult: .success(value), restoreResult: .failure(.serverRejected)), sessionStore: store)
+        let policy = ReceiveValidationPolicy(enabled: true, configuration: .init(
+            version: 1, revision: UUID(), endpoint: ReceiveValidationPolicy.Configuration.staging, accountID: value.userID))
+        try await ReceiveValidationPolicy.$override.withValue(policy) {
+            _ = try policy.beginAuthentication(foreground: true, endpoint: ReceiveValidationPolicy.Configuration.staging)
+            let failed = await service.restoreSession()
+            XCTAssertEqual(failed, .unavailable(.serverRejected))
+            policy.invalidate()
+            _ = try policy.beginAuthentication(foreground: true, endpoint: ReceiveValidationPolicy.Configuration.staging)
+            let login = await service.signIn(email: "fixture@example.invalid", password: "synthetic")
+            XCTAssertTrue(login.isAuthenticated)
+            try policy.requireRead(account: value.userID)
+            XCTAssertFalse(policy.sendingAllowed)
+        }
+        let preserved = await store.storedTokens(), mutations = await store.mutations()
+        XCTAssertEqual(preserved, tokens)
+        XCTAssertEqual(mutations, 0)
+    }
+}
+
+
+extension SupabaseAuthServiceTests {
+    func testReceiveGuardInvalidatedRestoreSettlesWithoutMutatingStoredTokens() async throws {
+        for succeeds in [false, true] {
+            let value = session(email: "fixture@example.invalid"), gate = AuthRestoreGate()
+            let tokens = StoredSessionTokens(accessToken: "preserved-access", refreshToken: "preserved-refresh")
+            let store = SessionStoreStub(tokens: tokens)
+            let transport = AuthTransportStub(restoreResult: succeeds ? .success(value) : .failure(.serverRejected), restoreGate: gate)
+            let service = SupabaseAuthService(transport: transport, sessionStore: store)
+            let policy = ReceiveValidationPolicy(enabled: true, configuration: .init(version: 1, revision: UUID(),
+                endpoint: ReceiveValidationPolicy.Configuration.staging, accountID: value.userID))
+            try await ReceiveValidationPolicy.$override.withValue(policy) {
+                _ = try policy.beginAuthentication(foreground: true, endpoint: ReceiveValidationPolicy.Configuration.staging)
+                let restore = Task { await service.restoreSession() }
+                for _ in 0..<200 {
+                    if await transport.restoreCallCount() == 1 { break }
+                    try await Task.sleep(for: .milliseconds(5))
+                }
+                policy.invalidate()
+                await gate.open()
+                let result = await restore.value
+                XCTAssertEqual(result, .unavailable(.validationAuthorizationEnded))
+                XCTAssertFalse(policy.sendingAllowed)
+            }
+            let preserved = await store.storedTokens(), mutations = await store.mutations()
+            XCTAssertEqual(preserved, tokens)
+            XCTAssertEqual(mutations, 0)
+        }
+    }
+
+    func testReceiveGuardLateRestoreCannotReplaceNewLoginOrSignOut() async throws {
+        for signsOut in [false, true] {
+            let value = session(email: "fixture@example.invalid"), gate = AuthRestoreGate()
+            let store = SessionStoreStub(tokens: .init(accessToken: "preserved-access", refreshToken: "preserved-refresh"))
+            let transport = AuthTransportStub(signInResult: .success(value), restoreResult: .failure(.serverRejected), restoreGate: gate)
+            let service = SupabaseAuthService(transport: transport, sessionStore: store)
+            let policy = ReceiveValidationPolicy(enabled: true, configuration: .init(version: 1, revision: UUID(),
+                endpoint: ReceiveValidationPolicy.Configuration.staging, accountID: value.userID))
+            try await ReceiveValidationPolicy.$override.withValue(policy) {
+                _ = try policy.beginAuthentication(foreground: true, endpoint: ReceiveValidationPolicy.Configuration.staging)
+                let restore = Task { await service.restoreSession() }
+                for _ in 0..<200 {
+                    if await transport.restoreCallCount() == 1 { break }
+                    try await Task.sleep(for: .milliseconds(5))
+                }
+                if signsOut {
+                    _ = await service.signOut()
+                    await gate.open()
+                    _ = await restore.value
+                    let state = await service.currentState()
+                    XCTAssertEqual(state, .signedOut(.userInitiated))
+                } else {
+                    let epoch = service.contractEpoch!.value
+                    _ = try policy.beginAuthentication(foreground: true, endpoint: ReceiveValidationPolicy.Configuration.staging)
+                    let login = Task { await service.signIn(email: "fixture@example.invalid", password: "synthetic") }
+                    for _ in 0..<200 {
+                        if service.contractEpoch!.value > epoch { break }
+                        try await Task.sleep(for: .milliseconds(5))
+                    }
+                    XCTAssertGreaterThan(service.contractEpoch!.value, epoch)
+                    await gate.open()
+                    _ = await restore.value
+                    let result = await login.value
+                    XCTAssertTrue(result.isAuthenticated)
+                    let state = await service.currentState()
+                    XCTAssertEqual(state, result)
+                }
+                XCTAssertFalse(policy.sendingAllowed)
+            }
+            let mutations = await store.mutations()
+            XCTAssertEqual(mutations, 0)
+        }
+    }
+}
+
+extension SupabaseAuthServiceTests {
+    func testGeneralBearerUsesOnlyVerifiedMemorySessionAndRevocationDeniesRead() async throws {
+        let value = session(email: "fixture@example.invalid", accessToken: "synthetic-live", expiresAt: Date().addingTimeInterval(3600))
+        let old = StoredSessionTokens(accessToken: "synthetic-preserved", refreshToken: "synthetic-preserved-refresh")
+        let store = SessionStoreStub(tokens: old), transport = AuthTransportStub(signInResult: .success(value))
+        let service = SupabaseAuthService(transport: transport, sessionStore: store)
+        let policy = ReceiveValidationPolicy(enabled: true, configuration: .init(version: 1, revision: UUID(),
+            endpoint: ReceiveValidationPolicy.Configuration.staging, accountID: value.userID))
+        try await ReceiveValidationPolicy.$override.withValue(policy) {
+            do { _ = try await service.generalValidationBearer(); XCTFail() } catch {}
+            _ = try policy.beginAuthentication(foreground: true, endpoint: ReceiveValidationPolicy.Configuration.staging)
+            _ = await service.signIn(email: "fixture@example.invalid", password: "synthetic")
+            let bearer = try await service.generalValidationBearer(); XCTAssertEqual(bearer, "Bearer synthetic-live")
+            policy.invalidate()
+            do { _ = try await service.generalValidationBearer(); XCTFail() } catch {}
+        }
+        let refresh = await transport.refreshCallCount(), restore = await transport.restoreCallCount(), stored = await store.storedTokens()
+        XCTAssertEqual(refresh, 0); XCTAssertEqual(restore, 0); XCTAssertEqual(stored, old)
+    }
+    func testGeneralBearerRejectsExpiredOrMissingExpiryWithoutRefreshing() async throws {
+        for expiry in [Date?.none, Date().addingTimeInterval(-1)] {
+            let value = session(email: "fixture@example.invalid", expiresAt: expiry)
+            let transport = AuthTransportStub(signInResult: .success(value))
+            let service = SupabaseAuthService(transport: transport, sessionStore: SessionStoreStub())
+            let policy = ReceiveValidationPolicy(enabled: true, configuration: .init(version: 1, revision: UUID(),
+                endpoint: ReceiveValidationPolicy.Configuration.staging, accountID: value.userID))
+            try await ReceiveValidationPolicy.$override.withValue(policy) {
+                _ = try policy.beginAuthentication(foreground: true, endpoint: ReceiveValidationPolicy.Configuration.staging)
+                _ = await service.signIn(email: "fixture@example.invalid", password: "synthetic")
+                do { _ = try await service.generalValidationBearer(); XCTFail() } catch {}
+            }
+            let refresh = await transport.refreshCallCount(); XCTAssertEqual(refresh, 0)
+        }
     }
 }

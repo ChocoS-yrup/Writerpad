@@ -21,55 +21,61 @@ extension SwiftDataMetadataRepository: DocumentRepository {
     }
 
     func save(_ document: DocumentNode) async throws {
-        _ = try requireProjectRecord(id: document.projectID)
-        try validateParent(of: document)
+        await ReceiveValidationPolicy.beforeMutation("metadata.save")
+        try ReceiveValidationPolicy.current.mutateIfReceiving {
+            _ = try requireProjectRecord(id: document.projectID)
+            try validateParent(of: document)
 
-        if let record = try uniqueDocumentRecord(id: document.id) {
-            guard record.projectID == document.projectID.rawValue else {
-                throw MetadataRepositoryError.documentProjectCannotChange(document.id)
+            if let record = try uniqueDocumentRecord(id: document.id) {
+                guard record.projectID == document.projectID.rawValue else {
+                    throw MetadataRepositoryError.documentProjectCannotChange(document.id)
+                }
+                try apply(document, to: record)
+            } else {
+                guard let cursorLocation = Int(exactly: document.cursor.location),
+                      let selectionLength = Int(exactly: document.cursor.selectionLength)
+                else {
+                    throw MetadataRepositoryError.invalidCursor(document.id)
+                }
+                let record = DocumentRecord(
+                    id: document.id.rawValue,
+                    projectID: document.projectID.rawValue,
+                    kindRawValue: document.kind.rawValue,
+                    parentID: document.parentID?.rawValue,
+                    relativePath: document.relativePath.rawValue,
+                    userOrder: document.userOrder,
+                    modifiedAt: document.modifiedAt,
+                    contentHash: document.contentHash?.rawValue,
+                    isDeleted: false,
+                    originalPath: nil,
+                    deletedAt: nil,
+                    cursorLocation: cursorLocation,
+                    selectionLength: selectionLength,
+                    isExpanded: document.isExpanded
+                )
+                try apply(document, to: record)
+                modelContext.insert(record)
             }
-            try apply(document, to: record)
-        } else {
-            guard let cursorLocation = Int(exactly: document.cursor.location),
-                  let selectionLength = Int(exactly: document.cursor.selectionLength)
-            else {
-                throw MetadataRepositoryError.invalidCursor(document.id)
-            }
-            let record = DocumentRecord(
-                id: document.id.rawValue,
-                projectID: document.projectID.rawValue,
-                kindRawValue: document.kind.rawValue,
-                parentID: document.parentID?.rawValue,
-                relativePath: document.relativePath.rawValue,
-                userOrder: document.userOrder,
-                modifiedAt: document.modifiedAt,
-                contentHash: document.contentHash?.rawValue,
-                isDeleted: false,
-                originalPath: nil,
-                deletedAt: nil,
-                cursorLocation: cursorLocation,
-                selectionLength: selectionLength,
-                isExpanded: document.isExpanded
-            )
-            try apply(document, to: record)
-            modelContext.insert(record)
+            try modelContext.save()
         }
-        try modelContext.save()
     }
 
     func removeMetadata(id: DocumentID) async throws {
-        let record = try requireDocumentRecord(id: id)
-        let projectID = ProjectID(rawValue: record.projectID)
-        if let workspace = try uniqueWorkspaceRecord(projectID: projectID) {
-            if workspace.leftDocumentID == record.id {
-                workspace.leftDocumentID = nil
+        await ReceiveValidationPolicy.beforeMutation("metadata.removeMetadata")
+        try ReceiveValidationPolicy.current.mutateIfReceiving {
+            let record = try requireDocumentRecord(id: id)
+            let projectID = ProjectID(rawValue: record.projectID)
+            if let workspace = try uniqueWorkspaceRecord(projectID: projectID) {
+                if workspace.leftDocumentID == record.id {
+                    workspace.leftDocumentID = nil
+                }
+                if workspace.rightDocumentID == record.id {
+                    workspace.rightDocumentID = nil
+                }
             }
-            if workspace.rightDocumentID == record.id {
-                workspace.rightDocumentID = nil
-            }
+            modelContext.delete(record)
+            try modelContext.save()
         }
-        modelContext.delete(record)
-        try modelContext.save()
     }
 
     private func validateParent(of document: DocumentNode) throws {
@@ -91,6 +97,53 @@ extension SwiftDataMetadataRepository: DocumentRepository {
     }
 }
 
+extension SwiftDataMetadataRepository: DocumentIdentityReplacing {
+    func replaceDocumentIdentity(
+        from oldID: DocumentID,
+        to newID: DocumentID,
+        in projectID: ProjectID
+    ) async throws {
+        await ReceiveValidationPolicy.beforeMutation("metadata.replaceDocumentIdentity")
+        try ReceiveValidationPolicy.current.mutateIfReceiving {
+            guard oldID != newID else { return }
+            guard try uniqueDocumentRecord(id: newID) == nil else {
+                throw MetadataRepositoryError.corruptedRecord(
+                    entity: "DocumentRecord",
+                    identifier: newID.rawValue.uuidString,
+                    reason: "replacement document identity already exists"
+                )
+            }
+            let record = try requireDocumentRecord(id: oldID)
+            guard record.projectID == projectID.rawValue else {
+                throw MetadataRepositoryError.documentProjectCannotChange(oldID)
+            }
+
+            let children = try documentRecords(
+                in: projectID,
+                parentID: oldID
+            )
+            if let workspace = try uniqueWorkspaceRecord(projectID: projectID) {
+                if workspace.leftDocumentID == oldID.rawValue {
+                    workspace.leftDocumentID = newID.rawValue
+                }
+                if workspace.rightDocumentID == oldID.rawValue {
+                    workspace.rightDocumentID = newID.rawValue
+                }
+            }
+            record.id = newID.rawValue
+            for child in children {
+                child.parentID = newID.rawValue
+            }
+            do {
+                try modelContext.save()
+            } catch {
+                modelContext.rollback()
+                throw error
+            }
+        }
+    }
+}
+
 extension SwiftDataMetadataRepository: DocumentFileMetadataUpdating {
     func validateBeforeFileSave(
         _ request: DocumentSaveRequest
@@ -108,25 +161,28 @@ extension SwiftDataMetadataRepository: DocumentFileMetadataUpdating {
     }
 
     func updateAfterFileSave(_ receipt: DocumentSaveReceipt) async throws {
-        let record = try requireDocumentRecord(id: receipt.documentID)
-        guard record.projectID == receipt.projectID.rawValue else {
-            throw MetadataRepositoryError.documentProjectCannotChange(receipt.documentID)
-        }
-        guard record.kindRawValue == DocumentKind.text.rawValue else {
-            throw MetadataRepositoryError.documentIsNotText(receipt.documentID)
-        }
-        record.relativePath = receipt.relativePath.rawValue
-        record.contentHash = receipt.contentHash.rawValue
-        record.modifiedAt = receipt.modifiedAt
-        if let cursor = receipt.cursor {
-            guard let location = Int(exactly: cursor.location),
-                  let length = Int(exactly: cursor.selectionLength)
-            else {
-                throw MetadataRepositoryError.invalidCursor(receipt.documentID)
+        await ReceiveValidationPolicy.beforeMutation("metadata.updateAfterFileSave")
+        try ReceiveValidationPolicy.current.mutateIfReceiving {
+            let record = try requireDocumentRecord(id: receipt.documentID)
+            guard record.projectID == receipt.projectID.rawValue else {
+                throw MetadataRepositoryError.documentProjectCannotChange(receipt.documentID)
             }
-            record.cursorLocation = location
-            record.selectionLength = length
+            guard record.kindRawValue == DocumentKind.text.rawValue else {
+                throw MetadataRepositoryError.documentIsNotText(receipt.documentID)
+            }
+            record.relativePath = receipt.relativePath.rawValue
+            record.contentHash = receipt.contentHash.rawValue
+            record.modifiedAt = receipt.modifiedAt
+            if let cursor = receipt.cursor {
+                guard let location = Int(exactly: cursor.location),
+                      let length = Int(exactly: cursor.selectionLength)
+                else {
+                    throw MetadataRepositoryError.invalidCursor(receipt.documentID)
+                }
+                record.cursorLocation = location
+                record.selectionLength = length
+            }
+            try modelContext.save()
         }
-        try modelContext.save()
     }
 }

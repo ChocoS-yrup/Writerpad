@@ -1,5 +1,26 @@
 import Foundation
 
+/// 문서 gate 내부 작업은 별도 Task다. 호출자 취소와 실제 TXT 교체 결과를
+/// 공유해, 취소/시간 초과를 아직 저장하지 않은 것으로 오인하지 않는다.
+private final class ComparedDocumentSaveState: @unchecked Sendable {
+    private let lock = NSLock()
+    private var cancelled = false
+    private var saved: (DocumentSaveReceipt, String)?
+    var replacement: (DocumentSaveReceipt, String)? { lock.withLock { saved } }
+    func cancel() { lock.withLock { cancelled = true } }
+    func check() throws {
+        try lock.withLock { if cancelled { throw CancellationError() } }
+    }
+    func replace(receipt: DocumentSaveReceipt, marker: String, operation: () throws -> Void) throws {
+        try lock.withLock {
+            guard !cancelled else { throw CancellationError() }
+            try Task.checkCancellation()
+            try operation()
+            saved = (receipt, marker)
+        }
+    }
+}
+
 /// UTF-8 TXT를 읽고, 문서별 저장 순서를 보장하며, 원자적으로 교체한다.
 actor LocalDocumentStore: LocalDocumentStoring {
     static let temporaryPrefix = ".writerpad-save-"
@@ -72,6 +93,19 @@ actor LocalDocumentStore: LocalDocumentStoring {
     }
 
     func save(_ request: DocumentSaveRequest) async throws -> DocumentSaveReceipt {
+        try await save(request, authorize: {})
+    }
+
+    func saveCompared(_ request: DocumentSaveRequest,
+        authorize: @escaping @Sendable () throws -> Void) async throws -> DocumentSaveReceipt {
+        guard request.expectedCurrentContentHash != nil else { throw LocalDocumentStoreError.comparedContentChanged }
+        return try await save(request, authorize: authorize)
+    }
+
+    private func save(_ request: DocumentSaveRequest,
+        authorize: @escaping @Sendable () throws -> Void) async throws -> DocumentSaveReceipt {
+        let compared = request.expectedCurrentContentHash == nil ? nil : ComparedDocumentSaveState()
+        if compared != nil { try Task.checkCancellation() }
         if let latest = latestSubmittedGeneration[request.documentID],
            request.generation <= latest {
             throw LocalDocumentStoreError.staleGeneration(
@@ -89,22 +123,33 @@ actor LocalDocumentStore: LocalDocumentStoring {
             return try await self.syncMutationGate.withCriticalSection(
                 documentID: request.documentID.rawValue
             ) {
-                try await self.performSave(request)
+                try await self.performSave(request, compared: compared, authorize: authorize)
             }
         }
         saveTails[request.documentID] = task
 
         do {
-            let receipt = try await task.value
+            let receipt = try await withTaskCancellationHandler {
+                try await task.value
+            } onCancel: {
+                if let compared { compared.cancel(); task.cancel() }
+            }
             clearTailIfCurrent(documentID: request.documentID, generation: request.generation)
             return receipt
         } catch {
             clearTailIfCurrent(documentID: request.documentID, generation: request.generation)
+            if let (receipt, marker) = compared?.replacement {
+                if case LocalDocumentStoreError.metadataUpdateFailed = error { throw error }
+                throw LocalDocumentStoreError.metadataUpdateFailed(receipt: receipt, markerPath: marker,
+                    reason: "선택한 원고는 저장됐지만 후속 기록의 완료 여부를 확인하지 못했습니다.")
+            }
             throw error
         }
     }
 
-    private func performSave(_ request: DocumentSaveRequest) async throws -> DocumentSaveReceipt {
+    private func performSave(_ request: DocumentSaveRequest,
+        compared: ComparedDocumentSaveState?,
+        authorize: @Sendable () throws -> Void) async throws -> DocumentSaveReceipt {
         try await metadataUpdater.validateBeforeFileSave(request)
         let workspaceRoot = try await workspaceLocator.workspaceRoot(for: request.projectID)
         let destinationURL = try validatedTextURL(
@@ -120,6 +165,17 @@ actor LocalDocumentStore: LocalDocumentStoring {
         }
 
         let data = Data(request.text.utf8)
+        // 문서 잠금과 앞선 저장 완료 뒤에 검사한다. 검사부터 원자적 교체까지
+        // await가 없으므로 뒤늦은 선택이 다른 로컬 저장을 덮지 않는다.
+        if let expected = request.expectedCurrentContentHash {
+            try Task.checkCancellation()
+            try compared?.check()
+            let current = try Data(contentsOf: destinationURL)
+            guard hasher.sha256(for: current) == expected else {
+                throw LocalDocumentStoreError.comparedContentChanged
+            }
+        }
+        try authorize()
         let temporaryURL = parentURL.appendingPathComponent(
             Self.temporaryPrefix
                 + request.documentID.rawValue.uuidString.lowercased()
@@ -148,7 +204,16 @@ actor LocalDocumentStore: LocalDocumentStoring {
                 )
             )
             try writeReconciliationMarker(receipt, to: markerURL)
-            try writer.replaceItem(at: destinationURL, with: temporaryURL)
+            if let compared {
+                try compared.replace(receipt: receipt, marker: markerURL.path) {
+                    try authorize()
+                    try ReceiveValidationPolicy.current.mutateIfReceiving {
+                        try writer.replaceItem(at: destinationURL, with: temporaryURL)
+                    }
+                }
+            } else {
+                try writer.replaceItem(at: destinationURL, with: temporaryURL)
+            }
             didReplaceManuscript = true
 
             do {
@@ -228,13 +293,13 @@ actor LocalDocumentStore: LocalDocumentStoring {
             return .localSavedButNotQueued(reason: "저장 snapshot을 복구할 수 없습니다.")
         }
         let batch = LocalMutationBatch(
-            batchID: syncUUIDGenerator.makeUUID(),
+            batchID: GeneralValidationRuntimeValues.current?.batch ?? syncUUIDGenerator.makeUUID(),
             projectID: receipt.projectID,
             localTransactionID: nil,
             kind: batchKind,
             mutations: [
                 .documentSnapshot(
-                    operationID: syncUUIDGenerator.makeUUID(),
+                    operationID: GeneralValidationRuntimeValues.current?.operation ?? syncUUIDGenerator.makeUUID(),
                     documentID: receipt.documentID,
                     relativePath: receipt.relativePath,
                     content: String(decoding: content.utf8Data, as: UTF8.self),
@@ -358,7 +423,7 @@ actor LocalDocumentStore: LocalDocumentStoring {
         let batches = pendingSyncHandoffs[documentID] ?? []
         guard !batches.isEmpty else {
             if fileManager.fileExists(atPath: url.path) {
-                try fileManager.removeItem(at: url)
+                try ReceiveValidationPolicy.current.mutateIfReceiving { try fileManager.removeItem(at: url) }
             }
             return
         }
@@ -370,7 +435,7 @@ actor LocalDocumentStore: LocalDocumentStoring {
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.sortedKeys]
         let data = try encoder.encode(envelope)
-        try data.write(to: url, options: [.atomic])
+        try ReceiveValidationPolicy.current.mutateIfReceiving { try data.write(to: url, options: [.atomic]) }
     }
 
     func validatedTextURL(
@@ -412,7 +477,9 @@ actor LocalDocumentStore: LocalDocumentStoring {
         encoder.dateEncodingStrategy = .iso8601
         let data = try encoder.encode(receipt)
         do {
-            try data.write(to: markerURL, options: [.atomic])
+            try ReceiveValidationPolicy.current.mutateIfReceiving {
+                try data.write(to: markerURL, options: [.atomic])
+            }
         } catch {
             let nsError = error as NSError
             if nsError.domain == NSCocoaErrorDomain,
@@ -435,7 +502,8 @@ actor LocalDocumentStore: LocalDocumentStoring {
     }
 
     private func temporaryModificationDate(_ url: URL) -> Date {
-        (try? url.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate)
+        if let values = GeneralValidationRuntimeValues.current { return values.date }
+        return (try? url.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate)
             ?? clock.now()
     }
 

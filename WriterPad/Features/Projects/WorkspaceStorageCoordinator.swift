@@ -56,7 +56,7 @@ actor WorkspaceStorageCoordinator {
         while let node = pending.popLast() {
             try Task.checkCancellation()
             if node.kind == .text {
-                if Self.isChapterPath(node.relativePath) {
+                if chapterNumber(in: node.relativePath) != nil {
                     result.append(node)
                 }
                 continue
@@ -76,17 +76,7 @@ actor WorkspaceStorageCoordinator {
             guard document.kind == .text,
                   case .active = document.deletionStatus
             else { return nil }
-            let components = document.relativePath.rawValue
-                .split(separator: "/")
-                .map(String.init)
-            guard components.count == 4,
-                  components[0] == "메인",
-                  components[1] == "원고",
-                  binderRules.volumeNumber(fromStoredName: components[2]) != nil
-            else { return nil }
-            return binderRules.titledChapterIdentity(
-                fromStoredName: components[3]
-            )?.number
+            return chapterNumber(in: document.relativePath)
         }.max() ?? 1
     }
 
@@ -113,18 +103,17 @@ actor WorkspaceStorageCoordinator {
         try await workspaceStateRepository.saveEditorState(state)
     }
 
-    private static func isChapterPath(_ path: RelativeDocumentPath) -> Bool {
+    // 바인더에서 허용한 제목 회차가 이동 목록과 마지막 화수에서도
+    // 같은 회차로 인식되도록 이름 규칙을 한곳에서 사용한다.
+    private func chapterNumber(in path: RelativeDocumentPath) -> Int? {
         let components = path.rawValue.split(separator: "/").map(String.init)
         guard components.count == 4,
               components[0] == "메인",
               components[1] == "원고",
-              components[2].hasSuffix("권"),
-              Int(components[2].dropLast()) != nil
-        else { return false }
-        let filename = components[3]
-        guard filename.hasSuffix("화.txt") else { return false }
-        let chapterNumber = filename.dropLast("화.txt".count)
-        return chapterNumber.count >= 3
-            && chapterNumber.utf8.allSatisfy { (48...57).contains($0) }
+              binderRules.volumeNumber(fromStoredName: components[2]) != nil
+        else { return nil }
+        return binderRules.titledChapterIdentity(
+            fromStoredName: components[3]
+        )?.number
     }
 }

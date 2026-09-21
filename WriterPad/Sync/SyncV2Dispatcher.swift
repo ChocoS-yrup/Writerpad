@@ -21,6 +21,7 @@ enum SyncV2AutomaticRebaseOutcome: Equatable, Sendable {
     case rebased
     case generationAdvanced
     case conflictPreserved
+    case sourceResolved
     case conflict(code: String, detail: String?)
 }
 
@@ -30,18 +31,21 @@ actor SyncV2AutomaticRebaser {
     private let localApplier: (any SyncV2LocalSnapshotApplying)?
     private let openLocalProvider:
         (any SyncV2OpenLocalSnapshotProviding)?
+    private let conflictRecoveryStore: ConflictRecoveryStore?
 
     init(
         store: any SyncV2DispatchStoring,
         snapshotClient: any SyncV2SnapshotClienting,
         localApplier: (any SyncV2LocalSnapshotApplying)? = nil,
         openLocalProvider:
-            (any SyncV2OpenLocalSnapshotProviding)? = nil
+            (any SyncV2OpenLocalSnapshotProviding)? = nil,
+        conflictRecoveryStore: ConflictRecoveryStore? = nil
     ) {
         self.store = store
         self.snapshotClient = snapshotClient
         self.localApplier = localApplier
         self.openLocalProvider = openLocalProvider
+        self.conflictRecoveryStore = conflictRecoveryStore
     }
 
     func rebase(
@@ -81,11 +85,28 @@ actor SyncV2AutomaticRebaser {
                 )
             }
             let local = try await store.latestLocalSnapshot(for: operation)
+            let mergedContent: String
+            if operation.baseRevision == 0 {
+                guard let merged = Self.mergeInitialTreeOrder(
+                    localContent: local.content,
+                    remoteContent: remote.content
+                ) else {
+                    return .conflict(
+                        code: "INVALID_TREE_ORDER",
+                        detail: "초기 tree-order와 서버 tree-order를 안전하게 병합할 수 없습니다."
+                    )
+                }
+                mergedContent = merged
+            } else {
+                // 이미 공유가 시작된 뒤의 순서 변경은 마지막 로컬 조작을
+                // 유지한다. 초기 연결 경쟁만 서버 항목과 합집합으로 병합한다.
+                mergedContent = local.content
+            }
             let result = try await store.rebaseAfterRevisionConflict(
                 operation,
                 remote: remote,
                 local: local,
-                mergedContent: local.content,
+                mergedContent: mergedContent,
                 mergedPath: syncV2TreeOrderPath
             )
             switch result {
@@ -328,6 +349,117 @@ actor SyncV2AutomaticRebaser {
         }
     }
 
+    private static func mergeInitialTreeOrder(
+        localContent: String,
+        remoteContent: String
+    ) -> String? {
+        guard
+            let local = treeOrderPayload(localContent),
+            let remote = treeOrderPayload(remoteContent)
+        else { return nil }
+
+        var mergedOrder: [String: [String]] = [:]
+        for key in Set(remote.order.keys).union(local.order.keys).sorted() {
+            var names: [String] = []
+            for name in (remote.order[key] ?? []) + (local.order[key] ?? []) {
+                let canonical = name.precomposedStringWithCanonicalMapping
+                if !names.contains(canonical) {
+                    names.append(canonical)
+                }
+            }
+            mergedOrder[key.precomposedStringWithCanonicalMapping] = names
+        }
+
+        var folderPaths: [String] = []
+        let derivedPaths = mergedOrder.keys.filter { $0 != "<root>" }
+        for path in remote.folderPaths + local.folderPaths + derivedPaths {
+            let canonical = path.precomposedStringWithCanonicalMapping
+            if !folderPaths.contains(canonical) {
+                folderPaths.append(canonical)
+            }
+        }
+        let object: [String: Any] = [
+            "folder_paths": folderPaths,
+            "tree_order": mergedOrder,
+            "version": 1,
+        ]
+        guard JSONSerialization.isValidJSONObject(object),
+              let data = try? JSONSerialization.data(
+                  withJSONObject: object,
+                  options: [.sortedKeys]
+              )
+        else { return nil }
+        return String(data: data, encoding: .utf8)
+    }
+
+    private static func treeOrderPayload(
+        _ content: String
+    ) -> (order: [String: [String]], folderPaths: [String])? {
+        guard
+            let data = content.data(using: .utf8),
+            let object = try? JSONSerialization.jsonObject(with: data),
+            let dictionary = object as? [String: Any],
+            let version = dictionary["version"] as? NSNumber,
+            CFGetTypeID(version) != CFBooleanGetTypeID(),
+            version.intValue == 1,
+            let rawOrder = dictionary["tree_order"] as? [String: Any]
+        else { return nil }
+
+        var order: [String: [String]] = [:]
+        for (key, value) in rawOrder {
+            guard let names = value as? [String] else { return nil }
+            order[key.precomposedStringWithCanonicalMapping] = names.map {
+                $0.precomposedStringWithCanonicalMapping
+            }
+        }
+        let folderPaths: [String]
+        if let value = dictionary["folder_paths"] {
+            guard let paths = value as? [String] else { return nil }
+            folderPaths = paths.map {
+                $0.precomposedStringWithCanonicalMapping
+            }
+        } else {
+            folderPaths = []
+        }
+        return (order, folderPaths)
+    }
+
+    func rebase(
+        _ operation: SyncV2FolderDispatchOperation
+    ) async throws -> SyncV2AutomaticRebaseOutcome {
+        guard
+            let remote = try await snapshotClient.fetchFolders(
+                projectID: operation.projectID
+            ).first(where: { $0.folderID == operation.folderID })
+        else {
+            return .conflict(
+                code: "FOLDER_NOT_FOUND",
+                detail: "revision conflict 뒤 최신 서버 폴더를 찾지 못했습니다."
+            )
+        }
+        guard remote.revision > operation.baseRevision else {
+            throw SyncV2ClientError.invalidResponse
+        }
+        guard !remote.isDeleted || operation.isDeleted else {
+            guard let conflictRecoveryStore else {
+                return .conflict(
+                    code: "REMOTE_DELETION",
+                    detail: "서버에서 삭제된 폴더는 이름변경으로 자동 복원하지 않습니다."
+                )
+            }
+            _ = try await conflictRecoveryStore.preserveRemoteDeletion(
+                operation: operation,
+                tombstoneRevision: remote.revision
+            )
+            return .sourceResolved
+        }
+        try await store.rebaseFolderAfterRevisionConflict(
+            operation,
+            remote: remote
+        )
+        return .rebased
+    }
+
     private static func newest(
         queued: SyncV2RebaseLocalSnapshot,
         open: SyncV2RebaseLocalSnapshot?
@@ -368,17 +500,26 @@ struct SyncV2RetryPolicy: Equatable, Sendable {
     let maximumDelay: TimeInterval
     let jitterFraction: Double
     let leaseConflictDelay: TimeInterval
+    /// 자동 되감기를 몇 번까지 허용할지다.
+    ///
+    /// 폴더는 늦게 커밋하는 쪽이 이기므로, 두 기기가 모두 이름 변경을 들고
+    /// 있으면 서로 되감기를 주고받을 수 있다. 지연만 있고 횟수 상한이 없으면
+    /// 멈출 근거가 사용자가 이름을 그만 바꾸는 것뿐인데 그것은 장치가 아니다.
+    /// 상한에 닿으면 세워서 화면이 말하게 한다.
+    let maximumAutomaticRebases: Int
 
     init(
         initialDelay: TimeInterval,
         maximumDelay: TimeInterval,
         jitterFraction: Double,
-        leaseConflictDelay: TimeInterval = 3
+        leaseConflictDelay: TimeInterval = 3,
+        maximumAutomaticRebases: Int = 8
     ) {
         self.initialDelay = initialDelay
         self.maximumDelay = maximumDelay
         self.jitterFraction = jitterFraction
         self.leaseConflictDelay = leaseConflictDelay
+        self.maximumAutomaticRebases = maximumAutomaticRebases
     }
 
     static let `default` = SyncV2RetryPolicy(
@@ -485,15 +626,389 @@ actor SyncV2NetworkRecoveryHub {
     }
 }
 
+/// 한 작품의 outbound queue와 snapshot 적용을 양방향으로 직렬화한다.
+///
+/// 서버 알림은 Bool로 접지 않고 단조 증가 세대로 보존한다. upload lane은
+/// 마지막 작업 뒤의 empty claim까지 하나의 permit으로 잡으므로 작업 사이의
+/// 짧은 공백이 pull 안정 지점으로 보이지 않는다.
+actor SyncV2ProjectUploadPullCoordinator {
+    enum Phase: Equatable, Sendable {
+        case idle
+        case initialPull
+        case drainingUpload
+        case applyingPull
+        case conflictResolutionPull
+        case retryWaiting
+        case blocked
+    }
+
+    struct Snapshot: Equatable, Sendable {
+        let phase: Phase
+        let observedGeneration: UInt64
+        let pulledGeneration: UInt64
+        let queue: SyncV2UploadQueueSnapshot
+        let enqueueReservationCount: Int
+        let runningUploadCount: Int
+        let runningPullCount: Int
+        let lastPullSucceeded: Bool
+        let deferredApplicationGeneration: UInt64?
+
+        var pendingServerGenerationCount: UInt64 {
+            observedGeneration >= pulledGeneration
+                ? observedGeneration - pulledGeneration
+                : 0
+        }
+
+        var isServerSynced: Bool {
+            queue == .idle
+                && enqueueReservationCount == 0
+                && runningUploadCount == 0
+                && runningPullCount == 0
+                && pendingServerGenerationCount == 0
+                && deferredApplicationGeneration == nil
+                && phase == .idle
+                && lastPullSucceeded
+        }
+    }
+
+    struct EnqueueReservation: Hashable, Sendable {
+        fileprivate let id: UUID
+        fileprivate let localProjectID: ProjectID
+    }
+
+    struct UploadPermit: Hashable, Sendable {
+        fileprivate let id: UUID
+        fileprivate let localProjectID: ProjectID
+    }
+
+    struct PullPermit: Hashable, Sendable {
+        fileprivate let id: UUID
+        fileprivate let localProjectID: ProjectID
+        let generation: UInt64
+        let isBootstrap: Bool
+    }
+
+    private struct Entry {
+        var phase: Phase = .idle
+        var observedGeneration: UInt64 = 0
+        var pulledGeneration: UInt64 = 0
+        var queue: SyncV2UploadQueueSnapshot = .idle
+        var enqueueReservations = Set<UUID>()
+        var uploadPermitID: UUID?
+        var pullPermitID: UUID?
+        var pullGeneration: UInt64?
+        var deferredApplicationGeneration: UInt64?
+        var lastPullSucceeded = false
+    }
+
+    nonisolated let contractStructureAuthority: SyncV2ContractStructureAuthority
+
+    init(contractStructureAuthority: SyncV2ContractStructureAuthority = SyncV2ContractStructureAuthority()) {
+        self.contractStructureAuthority = contractStructureAuthority
+    }
+
+    private var entries: [ProjectID: Entry] = [:]
+    private var pullReadyHandlers: [UUID: @Sendable () -> Void] = [:]
+    private var uploadReadyHandlers: [UUID: @Sendable () -> Void] = [:]
+
+    func installPullReadyHandler(
+        id: UUID,
+        action: @escaping @Sendable () -> Void
+    ) {
+        pullReadyHandlers[id] = action
+    }
+
+    func removePullReadyHandler(id: UUID) {
+        pullReadyHandlers[id] = nil
+    }
+
+    func installUploadReadyHandler(
+        id: UUID,
+        action: @escaping @Sendable () -> Void
+    ) {
+        uploadReadyHandlers[id] = action
+    }
+
+    func removeUploadReadyHandler(id: UUID) {
+        uploadReadyHandlers[id] = nil
+    }
+
+    func beginEnqueue(
+        localProjectID: ProjectID
+    ) -> EnqueueReservation {
+        let id = UUID()
+        var entry = entries[localProjectID] ?? Entry()
+        // 로컬 enqueue는 곧 이 기기가 만들 서버 변경이다. Realtime echo가
+        // 누락돼도 drain 뒤 검증 pull이 반드시 한 번 남도록 세대를 전진시킨다.
+        entry.observedGeneration &+= 1
+        entry.lastPullSucceeded = false
+        entry.enqueueReservations.insert(id)
+        entry.phase = .drainingUpload
+        entries[localProjectID] = entry
+        signalStateChanged()
+        return EnqueueReservation(id: id, localProjectID: localProjectID)
+    }
+
+    func finishEnqueue(
+        _ reservation: EnqueueReservation,
+        queue: SyncV2UploadQueueSnapshot
+    ) {
+        var entry = entries[reservation.localProjectID] ?? Entry()
+        guard entry.enqueueReservations.remove(reservation.id) != nil else {
+            return
+        }
+        contractStructureAuthority.observeQueue(queue, projectID: reservation.localProjectID)
+        entry.queue = queue
+        settlePhase(&entry)
+        entries[reservation.localProjectID] = entry
+        if queue.pendingCount > 0, entry.pullPermitID == nil {
+            signalUploadReady()
+        }
+        signalStateChanged()
+    }
+
+    func restore(
+        localProjectID: ProjectID,
+        queue: SyncV2UploadQueueSnapshot
+    ) {
+        var entry = entries[localProjectID] ?? Entry()
+        contractStructureAuthority.observeQueue(queue, projectID: localProjectID)
+        entry.queue = queue
+        settlePhase(&entry)
+        entries[localProjectID] = entry
+        signalStateChanged()
+    }
+
+    func beginUploadDrain(
+        localProjectID: ProjectID,
+        queue: SyncV2UploadQueueSnapshot
+    ) -> UploadPermit? {
+        var entry = entries[localProjectID] ?? Entry()
+        contractStructureAuthority.observeQueue(queue, projectID: localProjectID)
+        entry.queue = queue
+        guard entry.pullPermitID == nil,
+              entry.uploadPermitID == nil
+        else {
+            entries[localProjectID] = entry
+            return nil
+        }
+        let id = UUID()
+        entry.uploadPermitID = id
+        entry.phase = .drainingUpload
+        entries[localProjectID] = entry
+        signalStateChanged()
+        return UploadPermit(id: id, localProjectID: localProjectID)
+    }
+
+    func finishUploadDrain(
+        _ permit: UploadPermit,
+        queue: SyncV2UploadQueueSnapshot
+    ) {
+        var entry = entries[permit.localProjectID] ?? Entry()
+        guard entry.uploadPermitID == permit.id else { return }
+        entry.uploadPermitID = nil
+        contractStructureAuthority.observeQueue(queue, projectID: permit.localProjectID)
+        entry.queue = queue
+        settlePhase(&entry)
+        entries[permit.localProjectID] = entry
+        signalStateChanged()
+    }
+
+    func observeServerChange(
+        localProjectID: ProjectID,
+        queue: SyncV2UploadQueueSnapshot,
+        bootstrapAllowed: Bool
+    ) -> PullPermit? {
+        var entry = entries[localProjectID] ?? Entry()
+        entry.observedGeneration &+= 1
+        contractStructureAuthority.observeQueue(queue, projectID: localProjectID)
+        entry.queue = queue
+        let permit = beginPullIfPossible(
+            localProjectID: localProjectID,
+            entry: &entry,
+            bootstrapAllowed: bootstrapAllowed
+        )
+        entries[localProjectID] = entry
+        return permit
+    }
+
+    func beginDeferredPull(
+        localProjectID: ProjectID,
+        queue: SyncV2UploadQueueSnapshot,
+        bootstrapAllowed: Bool
+    ) -> PullPermit? {
+        var entry = entries[localProjectID] ?? Entry()
+        contractStructureAuthority.observeQueue(queue, projectID: localProjectID)
+        entry.queue = queue
+        let permit = beginPullIfPossible(
+            localProjectID: localProjectID,
+            entry: &entry,
+            bootstrapAllowed: bootstrapAllowed
+        )
+        entries[localProjectID] = entry
+        return permit
+    }
+
+    /// 열린 편집기 guard가 바뀐 경우에만 같은 서버 세대의 로컬 적용을 다시
+    /// 허가한다. 여러 pane 통지가 겹쳐도 첫 통지만 보류 표식을 소비한다.
+    @discardableResult
+    func resumeDeferredApplication(localProjectID: ProjectID) -> Bool {
+        var entry = entries[localProjectID] ?? Entry()
+        guard entry.deferredApplicationGeneration != nil else {
+            return false
+        }
+        entry.deferredApplicationGeneration = nil
+        entries[localProjectID] = entry
+        signalStateChanged()
+        return true
+    }
+
+    @discardableResult
+    func finishPull(
+        _ permit: PullPermit,
+        succeeded: Bool,
+        localApplicationDeferred: Bool = false,
+        queue: SyncV2UploadQueueSnapshot
+    ) -> Snapshot {
+        var entry = entries[permit.localProjectID] ?? Entry()
+        guard entry.pullPermitID == permit.id else {
+            return makeSnapshot(entry)
+        }
+        entry.pullPermitID = nil
+        entry.pullGeneration = nil
+        contractStructureAuthority.observeQueue(queue, projectID: permit.localProjectID)
+        entry.queue = queue
+        entry.lastPullSucceeded = succeeded
+        if succeeded && localApplicationDeferred {
+            entry.deferredApplicationGeneration = permit.generation
+        } else if succeeded {
+            entry.deferredApplicationGeneration = nil
+            entry.pulledGeneration = max(
+                entry.pulledGeneration,
+                permit.generation
+            )
+        }
+        settlePhase(&entry)
+        entries[permit.localProjectID] = entry
+        if queue.pendingCount > 0 {
+            signalUploadReady()
+        }
+        // 열린 문서 때문에 같은 세대의 로컬 적용이 보류된 동안에는 handler를
+        // 깨우지 않는다. 여기서 깨우면 permit은 거절되지만 화면 결과가
+        // `reconcilingStructure`에서 일반 waiting으로 덮이고, 불필요한 pull
+        // 시도도 한 번 생긴다. guard 변경이 resume을 소비할 때만 깨운다.
+        if entry.deferredApplicationGeneration == nil {
+            signalStateChanged()
+        }
+        return makeSnapshot(entry)
+    }
+
+    func snapshot(localProjectID: ProjectID) -> Snapshot {
+        makeSnapshot(entries[localProjectID] ?? Entry())
+    }
+
+    private func beginPullIfPossible(
+        localProjectID: ProjectID,
+        entry: inout Entry,
+        bootstrapAllowed: Bool
+    ) -> PullPermit? {
+        guard entry.observedGeneration > entry.pulledGeneration,
+              entry.deferredApplicationGeneration == nil,
+              entry.pullPermitID == nil,
+              entry.uploadPermitID == nil,
+              entry.enqueueReservations.isEmpty
+        else {
+            settlePhase(&entry)
+            return nil
+        }
+        let mayBypassQueue = bootstrapAllowed
+            && entry.pulledGeneration == 0
+            && !entry.lastPullSucceeded
+        guard mayBypassQueue || !entry.queue.hasUnsentLocalChanges else {
+            settlePhase(&entry)
+            return nil
+        }
+        let id = UUID()
+        let generation = entry.observedGeneration
+        entry.pullPermitID = id
+        entry.pullGeneration = generation
+        entry.phase = mayBypassQueue ? .initialPull : .applyingPull
+        return PullPermit(
+            id: id,
+            localProjectID: localProjectID,
+            generation: generation,
+            isBootstrap: mayBypassQueue
+        )
+    }
+
+    private func settlePhase(_ entry: inout Entry) {
+        if entry.pullPermitID != nil {
+            entry.phase = entry.pulledGeneration == 0
+                && !entry.lastPullSucceeded
+                ? .initialPull
+                : .applyingPull
+        } else if entry.uploadPermitID != nil
+                    || !entry.enqueueReservations.isEmpty
+                    || entry.queue.hasQueuedOrRunningUpload {
+            entry.phase = .drainingUpload
+        } else if entry.queue.conflictCount > 0 {
+            entry.phase = .blocked
+        } else if entry.queue.blockedCount > 0 {
+            entry.phase = .blocked
+        } else if entry.queue.retryWaitingCount > 0 {
+            entry.phase = .retryWaiting
+        } else {
+            entry.phase = .idle
+        }
+    }
+
+    private func signalStateChanged() {
+        pullReadyHandlers.values.forEach { $0() }
+    }
+
+    private func signalUploadReady() {
+        uploadReadyHandlers.values.forEach { $0() }
+    }
+
+    private func makeSnapshot(_ entry: Entry) -> Snapshot {
+        Snapshot(
+            phase: entry.phase,
+            observedGeneration: entry.observedGeneration,
+            pulledGeneration: entry.pulledGeneration,
+            queue: entry.queue,
+            enqueueReservationCount: entry.enqueueReservations.count,
+            runningUploadCount: entry.uploadPermitID == nil ? 0 : 1,
+            runningPullCount: entry.pullPermitID == nil ? 0 : 1,
+            lastPullSucceeded: entry.lastPullSucceeded,
+            deferredApplicationGeneration:
+                entry.deferredApplicationGeneration
+        )
+    }
+}
+
 actor SyncV2Dispatcher {
+    enum ProjectScope: Sendable {
+        case all
+        case only(Set<ProjectID>)
+
+        func contains(_ projectID: ProjectID) -> Bool {
+            switch self {
+            case .all: return true
+            case let .only(projectIDs): return projectIDs.contains(projectID)
+            }
+        }
+    }
+
     private struct ProjectLane {
         let generation: UUID
         let task: Task<Void, Never>
     }
 
     private let store: any SyncV2DispatchStoring
+    private let contractSender: (any SyncV2GeneralContractSending)?
     private let client: any SyncV2CommitClienting
     private let maximumConcurrentDocuments: Int
+    private let projectScope: ProjectScope
     private let retryPolicy: SyncV2RetryPolicy
     private let randomUnit: @Sendable () -> Double
     private let networkMonitor: SyncV2NetworkRecoveryMonitor
@@ -503,7 +1018,10 @@ actor SyncV2Dispatcher {
     private let automaticRebaser: SyncV2AutomaticRebaser?
     private let wakeup: SyncV2DispatchWakeup?
     private let networkRecoveryHub: SyncV2NetworkRecoveryHub?
+    nonisolated let uploadPullCoordinator:
+        SyncV2ProjectUploadPullCoordinator?
     private let wakeupID = UUID()
+    private let coordinatorHandlerID = UUID()
 
     private var isStarted = false
     private var activeLocalProjectID: ProjectID?
@@ -513,6 +1031,8 @@ actor SyncV2Dispatcher {
     init(
         store: any SyncV2DispatchStoring,
         client: any SyncV2CommitClienting,
+        contractSender: (any SyncV2GeneralContractSending)? = nil,
+        projectScope: ProjectScope = .all,
         maximumConcurrentDocuments: Int = 3,
         retryPolicy: SyncV2RetryPolicy = .default,
         randomUnit: @escaping @Sendable () -> Double = {
@@ -525,10 +1045,14 @@ actor SyncV2Dispatcher {
             (any EnsureProjectTransporting)? = nil,
         automaticRebaser: SyncV2AutomaticRebaser? = nil,
         wakeup: SyncV2DispatchWakeup? = nil,
-        networkRecoveryHub: SyncV2NetworkRecoveryHub? = nil
+        networkRecoveryHub: SyncV2NetworkRecoveryHub? = nil,
+        uploadPullCoordinator:
+            SyncV2ProjectUploadPullCoordinator? = nil
     ) {
         self.store = store
         self.client = client
+        self.contractSender = contractSender
+        self.projectScope = projectScope
         self.maximumConcurrentDocuments = max(
             1,
             maximumConcurrentDocuments
@@ -541,9 +1065,11 @@ actor SyncV2Dispatcher {
         self.automaticRebaser = automaticRebaser
         self.wakeup = wakeup
         self.networkRecoveryHub = networkRecoveryHub
+        self.uploadPullCoordinator = uploadPullCoordinator
     }
 
     func start() async {
+        guard ReceiveValidationPolicy.current.sendingAllowed else { return }
         guard !isStarted else { return }
         isStarted = true
         await wakeup?.install(id: wakeupID) { [weak self] in
@@ -551,7 +1077,16 @@ actor SyncV2Dispatcher {
                 await self?.newOperationsEnqueued()
             }
         }
-        try? await store.recoverInterruptedWork()
+        await uploadPullCoordinator?.installUploadReadyHandler(
+            id: coordinatorHandlerID
+        ) { [weak self] in
+            Task { await self?.newOperationsEnqueued() }
+        }
+        // Recovery rewrites queues across all projects. A restricted dispatcher
+        // preserves interrupted work until a separately scoped recovery exists.
+        if case .all = projectScope {
+            try? await store.recoverInterruptedWork()
+        }
         networkMonitor.start { [weak self] in
             Task {
                 await self?.networkRecovered()
@@ -569,6 +1104,9 @@ actor SyncV2Dispatcher {
         projectLanes.removeAll()
         networkMonitor.cancel()
         await wakeup?.remove(id: wakeupID)
+        await uploadPullCoordinator?.removeUploadReadyHandler(
+            id: coordinatorHandlerID
+        )
     }
 
     /// 열린 작품에 더 많은 문서 동시 처리량을 배정한다.
@@ -588,6 +1126,35 @@ actor SyncV2Dispatcher {
         await immediateRetryOpportunity()
     }
 
+    /// 서버가 거절해 세워 둔 폴더 변경을 화면 쪽에서 읽어 간다.
+    ///
+    /// 읽지 못하면 빈 목록으로 답한다. 진단을 읽다 실패한 것 때문에 동기화
+    /// 상태 표시가 무너지면 안 된다.
+    func stalledFolderChanges(
+        localProjectID: ProjectID
+    ) async -> [SyncV2StalledFolderChange] {
+        (try? await store.stalledFolderChanges(
+            localProjectID: localProjectID
+        )) ?? []
+    }
+
+    func uploadQueueSnapshot(
+        localProjectID: ProjectID
+    ) async -> SyncV2UploadQueueSnapshot {
+        (try? await store.uploadQueueSnapshot(
+            localProjectID: localProjectID
+        )) ?? SyncV2UploadQueueSnapshot(retryWaitingCount: 1)
+    }
+
+    func isBootstrapPullAllowed(
+        localProjectID: ProjectID
+    ) async -> Bool {
+        guard let hasBaseline = try? await store.hasServerSnapshotBaseline(
+            localProjectID: localProjectID
+        ) else { return false }
+        return !hasBaseline
+    }
+
     /// 사용자가 동기화 상세 화면에서 명시적으로 재시도를 선택할 때 호출한다.
     func userRequestedRetry() async {
         await immediateRetryOpportunity()
@@ -595,7 +1162,10 @@ actor SyncV2Dispatcher {
 
     /// NWPathMonitor가 unsatisfied/requiresConnection에서 satisfied로 바뀔 때만 호출된다.
     func networkRecovered() async {
-        await networkRecoveryHub?.signal()
+        guard ReceiveValidationPolicy.current.sendingAllowed else { return }
+        if case .all = projectScope {
+            await networkRecoveryHub?.signal()
+        }
         await immediateRetryOpportunity()
     }
 
@@ -605,17 +1175,20 @@ actor SyncV2Dispatcher {
 
     /// 자동 테스트가 고정 시각으로 한 cycle을 끝까지 비울 수 있는 결정적 진입점이다.
     func dispatchReadyOperations(now: Date) async {
+        guard ReceiveValidationPolicy.current.sendingAllowed else { return }
         guard let projectIDs = try? await store.readyLocalProjectIDs(
             now: now
         ) else { return }
         let orderedProjectIDs = prioritized(projectIDs)
         let store = self.store
         let client = self.client
+        let contractSender = self.contractSender
         let retryPolicy = self.retryPolicy
         let randomUnit = self.randomUnit
         let leaseManager = self.leaseManager
         let projectRecoveryTransport = self.projectRecoveryTransport
         let automaticRebaser = self.automaticRebaser
+        let uploadPullCoordinator = self.uploadPullCoordinator
         let activeLocalProjectID = self.activeLocalProjectID
         let maximumConcurrentDocuments = self.maximumConcurrentDocuments
         await withTaskGroup(of: Void.self) { group in
@@ -629,12 +1202,14 @@ actor SyncV2Dispatcher {
                             : 1,
                         store: store,
                         client: client,
+                        contractSender: contractSender,
                         retryPolicy: retryPolicy,
                         randomUnit: randomUnit,
                         leaseManager: leaseManager,
                         projectRecoveryTransport:
                             projectRecoveryTransport,
                         automaticRebaser: automaticRebaser,
+                        uploadPullCoordinator: uploadPullCoordinator,
                         now: { now }
                     )
                 }
@@ -643,9 +1218,15 @@ actor SyncV2Dispatcher {
     }
 
     private func immediateRetryOpportunity() async {
-        try? await store.makeRetryWaitOperationsReady(
-            localProjectID: nil
-        )
+        guard ReceiveValidationPolicy.current.sendingAllowed else { return }
+        switch projectScope {
+        case .all:
+            try? await store.makeRetryWaitOperationsReady(localProjectID: nil)
+        case let .only(projectIDs):
+            for projectID in projectIDs {
+                try? await store.makeRetryWaitOperationsReady(localProjectID: projectID)
+            }
+        }
         await refreshProjectLanesAndSchedule()
     }
 
@@ -666,6 +1247,7 @@ actor SyncV2Dispatcher {
     }
 
     private func startProjectLane(_ localProjectID: ProjectID) {
+        guard projectScope.contains(localProjectID) else { return }
         let generation = UUID()
         let limit =
             localProjectID == activeLocalProjectID
@@ -678,12 +1260,14 @@ actor SyncV2Dispatcher {
                 limit: limit,
                 store: self.store,
                 client: self.client,
+                contractSender: self.contractSender,
                 retryPolicy: self.retryPolicy,
                 randomUnit: self.randomUnit,
                 leaseManager: self.leaseManager,
                 projectRecoveryTransport:
                     self.projectRecoveryTransport,
                 automaticRebaser: self.automaticRebaser,
+                uploadPullCoordinator: self.uploadPullCoordinator,
                 now: Date.init
             )
             await self.projectLaneFinished(
@@ -719,6 +1303,7 @@ actor SyncV2Dispatcher {
     private func prioritized(
         _ projectIDs: [ProjectID]
     ) -> [ProjectID] {
+        let projectIDs = projectIDs.filter { projectScope.contains($0) }
         guard let activeLocalProjectID,
               projectIDs.contains(activeLocalProjectID) else {
             return projectIDs
@@ -728,6 +1313,77 @@ actor SyncV2Dispatcher {
     }
 
     private static func drainReadyOperations(
+        localProjectID: ProjectID,
+        limit: Int,
+        store: any SyncV2DispatchStoring,
+        client: any SyncV2CommitClienting,
+        contractSender: (any SyncV2GeneralContractSending)?,
+        retryPolicy: SyncV2RetryPolicy,
+        randomUnit: @escaping @Sendable () -> Double,
+        leaseManager: (any EditLeaseManaging)?,
+        projectRecoveryTransport:
+            (any EnsureProjectTransporting)?,
+        automaticRebaser: SyncV2AutomaticRebaser?,
+        uploadPullCoordinator:
+            SyncV2ProjectUploadPullCoordinator?,
+        now: @escaping @Sendable () -> Date
+    ) async -> Bool {
+        guard ReceiveValidationPolicy.current.sendingAllowed else { return false }
+        if let contractSender, await contractSender.handlesProject(localProjectID) {
+            return await contractSender.drainGeneralContract(localProjectID: localProjectID)
+        }
+        let uploadPermit:
+            SyncV2ProjectUploadPullCoordinator.UploadPermit?
+        if let uploadPullCoordinator {
+            let queue: SyncV2UploadQueueSnapshot
+            do {
+                queue = try await store.uploadQueueSnapshot(
+                    localProjectID: localProjectID
+                )
+            } catch {
+                return false
+            }
+            guard let permit = await uploadPullCoordinator.beginUploadDrain(
+                localProjectID: localProjectID,
+                queue: queue
+            ) else {
+                return false
+            }
+            uploadPermit = permit
+        } else {
+            uploadPermit = nil
+        }
+
+        let diagnosticID = UUID()
+        SyncV2RecoveryDiagnostics.record(stage: .legacyUpload, event: .started, projectID: localProjectID, operationID: diagnosticID)
+        let completedNormally = await drainClaimLoop(
+            localProjectID: localProjectID,
+            limit: limit,
+            store: store,
+            client: client,
+            retryPolicy: retryPolicy,
+            randomUnit: randomUnit,
+            leaseManager: leaseManager,
+            projectRecoveryTransport: projectRecoveryTransport,
+            automaticRebaser: automaticRebaser,
+            now: now
+        )
+        if let uploadPullCoordinator, let uploadPermit {
+            let queue = (try? await store.uploadQueueSnapshot(
+                localProjectID: localProjectID
+            )) ?? SyncV2UploadQueueSnapshot(
+                retryWaitingCount: 1
+            )
+            await uploadPullCoordinator.finishUploadDrain(
+                uploadPermit,
+                queue: queue
+            )
+        }
+        SyncV2RecoveryDiagnostics.record(stage: .legacyUpload, event: completedNormally ? .finished : .failed, projectID: localProjectID, operationID: diagnosticID)
+        return completedNormally
+    }
+
+    private static func drainClaimLoop(
         localProjectID: ProjectID,
         limit: Int,
         store: any SyncV2DispatchStoring,
@@ -780,14 +1436,20 @@ actor SyncV2Dispatcher {
                         )
                     }
                 }
-                for operation in folderOperations {
-                    group.addTask {
+                // 한 batch의 폴더 작업은 생성·복원은 부모부터, 삭제는 자식부터
+                // queue에 들어온다. 여러 요청을 동시에 보내면 서버 도착 순서가
+                // 뒤집혀 PARENT_FOLDER_NOT_FOUND 또는 FOLDER_NOT_EMPTY가 될 수
+                // 있으므로 폴더 줄은 claim 순서대로 하나씩 비운다. 문서 줄은
+                // 별도 task로 계속 나란히 흐른다.
+                group.addTask {
+                    for operation in folderOperations {
                         await Self.dispatchFolder(
                             operation,
                             store: store,
                             client: client,
                             retryPolicy: retryPolicy,
                             randomUnit: randomUnit,
+                            automaticRebaser: automaticRebaser,
                             now: now()
                         )
                     }
@@ -798,14 +1460,14 @@ actor SyncV2Dispatcher {
     }
 
     private func scheduleNextRetry() async {
-        guard isStarted,
-              scheduledWake == nil,
-              let date = try? await store.nextRetryDate(
-                  localProjectID: nil
-              ) else {
-            return
-        }
-        let delay = max(0, date.timeIntervalSinceNow)
+        guard isStarted, scheduledWake == nil else { return }
+        // The general sender's retry date spans all projects. Restricted runs
+        // require an explicit retry opportunity instead of this global timer.
+        guard case .all = projectScope else { return }
+        let storedDate = try? await store.nextRetryDate(localProjectID: nil)
+        let generalDate = await contractSender?.nextGeneralRetryDate()
+        guard let date = [storedDate, generalDate].compactMap({ $0 }).min() else { return }
+        let delay = max(5, date.timeIntervalSinceNow)
         let nanoseconds = UInt64(
             min(delay, TimeInterval(UInt64.max) / 1_000_000_000)
                 * 1_000_000_000
@@ -918,9 +1580,19 @@ actor SyncV2Dispatcher {
             // Windows 클라이언트도 이 코드를 REVISION_CONFLICT와 같이 취급한다.
             if Self.isAutomaticRebaseCandidate(error),
                let automaticRebaser {
+                guard operation.automaticRebaseCount
+                        < retryPolicy.maximumAutomaticRebases
+                else {
+                    try? await store.markConflict(
+                        operation,
+                        errorCode: "AUTO_REBASE_LIMIT",
+                        detail: "자동 되감기 상한에 닿았습니다. 다른 기기의 변경을 확인해 주세요."
+                    )
+                    return
+                }
                 do {
                     switch try await automaticRebaser.rebase(operation) {
-                    case .rebased:
+                    case .rebased, .sourceResolved:
                         return
                     case .conflictPreserved:
                         return
@@ -1009,6 +1681,7 @@ actor SyncV2Dispatcher {
         client: any SyncV2CommitClienting,
         retryPolicy: SyncV2RetryPolicy,
         randomUnit: @Sendable () -> Double,
+        automaticRebaser: SyncV2AutomaticRebaser?,
         now: Date
     ) async {
         do {
@@ -1028,6 +1701,60 @@ actor SyncV2Dispatcher {
             )
             try await store.complete(operation, result: result)
         } catch let error as SyncV2ClientError {
+            // 다른 기기가 먼저 이 폴더를 바꿔 서버 revision이 앞서 나갔다.
+            // 폴더에는 합칠 본문이 없으므로 문서처럼 3-way로 합칠 것이 없고,
+            // 기준선만 서버 값으로 옮겨 이 기기의 이름을 그대로 다시 보내면
+            // 된다. 늦게 커밋하는 쪽이 이기고 진 쪽은 pull로 따라간다.
+            //
+            // 되감기는 `SyncV2AutomaticRebaser`를 지난다. 문서 쪽 되감기와 같은
+            // 길을 쓰고, 서버에서 이미 지워진 폴더를 이름 변경으로 되살리려는
+            // 시도를 그 안에서 막는다. 계약 적합성 벡터 TV-008이
+            // "rename does not resurrect the folder implicitly"로 못 박은 것이다.
+            if isAutomaticRebaseCandidate(error), let automaticRebaser {
+                // 각 successor가 attempts를 0에서 다시 시작하므로, 영속적으로
+                // 이어지는 자동 되감기 횟수로 상한을 판정한다.
+                guard operation.automaticRebaseCount
+                        < retryPolicy.maximumAutomaticRebases
+                else {
+                    let code = "AUTO_REBASE_LIMIT"
+                    try? await store.markConflict(
+                        operation,
+                        errorCode: code,
+                        detail: "자동 되감기 상한에 닿았다. 다른 기기가 같은 폴더를 계속 바꾸고 있다."
+                    )
+                    Self.reportStalledFolder(operation, code: code)
+                    return
+                }
+                do {
+                    let outcome = try await automaticRebaser.rebase(operation)
+                    switch outcome {
+                    case .rebased, .generationAdvanced, .sourceResolved:
+                        return
+                    case .conflictPreserved:
+                        return
+                    case let .conflict(code, detail):
+                        try await store.markConflict(
+                            operation,
+                            errorCode: code,
+                            detail: detail
+                        )
+                        Self.reportStalledFolder(operation, code: code)
+                        return
+                    }
+                } catch {
+                    let delay = retryPolicy.delay(
+                        attempt: operation.attempts,
+                        randomUnit: randomUnit()
+                    )
+                    try? await store.deferRetry(
+                        operation,
+                        errorCode: "AUTO_REBASE_FAILED",
+                        detail: error.localizedDescription,
+                        nextAttemptAt: now.addingTimeInterval(delay)
+                    )
+                    return
+                }
+            }
             do {
                 switch handling(for: error) {
                 case let .retry(code, detail):
@@ -1048,12 +1775,14 @@ actor SyncV2Dispatcher {
                         errorCode: code,
                         detail: detail
                     )
+                    Self.reportStalledFolder(operation, code: code)
                 case let .blocked(code, detail):
                     try await store.markBlocked(
                         operation,
                         errorCode: code,
                         detail: detail
                     )
+                    Self.reportStalledFolder(operation, code: code)
                 }
             } catch {
                 // 서버 응답과 SQLite 반영 사이에서 끊기면 inflight 복구가 같은
@@ -1073,6 +1802,44 @@ actor SyncV2Dispatcher {
         }
     }
 
+    /// 서버가 REVISION_CONFLICT와 함께 알려준 현재 revision을 읽는다.
+    ///
+    /// 배포된 `commit_folder`는 거절할 때 detail에 현재 revision과 서버가 들고
+    /// 있는 이름·부모를 함께 싣는다. 그 값을 쓰면 기준선을 맞추려고 서버에 다시
+    /// 물을 필요가 없다. 형식이 다르거나 값이 없으면 nil을 돌려주고 호출자가
+    /// 지금까지 하던 대로 세운다.
+    private static func serverRevision(
+        fromRevisionConflict detail: String?
+    ) -> Int64? {
+        guard let detail,
+              let data = detail.data(using: .utf8),
+              let object = try? JSONSerialization.jsonObject(
+                  with: data
+              ) as? [String: Any],
+              let revision = object["current_revision"] as? NSNumber
+        else {
+            return nil
+        }
+        return revision.int64Value
+    }
+
+    /// 서 있는 폴더 하나당 한 줄만 남긴다.
+    ///
+    /// operation_id를 싣지 않는다. 같은 폴더가 같은 이유로 서 있는 것은 한
+    /// 상태이지 매번 새로 발견한 사건이 아니다. operation_id를 넣으면 사용자가
+    /// 같은 조작을 다시 시도할 때마다 새 발견처럼 보인다.
+    private static func reportStalledFolder(
+        _ operation: SyncV2FolderDispatchOperation,
+        code: String
+    ) {
+        SyncV2Diagnostics.stalledFolderOperation(
+            folderID: operation.folderID,
+            parentFolderID: operation.parentFolderID,
+            name: operation.name,
+            code: code
+        )
+    }
+
     private static func isAutomaticRebaseCandidate(
         _ error: SyncV2ClientError
     ) -> Bool {
@@ -1083,7 +1850,8 @@ actor SyncV2Dispatcher {
         case .documentNotFound, .operationIDReused, .pathConflict,
              .authRequired, .leaseRequired, .leaseConflict,
              .leaseExpired, .forbidden, .invalidArgument,
-             .folderNotFound, .folderAlreadyExists, .folderNotEmpty:
+             .folderNotFound, .folderAlreadyExists, .folderNotEmpty,
+             .parentFolderNotFound, .folderNameConflict, .folderCycle:
             // 자동 rebase는 본문을 3-way로 합치는 일이다. 폴더는 합칠 본문이
             // 없으므로 여기로 오지 않는다.
             return false
@@ -1117,9 +1885,15 @@ actor SyncV2Dispatcher {
             case .documentNotFound, .documentAlreadyExists,
                  .revisionConflict, .operationIDReused,
                  .pathConflict, .folderNotFound, .folderAlreadyExists,
-                 .folderNotEmpty:
-                // FOLDER_NOT_EMPTY는 순서를 잘못 잡았다는 뜻이라 그대로 다시
-                // 보내면 계속 거절당한다. 자동 재시도로 돌리지 않고 세워 둔다.
+                 .folderNotEmpty, .parentFolderNotFound,
+                 .folderNameConflict, .folderCycle:
+                // 시간이 지나서 저절로 풀리는 상태가 아니라 사람이 트리나
+                // 이름을 고쳐야 바뀌는 상태다. FOLDER_NOT_EMPTY는 순서를
+                // 잘못 잡았다는 뜻이고, PARENT_FOLDER_NOT_FOUND는 직렬
+                // 전송에서도 나왔다면 트리 불일치라는 뜻이며,
+                // FOLDER_NAME_CONFLICT는 사용자가 이름을 바꾸기 전에는 같은
+                // 답이 온다. 그대로 다시 보내면 계속 거절당하므로 자동
+                // 재시도로 돌리지 않고 세워 둔다.
                 return .conflict(code: code.rawValue, detail: detail)
             }
         }
@@ -1164,6 +1938,7 @@ final class SyncV2NetworkRecoveryMonitor: @unchecked Sendable {
     }
 
     func start(recoveryHandler: @escaping @Sendable () -> Void) {
+        guard ReceiveValidationPolicy.current.sendingAllowed else { return }
         lock.lock()
         guard !isRunning else {
             lock.unlock()
@@ -1208,6 +1983,7 @@ final class SyncV2NetworkRecoveryMonitor: @unchecked Sendable {
         )
         handler = recovered ? recoveryHandler : nil
         lock.unlock()
+        if recovered { SyncV2RecoveryDiagnostics.record(stage: .network, event: .available) }
         handler?()
     }
 }

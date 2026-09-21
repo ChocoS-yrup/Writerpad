@@ -76,6 +76,7 @@ actor ScriptedDurableChangeRecorder: DurableLocalChangeRecording {
     private let metadataUpdater: RecordingMetadataUpdater?
     private(set) var batches: [LocalMutationBatch] = []
     private(set) var metadataReceiptCounts: [Int] = []
+    private var recordedInitialSnapshots = Set<DurableLocalBatchKind>()
 
     init(
         results: [DurableRecordResult],
@@ -95,7 +96,23 @@ actor ScriptedDurableChangeRecorder: DurableLocalChangeRecording {
         guard !results.isEmpty else {
             return .localSavedButNotQueued(reason: "script exhausted")
         }
-        return results.removeFirst()
+        let result = results.removeFirst()
+        if batch.kind == .projectBinding || batch.kind == .windowsImport {
+            if case .queued = result {
+                recordedInitialSnapshots.insert(batch.kind)
+            } else if case .notNeeded = result {
+                recordedInitialSnapshots.insert(batch.kind)
+            }
+        }
+        return result
+    }
+
+    func hasRecordedInitialSnapshot(
+        for projectID: ProjectID,
+        kind: DurableLocalBatchKind
+    ) async throws -> Bool {
+        _ = projectID
+        return recordedInitialSnapshots.contains(kind)
     }
 
     func preservedResult(

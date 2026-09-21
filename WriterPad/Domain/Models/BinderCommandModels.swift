@@ -68,6 +68,9 @@ struct BinderVolumeCreationResult: Equatable, Sendable {
     let chapterIDs: [DocumentID]
     let volumePath: RelativeDocumentPath
     let shouldRefreshBinder: Bool
+    /// 명령이 최신 메타데이터에서 확인한 원고 폴더다.
+    /// 화면에 남은 예전 BinderNode ID를 다시 쓰지 않는다.
+    let manuscriptFolderID: DocumentID
     let folderToExpandID: DocumentID
     let documentToOpenID: DocumentID
 }

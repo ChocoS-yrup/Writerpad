@@ -1,0 +1,1 @@
+../../../../../WriterPad/Data/Local/BootstrapRecord.swift

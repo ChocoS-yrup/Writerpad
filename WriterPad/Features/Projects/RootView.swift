@@ -9,6 +9,8 @@ struct RootView: View {
         ProjectWorkspaceView(
             projectManager: environment.projectManager,
             projectImporter: environment.projectImporter,
+            receivePromotionInspector: environment.receivePromotionInspector,
+            receivePromotionTransaction: environment.receivePromotionTransaction,
             binderRepository: environment.binderRepository,
             binderCommands: environment.binderCommands,
             documentRepository: environment.documentRepository,
@@ -17,6 +19,7 @@ struct RootView: View {
             exporter: environment.exporter,
             backupStore: environment.backupStore,
             backupPolicyStore: environment.backupPolicyStore,
+            projectBackupCoordinator: environment.projectBackupCoordinator,
             restoreCoordinator: environment.restoreCoordinator,
             workspaceStateRepository: environment.workspaceStateRepository,
             futureChangeNotifier: environment.futureChangeNotifier,
@@ -25,11 +28,16 @@ struct RootView: View {
             syncDispatcher: environment.syncDispatcher,
             conflictResolutionService:
                 environment.conflictResolutionService,
+            conflictRecoveryStore: environment.conflictRecoveryStore,
             snapshotPullService: environment.snapshotPullService,
             realtimeTrigger: environment.realtimeTrigger,
             backgroundSyncCoordinator:
                 environment.backgroundSyncCoordinator,
             editLeaseManager: environment.editLeaseManager,
+            handshakeService: environment.handshakeService,
+            contractStructureSender: environment.contractStructureSender,
+            snapshotPuller: environment.snapshotPullService,
+            serverProjectCatalog: environment.serverProjectCatalog,
             isDarkMode: $isDarkMode,
             smartPairsEnabled: $smartPairsEnabled
         )

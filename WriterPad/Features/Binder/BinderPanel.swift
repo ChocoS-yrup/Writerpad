@@ -65,6 +65,7 @@ struct BinderPanel: View {
     let projectID: ProjectID
     let allowsKeyboardFocus: Bool
     let refreshGeneration: UInt64
+    let openDocumentIDs: Set<DocumentID>
     let contentStateOverrides: [DocumentID: BinderTextContentState]
     let onSelection: (BinderNode) -> Void
     let onErrorChange: (String?) -> Void
@@ -98,6 +99,7 @@ struct BinderPanel: View {
         editOperation: Binding<BinderEditOperation>,
         allowsKeyboardFocus: Bool = true,
         refreshGeneration: UInt64 = 0,
+        openDocumentIDs: Set<DocumentID> = [],
         contentStateOverrides: [DocumentID: BinderTextContentState] = [:],
         onSelection: @escaping (BinderNode) -> Void = { _ in },
         onErrorChange: @escaping (String?) -> Void = { _ in },
@@ -107,6 +109,7 @@ struct BinderPanel: View {
         self.projectID = projectID
         self.allowsKeyboardFocus = allowsKeyboardFocus
         self.refreshGeneration = refreshGeneration
+        self.openDocumentIDs = openDocumentIDs
         self.contentStateOverrides = contentStateOverrides
         self.onSelection = onSelection
         self.onErrorChange = onErrorChange
@@ -170,6 +173,14 @@ struct BinderPanel: View {
         ) {
             await model.load(projectID: projectID)
         }
+        .onChange(of: openDocumentIDs) { previous, current in
+            let affectedDocumentIDs = previous.symmetricDifference(current)
+            Task {
+                await model.refreshCommandDescriptors(
+                    forDocumentIDs: affectedDocumentIDs
+                )
+            }
+        }
         .alert(
             namePrompt?.title ?? "이름 입력",
             isPresented: Binding(
@@ -180,7 +191,10 @@ struct BinderPanel: View {
         ) { prompt in
             TextField(prompt.placeholder, text: $promptName)
                 .id(prompt.id)
+                .submitLabel(.done)
+                .onSubmit(submitNamePrompt)
             Button("취소", role: .cancel) { namePrompt = nil }
+                .keyboardShortcut(.cancelAction)
             Button("확인") { submitNamePrompt() }
                 .disabled(prompt.requiresTypedName && promptName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
         } message: { prompt in
@@ -281,6 +295,13 @@ struct BinderPanel: View {
                 await model.prepareDisclosureState(for: row.node)
             }
             .padding(.leading, CGFloat(row.depth * 14))
+            .accessibilityActions {
+                if row.node.isFolder {
+                    Button("새 폴더") {
+                        beginPrompt(.create(kind: .folder, parent: row.node))
+                    }
+                }
+            }
     }
 
     private func binderEditRow(_ row: BinderVisibleRow) -> some View {
@@ -916,6 +937,13 @@ struct BinderPanel: View {
             commandButton(.rename, node: node, systemImage: "pencil") {
                 beginPrompt(.rename(node))
             }
+            let descriptor = model.descriptor(.rename, for: node)
+            if !descriptor.isEnabled, let reason = descriptor.denialReason {
+                Divider()
+                Label(reason, systemImage: "info.circle")
+                    .font(.caption)
+                    .disabled(true)
+            }
         } else {
             regularBinderContextMenu(for: node)
         }
@@ -1205,9 +1233,11 @@ private struct ChapterRenameSheet: View {
             .toolbar {
                 ToolbarItem(placement: .cancellationAction) {
                     Button("취소", action: onCancel)
+                        .keyboardShortcut(.cancelAction)
                 }
                 ToolbarItem(placement: .confirmationAction) {
                     Button("저장", action: onSave)
+                        .keyboardShortcut(.defaultAction)
                 }
             }
         }

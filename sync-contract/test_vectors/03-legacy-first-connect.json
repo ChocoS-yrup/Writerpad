@@ -2,7 +2,7 @@
   "$schema": "../transition-vector.schema.json",
   "vector_id": "TV-003",
   "title": "Legacy client first connection",
-  "contract_version": "0.3.0",
+  "contract_version": "0.2.0",
   "minimum_protocol_version": 1,
   "tags": [
     "bootstrap",

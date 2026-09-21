@@ -4,6 +4,101 @@ import XCTest
 
 @MainActor
 final class SyncSettingsModelTests: XCTestCase {
+#if DEBUG
+    func testContractGateCannotOpenWithoutFreshHandshakeButStoredGateCanClose()
+        async throws {
+        let project = makeManagedProject(
+            id: "00000000-0000-0000-0000-000000000899",
+            name: "관문 확인"
+        )
+        let defaults = makeDefaults()
+        let model = SyncSettingsModel(
+            projectLister: SyncSettingsProjectListerStub(projects: [project]),
+            authenticationService: SyncSettingsAuthenticationStub(
+                state: .signedOut(.noStoredSession)
+            ),
+            projectBindingService: SyncSettingsBindingStub(
+                projects: [project],
+                ownerSubject: UUID()
+            ),
+            defaults: defaults
+        )
+
+        await model.load()
+        let row = try XCTUnwrap(model.projectRows.first)
+        XCTAssertFalse(model.isGateOpen(for: row))
+
+        await model.setGateOpen(true, for: row).value
+
+        XCTAssertFalse(model.isGateOpen(for: row))
+        XCTAssertFalse(ContractPathGate.isOpen(for: project.id, in: defaults))
+        XCTAssertNotNil(model.gateReport)
+        // 기존 설치에서 명시적으로 켜 두었던 값의 표시·닫힘을 별도로 확인한다.
+        ContractPathGate.setOpen(true, for: project.id, in: defaults)
+
+        let restoredModel = SyncSettingsModel(
+            projectLister: SyncSettingsProjectListerStub(projects: [project]),
+            authenticationService: SyncSettingsAuthenticationStub(
+                state: .signedOut(.noStoredSession)
+            ),
+            projectBindingService: SyncSettingsBindingStub(
+                projects: [project],
+                ownerSubject: UUID()
+            ),
+            defaults: defaults
+        )
+        await restoredModel.load()
+        let restoredRow = try XCTUnwrap(restoredModel.projectRows.first)
+        XCTAssertTrue(restoredModel.isGateOpen(for: restoredRow))
+
+        await restoredModel.setGateOpen(false, for: restoredRow).value
+
+        XCTAssertFalse(restoredModel.isGateOpen(for: restoredRow))
+        XCTAssertNil(
+            defaults.object(
+                forKey: ContractPathGate.storageKey(for: project.id)
+            )
+        )
+        XCTAssertEqual(restoredModel.gateReport, "관문 확인 관문: 닫힘")
+    }
+#endif
+
+    func testSignUpConfirmationKeepsProtectedCloudRoutesLocked() async {
+        let project = makeManagedProject(
+            id: "00000000-0000-0000-0000-000000000900",
+            name: "확인 대기"
+        )
+        let auth = SyncSettingsAuthenticationStub(
+            state: .signedOut(.noStoredSession),
+            signUpResult: .confirmationRequired(
+                maskedEmail: "n***@example.com"
+            )
+        )
+        let model = SyncSettingsModel(
+            projectLister: SyncSettingsProjectListerStub(
+                projects: [project]
+            ),
+            authenticationService: auth,
+            projectBindingService: SyncSettingsBindingStub(
+                projects: [project],
+                ownerSubject: UUID()
+            ),
+            defaults: makeDefaults()
+        )
+
+        await model.load()
+        await model.signUp(
+            email: "new@example.com",
+            password: "safe-password"
+        )
+
+        XCTAssertFalse(model.isAuthenticated)
+        XCTAssertEqual(
+            model.informationMessage,
+            "확인 이메일을 보냈습니다 (n***@example.com). 이메일을 확인한 뒤 로그인하세요."
+        )
+    }
+
     func testEnablingGlobalSyncConnectsOnlyUnboundProjects() async {
         let first = makeManagedProject(
             id: "00000000-0000-0000-0000-000000000901",
@@ -226,9 +321,14 @@ private actor SyncSettingsProjectListerStub: SyncProjectListing {
 
 private actor SyncSettingsAuthenticationStub: AuthenticationServicing {
     private var state: AuthenticationState
+    private let signUpResult: AuthenticationSignUpResult
 
-    init(state: AuthenticationState) {
+    init(
+        state: AuthenticationState,
+        signUpResult: AuthenticationSignUpResult = .failed(.serverRejected)
+    ) {
         self.state = state
+        self.signUpResult = signUpResult
     }
 
     func currentState() -> AuthenticationState {
@@ -243,6 +343,18 @@ private actor SyncSettingsAuthenticationStub: AuthenticationServicing {
     func refreshSession(force: Bool) -> AuthenticationState {
         _ = force
         return state
+    }
+
+    func signUp(
+        email: String,
+        password: String
+    ) -> AuthenticationSignUpResult {
+        _ = email
+        _ = password
+        if case let .authenticated(account) = signUpResult {
+            state = .authenticated(account)
+        }
+        return signUpResult
     }
 
     func signIn(
@@ -368,5 +480,85 @@ private actor SyncSettingsBindingStub: ProjectBindingServicing {
         )
         bindings[localProjectID] = binding
         return .connected(binding)
+    }
+}
+
+
+@MainActor
+final class GeneralSyncRecoveryModelTests: XCTestCase {
+    private actor Reader: SyncV2GeneralRecoveryReading {
+        let detail: SyncV2GeneralRecoveryDetail
+        var failPage = false
+        var holdDetail = false
+        private var continuation: CheckedContinuation<Void, Never>?
+        init(detail: SyncV2GeneralRecoveryDetail) { self.detail = detail }
+        func configure(fail: Bool = false, hold: Bool = false) { failPage = fail; holdDetail = hold }
+        func generalRecoveryPage(localProjectID: ProjectID, after queueID: Int64?) async throws -> SyncV2GeneralRecoveryPage {
+            if failPage { throw SyncV2GeneralRecoveryError.unavailable }
+            return .init(rows: [detail.row], nextCursor: nil)
+        }
+        func generalRecoveryDetail(localProjectID: ProjectID, batchID: UUID) async throws -> SyncV2GeneralRecoveryDetail {
+            if holdDetail { await withCheckedContinuation { continuation = $0 } }
+            return detail
+        }
+        func waiting() -> Bool { continuation != nil }
+        func release() { continuation?.resume(); continuation = nil }
+    }
+
+    private func fixture() throws -> (GeneralSyncRecoveryModel, Reader, SyncV2GeneralRecoveryDetail) {
+        let local = ProjectID(rawValue: UUID()), batchID = UUID()
+        let batch = LocalMutationBatch(batchID: batchID, projectID: local, localTransactionID: nil,
+            mutations: [.documentSnapshot(operationID: UUID(), documentID: .init(rawValue: UUID()),
+                relativePath: .init(rawValue: "본문.txt"), content: "보관된 원고", contentHash: SHA256ContentHasher().sha256(for: Data("보관된 원고".utf8)),
+                localSaveGeneration: 1, isDeleted: false)])
+        let row = SyncV2GeneralRecoveryRow(queueID: 1, batchID: batchID, sourceStatus: "blocked", requestStatus: nil,
+            errorCode: "REVISION_CONFLICT", createdAt: "2026-09-08", isQueueHead: true)
+        let detail = try SyncV2GeneralRecoveryDetail(localProjectID: local, serverProjectID: UUID(), row: row,
+            sourceJSON: String(decoding: JSONEncoder().encode(batch), as: UTF8.self), requestJSON: nil, responseJSON: nil)
+        let reader = Reader(detail: detail)
+        return (GeneralSyncRecoveryModel(projectID: local, reader: reader), reader, detail)
+    }
+
+    func testLoadsAndExportsLocalDataWithoutAuthenticationOrDispatcher() async throws {
+        let (model, _, detail) = try fixture()
+        await model.load(); await model.select(detail.row)
+        XCTAssertEqual(model.rows.map(\.id), [detail.row.id])
+        XCTAssertEqual(try model.detail?.manuscripts().first?.content, "보관된 원고")
+        XCTAssertFalse(model.isLoading); XCTAssertNil(model.errorMessage)
+    }
+
+    func testFailedRefreshIsVisibleAndClearsStaleDetail() async throws {
+        let (model, reader, detail) = try fixture()
+        await model.load(); await model.select(detail.row)
+        await reader.configure(fail: true)
+        await model.load()
+        XCTAssertNotNil(model.errorMessage); XCTAssertNil(model.detail); XCTAssertTrue(model.rows.isEmpty)
+        XCTAssertFalse(model.isLoading)
+    }
+
+    func testClosedScreenDiscardsLateDetail() async throws {
+        let (model, reader, detail) = try fixture()
+        await reader.configure(hold: true)
+        let task = Task { await model.select(detail.row) }
+        for _ in 0..<200 {
+            if await reader.waiting() { break }
+            try await Task.sleep(for: .milliseconds(5))
+        }
+        let waiting = await reader.waiting(); XCTAssertTrue(waiting)
+        model.stop(); await reader.release(); await task.value
+        XCTAssertNil(model.detail); XCTAssertFalse(model.isLoading)
+    }
+
+    func testRefreshDiscardsLateSelectionFromPreviousGeneration() async throws {
+        let (model, reader, detail) = try fixture()
+        await reader.configure(hold: true)
+        let task = Task { await model.select(detail.row) }
+        for _ in 0..<200 {
+            if await reader.waiting() { break }
+            try await Task.sleep(for: .milliseconds(5))
+        }
+        let waiting = await reader.waiting(); XCTAssertTrue(waiting)
+        await model.load(); await reader.release(); await task.value
+        XCTAssertNil(model.detail); XCTAssertEqual(model.rows.count, 1); XCTAssertFalse(model.isLoading)
     }
 }

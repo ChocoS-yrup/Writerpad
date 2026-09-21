@@ -1,10 +1,93 @@
 import Foundation
 
+/// 본문 없이 문서의 정체와 세대만 담는다.
+///
+/// 변경 없는 pull에서 본문은 읽히지 않고 버려진다. 그런데도 매번 작품의
+/// 모든 본문을 받으면 전송량이 작품 크기에 비례해 늘어난다. 먼저 이 표를
+/// 받아 본문이 실제로 필요한 문서를 가려낸 뒤 그 문서만 채운다.
+///
+/// 판정에 쓰는 필드는 전부 여기 있다. 본문을 보는 곳은 휴지통 비움 payload
+/// 해석과 로컬 적용뿐이다.
+struct SyncV2RemoteDocumentManifestEntry: Codable, Equatable, Sendable {
+    let documentID: UUID
+    let relativePath: String
+    let revision: Int64
+    let parentFolderID: UUID?
+    let name: String?
+    let structureRevision: Int64?
+    let isDeleted: Bool
+    let deletedAt: Date?
+    let updatedAt: Date
+
+    enum CodingKeys: String, CodingKey {
+        case documentID = "document_id"
+        case relativePath = "relative_path"
+        case revision
+        case parentFolderID = "parent_folder_id"
+        case name
+        case structureRevision = "structure_revision"
+        case isDeleted = "is_deleted"
+        case deletedAt = "deleted_at"
+        case updatedAt = "updated_at"
+    }
+
+    init(
+        documentID: UUID,
+        relativePath: String,
+        revision: Int64,
+        isDeleted: Bool,
+        deletedAt: Date?,
+        updatedAt: Date,
+        parentFolderID: UUID? = nil,
+        name: String? = nil,
+        structureRevision: Int64? = nil
+    ) {
+        self.documentID = documentID
+        self.relativePath = relativePath
+        self.revision = revision
+        self.parentFolderID = parentFolderID
+        self.name = name
+        self.structureRevision = structureRevision
+        self.isDeleted = isDeleted
+        self.deletedAt = deletedAt
+        self.updatedAt = updatedAt
+    }
+
+    /// 본문을 받아 온 뒤 표와 같은 문서·같은 세대인지 확인한다. 표와 본문은
+    /// 서로 다른 요청이라 그 사이에 서버가 바뀔 수 있다.
+    func describesSameRow(as snapshot: SyncV2RemoteDocumentSnapshot) -> Bool {
+        documentID == snapshot.documentID
+            && revision == snapshot.revision
+            && relativePath == snapshot.relativePath
+            && isDeleted == snapshot.isDeleted
+            && parentFolderID == snapshot.parentFolderID
+            && name == snapshot.name
+            && structureRevision == snapshot.structureRevision
+    }
+}
+
+extension SyncV2RemoteDocumentSnapshot {
+    var manifestEntry: SyncV2RemoteDocumentManifestEntry {
+        SyncV2RemoteDocumentManifestEntry(
+            documentID: documentID,
+            relativePath: relativePath,
+            revision: revision,
+            isDeleted: isDeleted,
+            deletedAt: deletedAt,
+            updatedAt: updatedAt,
+            parentFolderID: parentFolderID, name: name, structureRevision: structureRevision
+        )
+    }
+}
+
 struct SyncV2RemoteDocumentSnapshot: Codable, Equatable, Sendable {
     let documentID: UUID
     let relativePath: String
     let content: String
     let revision: Int64
+    let parentFolderID: UUID?
+    let name: String?
+    let structureRevision: Int64?
     let isDeleted: Bool
     let deletedAt: Date?
     let updatedAt: Date
@@ -14,6 +97,9 @@ struct SyncV2RemoteDocumentSnapshot: Codable, Equatable, Sendable {
         case relativePath = "relative_path"
         case content
         case revision
+        case parentFolderID = "parent_folder_id"
+        case name
+        case structureRevision = "structure_revision"
         case isDeleted = "is_deleted"
         case deletedAt = "deleted_at"
         case updatedAt = "updated_at"
@@ -26,12 +112,18 @@ struct SyncV2RemoteDocumentSnapshot: Codable, Equatable, Sendable {
         revision: Int64,
         isDeleted: Bool,
         deletedAt: Date?,
-        updatedAt: Date
+        updatedAt: Date,
+        parentFolderID: UUID? = nil,
+        name: String? = nil,
+        structureRevision: Int64? = nil
     ) {
         self.documentID = documentID
         self.relativePath = relativePath
         self.content = content
         self.revision = revision
+        self.parentFolderID = parentFolderID
+        self.name = name
+        self.structureRevision = structureRevision
         self.isDeleted = isDeleted
         self.deletedAt = deletedAt
         self.updatedAt = updatedAt
@@ -43,6 +135,9 @@ struct SyncV2RemoteDocumentSnapshot: Codable, Equatable, Sendable {
         relativePath = try values.decode(String.self, forKey: .relativePath)
         content = try values.decode(String.self, forKey: .content)
         revision = try values.decode(Int64.self, forKey: .revision)
+        parentFolderID = try values.decodeIfPresent(UUID.self, forKey: .parentFolderID)
+        name = try values.decodeIfPresent(String.self, forKey: .name)
+        structureRevision = try values.decodeIfPresent(Int64.self, forKey: .structureRevision)
         isDeleted = try values.decode(Bool.self, forKey: .isDeleted)
         deletedAt = try Self.decodeOptionalDate(
             values,
@@ -57,6 +152,9 @@ struct SyncV2RemoteDocumentSnapshot: Codable, Equatable, Sendable {
         try values.encode(relativePath, forKey: .relativePath)
         try values.encode(content, forKey: .content)
         try values.encode(revision, forKey: .revision)
+        try values.encodeIfPresent(parentFolderID, forKey: .parentFolderID)
+        try values.encodeIfPresent(name, forKey: .name)
+        try values.encodeIfPresent(structureRevision, forKey: .structureRevision)
         try values.encode(isDeleted, forKey: .isDeleted)
         try values.encode(
             deletedAt.map(Self.encodeDate),
@@ -100,7 +198,6 @@ struct SyncV2RemoteDocumentSnapshot: Codable, Equatable, Sendable {
         }
         return date
     }
-
     private static func encodeDate(_ date: Date) -> String {
         let formatter = ISO8601DateFormatter()
         formatter.formatOptions = [
@@ -110,6 +207,37 @@ struct SyncV2RemoteDocumentSnapshot: Codable, Equatable, Sendable {
         return formatter.string(from: date)
     }
 }
+/// 로컬에 적어 둔 계약 tree_order 한 줄이다. 쓰기 전에 `serverRevision`을 base로
+/// 싣고, `children`으로 서버가 아는 목록을 확인한다.
+struct SyncV2StoredTreeOrder: Equatable, Sendable {
+    let treeOrderID: UUID
+    let parentFolderID: UUID?
+    let children: [UUID]
+    let serverRevision: Int64
+}
+
+/// 계약이 정한 tree_order 한 줄이다.
+///
+/// 자식을 이름이 아니라 `folder_id`/`document_id`로 적는다. 이름으로 두면 이름이
+/// 바뀌는 순간 순서가 어느 것을 가리키는지 알 수 없다. 그리고 revision은 우리가
+/// 만들어낼 수 없는 값이라, 이 줄을 받아 두지 않으면 순서를 안전하게 쓸 수 없다.
+struct SyncV2RemoteTreeOrder: Codable, Equatable, Sendable {
+    let treeOrderID: UUID
+    /// `nil`이면 작품 최상위다.
+    let parentFolderID: UUID?
+    let children: [UUID]
+    let revision: Int64
+    let updatedAt: Date
+
+    enum CodingKeys: String, CodingKey {
+        case treeOrderID = "tree_order_id"
+        case parentFolderID = "parent_folder_id"
+        case children
+        case revision
+        case updatedAt = "updated_at"
+    }
+}
+
 
 /// 서버 folders 한 줄이다. 문서와 달리 본문도 경로도 없다. 위치는
 /// parentFolderID 사슬로만 나타내므로, 경로는 받는 쪽에서 이름을 이어 붙여
@@ -269,18 +397,55 @@ enum SyncV2SnapshotPullOutcome: Equatable, Sendable {
 }
 
 struct SyncV2SnapshotPullReport: Equatable, Sendable {
+    // 폴더 조회 실패를 삼킨 일반 원고 pull 성공은 계약 구조 기준의 증명이 아니다.
+    var contractStructureBaselineReady: Bool = false
     let outcomes: [SyncV2SnapshotPullOutcome]
     let appliedSnapshots: [SyncV2RemoteDocumentSnapshot]
     /// 구조를 적용하지 못하게 만든 이름과 사유다. merge reason은 문자열 raw
     /// value라 값을 담을 수 없어 보고서로 따로 올린다. 이것이 없으면 사용자는
     /// 무엇을 고쳐야 할지 알 수 없어 상태에서 빠져나올 수 없다.
     var rejectedStructureNames: [SyncV2RejectedStructureName] = []
+    /// 원격 폴더 tombstone은 왔지만 자식의 live/tombstone 세대가
+    /// 아직 완료되지 않아 다음 Realtime snapshot을 기다리는 건수다.
+    /// 로컬 자료 위험과는 다르므로 rejectedStructureNames에 섞지 않는다.
+    var pendingChildTombstoneFolderCount: Int = 0
+    /// 서버 snapshot은 받았지만 열린 clean 문서를 보호하느라 tombstone을
+    /// 로컬에 아직 적용하지 못한 항목 수다. coordinator가 서버 세대 수신과
+    /// 로컬 적용 완료를 구분하는 데 사용한다.
+    var deferredLocalApplicationCount: Int = 0
+
+    var hasDeferredLocalApplication: Bool {
+        deferredLocalApplicationCount > 0
+    }
+}
+
+/// 거부를 사용자에게 어떻게 말해야 하는지 가른다.
+///
+/// 두 종류가 한 목록에 섞여 있었고, 화면은 목록의 첫 항목을 "이름을 고치라"는
+/// 문장에 그대로 끼워 넣었다. 이름 문제가 아닌 거부가 앞에 있으면 사용자는
+/// 손댈 필요가 없는 이름을 고치러 간다. 그래서 종류를 값으로 들고 다닌다.
+enum SyncV2RejectedStructureKind: Equatable, Sendable {
+    /// 이 이름 자체를 iPad에 쓸 수 없다. 보낸 기기에서 이름을 고치면 풀린다.
+    case unusableName
+    /// 이름 문제가 아니다. 덮어쓰지 않으려고 적용하지 않은 것이라, 이름을
+    /// 고쳐도 바뀌지 않는다.
+    case notApplied
+}
+
+/// 서버가 거절해 세워 둔 폴더 변경이다.
+///
+/// 이 기기가 한 조작이 서버에 올라가지 못한 상태다. 들어오는 변경을 적용하지
+/// 않은 것과 방향이 반대라 같은 목록에 담지 않는다.
+struct SyncV2StalledFolderChange: Equatable, Sendable {
+    let name: String
+    let errorCode: String
 }
 
 struct SyncV2RejectedStructureName: Equatable, Sendable {
     let name: String
     let parent: String
     let reason: String
+    let kind: SyncV2RejectedStructureKind
 }
 
 /// Watchdog와 실제 작업 중 먼저 끝난 값을 한 번만 채택하는 one-shot Race다.

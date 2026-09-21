@@ -407,6 +407,7 @@ private struct LocalPerformanceBaselineFixture {
         )
         let manager = LocalProjectManager(
             projectRepository: metadata,
+            creationMetadataStore: metadata,
             workspaceStateRepository: metadata,
             pathResolver: resolver,
             clock: clock

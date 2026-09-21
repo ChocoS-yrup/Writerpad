@@ -148,6 +148,57 @@ final class SwiftDataMetadataRepositoryTests: XCTestCase {
     }
 
     @MainActor
+    func testReplacingDocumentIdentityUpdatesChildrenAndWorkspaceReferences()
+        async throws {
+        let repository = try makeInMemoryRepository()
+        try await repository.save(makeProject())
+        try await repository.save(makeFolder())
+        let document = makeDocument(
+            id: firstDocumentID,
+            projectID: projectID,
+            parentID: folderID,
+            order: 1,
+            path: "메인/원고/1권/001화.txt"
+        )
+        try await repository.save(document)
+        try await repository.saveEditorState(
+            EditorWorkspaceState(
+                projectID: projectID,
+                left: EditorPaneState(
+                    documentID: firstDocumentID,
+                    cursor: .start
+                ),
+                right: nil,
+                activePane: .left
+            )
+        )
+        let replacementFolderID = DocumentID(rawValue: UUID())
+        let replacementDocumentID = DocumentID(rawValue: UUID())
+
+        try await repository.replaceDocumentIdentity(
+            from: folderID,
+            to: replacementFolderID,
+            in: projectID
+        )
+        try await repository.replaceDocumentIdentity(
+            from: firstDocumentID,
+            to: replacementDocumentID,
+            in: projectID
+        )
+
+        let oldFolder = try await repository.document(id: folderID)
+        let oldDocument = try await repository.document(id: firstDocumentID)
+        let replacedDocument = try await repository.document(
+            id: replacementDocumentID
+        )
+        let editorState = try await repository.editorState(for: projectID)
+        XCTAssertNil(oldFolder)
+        XCTAssertNil(oldDocument)
+        XCTAssertEqual(replacedDocument?.parentID, replacementFolderID)
+        XCTAssertEqual(editorState.left.documentID, replacementDocumentID)
+    }
+
+    @MainActor
     func testFileSaveReceiptUpdatesHashPathAndModificationDate() async throws {
         let repository = try makeInMemoryRepository()
         try await repository.save(makeProject())

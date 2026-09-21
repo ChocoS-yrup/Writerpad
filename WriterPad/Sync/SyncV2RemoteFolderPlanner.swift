@@ -98,6 +98,13 @@ enum SyncV2RemoteFolderPlanner {
             guard let folder = remoteByID[folderID] else { continue }
             let local = localByID[folderID]
 
+            // 메인과 9개 고정 바인더는 로컬 구조의 일부다. 낡은
+            // 서버 행이 tombstone이거나 다른 이름을 가리켜도 삭제·이동하지
+            // 않는다. 그 아래의 사용자 폴더만 원격 변경을 받는다.
+            if let local, isProtectedRootPath(local.relativePath) {
+                continue
+            }
+
             if blockedFolderIDs.contains(folderID) {
                 conflicts.append(
                     .conflict(
@@ -138,6 +145,21 @@ enum SyncV2RemoteFolderPlanner {
 
             if let local, canonical(local.relativePath.rawValue)
                 == canonical(path) {
+                if case .trashed = local.deletionStatus {
+                    // 이전 버전이 휴지통 폴더를 물리적으로만 복원하고
+                    // metadata를 trashed로 남긴 중간 상태다. 경로 이동 없이
+                    // 같은 move 경계로 다시 넘겨 live로 수렴시킨다.
+                    moves.append(
+                        .move(
+                            folderID: folderID,
+                            parentID: folder.parentFolderID.map(
+                                DocumentID.init(rawValue:)
+                            ),
+                            from: local.relativePath,
+                            to: RelativeDocumentPath(rawValue: path)
+                        )
+                    )
+                }
                 continue
             }
 
@@ -313,5 +335,15 @@ enum SyncV2RemoteFolderPlanner {
 
     private static func canonical(_ path: String) -> String {
         SyncV2FolderIdentity.canonicalPath(path)
+    }
+
+    private static func isProtectedRootPath(
+        _ path: RelativeDocumentPath
+    ) -> Bool {
+        let key = canonical(path.rawValue)
+        if key == canonical("메인") { return true }
+        return BinderFixedCategory.allCases.contains {
+            canonical($0.relativePath.rawValue) == key
+        }
     }
 }

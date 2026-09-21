@@ -1,0 +1,65 @@
+{
+  "review_date": "2026-09-06",
+  "product_commit": "bb40d22164f34371f9ad7f70b9cddf208a692f83",
+  "scope": "Isolated diagnostic reproduction; passing probes assert current unsafe dispatch, not safety acceptance.",
+  "command": "Scripts/run_tests.sh SyncV2HandshakeTests",
+  "start_kst": "2026-09-06T09:25:41.428+09:00",
+  "finish_kst": "2026-09-06T09:26:58.431+09:00",
+  "xcresult": "build/TestDerivedData/Logs/Test/Test-WriterPad-2026.09.06_09-25-41-+0900.xcresult",
+  "simulator": "iPad Pro 13-inch (M5), iOS 26.5",
+  "total": 51,
+  "passed": 51,
+  "failed": 0,
+  "skipped": 0,
+  "existing_tests": 49,
+  "diagnostic_probe_methods": 2,
+  "observations": [
+    {
+      "case": "no successful baseline pull in coordinator",
+      "transport_calls": 1,
+      "safety_accepted": false
+    },
+    {
+      "case": "during claim",
+      "queue": "blockedCount=1",
+      "transport_calls": 1,
+      "request_unchanged": true,
+      "safety_accepted": false
+    },
+    {
+      "case": "during claim",
+      "queue": "conflictCount=1",
+      "transport_calls": 1,
+      "request_unchanged": true,
+      "safety_accepted": false
+    },
+    {
+      "case": "immediately before transport authorization",
+      "queue": "blockedCount=1",
+      "transport_calls": 1,
+      "request_unchanged": true,
+      "safety_accepted": false
+    },
+    {
+      "case": "immediately before transport authorization",
+      "queue": "conflictCount=1",
+      "transport_calls": 1,
+      "request_unchanged": true,
+      "safety_accepted": false
+    }
+  ],
+  "limits": [
+    "Queue counts are injected into the real coordinator; this is not an end-to-end folder conflict.",
+    "No server inactive-project transition test was run.",
+    "lastPullSucceeded is a sync-status field, not a sufficient replacement for structural authority.",
+    "Historical physical-device recovery timestamps were not captured."
+  ],
+  "probe_patch": "ipad-c9-review-probes-2026-09-06.patch",
+  "probe_patch_sha256": "ea50650bd72b6b70e1754a91253fc26cd1d0a3428c7f6db9d0b98f4dc5942701",
+  "tests_restored_to_product_commit": true,
+  "product_source_changed": false,
+  "real_gate_changed": false,
+  "server_write": false,
+  "device_reinstalled": false,
+  "commit_or_push": false
+}

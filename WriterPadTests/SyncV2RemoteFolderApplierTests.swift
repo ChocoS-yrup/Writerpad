@@ -121,6 +121,336 @@ final class SyncV2RemoteFolderApplierTests: XCTestCase {
         XCTAssertTrue(fixture.exists("메인/지울 폴더/미전송.txt"))
     }
 
+    func testNonEmptyTombstoneIsDeferredWithoutUserWarningDuringDocumentStage()
+        async throws {
+        let folderID = DocumentID(rawValue: UUID())
+        let childID = DocumentID(rawValue: UUID())
+        let fixture = try Fixture(
+            projectID: projectID,
+            documents: [
+                folder(id: rootID, path: "메인", parent: nil),
+                folder(id: folderID, path: "메인/원격 삭제", parent: rootID),
+                text(
+                    id: childID,
+                    path: "메인/원격 삭제/문서.txt",
+                    parent: folderID
+                ),
+            ]
+        )
+        try fixture.makeDirectory("메인/원격 삭제")
+        try fixture.write("메인/원격 삭제/문서.txt", contents: "본문")
+
+        let report = await fixture.applier
+            .stageRemoteFoldersDeferringNonEmptyDeletions(
+                localProjectID: projectID,
+                remote: [
+                    remoteFolder(
+                        id: folderID,
+                        parent: rootID,
+                        name: "원격 삭제",
+                        isDeleted: true
+                    ),
+                ],
+                blockedFolderIDs: []
+            )
+
+        XCTAssertEqual(report.deferredFolderIDs, [folderID])
+        XCTAssertTrue(report.rejectedFolderIDs.isEmpty)
+        XCTAssertTrue(report.rejectedNames.isEmpty)
+        XCTAssertTrue(fixture.exists("메인/원격 삭제/문서.txt"))
+    }
+
+    func testDeferredTombstoneDeletesImmediatelyAfterChildApply()
+        async throws {
+        let folderID = DocumentID(rawValue: UUID())
+        let childID = DocumentID(rawValue: UUID())
+        let path = "메인/같은 pull"
+        let childPath = path + "/문서.txt"
+        let fixture = try Fixture(
+            projectID: projectID,
+            documents: [
+                folder(id: rootID, path: "메인", parent: nil),
+                folder(id: folderID, path: path, parent: rootID),
+                text(id: childID, path: childPath, parent: folderID),
+            ]
+        )
+        try fixture.makeDirectory(path)
+        try fixture.write(childPath, contents: "본문")
+
+        let staged = await fixture.applier
+            .stageRemoteFoldersDeferringNonEmptyDeletions(
+                localProjectID: projectID,
+                remote: [
+                    remoteFolder(
+                        id: folderID,
+                        parent: rootID,
+                        name: "같은 pull",
+                        isDeleted: true
+                    ),
+                ],
+                blockedFolderIDs: []
+            )
+        try FileManager.default.removeItem(
+            at: fixture.root.appendingPathComponent(childPath)
+        )
+        try await fixture.repository.removeMetadata(id: childID)
+
+        let finalized = await fixture.applier
+            .finalizeDeferredFolderDeletions(
+                localProjectID: projectID,
+                remote: [
+                    remoteFolder(
+                        id: folderID,
+                        parent: rootID,
+                        name: "같은 pull",
+                        isDeleted: true
+                    ),
+                ],
+                deferredFolderIDs: staged.deferredFolderIDs,
+                blockedFolderIDs: [],
+                waitingForRemoteChildrenFolderIDs: []
+            )
+
+        XCTAssertEqual(finalized.deletedFolderIDs, [folderID])
+        XCTAssertTrue(finalized.rejectedNames.isEmpty)
+        XCTAssertFalse(fixture.exists(path))
+    }
+
+    func testKnownRemoteChildWaitsWithoutNotAppliedWarning()
+        async throws {
+        let folderID = DocumentID(rawValue: UUID())
+        let childID = DocumentID(rawValue: UUID())
+        let path = "메인/정리 대기"
+        let childPath = path + "/문서.txt"
+        let fixture = try Fixture(
+            projectID: projectID,
+            documents: [
+                folder(id: rootID, path: "메인", parent: nil),
+                folder(id: folderID, path: path, parent: rootID),
+                text(id: childID, path: childPath, parent: folderID),
+            ]
+        )
+        try fixture.makeDirectory(path)
+        try fixture.write(childPath, contents: "본문")
+
+        let finalized = await fixture.applier
+            .finalizeDeferredFolderDeletions(
+                localProjectID: projectID,
+                remote: [
+                    remoteFolder(
+                        id: folderID,
+                        parent: rootID,
+                        name: "정리 대기",
+                        isDeleted: true
+                    ),
+                ],
+                deferredFolderIDs: [folderID],
+                blockedFolderIDs: [],
+                waitingForRemoteChildrenFolderIDs: [folderID]
+            )
+
+        XCTAssertEqual(
+            finalized.pendingChildTombstoneFolderIDs,
+            [folderID]
+        )
+        XCTAssertEqual(finalized.rejectedFolderIDs, [folderID])
+        XCTAssertTrue(finalized.rejectedNames.isEmpty)
+        XCTAssertTrue(fixture.exists(childPath))
+    }
+
+    func testUnexpectedDiskChildRemainsAVisibleFailClosedRejection()
+        async throws {
+        let folderID = DocumentID(rawValue: UUID())
+        let childID = DocumentID(rawValue: UUID())
+        let path = "메인/자료 보호"
+        let childPath = path + "/문서.txt"
+        let fixture = try Fixture(
+            projectID: projectID,
+            documents: [
+                folder(id: rootID, path: "메인", parent: nil),
+                folder(id: folderID, path: path, parent: rootID),
+                text(id: childID, path: childPath, parent: folderID),
+            ]
+        )
+        try fixture.makeDirectory(path)
+        try fixture.write(childPath, contents: "본문")
+        try fixture.write(path + "/metadata에 없는.txt", contents: "보호")
+
+        let finalized = await fixture.applier
+            .finalizeDeferredFolderDeletions(
+                localProjectID: projectID,
+                remote: [
+                    remoteFolder(
+                        id: folderID,
+                        parent: rootID,
+                        name: "자료 보호",
+                        isDeleted: true
+                    ),
+                ],
+                deferredFolderIDs: [folderID],
+                blockedFolderIDs: [],
+                waitingForRemoteChildrenFolderIDs: [folderID]
+            )
+
+        XCTAssertTrue(finalized.pendingChildTombstoneFolderIDs.isEmpty)
+        XCTAssertEqual(finalized.rejectedNames.count, 1)
+        XCTAssertTrue(fixture.exists(path + "/metadata에 없는.txt"))
+    }
+
+    func testDeferredNestedFoldersAreDeletedDeepestFirst() async throws {
+        let parentID = DocumentID(rawValue: UUID())
+        let nestedID = DocumentID(rawValue: UUID())
+        let childID = DocumentID(rawValue: UUID())
+        let parentPath = "메인/부모"
+        let nestedPath = parentPath + "/자식"
+        let childPath = nestedPath + "/문서.txt"
+        let fixture = try Fixture(
+            projectID: projectID,
+            documents: [
+                folder(id: rootID, path: "메인", parent: nil),
+                folder(id: parentID, path: parentPath, parent: rootID),
+                folder(id: nestedID, path: nestedPath, parent: parentID),
+                text(id: childID, path: childPath, parent: nestedID),
+            ]
+        )
+        try fixture.makeDirectory(nestedPath)
+        try fixture.write(childPath, contents: "본문")
+        let remote = [
+            remoteFolder(
+                id: parentID,
+                parent: rootID,
+                name: "부모",
+                isDeleted: true
+            ),
+            remoteFolder(
+                id: nestedID,
+                parent: parentID,
+                name: "자식",
+                isDeleted: true
+            ),
+        ]
+
+        let staged = await fixture.applier
+            .stageRemoteFoldersDeferringNonEmptyDeletions(
+                localProjectID: projectID,
+                remote: remote,
+                blockedFolderIDs: []
+            )
+        try FileManager.default.removeItem(
+            at: fixture.root.appendingPathComponent(childPath)
+        )
+        try await fixture.repository.removeMetadata(id: childID)
+        let finalized = await fixture.applier
+            .finalizeDeferredFolderDeletions(
+                localProjectID: projectID,
+                remote: remote,
+                deferredFolderIDs: staged.deferredFolderIDs,
+                blockedFolderIDs: [],
+                waitingForRemoteChildrenFolderIDs: []
+            )
+
+        XCTAssertEqual(finalized.deletedFolderIDs, [nestedID, parentID])
+        XCTAssertFalse(fixture.exists(parentPath))
+    }
+
+    /// 휴지통 안의 폴더는 이 기기가 원격 삭제를 이미 보존해 두었다는
+    /// 로컬 표현이다. 안의 TXT를 지우지는 않되, 서버 tombstone을 미적용으로
+    /// 보고해서도 안 된다. 그러면 다른 기기의 복원이 와도 중간 삭제 오류가
+    /// 최종 상태로 남는다.
+    func testTombstoneForFolderAlreadyInTrashKeepsLocalCopyWithoutRejection()
+        async throws {
+        let trashID = DocumentID(rawValue: UUID())
+        let folderID = DocumentID(rawValue: UUID())
+        let childID = DocumentID(rawValue: UUID())
+        let folderPath = "메인/휴지통/보존 폴더"
+        let childPath = folderPath + "/문서.txt"
+        let fixture = try Fixture(
+            projectID: projectID,
+            documents: [
+                folder(id: rootID, path: "메인", parent: nil),
+                folder(id: trashID, path: "메인/휴지통", parent: rootID),
+                folder(
+                    id: folderID,
+                    path: folderPath,
+                    parent: trashID,
+                    deletionStatus: .trashed(
+                        originalPath: RelativeDocumentPath(
+                            rawValue: "메인/보존 폴더"
+                        ),
+                        deletedAt: .distantPast
+                    )
+                ),
+                text(
+                    id: childID,
+                    path: childPath,
+                    parent: folderID,
+                    deletionStatus: .trashed(
+                        originalPath: RelativeDocumentPath(
+                            rawValue: "메인/보존 폴더/문서.txt"
+                        ),
+                        deletedAt: .distantPast
+                    )
+                ),
+            ]
+        )
+        try fixture.makeDirectory(folderPath)
+        try fixture.write(childPath, contents: "휴지통 본문")
+
+        let report = await fixture.applier.applyRemoteFolders(
+            localProjectID: projectID,
+            remote: [
+                remoteFolder(
+                    id: folderID,
+                    parent: rootID,
+                    name: "보존 폴더",
+                    isDeleted: true
+                ),
+            ],
+            blockedFolderIDs: []
+        )
+
+        XCTAssertTrue(report.rejectedNames.isEmpty)
+        XCTAssertTrue(report.rejectedFolderIDs.isEmpty)
+        XCTAssertTrue(fixture.exists(childPath))
+        let stored = try await fixture.repository.documents(in: projectID)
+        XCTAssertEqual(
+            stored.first { $0.id == folderID }?.relativePath.rawValue,
+            folderPath
+        )
+
+        let restored = await fixture.applier.applyRemoteFolders(
+            localProjectID: projectID,
+            remote: [
+                remoteFolder(id: rootID, parent: nil, name: "메인"),
+                remoteFolder(
+                    id: folderID,
+                    parent: rootID,
+                    name: "보존 폴더"
+                ),
+            ],
+            blockedFolderIDs: []
+        )
+
+        XCTAssertEqual(restored.movedFolderIDs, [folderID])
+        XCTAssertTrue(restored.rejectedNames.isEmpty)
+        XCTAssertFalse(fixture.exists(folderPath))
+        XCTAssertTrue(fixture.exists("메인/보존 폴더/문서.txt"))
+        let afterRestore = try await fixture.repository.documents(in: projectID)
+        XCTAssertEqual(
+            afterRestore.first { $0.id == childID }?.relativePath.rawValue,
+            "메인/보존 폴더/문서.txt"
+        )
+        XCTAssertEqual(
+            afterRestore.first { $0.id == folderID }?.deletionStatus,
+            .active
+        )
+        guard case .trashed = afterRestore.first(where: {
+            $0.id == childID
+        })?.deletionStatus else {
+            return XCTFail("문서는 live snapshot이 오기 전까지 tombstone을 유지해야 합니다.")
+        }
+    }
+
     func testEmptyTombstonedFolderIsRemoved() async throws {
         let folderID = DocumentID(rawValue: UUID())
         let fixture = try Fixture(
@@ -150,6 +480,50 @@ final class SyncV2RemoteFolderApplierTests: XCTestCase {
         XCTAssertFalse(fixture.exists("메인/빈 폴더"))
         let stored = try await fixture.repository.documents(in: projectID)
         XCTAssertNil(stored.first { $0.id == folderID })
+    }
+
+    func testLiveFolderAtDesiredPathReactivatesInterruptedRestore()
+        async throws {
+        let folderID = DocumentID(rawValue: UUID())
+        let path = "메인/중단된 복원"
+        let fixture = try Fixture(
+            projectID: projectID,
+            documents: [
+                folder(id: rootID, path: "메인", parent: nil),
+                folder(
+                    id: folderID,
+                    path: path,
+                    parent: rootID,
+                    deletionStatus: .trashed(
+                        originalPath: RelativeDocumentPath(rawValue: path),
+                        deletedAt: .distantPast
+                    )
+                ),
+            ]
+        )
+        try fixture.makeDirectory(path)
+
+        let report = await fixture.applier.applyRemoteFolders(
+            localProjectID: projectID,
+            remote: [
+                remoteFolder(id: rootID, parent: nil, name: "메인"),
+                remoteFolder(
+                    id: folderID,
+                    parent: rootID,
+                    name: "중단된 복원"
+                ),
+            ],
+            blockedFolderIDs: []
+        )
+
+        XCTAssertEqual(report.movedFolderIDs, [folderID])
+        XCTAssertTrue(report.rejectedNames.isEmpty)
+        let documents = try await fixture.repository.documents(in: projectID)
+        XCTAssertEqual(
+            documents.first { $0.id == folderID }?.deletionStatus,
+            .active
+        )
+        XCTAssertTrue(fixture.exists(path))
     }
 
     func testOccupiedDestinationOnDiskIsNotOverwritten() async throws {
@@ -247,24 +621,39 @@ final class SyncV2RemoteFolderApplierTests: XCTestCase {
     private func folder(
         id: DocumentID,
         path: String,
-        parent: DocumentID?
+        parent: DocumentID?,
+        deletionStatus: DocumentDeletionStatus = .active
     ) -> DocumentNode {
-        node(id: id, path: path, parent: parent, kind: .folder)
+        node(
+            id: id,
+            path: path,
+            parent: parent,
+            kind: .folder,
+            deletionStatus: deletionStatus
+        )
     }
 
     private func text(
         id: DocumentID,
         path: String,
-        parent: DocumentID?
+        parent: DocumentID?,
+        deletionStatus: DocumentDeletionStatus = .active
     ) -> DocumentNode {
-        node(id: id, path: path, parent: parent, kind: .text)
+        node(
+            id: id,
+            path: path,
+            parent: parent,
+            kind: .text,
+            deletionStatus: deletionStatus
+        )
     }
 
     private func node(
         id: DocumentID,
         path: String,
         parent: DocumentID?,
-        kind: DocumentKind
+        kind: DocumentKind,
+        deletionStatus: DocumentDeletionStatus = .active
     ) -> DocumentNode {
         DocumentNode(
             id: id,
@@ -274,7 +663,8 @@ final class SyncV2RemoteFolderApplierTests: XCTestCase {
             relativePath: RelativeDocumentPath(rawValue: path),
             userOrder: 0,
             modifiedAt: .distantPast,
-            contentHash: nil
+            contentHash: nil,
+            deletionStatus: deletionStatus
         )
     }
 

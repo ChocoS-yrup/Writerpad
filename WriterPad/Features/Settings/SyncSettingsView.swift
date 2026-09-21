@@ -1,17 +1,21 @@
 import Foundation
 import SwiftUI
+import UIKit
 
 enum GlobalSyncPreference {
     static let storageKey = "writerpad.sync-all-projects-enabled"
+    static let contractEpoch = SyncV2ContractEpoch()
 
     static func isEnabled(in defaults: UserDefaults = .standard) -> Bool {
-        defaults.bool(forKey: storageKey)
+        ReceiveValidationPolicy.current.sendingAllowed && defaults.bool(forKey: storageKey)
     }
 
     static func setEnabled(
         _ isEnabled: Bool,
         in defaults: UserDefaults = .standard
     ) {
+        guard ReceiveValidationPolicy.current.sendingAllowed else { return }
+        contractEpoch.advance()
         defaults.set(isEnabled, forKey: storageKey)
     }
 }
@@ -59,6 +63,7 @@ final class SyncSettingsModel: ObservableObject {
     @Published private(set) var authenticationState: AuthenticationState =
         .localOnly
     @Published private(set) var projectRows: [SyncProjectRow] = []
+    @Published private(set) var generalQueueStatuses: [ProjectID: SyncV2GeneralQueueStatus] = [:]
     @Published private(set) var isSyncAllEnabled: Bool
     @Published private(set) var isWorking = false
     @Published private(set) var errorMessage: String?
@@ -71,6 +76,10 @@ final class SyncSettingsModel: ObservableObject {
     private let backgroundSyncCoordinator:
         SyncV2BackgroundSyncCoordinator?
     private let editLeaseManager: (any EditLeaseManaging)?
+    private let handshakeService: SyncV2HandshakeService?
+    private let contractStructureSender: SyncV2ContractStructureSender?
+    var generalRecoveryReader: (any SyncV2GeneralRecoveryReading)? { contractStructureSender }
+    private let snapshotPuller: (any SyncV2SnapshotPulling)?
     private let defaults: UserDefaults
 
     init(
@@ -81,6 +90,9 @@ final class SyncSettingsModel: ObservableObject {
         backgroundSyncCoordinator:
             SyncV2BackgroundSyncCoordinator? = nil,
         editLeaseManager: (any EditLeaseManaging)? = nil,
+        handshakeService: SyncV2HandshakeService? = nil,
+        contractStructureSender: SyncV2ContractStructureSender? = nil,
+        snapshotPuller: (any SyncV2SnapshotPulling)? = nil,
         defaults: UserDefaults = .standard
     ) {
         projectLister = ProjectManagerSyncProjectLister(
@@ -91,6 +103,9 @@ final class SyncSettingsModel: ObservableObject {
         self.syncDispatcher = syncDispatcher
         self.backgroundSyncCoordinator = backgroundSyncCoordinator
         self.editLeaseManager = editLeaseManager
+        self.handshakeService = handshakeService
+        self.contractStructureSender = contractStructureSender
+        self.snapshotPuller = snapshotPuller
         self.defaults = defaults
         isSyncAllEnabled = GlobalSyncPreference.isEnabled(in: defaults)
     }
@@ -103,6 +118,9 @@ final class SyncSettingsModel: ObservableObject {
         backgroundSyncCoordinator:
             SyncV2BackgroundSyncCoordinator? = nil,
         editLeaseManager: (any EditLeaseManaging)? = nil,
+        handshakeService: SyncV2HandshakeService? = nil,
+        contractStructureSender: SyncV2ContractStructureSender? = nil,
+        snapshotPuller: (any SyncV2SnapshotPulling)? = nil,
         defaults: UserDefaults
     ) {
         self.projectLister = projectLister
@@ -111,9 +129,310 @@ final class SyncSettingsModel: ObservableObject {
         self.syncDispatcher = syncDispatcher
         self.backgroundSyncCoordinator = backgroundSyncCoordinator
         self.editLeaseManager = editLeaseManager
+        self.handshakeService = handshakeService
+        self.contractStructureSender = contractStructureSender
+        self.snapshotPuller = snapshotPuller
         self.defaults = defaults
         isSyncAllEnabled = GlobalSyncPreference.isEnabled(in: defaults)
     }
+
+#if DEBUG
+    /// 서버가 이 작품에 대해 무엇을 지원하는지 한 번 묻고 그 답을 보여 준다.
+    ///
+    /// 읽기 전용이다. 답이 무엇이든 계약 경로를 열지 않으며, 관문은 이 화면에서
+    /// 건드리지 않는다. 개발 빌드에서 서버와 처음 대화해 보기 위한 자리다.
+    @Published private(set) var handshakeReport: String?
+
+    /// 연결하지 않은 서버 작품에도 물을 수 있게 한다.
+    ///
+    /// 작품을 연결하면 `ensure_project`가 서버에 쓴다. 핸드셰이크만 확인하려는
+    /// 자리에서 그 쓰기를 유발하지 않으려고 서버 작품 id를 직접 받는다. 로컬
+    /// 작품 id는 캐시 키에만 쓰이고 요청에는 실리지 않는다.
+    /// 서버 구조를 내려받아 로컬에 반영만 한다. 서버로 나가는 것은 없다.
+    ///
+    /// 전체 동기화 토글은 dispatcher 를 함께 시작해서 나가는 쪽도 연다. 대조만
+    /// 하려는 자리에서 그걸 켜면, 이름은 같고 id 가 다른 로컬 폴더가 서버로
+    /// 나가 중복이 되거나 FOLDER_NAME_CONFLICT 로 막힌다. 그래서 pull 만 부른다.
+    @Published private(set) var pullReport: String?
+
+    /// 작품별 계약 경로 관문이다. 로컬 스위치이고 서버에 나가는 것이 없다.
+    ///
+    /// 켜도 그 자체로는 아무것도 쓰지 않는다. 서 있는 핸드셰이크와 함께여야
+    /// 계약 경로가 쓰이고, 그 둘 중 어느 것도 서버가 움직일 수 없다.
+    @Published private(set) var openContractPathProjectIDs: Set<ProjectID> = []
+
+    func isGateOpen(for row: SyncProjectRow) -> Bool {
+        openContractPathProjectIDs.contains(row.project.id)
+    }
+
+    @discardableResult
+    func setGateOpen(_ isOpen: Bool, for row: SyncProjectRow) -> Task<Void, Never> {
+        // 닫힘은 await 전에 반영한다. 열기는 새 조회가 끝난 뒤에만 허용한다.
+        if !isOpen {
+            ContractPathGate.close(for: row.project.id, in: defaults)
+            openContractPathProjectIDs.remove(row.project.id)
+            gateReport = "\(row.project.name) 관문: 닫힘"
+            return Task { await handshakeService?.gateClosed() }
+        }
+        let revision = ContractPathGate.revision(for: row.project.id, in: defaults)
+        let authEpoch = authenticationService.contractEpoch?.value ?? 0
+        let bindingEpoch = projectBindingService.contractEpoch?.value ?? 0
+        return Task {
+            guard let handshakeService else {
+                gateReport = "새 핸드셰이크를 확인할 수 없어 관문을 열지 않았습니다."
+                return
+            }
+            let state = await authenticationService.currentState()
+            let binding = await projectBindingService.currentBinding(for: row.project.id)
+            guard let serverID = binding?.serverProjectID,
+                  let context = SyncV2HandshakeContext.make(authenticationState: state,
+                      localProjectID: row.project.id, serverProjectID: serverID,
+                      authenticationEpoch: authEpoch, bindingEpoch: bindingEpoch)
+            else { gateReport = "로그인과 작품 연결을 확인해 주세요."; return }
+            do {
+                // 캐시가 있어도 명시적 열기는 서버를 새로 확인한다.
+                _ = try await handshakeService.refreshForGate(context: context)
+                let handshakeEpoch = handshakeService.authorizationEpoch.value
+                guard await handshakeService.isFresh(for: context), !Task.isCancelled else { return }
+                let opened = ContractPathGate.openAfterValidation(for: row.project.id,
+                    in: defaults, revision: revision) {
+                    authEpoch == (authenticationService.contractEpoch?.value ?? 0) &&
+                    bindingEpoch == (projectBindingService.contractEpoch?.value ?? 0) &&
+                    (projectBindingService.contractEpoch?.isAvailable ?? false) &&
+                    handshakeEpoch == handshakeService.authorizationEpoch.value
+                }
+                if opened { openContractPathProjectIDs.insert(row.project.id) }
+                gateReport = opened ? "\(row.project.name) 관문: 열림" : "상태가 바뀌어 관문을 열지 않았습니다."
+            } catch {
+                guard ContractPathGate.revision(for: row.project.id, in: defaults) == revision else { return }
+                gateReport = "새 핸드셰이크에 실패하여 관문을 열지 않았습니다: \(error)"
+            }
+        }
+    }
+
+    func refreshGeneralQueueStatus(for row: SyncProjectRow) async {
+        guard let contractStructureSender else { return }
+        generalQueueStatuses[row.id] = try? await contractStructureSender.generalQueueStatus(localProjectID: row.id)
+    }
+
+    func retryGeneralSync(for row: SyncProjectRow) async {
+        guard !isWorking, let contractStructureSender else { return }
+        isWorking = true
+        defer { isWorking = false }
+        do {
+            try await contractStructureSender.retryGeneralContract(localProjectID: row.id)
+            informationMessage = "저장된 변경의 재시도를 요청했습니다. 응답이 확인될 때까지 로컬 원본을 유지합니다."
+        } catch { errorMessage = "재시도를 시작하지 못했습니다. 동기화 연결 상태를 확인해 주세요." }
+        await refreshGeneralQueueStatus(for: row)
+    }
+
+    @Published private(set) var gateReport: String?
+    @Published private(set) var contractSendReport: String?
+    @Published private(set) var contractPreparations: [ProjectID: SyncV2ContractPreparation] = [:]
+    @Published private(set) var preparationExportURLs: [ProjectID: URL] = [:]
+    @Published private(set) var preparationReport: String?
+
+    func prepareEmptyVolume(for row: SyncProjectRow) async {
+        guard !isWorking, let contractStructureSender else { return }
+        isWorking = true
+        defer { isWorking = false }
+        do {
+            let value = try await contractStructureSender.prepareEmptyVolume(localProjectID: row.id)
+            try publishPreparation(value)
+            preparationReport = "빈 2권과 원고 순서의 검토용 요청을 저장했습니다. 폴더 생성과 서버 전송은 하지 않았습니다."
+        } catch {
+            preparationReport = "준비를 완료하지 못했습니다: \(error)"
+        }
+    }
+
+    func discardUnsentPreparation(for row: SyncProjectRow) async {
+        guard !isWorking, let contractStructureSender else { return }
+        isWorking = true
+        defer { isWorking = false }
+        do {
+            try await contractStructureSender.discardUnsentPreparation(localProjectID: row.id)
+            contractPreparations.removeValue(forKey: row.id)
+            preparationExportURLs.removeValue(forKey: row.id)
+            preparationReport = "미전송 검토 요청을 폐기했습니다. 새 준비에는 새 식별자가 사용됩니다."
+        } catch {
+            preparationReport = "요청을 보존했습니다. 송신을 시도한 배치는 먼저 결과를 확인해야 합니다: \(error)"
+        }
+    }
+
+    private func publishPreparation(_ value: SyncV2ContractPreparation) throws {
+        let directory = try FileManager.default.url(for: .documentDirectory, in: .userDomainMask,
+            appropriateFor: nil, create: true).appendingPathComponent("ContractReviews", isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        let url = directory.appendingPathComponent(try value.request.batchID.uuidString.lowercased() + ".json")
+        try value.exportData().write(to: url, options: .atomic)
+        contractPreparations[value.localProjectID] = value
+        preparationExportURLs[value.localProjectID] = url
+    }
+
+    func sendReviewedPreparation(for row: SyncProjectRow) async {
+        guard !isWorking, let contractStructureSender, let value = contractPreparations[row.id] else { return }
+        let authRevision = authenticationService.contractEpoch?.value
+        let bindingRevision = projectBindingService.contractEpoch?.value
+        isWorking = true
+        defer {
+            isWorking = false
+            _ = setGateOpen(false, for: row)
+        }
+        do {
+            let report = try await contractStructureSender.sendNext(localProjectID: row.id,
+                preparedBatchID: value.request.batchID, reviewedRequestSHA256: value.requestSHA256)
+            guard report.mayPresentCompletion, authRevision == authenticationService.contractEpoch?.value,
+                  bindingRevision == projectBindingService.contractEpoch?.value else { return }
+            contractSendReport = "검토 배치 응답: \(report.batchID.uuidString.lowercased()) / \(report.status.rawValue)"
+        } catch {
+            contractSendReport = "전송 완료를 확인하지 못했습니다. 같은 요청을 보존했습니다: \(error)"
+        }
+    }
+    private var contractReportRequestID = UUID()
+
+    func sendOneContractBatch(for row: SyncProjectRow) async {
+        guard let contractStructureSender else {
+            contractSendReport = "계약 구조 전송을 사용할 수 없습니다."
+            return
+        }
+        let requestID = UUID()
+        contractReportRequestID = requestID
+        let authEpoch = authenticationService.contractEpoch?.value ?? 0
+        let bindingEpoch = projectBindingService.contractEpoch?.value ?? 0
+        let generation = handshakeService?.authorizationEpoch.value
+        func isCurrent() -> Bool {
+            !Task.isCancelled && contractReportRequestID == requestID && authEpoch == (authenticationService.contractEpoch?.value ?? 0) &&
+            bindingEpoch == (projectBindingService.contractEpoch?.value ?? 0) &&
+            generation == handshakeService?.authorizationEpoch.value
+        }
+        isWorking = true
+        defer { isWorking = false }
+        do {
+            let report = try await contractStructureSender.sendNext(
+                localProjectID: row.project.id
+            )
+            guard isCurrent(), report.mayPresentCompletion else { return }
+            contractSendReport = """
+            서버 응답 검증 완료
+            batch_id: \(report.batchID.uuidString.lowercased())
+            status: \(report.status.rawValue)
+            operations: \(report.operationCount)
+            """
+        } catch {
+            guard isCurrent() else { return }
+            contractSendReport = "실패: \(error)"
+        }
+    }
+
+    func runPullOnly(for row: SyncProjectRow) async {
+        guard let snapshotPuller else {
+            pullReport = "snapshot 전송이 없습니다. Supabase 설정을 확인하세요."
+            return
+        }
+        guard let serverProjectID = row.binding?.serverProjectID else {
+            pullReport = "이 작품은 서버에 연결되어 있지 않습니다."
+            return
+        }
+        isWorking = true
+        defer { isWorking = false }
+        do {
+            let report = try await snapshotPuller.pull(
+                localProjectID: row.project.id,
+                serverProjectID: serverProjectID,
+                editingGuards: [:]
+            )
+            var lines = [
+                "적용된 스냅샷: \(report.appliedSnapshots.count)",
+                "결과: \(report.outcomes.count)",
+            ]
+            if report.rejectedStructureNames.isEmpty {
+                lines.append("거부된 구조 이름: 없음")
+            } else {
+                lines.append("거부된 구조 이름 \(report.rejectedStructureNames.count):")
+                for rejected in report.rejectedStructureNames.prefix(5) {
+                    lines.append("  \(rejected.parent)/\(rejected.name) — \(rejected.reason)")
+                }
+            }
+            pullReport = lines.joined(separator: "\n")
+            await reloadProjects()
+        } catch {
+            pullReport = "실패: \(error)"
+        }
+    }
+
+    func runHandshake(serverProjectIDText: String) async {
+        guard let serverProjectID = UUID(uuidString: serverProjectIDText.trimmingCharacters(in: .whitespacesAndNewlines)) else {
+            handshakeReport = "서버 작품 id가 UUID 형식이 아닙니다."
+            return
+        }
+        await runHandshake(
+            localProjectID: ProjectID(rawValue: serverProjectID),
+            serverProjectID: serverProjectID
+        )
+    }
+
+    func runHandshake(for row: SyncProjectRow) async {
+        guard handshakeService != nil else {
+            handshakeReport = "핸드셰이크 전송이 없습니다. Supabase 설정을 확인하세요."
+            return
+        }
+        guard let serverProjectID = row.binding?.serverProjectID else {
+            handshakeReport = "이 작품은 서버에 연결되어 있지 않습니다."
+            return
+        }
+        await runHandshake(
+            localProjectID: row.project.id,
+            serverProjectID: serverProjectID
+        )
+    }
+
+    private func runHandshake(
+        localProjectID: ProjectID,
+        serverProjectID: UUID
+    ) async {
+        guard let handshakeService else {
+            handshakeReport = "핸드셰이크 전송이 없습니다. Supabase 설정을 확인하세요."
+            return
+        }
+        guard let context = SyncV2HandshakeContext.make(
+            authenticationState: await authenticationService.currentState(),
+            localProjectID: localProjectID,
+            serverProjectID: serverProjectID,
+            authenticationEpoch: authenticationService.contractEpoch?.value ?? 0,
+            bindingEpoch: projectBindingService.contractEpoch?.value ?? 0
+        ) else {
+            handshakeReport = "로그인 상태가 아니라 누구로서 묻는지 확정할 수 없습니다."
+            return
+        }
+
+        isWorking = true
+        defer { isWorking = false }
+        do {
+            let handshake = try await handshakeService.refresh(context: context)
+            let gateIsOpen = ContractPathGate.isOpen(
+                for: localProjectID,
+                in: defaults
+            )
+            let usesContractPath = await handshakeService.usesContractStructure(
+                context: context,
+                gateIsOpen: gateIsOpen
+            )
+            handshakeReport = """
+            supported: 예
+            mode: \(handshake.projectSyncMode.rawValue) / epoch \(handshake.migrationEpoch)
+            contract: \(handshake.contractVersion)
+            protocol: \(handshake.serverProtocolVersion)
+            supported_protocol_versions: \(handshake.supportedProtocolVersions)
+            digest: \(handshake.contractSHA256.prefix(12))…
+            capabilities: \(handshake.serverCapabilities.count)개
+            조회 당시 관문: \(gateIsOpen ? "열림" : "닫힘")
+            조회 당시 계약 경로: \(usesContractPath ? "사용" : "미사용")
+            """
+        } catch {
+            handshakeReport = "실패: \(error)"
+        }
+    }
+#endif
 
     var isAuthenticated: Bool {
         authenticationState.isAuthenticated
@@ -128,7 +447,51 @@ final class SyncSettingsModel: ObservableObject {
         await reloadProjects()
     }
 
+    func observeAuthenticationChanges() async {
+        let updates = await authenticationService.stateUpdates()
+        for await updatedState in updates {
+            guard !Task.isCancelled else { return }
+            authenticationState = updatedState
+        }
+    }
+
+    func signUp(email: String, password: String) async {
+        guard !isWorking else { return }
+        isWorking = true
+        errorMessage = nil
+        informationMessage = nil
+
+        let result = await authenticationService.signUp(
+            email: email,
+            password: password
+        )
+        authenticationState = await authenticationService.currentState()
+        switch result {
+        case .authenticated:
+            if isSyncAllEnabled {
+                await syncDispatcher?.start()
+                await backgroundSyncCoordinator?.start()
+            }
+            await syncDispatcher?.loginSucceeded()
+            informationMessage = "계정을 만들고 로그인했습니다."
+        case let .confirmationRequired(maskedEmail):
+            let recipient = maskedEmail.map { " (\($0))" } ?? ""
+            informationMessage = "확인 이메일을 보냈습니다\(recipient). 이메일을 확인한 뒤 로그인하세요."
+        case let .failed(failure):
+            errorMessage = Self.authenticationMessage(
+                .unavailable(failure)
+            )
+        }
+        isWorking = false
+    }
+
     func signIn(email: String, password: String) async {
+        guard !isWorking else { return }
+        if ReceiveValidationPolicy.current.enabled {
+            do { _ = try ReceiveValidationPolicy.current.beginAuthentication(foreground: UIApplication.shared.applicationState == .active,
+                endpoint: ReceiveValidationPolicy.Configuration.staging) }
+            catch { errorMessage = "수신 확인 설정을 준비하지 못했습니다."; return }
+        }
         guard !isWorking else { return }
         isWorking = true
         errorMessage = nil
@@ -170,6 +533,7 @@ final class SyncSettingsModel: ObservableObject {
     }
 
     func enableSyncForAllProjects() async {
+        guard ReceiveValidationPolicy.current.sendingAllowed else { return }
         guard !isWorking else { return }
         guard authenticationState.isAuthenticated else {
             requireLogin()
@@ -210,6 +574,7 @@ final class SyncSettingsModel: ObservableObject {
     }
 
     func disableSyncForAllProjects() async {
+        guard ReceiveValidationPolicy.current.sendingAllowed else { return }
         guard !isWorking else { return }
         isSyncAllEnabled = false
         GlobalSyncPreference.setEnabled(false, in: defaults)
@@ -308,6 +673,26 @@ final class SyncSettingsModel: ObservableObject {
                 )
             }
             projectRows = rows
+#if DEBUG
+            // UserDefaults만 읽으면 토글 자체는 관찰할 상태가 없어 탭 직후 예전
+            // 값으로 돌아간다. 로드할 때 저장값을 화면 상태로 한 번 끌어올린다.
+            openContractPathProjectIDs = Set(
+                rows.lazy
+                    .filter {
+                        ContractPathGate.isOpen(
+                            for: $0.project.id,
+                            in: self.defaults
+                        )
+                    }
+                    .map(\.project.id)
+            )
+            for row in rows where row.binding?.serverProjectID == SyncV2EmptyVolumeReview.projectID {
+                if let value = try await contractStructureSender?.reviewedPreparation(localProjectID: row.id) {
+                    try publishPreparation(value)
+                }
+            }
+
+#endif
         } catch {
             errorMessage = "작품 목록을 불러오지 못했습니다: \(error.localizedDescription)"
         }
@@ -353,8 +738,18 @@ final class SyncSettingsModel: ObservableObject {
             switch failure {
             case .configurationUnavailable:
                 return "서버 주소와 공개 키가 이 빌드에 설정되지 않았습니다."
+            case .validationAuthorizationEnded:
+                return "인증 확인 권한이 만료되거나 취소되어 로그인을 완료하지 못했습니다. 승인된 시험 계정과 화면 이탈 여부를 확인해 주세요."
             case .invalidCredentials:
                 return "아이디 또는 비밀번호가 올바르지 않습니다."
+            case .weakPassword:
+                return "더 안전한 비밀번호를 사용하세요."
+            case .accountAlreadyExists:
+                return "이미 등록된 이메일입니다. 로그인해 주세요."
+            case .signUpDisabled:
+                return "현재 새 계정을 만들 수 없습니다."
+            case .emailNotConfirmed:
+                return "이메일 확인을 완료한 뒤 로그인하세요."
             case .networkUnavailable:
                 return "서버에 연결할 수 없습니다. 네트워크를 확인하세요."
             case .keychainAccess:
@@ -399,10 +794,32 @@ final class SyncSettingsModel: ObservableObject {
             return "서버가 예상과 다른 작품 정보를 반환했습니다."
         case .serverRejected:
             return "서버가 작품 연결을 처리하지 못했습니다."
+        case .initialSnapshotNotQueued:
+            return "최초 작품 snapshot을 안전하게 기록하지 못했습니다. 앱을 다시 열면 자동으로 재시도합니다."
         case .notBound:
             return "아직 서버에 연결되지 않은 작품입니다."
         }
     }
+}
+
+private enum AuthenticationFormMode: String, CaseIterable, Identifiable {
+    case signIn
+    case signUp
+
+    var id: String { rawValue }
+
+    var title: String {
+        switch self {
+        case .signIn: "로그인"
+        case .signUp: "회원 가입"
+        }
+    }
+}
+
+private enum AuthenticationField: Hashable {
+    case email
+    case password
+    case passwordConfirmation
 }
 
 private enum ExistingConnectionKind: String, Identifiable {
@@ -430,13 +847,178 @@ private struct ExistingConnectionRequest: Identifiable {
     }
 }
 
+private struct AuthenticationTextField: UIViewRepresentable {
+    let field: AuthenticationField
+    let placeholder: String
+    @Binding var text: String
+    @Binding var focusedField: AuthenticationField?
+    let isSecure: Bool
+    let keyboardType: UIKeyboardType
+    let textContentType: UITextContentType?
+    let accessibilityIdentifier: String
+    let isPreviousEnabled: Bool
+    let isNextEnabled: Bool
+    let onMove: (Int) -> Void
+    let onSubmit: (() -> Void)?
+
+    func makeCoordinator() -> Coordinator {
+        Coordinator(parent: self)
+    }
+
+    func makeUIView(context: Context) -> UITextField {
+        let textField = UITextField(frame: .zero)
+        textField.delegate = context.coordinator
+        textField.addTarget(
+            context.coordinator,
+            action: #selector(Coordinator.textDidChange(_:)),
+            for: .editingChanged
+        )
+        configure(textField, coordinator: context.coordinator)
+        return textField
+    }
+
+    func updateUIView(_ textField: UITextField, context: Context) {
+        context.coordinator.parent = self
+        configure(textField, coordinator: context.coordinator)
+
+        if textField.text != text {
+            textField.text = text
+        }
+
+        if focusedField == field {
+            if !textField.isFirstResponder {
+                textField.becomeFirstResponder()
+            }
+        } else if textField.isFirstResponder {
+            textField.resignFirstResponder()
+        }
+    }
+
+    private func configure(
+        _ textField: UITextField,
+        coordinator: Coordinator
+    ) {
+        textField.placeholder = placeholder
+        textField.font = UIFont.preferredFont(forTextStyle: .body)
+        textField.textColor = .label
+        textField.tintColor = .tintColor
+        textField.keyboardType = keyboardType
+        textField.textContentType = textContentType
+        if textField.isSecureTextEntry != isSecure {
+            textField.isSecureTextEntry = isSecure
+        }
+        textField.autocapitalizationType = .none
+        textField.autocorrectionType = .no
+        textField.spellCheckingType = .no
+        textField.returnKeyType = onSubmit != nil ? .go : (isNextEnabled ? .next : .done)
+        textField.accessibilityIdentifier = accessibilityIdentifier
+        textField.accessibilityLabel = placeholder
+
+        guard coordinator.previousEnabled != isPreviousEnabled
+                || coordinator.nextEnabled != isNextEnabled
+                || coordinator.previousButton == nil
+                || coordinator.nextButton == nil else {
+            return
+        }
+
+        coordinator.previousEnabled = isPreviousEnabled
+        coordinator.nextEnabled = isNextEnabled
+        let previousButton = UIBarButtonItem(
+            image: UIImage(systemName: "chevron.up"),
+            style: .plain,
+            target: coordinator,
+            action: #selector(Coordinator.moveToPreviousField)
+        )
+        previousButton.accessibilityLabel = "이전 입력란"
+        previousButton.accessibilityIdentifier =
+            "writerpad.auth-previous-field"
+        previousButton.isEnabled = isPreviousEnabled
+
+        let nextButton = UIBarButtonItem(
+            image: UIImage(systemName: "chevron.down"),
+            style: .plain,
+            target: coordinator,
+            action: #selector(Coordinator.moveToNextField)
+        )
+        nextButton.accessibilityLabel = "다음 입력란"
+        nextButton.accessibilityIdentifier = "writerpad.auth-next-field"
+        nextButton.isEnabled = isNextEnabled
+
+        coordinator.previousButton = previousButton
+        coordinator.nextButton = nextButton
+        textField.inputAssistantItem.trailingBarButtonGroups = [
+            UIBarButtonItemGroup(
+                barButtonItems: [previousButton, nextButton],
+                representativeItem: nil
+            )
+        ]
+        if textField.isFirstResponder {
+            textField.reloadInputViews()
+        }
+    }
+
+    final class Coordinator: NSObject, UITextFieldDelegate {
+        var parent: AuthenticationTextField
+        var previousEnabled: Bool?
+        var nextEnabled: Bool?
+        var previousButton: UIBarButtonItem?
+        var nextButton: UIBarButtonItem?
+
+        init(parent: AuthenticationTextField) {
+            self.parent = parent
+        }
+
+        @objc func textDidChange(_ textField: UITextField) {
+            parent.text = textField.text ?? ""
+        }
+
+        func textFieldDidBeginEditing(_ textField: UITextField) {
+            parent.focusedField = parent.field
+        }
+
+        func textFieldDidEndEditing(_ textField: UITextField) {
+            if parent.focusedField == parent.field {
+                parent.focusedField = nil
+            }
+        }
+
+        func textFieldShouldReturn(_ textField: UITextField) -> Bool {
+            parent.text = textField.text ?? ""
+            if let onSubmit = parent.onSubmit {
+                onSubmit()
+            } else if parent.isNextEnabled {
+                parent.onMove(1)
+            } else {
+                textField.resignFirstResponder()
+            }
+            return false
+        }
+
+        @objc func moveToPreviousField() {
+            parent.onMove(-1)
+        }
+
+        @objc func moveToNextField() {
+            parent.onMove(1)
+        }
+    }
+}
+
 struct SyncSettingsView: View {
+    @EnvironmentObject private var environment: AppEnvironment
     @StateObject private var model: SyncSettingsModel
+    @State private var authenticationMode: AuthenticationFormMode = .signIn
     @State private var email = ""
     @State private var password = ""
+    @State private var passwordConfirmation = ""
+    @State private var focusedAuthenticationField: AuthenticationField?
     @State private var isConfirmingEnableAll = false
     @State private var connectionRequest: ExistingConnectionRequest?
     @State private var disconnectTarget: SyncProjectRow?
+    @State private var generalRecoveryTarget: SyncProjectRow?
+#if DEBUG
+    @State private var handshakeProjectIDText = ""
+#endif
 
     init(
         projectManager: any ProjectManaging,
@@ -445,7 +1027,10 @@ struct SyncSettingsView: View {
         syncDispatcher: SyncV2Dispatcher?,
         backgroundSyncCoordinator:
             SyncV2BackgroundSyncCoordinator? = nil,
-        editLeaseManager: (any EditLeaseManaging)? = nil
+        editLeaseManager: (any EditLeaseManaging)? = nil,
+        handshakeService: SyncV2HandshakeService? = nil,
+        contractStructureSender: SyncV2ContractStructureSender? = nil,
+        snapshotPuller: (any SyncV2SnapshotPulling)? = nil,
     ) {
         _model = StateObject(
             wrappedValue: SyncSettingsModel(
@@ -454,19 +1039,41 @@ struct SyncSettingsView: View {
                 projectBindingService: projectBindingService,
                 syncDispatcher: syncDispatcher,
                 backgroundSyncCoordinator: backgroundSyncCoordinator,
-                editLeaseManager: editLeaseManager
+                editLeaseManager: editLeaseManager,
+                handshakeService: handshakeService,
+                contractStructureSender: contractStructureSender,
+                snapshotPuller: snapshotPuller
             )
         )
     }
 
     var body: some View {
         Form {
+            if ReceiveValidationPolicy.current.enabled { Text("송신 잠김 · 선택한 서버 작품만 가져올 수 있습니다.") }
             accountSection
-            globalSyncSection
-            projectConnectionsSection
+            if GeneralSyncValidationScope.current.restricted {
+                if let general = environment.generalValidationModel { GeneralValidationSection(model: general) }
+            } else if ReceiveValidationPolicy.current.bodyValidationEnabled { BodyValidationSection() }
+            localGeneralRecoverySection.disabled(ReceiveValidationPolicy.current.enabled)
+            if model.isAuthenticated {
+                globalSyncSection.disabled(ReceiveValidationPolicy.current.enabled)
+                projectConnectionsSection.disabled(ReceiveValidationPolicy.current.enabled)
+#if DEBUG
+                handshakeDiagnosticsSection.disabled(ReceiveValidationPolicy.current.enabled)
+#endif
+            } else {
+                protectedCloudSection
+            }
         }
         .navigationTitle("서버 동기화")
+        .onDisappear { if ReceiveValidationPolicy.current.enabled { ReceiveValidationPolicy.current.invalidate() } }
         .navigationBarTitleDisplayMode(.inline)
+        .onChange(of: authenticationMode) { _, mode in
+            if mode == .signIn,
+               focusedAuthenticationField == .passwordConfirmation {
+                focusedAuthenticationField = .password
+            }
+        }
         .disabled(model.isWorking)
         .overlay {
             if model.isWorking {
@@ -475,7 +1082,10 @@ struct SyncSettingsView: View {
                     .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 14))
             }
         }
-        .task { await model.load() }
+        .task {
+            await model.load()
+            await model.observeAuthenticationChanges()
+        }
         .confirmationDialog(
             "연결되지 않은 작품 \(model.unconnectedProjectCount)개를 새 서버 작품으로 연결할까요?",
             isPresented: $isConfirmingEnableAll,
@@ -506,6 +1116,11 @@ struct SyncSettingsView: View {
             }
         } message: {
             Text("서버의 작품과 원고는 삭제하지 않습니다.")
+        }
+        .sheet(item: $generalRecoveryTarget) { row in
+            if let reader = model.generalRecoveryReader {
+                GeneralSyncRecoveryView(projectID: row.id, projectName: row.project.name, reader: reader)
+            }
         }
         .sheet(item: $connectionRequest) { request in
             ExistingProjectConnectionView(
@@ -549,6 +1164,96 @@ struct SyncSettingsView: View {
         }
     }
 
+#if DEBUG
+    /// 개발 빌드에서만 보이는 진단 자리다. 서버에 읽기만 하고 아무것도 쓰지 않는다.
+    private var handshakeDiagnosticsSection: some View {
+        Section("계약 핸드셰이크 (개발용)") {
+            TextField("서버 작품 id (UUID)", text: $handshakeProjectIDText)
+                .textInputAutocapitalization(.never)
+                .autocorrectionDisabled()
+                .keyboardType(.asciiCapable)
+                .font(.footnote.monospaced())
+            Button("이 id로 확인") {
+                Task {
+                    await model.runHandshake(
+                        serverProjectIDText: handshakeProjectIDText
+                    )
+                }
+            }
+            .disabled(model.isWorking || handshakeProjectIDText.isEmpty)
+            ForEach(model.projectRows.filter(\.isConnected)) { row in
+                Toggle(
+                    "\(row.project.name) 관문",
+                    isOn: Binding(
+                        get: { model.isGateOpen(for: row) },
+                        set: { newValue in
+                            model.setGateOpen(newValue, for: row)
+                        }
+                    )
+                )
+                Button("\(row.project.name) — pull만 실행") {
+                    Task { await model.runPullOnly(for: row) }
+                }
+                .disabled(model.isWorking)
+                Button("\(row.project.name) 확인") {
+                    Task { await model.runHandshake(for: row) }
+                }
+                .disabled(model.isWorking)
+                if row.binding?.serverProjectID == SyncV2EmptyVolumeReview.projectID {
+                    Button("빈 2권 시험 요청 준비 · 전송 없음") {
+                        Task { await model.prepareEmptyVolume(for: row) }
+                    }
+                    .disabled(model.isWorking || model.isGateOpen(for: row))
+                    if let value = model.contractPreparations[row.id] {
+                        Text("검토 요청 SHA-256: \(value.requestSHA256)")
+                            .font(.caption.monospaced()).textSelection(.enabled)
+                        if let url = model.preparationExportURLs[row.id] {
+                            ShareLink("검토 요청 JSON 공유", item: url)
+                        }
+                        Button("미전송 검토 요청 폐기", role: .destructive) {
+                            Task { await model.discardUnsentPreparation(for: row) }
+                        }
+                        .disabled(model.isWorking || model.isGateOpen(for: row))
+                        Button("검토한 빈 2권 배치 1건 전송") {
+                            Task { await model.sendReviewedPreparation(for: row) }
+                        }
+                        .disabled(model.isWorking || !model.isGateOpen(for: row))
+                    }
+                }
+                Button("\(row.project.name) — 대기 계약 배치 1건 전송") {
+                    Task { await model.sendOneContractBatch(for: row) }
+                }
+                .disabled(model.isWorking || !model.isGateOpen(for: row))
+            }
+            if let report = model.gateReport {
+                Text(report)
+                    .font(.footnote.monospaced())
+            }
+            if let report = model.pullReport {
+                Text(report)
+                    .font(.footnote.monospaced())
+                    .textSelection(.enabled)
+            }
+            if let report = model.handshakeReport {
+                Text(report)
+                    .font(.footnote.monospaced())
+                    .textSelection(.enabled)
+            }
+            if let report = model.preparationReport {
+                Text(report).font(.footnote).textSelection(.enabled)
+            }
+            if let report = model.contractSendReport {
+                Text(report)
+                    .font(.footnote.monospaced())
+                    .textSelection(.enabled)
+            }
+            Text("요청 준비와 공유는 서버에 쓰지 않습니다. 관문을 열고 전송 버튼을 누르면 서버 구조를 씁니다. 검토 배치 전송 후에는 관문이 닫힙니다.")
+                .font(.footnote)
+                .foregroundStyle(.secondary)
+        }
+    }
+#endif
+
     @ViewBuilder
     private var accountSection: some View {
         Section("서버 계정") {
@@ -565,31 +1270,76 @@ struct SyncSettingsView: View {
                     Text("저장된 로그인을 확인하는 중…")
                 }
             case .localOnly, .signedOut, .unavailable:
-                TextField("이메일", text: $email)
-                    .textInputAutocapitalization(.never)
-                    .keyboardType(.emailAddress)
-                    .textContentType(.username)
-                    .autocorrectionDisabled()
-                    .accessibilityIdentifier("writerpad.sync-email")
-                SecureField("비밀번호", text: $password)
-                    .textContentType(.password)
-                    .accessibilityIdentifier("writerpad.sync-password")
-                Button("로그인") {
-                    let submittedEmail = email
-                    let submittedPassword = password
-                    password = ""
-                    Task {
-                        await model.signIn(
-                            email: submittedEmail,
-                            password: submittedPassword
-                        )
+                Picker("인증 방식", selection: $authenticationMode) {
+                    ForEach(AuthenticationFormMode.allCases) { mode in
+                        Text(mode.title).tag(mode)
                     }
                 }
-                .disabled(
-                    email.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-                        || password.isEmpty
+                .pickerStyle(.segmented)
+                .accessibilityIdentifier("writerpad.auth-mode")
+                AuthenticationTextField(
+                    field: .email,
+                    placeholder: "이메일",
+                    text: $email,
+                    focusedField: $focusedAuthenticationField,
+                    isSecure: false,
+                    keyboardType: .emailAddress,
+                    textContentType: .username,
+                    accessibilityIdentifier: "writerpad.sync-email",
+                    isPreviousEnabled: previousAuthenticationField != nil,
+                    isNextEnabled: nextAuthenticationField != nil,
+                    onMove: { moveAuthenticationFocus(by: $0) },
+                    onSubmit: nil
                 )
-                .accessibilityIdentifier("writerpad.sync-sign-in")
+                .frame(maxWidth: .infinity, minHeight: 36)
+                AuthenticationTextField(
+                    field: .password,
+                    placeholder: "비밀번호",
+                    text: $password,
+                    focusedField: $focusedAuthenticationField,
+                    isSecure: true,
+                    keyboardType: .default,
+                    textContentType: authenticationMode == .signUp
+                        ? .newPassword
+                        : .password,
+                    accessibilityIdentifier: "writerpad.sync-password",
+                    isPreviousEnabled: previousAuthenticationField != nil,
+                    isNextEnabled: nextAuthenticationField != nil,
+                    onMove: { moveAuthenticationFocus(by: $0) },
+                    onSubmit: authenticationMode == .signIn
+                        ? { submitAuthentication() } : nil
+                )
+                .frame(maxWidth: .infinity, minHeight: 36)
+                if authenticationMode == .signUp {
+                    AuthenticationTextField(
+                        field: .passwordConfirmation,
+                        placeholder: "비밀번호 확인",
+                        text: $passwordConfirmation,
+                        focusedField: $focusedAuthenticationField,
+                        isSecure: true,
+                        keyboardType: .default,
+                        textContentType: .newPassword,
+                        accessibilityIdentifier:
+                            "writerpad.sync-password-confirmation",
+                        isPreviousEnabled: previousAuthenticationField != nil,
+                        isNextEnabled: nextAuthenticationField != nil,
+                        onMove: { moveAuthenticationFocus(by: $0) },
+                        onSubmit: nil
+                    )
+                    .frame(maxWidth: .infinity, minHeight: 36)
+                    Text("비밀번호는 6자 이상이어야 합니다. 서버의 보안 정책에 따라 더 강한 비밀번호가 필요할 수 있습니다.")
+                        .font(.footnote)
+                        .foregroundStyle(.secondary)
+                }
+                Button(authenticationMode.title) {
+                    submitAuthentication()
+                }
+                .disabled(!canSubmitAuthentication)
+                .accessibilityIdentifier(
+                    authenticationMode == .signUp
+                        ? "writerpad.sync-sign-up"
+                        : "writerpad.sync-sign-in"
+                )
 
                 if case let .unavailable(failure) = model.authenticationState {
                     Text(unavailableHint(failure))
@@ -598,9 +1348,105 @@ struct SyncSettingsView: View {
                 }
             }
 
-            Text("비밀번호는 로그인 요청에만 사용하며 앱 설정에 저장하지 않습니다. 로그인 토큰은 iPad 키체인에 저장합니다.")
+            Text("비밀번호는 로그인·회원 가입 요청에만 사용하며 앱 설정에 저장하지 않습니다. 로그인 토큰은 iPad 키체인에 저장합니다.")
                 .font(.footnote)
                 .foregroundStyle(.secondary)
+        }
+    }
+
+    private var protectedCloudSection: some View {
+        Section("보호된 클라우드 기능") {
+            Label("로그인 필요", systemImage: "lock.fill")
+                .font(.headline)
+            Text("모든 작품 동기화와 작품별 서버 연결은 인증된 계정에서만 열립니다. 로컬 작품 작성과 저장은 계속 사용할 수 있습니다.")
+                .font(.footnote)
+                .foregroundStyle(.secondary)
+        }
+        .accessibilityIdentifier("writerpad.protected-cloud-route")
+    }
+
+    private func submitAuthentication() {
+        guard !model.isWorking, canSubmitAuthentication else { return }
+        let submittedMode = authenticationMode
+        let submittedEmail = email
+        let submittedPassword = password
+        focusedAuthenticationField = nil
+        password = ""
+        passwordConfirmation = ""
+        Task {
+            if submittedMode == .signUp {
+                await model.signUp(
+                    email: submittedEmail,
+                    password: submittedPassword
+                )
+            } else {
+                await model.signIn(
+                    email: submittedEmail,
+                    password: submittedPassword
+                )
+            }
+        }
+    }
+
+    private var canSubmitAuthentication: Bool {
+        let hasEmail = !email.trimmingCharacters(
+            in: .whitespacesAndNewlines
+        ).isEmpty
+        guard hasEmail, !password.isEmpty else { return false }
+        if authenticationMode == .signUp {
+            return password.count >= 6 && password == passwordConfirmation
+        }
+        return true
+    }
+
+    private var authenticationFields: [AuthenticationField] {
+        if authenticationMode == .signUp {
+            return [.email, .password, .passwordConfirmation]
+        }
+        return [.email, .password]
+    }
+
+    private var previousAuthenticationField: AuthenticationField? {
+        adjacentAuthenticationField(offset: -1)
+    }
+
+    private var nextAuthenticationField: AuthenticationField? {
+        adjacentAuthenticationField(offset: 1)
+    }
+
+    private func adjacentAuthenticationField(
+        offset: Int
+    ) -> AuthenticationField? {
+        guard let focusedAuthenticationField,
+              let currentIndex = authenticationFields.firstIndex(
+                  of: focusedAuthenticationField
+              ) else {
+            return nil
+        }
+        let targetIndex = currentIndex + offset
+        guard authenticationFields.indices.contains(targetIndex) else {
+            return nil
+        }
+        return authenticationFields[targetIndex]
+    }
+
+    private func moveAuthenticationFocus(by offset: Int) {
+        focusedAuthenticationField = adjacentAuthenticationField(
+            offset: offset
+        )
+    }
+
+    @ViewBuilder
+    private var localGeneralRecoverySection: some View {
+        if model.generalRecoveryReader != nil, !model.projectRows.isEmpty {
+            Section("보관된 동기화 변경") {
+                ForEach(model.projectRows) { row in
+                    Button(row.project.name + " · 변경 확인") { generalRecoveryTarget = row }
+                        .accessibilityIdentifier("writerpad.general-recovery-" + row.id.rawValue.uuidString)
+                }
+                Text("충돌하거나 대기 중인 변경을 확인하고 저장 당시 원고를 꺼낼 수 있습니다. 이 iPad의 보관본만 읽습니다.")
+                    .font(.footnote).foregroundStyle(.secondary)
+            }
         }
     }
 
@@ -669,6 +1515,15 @@ struct SyncSettingsView: View {
                         }
 
                         if row.isConnected {
+                            if let status = model.generalQueueStatuses[row.id], status.pendingCount > 0 {
+                                Text(status.message).font(.caption).foregroundStyle(.secondary)
+                                if (status.retryCount > 0 || status.resumeMessage != nil) && status.attentionCount == 0 {
+                                    Button("일반 동기화 재시도") { Task { await model.retryGeneralSync(for: row) } }
+                                        .disabled(model.isWorking || !model.isSyncAllEnabled)
+                                }
+                            }
+                            Button("동기화 상태 새로 고침") { Task { await model.refreshGeneralQueueStatus(for: row) } }
+                                .task { await model.refreshGeneralQueueStatus(for: row) }
                             HStack {
                                 Button("서버 이름 갱신") {
                                     Task {
@@ -731,8 +1586,18 @@ struct SyncSettingsView: View {
         switch failure {
         case .configurationUnavailable:
             return "이 빌드에는 서버 주소와 공개 키가 설정되지 않았습니다."
+        case .validationAuthorizationEnded:
+            return "인증 확인이 중단됐습니다. 승인된 시험 계정과 화면 이탈 여부를 확인해 주세요."
         case .invalidCredentials:
             return "아이디 또는 비밀번호를 다시 확인하세요."
+        case .weakPassword:
+            return "더 안전한 비밀번호를 사용하세요."
+        case .accountAlreadyExists:
+            return "이미 등록된 이메일입니다. 로그인해 주세요."
+        case .signUpDisabled:
+            return "현재 새 계정을 만들 수 없습니다."
+        case .emailNotConfirmed:
+            return "이메일 확인을 완료한 뒤 로그인하세요."
         case .networkUnavailable:
             return "네트워크에 연결되면 다시 시도하세요."
         case .keychainAccess:
@@ -780,11 +1645,13 @@ private struct ExistingProjectConnectionView: View {
             .toolbar {
                 ToolbarItem(placement: .cancellationAction) {
                     Button("취소", action: onCancel)
+                        .keyboardShortcut(.cancelAction)
                 }
                 ToolbarItem(placement: .confirmationAction) {
                     Button("연결") {
                         onConnect(serverID, confirmation)
                     }
+                    .keyboardShortcut(.defaultAction)
                     .disabled(serverID.isEmpty || confirmation.isEmpty)
                 }
             }

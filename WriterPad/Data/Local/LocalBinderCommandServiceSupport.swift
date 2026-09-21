@@ -369,6 +369,7 @@ extension LocalBinderCommandService {
             chapterIDs: chapters.map(\.id),
             volumePath: volumePath,
             shouldRefreshBinder: true,
+            manuscriptFolderID: manuscript.id,
             folderToExpandID: volumeID,
             documentToOpenID: firstChapter.id
         )
@@ -466,9 +467,15 @@ extension LocalBinderCommandService {
         _ originalJournal: BinderCommandJournal,
         workspaceRoot: URL
     ) async throws {
-        let documentIDs = (originalJournal.oldNodes + originalJournal.newNodes)
+        var documentIDs = (originalJournal.oldNodes + originalJournal.newNodes)
             .filter { $0.kind == .text }
             .map { $0.id.rawValue }
+        // 빈 폴더는 text UUID가 없어 기존 코드에서는 Gate를
+        // 그냥 통과했다. 원격 폴더 반영과 새 폴더 생성이
+        // 충돌하지 않도록 작품별 구조 키도 함께 사용한다.
+        documentIDs.append(
+            syncV2ProjectStructureMutationID(originalJournal.projectID)
+        )
         try await syncMutationGate.withCriticalSections(
             documentIDs: documentIDs
         ) { [self] in
@@ -684,10 +691,18 @@ extension LocalBinderCommandService {
             break
         }
 
-        // 폴더 자체를 서버에 알린다. tree_order는 이름 목록이라 이름이 바뀌면
-        // "옛 이름 사라짐 + 새 이름 생김"으로 도착한다. 같은 folder_id로 보내야
-        // 받는 기기가 옮기기로 처리한다.
-        mutations.append(contentsOf: folderMutations(for: journal))
+        // 새 권은 장 문서보다 권 폴더를 먼저 durable queue에 둔다. 실제 claim도
+        // volume_creation 폴더 장벽을 쓰지만, 재시작 뒤 queue 순서와 감사 기록도
+        // "권 폴더 -> 장 문서 -> tree_order"를 그대로 보여야 한다.
+        let folders = folderMutations(for: journal)
+        if journal.kind == .createVolume {
+            mutations.insert(contentsOf: folders, at: 0)
+        } else {
+            // 폴더 자체를 서버에 알린다. tree_order는 이름 목록이라 이름이 바뀌면
+            // "옛 이름 사라짐 + 새 이름 생김"으로 도착한다. 같은 folder_id로
+            // 보내야 받는 기기가 옮기기로 처리한다.
+            mutations.append(contentsOf: folders)
+        }
 
         if journal.kind != .permanentDelete && journal.kind != .emptyTrash {
             let documents = try await metadataStore.binderDocuments(
@@ -710,7 +725,8 @@ extension LocalBinderCommandService {
             projectID: journal.projectID,
             localTransactionID: journal.transactionID,
             kind: batchKind,
-            mutations: mutations
+            mutations: mutations,
+            structureSnapshot: try await metadataStore.binderDocuments(in: journal.projectID)
         )
     }
 
@@ -848,19 +864,41 @@ extension LocalBinderCommandService {
         let folders = live.filter { $0.kind == .folder }
         var order: [String: [String]] = [:]
         for parent in folders {
+            let isRoot = hierarchyPolicy.isTopLevelContainer(parent)
             let children = live
                 .filter { $0.parentID == parent.id }
                 .sorted {
+                    if isRoot {
+                        return BinderOrderingPolicy.rootItemPrecedes(
+                            lhsUserOrder: $0.userOrder,
+                            lhsFixedCategory: fixedCategory(for: $0.relativePath),
+                            lhsStableName: $0.relativePath.rawValue
+                                .precomposedStringWithCanonicalMapping,
+                            rhsUserOrder: $1.userOrder,
+                            rhsFixedCategory: fixedCategory(for: $1.relativePath),
+                            rhsStableName: $1.relativePath.rawValue
+                                .precomposedStringWithCanonicalMapping
+                        )
+                    }
                     if $0.userOrder != $1.userOrder {
                         return $0.userOrder < $1.userOrder
                     }
                     return $0.relativePath.rawValue < $1.relativePath.rawValue
                 }
-            guard !children.isEmpty else { continue }
-            let key = hierarchyPolicy.isTopLevelContainer(parent)
+            let rawKey = isRoot
                 ? "<root>"
                 : parent.relativePath.rawValue
-            order[key] = children.map { storedName(of: $0.relativePath) }
+            let key = rawKey == "<root>"
+                ? rawKey
+                : SyncV2ServerPath.canonical(rawKey)
+            // iOS 파일시스템은 한글 경로를 NFD로 되돌려줄 수
+            // 있다. folders 행은 NFC로 보내므로 tree_order도 같은
+            // 바이트 규약을 써야 Windows가 같은 폴더로 인식한다.
+            // 빈 폴더도 []로 명시해 문서 경로 없이 구조가
+            // 완전하게 전달되도록 한다.
+            order[key] = children.map {
+                SyncV2ServerPath.canonical(storedName(of: $0.relativePath))
+            }
         }
         return try canonicalJSON([
             "version": 1,

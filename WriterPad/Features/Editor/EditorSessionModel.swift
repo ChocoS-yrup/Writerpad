@@ -168,6 +168,7 @@ final class EditorSessionModel: ObservableObject {
     @Published private(set) var statistics = ManuscriptStatistics.empty
     @Published private(set) var currentDocumentID: DocumentID?
     @Published private(set) var selectedDisplayName: String?
+    @Published private(set) var isReadOnly = false
     @Published private(set) var externalVersion: UInt64 = 0
     private(set) var externalTextMutation: SharedEditorTextChange.VersionedMutation?
     @Published private(set) var focusRequest: UInt64 = 0
@@ -228,6 +229,7 @@ final class EditorSessionModel: ObservableObject {
     /// SwiftData의 문서 커서는 앱 재실행을 위한 최종 위치다. 같은 문서를 좌우 패널에
     /// 동시에 열 수 있으므로 실행 중 왕복에는 세션별 위치를 우선 사용한다.
     private var sessionCursors: [DocumentID: TextCursorState] = [:]
+    private var sessionContentHashes: [DocumentID: ContentHash] = [:]
 
     init(
         documentRepository: any DocumentRepository,
@@ -322,6 +324,7 @@ final class EditorSessionModel: ObservableObject {
     }
 
     func updateText(_ updatedText: String) {
+        guard !isReadOnly else { return }
         guard setText(updatedText, statisticsUpdate: .deferred) else { return }
         storeCurrentDraft()
         markDirtyAndScheduleAutosave()
@@ -331,6 +334,7 @@ final class EditorSessionModel: ObservableObject {
     /// `UITextView.text`와 SwiftUI `String`을 만들거나 게시하지 않는다.
     @discardableResult
     func applyTextMutation(_ mutation: SharedEditorTextChange.Mutation) -> Bool {
+        guard !isReadOnly else { return false }
         guard textBuffer.apply(mutation) else { return false }
         refreshDocumentSearchAfterTextChange()
         statisticsTask?.cancel()
@@ -353,7 +357,7 @@ final class EditorSessionModel: ObservableObject {
     func automaticRebaseSnapshot(
         documentID: DocumentID
     ) -> SyncV2RebaseLocalSnapshot? {
-        guard currentDocumentID == documentID else { return nil }
+        guard currentDocumentID == documentID, !isReadOnly else { return nil }
         return SyncV2RebaseLocalSnapshot(
             content: currentText,
             localPath: "",
@@ -436,6 +440,7 @@ final class EditorSessionModel: ObservableObject {
 
     /// 복원 완료 후 디스크와 편집기 표시를 같은 원고로 맞춘다.
     func applyRestoredText(_ restoredText: String) {
+        guard !isReadOnly else { return }
         autosaveDebouncer.cancel()
         setText(restoredText, statisticsUpdate: .immediate)
         dirtyGeneration = max(dirtyGeneration &+ 1, saveGeneration &+ 1)
@@ -456,8 +461,20 @@ final class EditorSessionModel: ObservableObject {
         content: String,
         relativePath: String? = nil
     ) -> Bool {
-        guard currentDocumentID == documentID,
-              !isComposing,
+        guard currentDocumentID == documentID else {
+            // 다른 문서를 보는 동안 내려온 본문도 예전 패널 커서로 덮어 복원하지 않는다.
+            // 같은 본문 재조회와 저장하지 못한 로컬 초안은 기존 위치를 유지한다.
+            if let previousHash = sessionContentHashes[documentID],
+               draftStore.draft(for: documentID) == nil {
+                let hash = SHA256ContentHasher().sha256(for: Data(content.utf8))
+                if previousHash != hash {
+                    sessionCursors[documentID] = TextCursorState(location: UInt(content.utf16.count), selectionLength: 0)
+                    sessionContentHashes[documentID] = hash
+                }
+            }
+            return false
+        }
+        guard !isComposing,
               !hasUnsavedChanges
         else { return false }
         if let relativePath {
@@ -468,13 +485,7 @@ final class EditorSessionModel: ObservableObject {
         let previous = textBuffer.snapshot()
         guard previous != content else { return true }
         autosaveDebouncer.cancel()
-        updateCursor(
-            SharedEditorTextChange.adjustedCursor(
-                cursor,
-                from: previous,
-                to: content
-            )
-        )
+        updateCursor(TextCursorState(location: UInt(content.utf16.count), selectionLength: 0))
         guard setText(content, statisticsUpdate: .immediate) else {
             return false
         }
@@ -482,6 +493,8 @@ final class EditorSessionModel: ObservableObject {
         lastSavedDirtyGeneration = dirtyGeneration
         externalTextMutation = nil
         externalVersion &+= 1
+        sessionContentHashes[documentID] = SHA256ContentHasher().sha256(for: Data(content.utf8))
+        selectionNavigationRequest &+= 1
         saveState = .idle
         draftStore.removeIfMatching(
             text: previous,
@@ -490,11 +503,37 @@ final class EditorSessionModel: ObservableObject {
         return true
     }
 
+    /// 외부 충돌 선택의 저장 결과를 표시와 재시도 상태에 함께 반영한다.
+    /// Swift 문자열의 정규화 동등성으로 실제 저장 바이트 차이를 무시하지 않는다.
+    @discardableResult
+    func applyComparedSave(_ receipt: DocumentSaveReceipt, content: String,
+        expected: SyncV2RebaseLocalSnapshot) -> Bool {
+        guard currentDocumentID == receipt.documentID, !isReadOnly, !hasUnsavedChanges,
+              canApplyAutomaticRebase(expected: expected),
+              Data(currentText.utf8) == Data(expected.content.utf8) else { return false }
+        let previous = currentText
+        autosaveDebouncer.cancel()
+        if setText(content, statisticsUpdate: .immediate, preservingUTF8: true) {
+            updateCursor(TextCursorState(location: UInt(content.utf16.count), selectionLength: 0))
+            externalTextMutation = nil; externalVersion &+= 1; selectionNavigationRequest &+= 1
+        }
+        saveGeneration = max(saveGeneration, receipt.generation)
+        dirtyGeneration = max(dirtyGeneration, saveGeneration)
+        lastSavedDirtyGeneration = dirtyGeneration
+        sessionContentHashes[receipt.documentID] = receipt.contentHash
+        saveState = .saved(generation: receipt.generation, savedAt: receipt.modifiedAt, contentHash: receipt.contentHash)
+        apply(durableRecordResult: receipt.durableRecordResult ?? .localSavedButNotQueued(
+            reason: "원고는 저장됐지만 메타데이터 복구가 필요합니다. 앱을 다시 열어 복구한 뒤 확인해 주세요."),
+            generation: receipt.generation, documentID: receipt.documentID)
+        draftStore.removeIfMatching(text: previous, for: receipt.documentID)
+        return true
+    }
+
     /// 같은 문서를 표시 중인 반대 패널의 변경을 표시 버전으로만 반영한다.
     /// 패널별 커서·선택·Undo 상태는 건드리지 않는다.
     @discardableResult
     func receiveSharedMutation(_ mutation: SharedEditorTextChange.Mutation) -> Bool {
-        guard !isComposing else { return false }
+        guard !isReadOnly, !isComposing else { return false }
         updateCursor(SharedEditorTextChange.adjustedCursor(cursor, applying: mutation))
         guard textBuffer.apply(mutation) else { return false }
         refreshDocumentSearchAfterTextChange()
@@ -516,7 +555,7 @@ final class EditorSessionModel: ObservableObject {
     }
 
     func receiveSharedTextSnapshot(_ sharedText: String) {
-        guard !isComposing else { return }
+        guard !isReadOnly, !isComposing else { return }
         let previousText = textBuffer.snapshot()
         guard previousText != sharedText else { return }
         updateCursor(
@@ -623,7 +662,7 @@ final class EditorSessionModel: ObservableObject {
     }
 
     func requestFocus() {
-        guard currentDocumentID != nil else { return }
+        guard currentDocumentID != nil, !isReadOnly else { return }
         focusRequest &+= 1
     }
 
@@ -658,12 +697,12 @@ final class EditorSessionModel: ObservableObject {
     }
 
     func requestUndo() {
-        guard currentDocumentID != nil else { return }
+        guard currentDocumentID != nil, !isReadOnly else { return }
         undoRequest &+= 1
     }
 
     func requestRedo() {
-        guard currentDocumentID != nil else { return }
+        guard currentDocumentID != nil, !isReadOnly else { return }
         redoRequest &+= 1
     }
 
@@ -688,7 +727,7 @@ final class EditorSessionModel: ObservableObject {
                 compositionCommitRequest &+= 1
             }
             await completePendingSelectionIfPossible()
-            if hasUnsavedChanges {
+            if !isReadOnly {
                 await synchronizeEditLease(to: currentDocumentID)
             }
         }
@@ -696,7 +735,7 @@ final class EditorSessionModel: ObservableObject {
     }
 
     private func performSelection(_ node: BinderNode) async {
-        if node.kind == .text, currentDocumentID == node.id {
+        if node.kind == .text, currentDocumentID == node.id, !isReadOnly {
             focusRequest &+= 1
             return
         }
@@ -710,6 +749,7 @@ final class EditorSessionModel: ObservableObject {
 
         guard node.kind == .text else {
             currentDocumentID = nil
+            isReadOnly = false
             setText("", statisticsUpdate: .immediate)
             cursor = .start
             isLoading = false
@@ -720,23 +760,24 @@ final class EditorSessionModel: ObservableObject {
             return
         }
 
-        if let draft = draftStore.draft(for: node.id) {
-            await apply(
-                documentID: node.id,
-                text: draft.text,
-                cursor: draft.cursor,
-                isUnsavedDraft: true
-            )
-            return
-        }
-
         isLoading = true
         currentDocumentID = nil
+        isReadOnly = false
         do {
             guard let document = try await documentRepository.document(id: node.id),
                   document.kind == .text
             else {
                 throw EditorSessionError.documentNotFound(node.displayName)
+            }
+            let readOnly = Self.isReadOnly(document)
+            if !readOnly, let draft = draftStore.draft(for: node.id) {
+                await apply(
+                    documentID: node.id,
+                    text: draft.text,
+                    cursor: draft.cursor,
+                    isUnsavedDraft: true
+                )
+                return
             }
             let loadedText = try await documentStore.loadText(for: document)
             let persistedCursor: TextCursorState?
@@ -753,15 +794,19 @@ final class EditorSessionModel: ObservableObject {
             await apply(
                 documentID: document.id,
                 text: loadedText,
-                cursor: restoredCursor
+                cursor: restoredCursor,
+                isReadOnly: readOnly
             )
-            await recoverPendingSyncHandoff(
-                for: document,
-                selectionSequence: sequence
-            )
+            if !readOnly {
+                await recoverPendingSyncHandoff(
+                    for: document,
+                    selectionSequence: sequence
+                )
+            }
         } catch {
             guard sequence == selectionSequence else { return }
             currentDocumentID = nil
+            isReadOnly = false
             setText("", statisticsUpdate: .immediate)
             cursor = .start
             isLoading = false
@@ -790,12 +835,14 @@ final class EditorSessionModel: ObservableObject {
     @discardableResult
     func saveNow(backupReason: BackupReason = .automaticSave) async -> Bool {
         autosaveDebouncer.cancel()
+        guard !isReadOnly else { return await persistSessionState() }
         return await performSaveNow(backupReason: backupReason)
     }
 
     @discardableResult
     private func performSaveNow(backupReason: BackupReason = .automaticSave) async -> Bool {
         guard let currentDocumentID else { return true }
+        guard !isReadOnly else { return await persistSessionState() }
         guard !isComposing else {
             pendingSaveAfterComposition = true
             return true
@@ -851,6 +898,7 @@ final class EditorSessionModel: ObservableObject {
                     cursor: snapshotCursor
                 )
             )
+            sessionContentHashes[receipt.documentID] = receipt.contentHash
             if let durableRecordResult = receipt.durableRecordResult {
                 apply(
                     durableRecordResult: durableRecordResult,
@@ -905,6 +953,7 @@ final class EditorSessionModel: ObservableObject {
     }
 
     private func markDirtyAndScheduleAutosave() {
+        guard !isReadOnly else { return }
         dirtyGeneration = max(
             dirtyGeneration &+ 1,
             saveGeneration &+ 1,
@@ -923,6 +972,7 @@ final class EditorSessionModel: ObservableObject {
     private func startEditLeaseAfterFirstMutationIfNeeded() {
         guard
             isSceneActive,
+            !isReadOnly,
             !isEditLeaseStartScheduled,
             editLeaseManager != nil,
             let documentID = currentDocumentID,
@@ -996,6 +1046,7 @@ final class EditorSessionModel: ObservableObject {
         let sequence = selectionSequence
         errorMessage = nil
         isLoading = true
+        isReadOnly = false
         do {
             guard let document = try await documentRepository.document(id: documentID),
                   document.kind == .text
@@ -1003,7 +1054,8 @@ final class EditorSessionModel: ObservableObject {
                 throw EditorSessionError.documentNotFound(documentID.rawValue.uuidString)
             }
             selectedDisplayName = Self.displayName(for: document.relativePath)
-            if let draft = draftStore.draft(for: documentID) {
+            let readOnly = Self.isReadOnly(document)
+            if !readOnly, let draft = draftStore.draft(for: documentID) {
                 await apply(
                     documentID: documentID,
                     text: draft.text,
@@ -1017,15 +1069,19 @@ final class EditorSessionModel: ObservableObject {
             await apply(
                 documentID: documentID,
                 text: loadedText,
-                cursor: cursor
+                cursor: cursor,
+                isReadOnly: readOnly
             )
-            await recoverPendingSyncHandoff(
-                for: document,
-                selectionSequence: sequence
-            )
+            if !readOnly {
+                await recoverPendingSyncHandoff(
+                    for: document,
+                    selectionSequence: sequence
+                )
+            }
         } catch {
             guard sequence == selectionSequence else { return }
             currentDocumentID = nil
+            isReadOnly = false
             setText("", statisticsUpdate: .immediate)
             self.cursor = .start
             isLoading = false
@@ -1043,6 +1099,7 @@ final class EditorSessionModel: ObservableObject {
         pendingDisplayName = nil
         selectedDisplayName = nil
         currentDocumentID = nil
+        isReadOnly = false
         setText("", statisticsUpdate: .immediate)
         cursor = .start
         isLoading = false
@@ -1057,30 +1114,35 @@ final class EditorSessionModel: ObservableObject {
         documentID: DocumentID,
         text: String,
         cursor: TextCursorState,
-        isUnsavedDraft: Bool = false
+        isUnsavedDraft: Bool = false,
+        isReadOnly: Bool = false
     ) async {
         autosaveDebouncer.cancel()
         let shouldReleasePreviousLease =
             leaseTrackedDocumentID != nil
-            && leaseTrackedDocumentID != documentID
+            && (leaseTrackedDocumentID != documentID || isReadOnly)
 
         // 문서 본문 전환은 이전 문서의 네트워크 잠금 정리보다 먼저 끝낸다.
         // 특히 대상이 빈 draft일 때 잠금 해제를 기다리면 제목만 새 화로
         // 바뀐 채 이전 UITextView와 본문이 화면에 남을 수 있다.
+        self.isReadOnly = isReadOnly
         currentDocumentID = documentID
         setText(text, statisticsUpdate: .immediate)
         self.cursor = cursor
         sessionCursors[documentID] = cursor
+        sessionContentHashes[documentID] = SHA256ContentHasher().sha256(for: Data(text.utf8))
         isLoading = false
         externalTextMutation = nil
         externalVersion &+= 1
-        focusRequest &+= 1
+        if !isReadOnly { focusRequest &+= 1 }
         resetSaveTracking()
-        if isUnsavedDraft {
+        if isUnsavedDraft, !isReadOnly {
             markDirtyAndScheduleAutosave()
         }
-        if shouldReleasePreviousLease {
-            await synchronizeEditLease(to: nil)
+        if shouldReleasePreviousLease || leaseTrackedDocumentID != documentID {
+            await synchronizeEditLease(
+                to: isSceneActive && !isReadOnly ? documentID : nil
+            )
         }
     }
 
@@ -1089,7 +1151,7 @@ final class EditorSessionModel: ObservableObject {
     }
 
     func resumeEditLease() async {
-        guard isSceneActive, hasUnsavedChanges else { return }
+        guard isSceneActive, !isReadOnly else { return }
         await synchronizeEditLease(to: currentDocumentID)
     }
 
@@ -1280,9 +1342,11 @@ final class EditorSessionModel: ObservableObject {
     @discardableResult
     private func setText(
         _ updatedText: String,
-        statisticsUpdate: StatisticsUpdate
+        statisticsUpdate: StatisticsUpdate,
+        preservingUTF8: Bool = false
     ) -> Bool {
-        guard textBuffer.snapshot() != updatedText else { return false }
+        let previous = textBuffer.snapshot()
+        guard preservingUTF8 ? Data(previous.utf8) != Data(updatedText.utf8) : previous != updatedText else { return false }
         text = updatedText
         textBuffer = ManuscriptTextBuffer(updatedText)
         if !documentSearch.query.isEmpty {
@@ -1341,11 +1405,20 @@ final class EditorSessionModel: ObservableObject {
         }
     }
 
+#if DEBUG
+    /// 예약된 통계 계산이 끝날 때까지 기다린다. 가상 시계로 시간을 돌리는 시험이
+    /// 실제 시계로 어림잡아 기다리지 않고 계산이 반영된 시점을 정확히 붙잡는다.
+    /// 대기 중인 계산이 없으면 곧바로 돌아온다.
+    func awaitStatisticsForTesting() async {
+        await statisticsTask?.value
+    }
+#endif
+
     private func apply(_ effects: [EditorFocusEffect]) async {
         for effect in effects {
             switch effect {
             case .requestFocus:
-                if currentDocumentID != nil {
+                if currentDocumentID != nil, !isReadOnly {
                     focusRequest &+= 1
                 }
             case .completePendingTransition:
@@ -1371,7 +1444,7 @@ final class EditorSessionModel: ObservableObject {
         if currentDocumentID == navigation.documentID {
             updateCursor(clamped(navigation.cursor, toUTF16Length: currentUTF16Length))
             selectionNavigationRequest &+= 1
-            focusRequest &+= 1
+            if !isReadOnly { focusRequest &+= 1 }
             return
         }
 
@@ -1386,25 +1459,30 @@ final class EditorSessionModel: ObservableObject {
         selectedDisplayName = navigation.displayName
         errorMessage = nil
 
-        if let draft = draftStore.draft(for: navigation.documentID) {
-            let target = clamped(navigation.cursor, toUTF16Length: draft.buffer.utf16Length)
-            await apply(
-                documentID: navigation.documentID,
-                text: draft.text,
-                cursor: target,
-                isUnsavedDraft: true
-            )
-            selectionNavigationRequest &+= 1
-            return
-        }
-
         isLoading = true
         currentDocumentID = nil
+        isReadOnly = false
         do {
             guard let document = try await documentRepository.document(
                 id: navigation.documentID
             ), document.kind == .text else {
                 throw EditorSessionError.documentNotFound(navigation.displayName)
+            }
+            let readOnly = Self.isReadOnly(document)
+            if !readOnly,
+               let draft = draftStore.draft(for: navigation.documentID) {
+                let target = clamped(
+                    navigation.cursor,
+                    toUTF16Length: draft.buffer.utf16Length
+                )
+                await apply(
+                    documentID: navigation.documentID,
+                    text: draft.text,
+                    cursor: target,
+                    isUnsavedDraft: true
+                )
+                selectionNavigationRequest &+= 1
+                return
             }
             let loadedText = try await documentStore.loadText(for: document)
             guard sequence == selectionSequence else { return }
@@ -1415,12 +1493,14 @@ final class EditorSessionModel: ObservableObject {
             await apply(
                 documentID: document.id,
                 text: loadedText,
-                cursor: target
+                cursor: target,
+                isReadOnly: readOnly
             )
             selectionNavigationRequest &+= 1
         } catch {
             guard sequence == selectionSequence else { return }
             currentDocumentID = nil
+            isReadOnly = false
             setText("", statisticsUpdate: .immediate)
             cursor = .start
             isLoading = false
@@ -1445,6 +1525,11 @@ final class EditorSessionModel: ObservableObject {
     private static func displayName(for path: RelativeDocumentPath) -> String {
         let component = path.rawValue.split(separator: "/").last.map(String.init) ?? path.rawValue
         return component.hasSuffix(".txt") ? String(component.dropLast(4)) : component
+    }
+
+    private static func isReadOnly(_ document: DocumentNode) -> Bool {
+        if case .trashed = document.deletionStatus { return true }
+        return false
     }
 
     private struct PendingSearchNavigation {

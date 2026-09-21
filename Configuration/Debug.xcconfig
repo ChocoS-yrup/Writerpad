@@ -1,2 +1,7 @@
 #include "Shared.xcconfig"
 #include? "Supabase.Debug.local.xcconfig"
+
+// Debug 빌드는 따로 산다. 보존해 둔 계보의 빌드를 같은 기기에 두고
+// 비교할 수 있어야 한다.
+WRITERPAD_BUNDLE_SUFFIX = .debug
+WRITERPAD_DISPLAY_NAME = ChocoS Debug

@@ -1,5 +1,5 @@
 {
- "table_id": "storage-name-excluded-v2",
+ "table_id": "storage-name-excluded-v1",
  "purpose": "Scalars that are assigned but must not appear in a storage name.",
  "rule": "A storage name MUST be rejected (STORAGE_NAME_UNSUPPORTED_SCALAR) if it contains any scalar in these ranges. This is checked before NFKC, on the input scalars.",
  "rationale": "Private Use is by definition a private agreement, so two clients have no guarantee of reading it the same way; it is unfit as collision-key material. Tags and the Variation Selectors Supplement are invisible and carry no naming intent.",

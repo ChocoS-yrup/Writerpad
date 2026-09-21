@@ -19,10 +19,13 @@ enum LocalDocumentStoreError: Error, Equatable, LocalizedError, Sendable {
     case operationFailed(operation: LocalDocumentOperation, path: String, code: Int32)
     case staleGeneration(documentID: DocumentID, requested: UInt64, latest: UInt64)
     case documentNoLongerWritable(DocumentID)
+    case comparedContentChanged
     case metadataUpdateFailed(receipt: DocumentSaveReceipt, markerPath: String, reason: String)
 
     var errorDescription: String? {
         switch self {
+        case .comparedContentChanged:
+            "비교한 뒤 원고가 바뀌었습니다. 현재 원고를 유지하고 다시 비교해 주세요."
         case let .textFileRequired(path):
             "UTF-8 TXT 문서만 열거나 저장할 수 있습니다: \(path)"
         case let .fileNotFound(path):

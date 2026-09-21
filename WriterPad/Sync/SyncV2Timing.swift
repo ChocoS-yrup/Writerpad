@@ -6,6 +6,7 @@ import Foundation
 struct SyncV2Timing: Equatable, Sendable {
     let authRestoreTimeout: Duration
     let realtimeSubscriptionTimeout: Duration
+    let initialRealtimeSubscriptionGrace: Duration
     let pullTimeout: Duration
     let workspaceAuthenticationTimeout: Duration
     let authenticationRetryDelay: Duration
@@ -22,6 +23,7 @@ struct SyncV2Timing: Equatable, Sendable {
     init(
         authRestoreTimeout: Duration = .seconds(12),
         realtimeSubscriptionTimeout: Duration = .seconds(12),
+        initialRealtimeSubscriptionGrace: Duration = .seconds(1),
         pullTimeout: Duration = .seconds(15),
         workspaceAuthenticationTimeout: Duration = .seconds(12),
         authenticationRetryDelay: Duration = .seconds(3),
@@ -40,6 +42,8 @@ struct SyncV2Timing: Equatable, Sendable {
     ) {
         self.authRestoreTimeout = authRestoreTimeout
         self.realtimeSubscriptionTimeout = realtimeSubscriptionTimeout
+        self.initialRealtimeSubscriptionGrace =
+            initialRealtimeSubscriptionGrace
         self.pullTimeout = pullTimeout
         self.workspaceAuthenticationTimeout =
             workspaceAuthenticationTimeout
@@ -69,6 +73,8 @@ struct SyncV2Timing: Equatable, Sendable {
 //   watchdog 예산보다 먼저 끝나 원래 요청을 재시도할 수 있어야 한다.
 // - realtimeSubscriptionTimeout < pullTimeout: 연결 성립 여부를 먼저 판정한 뒤
 //   더 긴 snapshot 확인 예산을 사용한다.
+// - initialRealtimeSubscriptionGrace < realtimeSubscriptionTimeout: 최초
+//   snapshot은 Realtime 장애 판정 전에도 유한 시간 안에 시작한다.
 // - backoff.max() < periodicDelay: 명시적 재연결 backoff가 90초 안전망보다
 //   먼저 실행되어야 한다.
 // - debounceDelay < backoff.min(): 이벤트 병합이 첫 재연결보다 먼저 끝나야 한다.

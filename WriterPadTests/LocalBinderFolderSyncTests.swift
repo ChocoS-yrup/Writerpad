@@ -216,6 +216,7 @@ final class LocalBinderFolderSyncTests: XCTestCase {
         let clock = FixedClock()
         let manager = LocalProjectManager(
             projectRepository: repository,
+            creationMetadataStore: repository,
             workspaceStateRepository: repository,
             pathResolver: resolver,
             clock: clock
@@ -288,6 +289,15 @@ private actor FolderMutationRecorder: DurableLocalChangeRecording {
     ) async -> DurableRecordingRequirement {
         _ = projectID
         return .durableQueue
+    }
+
+    func hasRecordedInitialSnapshot(
+        for projectID: ProjectID,
+        kind: DurableLocalBatchKind
+    ) async throws -> Bool {
+        _ = projectID
+        _ = kind
+        return false
     }
 
     func record(_ batch: LocalMutationBatch) async -> DurableRecordResult {

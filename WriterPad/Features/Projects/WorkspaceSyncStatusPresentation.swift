@@ -61,6 +61,15 @@ enum WorkspaceSyncStatusReducer {
                 severity: .failure,
                 retry: true
             )
+        case let .serverSizeLimitExceeded(_, bytes, limit):
+            // 작품의 과거 동기화 성공이나 재연결 상태가 현재 문서의
+            // 전송 불가 사유를 가리면 다른 기기로 이동해도 된다고 오인한다.
+            return value(
+                "서버 크기 제한 초과",
+                "exclamationmark.icloud",
+                "로컬 TXT에는 저장됐지만 서버로 전송하지 못했습니다. \(bytes.formatted())바이트 문서가 서버 제한 \(limit.formatted())바이트를 초과했습니다.",
+                severity: .failure
+            )
         default:
             break
         }
@@ -100,7 +109,11 @@ enum WorkspaceSyncStatusReducer {
             workspaceState.lastResult
         ) {
         case (_, .conflictRequired), (_, .structuralConflict),
-             (_, .waiting), (_, .automaticallyMerged):
+             (_, .notApplied), (_, .notPublished), (_, .waiting),
+             (_, .reconcilingStructure),
+             (_, .uploadPending), (_, .retryWaiting),
+             (_, .actualConflict), (_, .blocked),
+             (_, .automaticallyMerged):
             // 결과 축은 연결 수명주기와 독립적이다. 사용자 조치가 필요하거나
             // 아직 확인해야 할 pull 결과는 Realtime 전이로 가리지 않는다.
             break
@@ -166,6 +179,25 @@ enum WorkspaceSyncStatusReducer {
                 severity: .failure,
                 retry: true
             )
+        case let .notPublished(detail):
+            // 이 기기가 한 조작이 서버에 없다. 실패로 부르되 재시도 버튼은
+            // 달지 않는다 — 세워 둔 작업은 다시 claim되지 않아 눌러도 바뀌지
+            // 않는다.
+            return value(
+                "서버에 못 올린 변경 있음",
+                "exclamationmark.icloud",
+                detail,
+                severity: .warning
+            )
+        case let .notApplied(detail):
+            // 실패가 아니라 덮어쓰지 않으려고 미룬 것이므로 정보성으로 둔다.
+            // 재시도 버튼을 달지 않는다. 눌러도 바뀌지 않고, 아무 일도 하지
+            // 않는 버튼은 사실을 감추는 또 하나의 거짓이 된다.
+            return value(
+                "적용하지 않은 항목 있음",
+                "info.circle",
+                detail
+            )
         default:
             break
         }
@@ -182,6 +214,35 @@ enum WorkspaceSyncStatusReducer {
         }
 
         switch workspaceState.lastResult {
+        case let .uploadPending(count):
+            return value(
+                "전송 대기",
+                "icloud.and.arrow.up",
+                "이 iPad의 로컬 변경 \(count)건이 서버 전송 순서를 기다리고 있습니다."
+            )
+        case let .retryWaiting(count):
+            return value(
+                "재시도 대기",
+                "clock.arrow.circlepath",
+                "일시적인 전송 실패 \(count)건을 보존했습니다. 다음 재시도 전에는 서버 snapshot을 적용하지 않습니다.",
+                severity: .warning,
+                retry: true
+            )
+        case let .actualConflict(count):
+            return value(
+                "실제 충돌 \(count)건",
+                "exclamationmark.arrow.triangle.2.circlepath",
+                "서버 revision과 겹친 변경입니다. 충돌 해소용 읽기와 병합 절차가 필요합니다.",
+                severity: .failure,
+                retry: true
+            )
+        case let .blocked(count):
+            return value(
+                "적용 거부 \(count)건",
+                "exclamationmark.icloud",
+                "서버 계약 또는 권한에 의해 영구 거부된 로컬 변경입니다. 자동 반복하지 않습니다.",
+                severity: .failure
+            )
         case .waiting:
             return value(
                 "동기화 대기",
@@ -190,24 +251,18 @@ enum WorkspaceSyncStatusReducer {
                 severity: .warning,
                 retry: true
             )
+        case let .reconcilingStructure(count):
+            return value(
+                "동기화 정리 중",
+                "folder.badge.clock",
+                "폴더 \(count)개의 자식 삭제 세대를 기다리고 있습니다. 로컬 TXT는 지우지 않습니다."
+            )
         case .authenticationRequired:
             return value(
                 "인증 필요",
                 "person.crop.circle.badge.exclamationmark",
                 "서버 동기화를 계속하려면 설정에서 다시 로그인하세요.",
                 severity: .warning
-            )
-        default:
-            break
-        }
-
-        switch handoffState {
-        case let .serverSizeLimitExceeded(_, bytes, limit):
-            return value(
-                "서버 크기 제한 초과",
-                "exclamationmark.icloud",
-                "\(bytes.formatted())바이트 문서가 서버 제한 \(limit.formatted())바이트를 초과했습니다.",
-                severity: .failure
             )
         default:
             break

@@ -174,9 +174,10 @@ protocol EditLeaseTransporting: Sendable {
 
 actor LiveEditLeaseTransport: EditLeaseTransporting {
     private let client: SupabaseClient
+    private let receiveClients: ReceiveValidationSDKClients?
 
-    init(client: SupabaseClient) {
-        self.client = client
+    init(client: SupabaseClient, receiveClients: ReceiveValidationSDKClients? = nil) {
+        self.client = client; self.receiveClients = receiveClients
     }
 
     func acquire(
@@ -207,6 +208,13 @@ actor LiveEditLeaseTransport: EditLeaseTransporting {
         _ name: String,
         parameters: Parameters
     ) async throws -> Result {
+        if ReceiveValidationPolicy.current.enabled {
+            try ReceiveValidationPolicy.current.requireBody()
+            var request = URLRequest(url: URL(string: ReceiveValidationPolicy.Configuration.staging + "/rest/v1/rpc/" + name)!)
+            request.httpMethod = "POST"; request.httpBody = try JSONEncoder().encode(parameters)
+            _ = try ReceiveValidationPolicy.current.authorize(request)
+        }
+        let client = try ReceiveValidationSDKClients.operationClient(client, pool: receiveClients)
         do {
             let response: PostgrestResponse<Result> = try await client
                 .rpc(name, params: parameters)
@@ -327,14 +335,18 @@ actor EditLeaseClient: EditLeaseClienting {
         deviceID: UUID,
         leaseToken: UUID
     ) async throws -> Bool {
+        let scope = GeneralSyncValidationScope.current
+        try scope.require(document: documentID)
         do {
-            return try await transport.release(
+            let result = try await transport.release(
                 ReleaseEditLeaseParameters(
                     documentID: documentID,
                     deviceID: deviceID,
                     leaseToken: leaseToken
                 )
             )
+            try scope.require(document: documentID)
+            return result
         } catch let error as SyncV2CommitTransportError {
             throw SyncV2Client.classify(error)
         } catch let error as SyncV2ClientError {
@@ -354,6 +366,8 @@ actor EditLeaseClient: EditLeaseClienting {
         documentID: UUID,
         deviceID: UUID
     ) async throws -> EditLeaseInspectionResult {
+        let scope = GeneralSyncValidationScope.current
+        try scope.require(document: documentID)
         do {
             let result = try await transport.inspect(
                 InspectEditLeaseParameters(
@@ -361,6 +375,7 @@ actor EditLeaseClient: EditLeaseClienting {
                     deviceID: deviceID
                 )
             )
+            try scope.require(document: documentID)
             guard result.documentID == documentID else {
                 throw SyncV2ClientError.invalidResponse
             }
@@ -385,8 +400,11 @@ actor EditLeaseClient: EditLeaseClienting {
         deviceID: UUID,
         operation: () async throws -> EditLeaseMutationResult
     ) async throws -> EditLeaseMutationResult {
+        let scope = GeneralSyncValidationScope.current
+        try scope.require(document: documentID)
         do {
             let result = try await operation()
+            try scope.require(document: documentID)
             guard
                 result.documentID == documentID,
                 result.deviceID == deviceID
@@ -434,6 +452,11 @@ protocol EditLeaseManaging: Sendable {
     ) async -> AsyncStream<EditLeaseDisplayState>
     func beginEditing(documentID: UUID) async -> EditLeaseDisplayState
     func refreshEditing(documentID: UUID) async -> EditLeaseDisplayState
+    func ensureLeaseForActiveLiveDocument(
+        documentID: UUID,
+        serverRevision: Int64
+    ) async
+    func documentBecameTombstone(documentID: UUID) async
     func offlineDisplayState(documentID: UUID) async
         -> EditLeaseDisplayState
     func endEditing(documentID: UUID) async
@@ -453,6 +476,20 @@ protocol EditLeaseManaging: Sendable {
         error: SyncV2ClientError
     ) async
     func releaseAll() async
+}
+
+extension EditLeaseManaging {
+    func ensureLeaseForActiveLiveDocument(
+        documentID: UUID,
+        serverRevision: Int64
+    ) async {
+        guard ReceiveValidationPolicy.current.sendingAllowed else { return }
+        _ = (documentID, serverRevision)
+    }
+
+    func documentBecameTombstone(documentID: UUID) async {
+        _ = documentID
+    }
 }
 
 typealias EditLeaseSleep = @Sendable (Duration) async throws -> Void
@@ -509,6 +546,9 @@ final class EditLeaseConnectivityMonitor:
 actor EditLeaseManager: EditLeaseManaging {
     static let leaseTTLSeconds = 90
     static let heartbeatInterval: Duration = .seconds(45)
+    static let transientRetryDelays: [Duration] = [
+        .seconds(1), .seconds(2), .seconds(5),
+    ]
 
     private struct LeaseKey: Hashable, Sendable {
         let documentID: UUID
@@ -521,6 +561,9 @@ actor EditLeaseManager: EditLeaseManaging {
         var activeReferences: Int
         var requiresLease: Bool
         var state: EditLeaseDisplayState
+        var serverRevision: Int64?
+        var lifecycleSequence: UInt64
+        var retryAttempt: Int
     }
 
     private let client: any EditLeaseClienting
@@ -533,8 +576,12 @@ actor EditLeaseManager: EditLeaseManaging {
         (@Sendable () async -> AuthenticationState)?
     private var entries: [LeaseKey: Entry] = [:]
     private var heartbeatTasks: [LeaseKey: Task<Void, Never>] = [:]
-    private var acquisitionTasks:
-        [LeaseKey: Task<EditLeaseMutationResult, any Error>] = [:]
+    private struct Acquisition {
+        let id: UUID
+        let task: Task<EditLeaseMutationResult, any Error>
+    }
+    private var acquisitionTasks: [LeaseKey: Acquisition] = [:]
+    private var retryTasks: [LeaseKey: Task<Void, Never>] = [:]
     private var stateObservers: [
         UUID: [UUID: AsyncStream<EditLeaseDisplayState>.Continuation]
     ] = [:]
@@ -587,7 +634,7 @@ actor EditLeaseManager: EditLeaseManaging {
     func beginEditing(
         documentID: UUID
     ) async -> EditLeaseDisplayState {
-        guard isEnabled() else { return .localOnly }
+        guard ReceiveValidationPolicy.current.sendingAllowed, isEnabled() else { return .localOnly }
         let deviceID: UUID
         do {
             let identifier = try await deviceIdentityProvider
@@ -602,7 +649,10 @@ actor EditLeaseManager: EditLeaseManaging {
             expiresAt: nil,
             activeReferences: 0,
             requiresLease: false,
-            state: .localOnly
+            state: .localOnly,
+            serverRevision: nil,
+            lifecycleSequence: 0,
+            retryAttempt: 0
         )
         entry.activeReferences += 1
         entries[key] = entry
@@ -618,10 +668,14 @@ actor EditLeaseManager: EditLeaseManaging {
             return .unavailable
         }
         guard let revision, revision > 0 else {
+            entries[key]?.requiresLease = false
+            entries[key]?.serverRevision = nil
             entries[key]?.state = .localOnly
             return .localOnly
         }
         entries[key]?.requiresLease = true
+        entries[key]?.serverRevision = revision
+        let lifecycleSequence = entries[key]?.lifecycleSequence
         if let authenticationDisplayState =
             await authenticationDisplayState() {
             entries[key]?.state = authenticationDisplayState
@@ -632,11 +686,18 @@ actor EditLeaseManager: EditLeaseManaging {
             _ = try await validToken(for: key)
             return entries[key]?.state ?? .unavailable
         } catch let error as SyncV2ClientError {
+            guard entries[key]?.lifecycleSequence == lifecycleSequence,
+                  entries[key]?.requiresLease == true
+            else { return entries[key]?.state ?? .localOnly }
             let state = Self.displayState(for: error)
             entries[key]?.state = state
             publish(state, documentID: documentID)
+            scheduleRecoveryAfterAcquireFailure(error, for: key)
             return state
         } catch {
+            guard entries[key]?.lifecycleSequence == lifecycleSequence,
+                  entries[key]?.requiresLease == true
+            else { return entries[key]?.state ?? .localOnly }
             entries[key]?.state = .unavailable
             publish(.unavailable, documentID: documentID)
             return .unavailable
@@ -646,7 +707,7 @@ actor EditLeaseManager: EditLeaseManaging {
     func refreshEditing(
         documentID: UUID
     ) async -> EditLeaseDisplayState {
-        guard isEnabled() else { return .localOnly }
+        guard ReceiveValidationPolicy.current.sendingAllowed, isEnabled() else { return .localOnly }
         let identifier: DeviceIdentifier
         do {
             identifier = try await deviceIdentityProvider
@@ -687,6 +748,76 @@ actor EditLeaseManager: EditLeaseManaging {
         }
     }
 
+    func ensureLeaseForActiveLiveDocument(
+        documentID: UUID,
+        serverRevision: Int64
+    ) async {
+        guard ReceiveValidationPolicy.current.sendingAllowed, isEnabled(), serverRevision > 0 else { return }
+        let identifier: DeviceIdentifier
+        do {
+            identifier = try await deviceIdentityProvider.currentIdentifier()
+        } catch {
+            return
+        }
+        let key = LeaseKey(
+            documentID: documentID,
+            deviceID: identifier.uuid
+        )
+        guard var entry = entries[key], entry.activeReferences > 0 else {
+            return
+        }
+        if entry.requiresLease,
+           entry.serverRevision == serverRevision,
+           entry.token != nil || acquisitionTasks[key] != nil {
+            return
+        }
+        if !entry.requiresLease || entry.serverRevision != serverRevision {
+            entry.lifecycleSequence &+= 1
+        }
+        entry.requiresLease = true
+        entry.serverRevision = serverRevision
+        entry.state = .acquiring
+        entry.retryAttempt = 0
+        entries[key] = entry
+        let lifecycleSequence = entry.lifecycleSequence
+        publish(.acquiring, documentID: documentID)
+        do {
+            _ = try await validToken(for: key)
+        } catch let error as SyncV2ClientError {
+            guard entries[key]?.requiresLease == true,
+                  entries[key]?.lifecycleSequence == lifecycleSequence,
+                  entries[key]?.serverRevision == serverRevision
+            else { return }
+            let state = Self.displayState(for: error)
+            entries[key]?.state = state
+            publish(state, documentID: documentID)
+            scheduleRecoveryAfterAcquireFailure(error, for: key)
+        } catch {
+            guard entries[key]?.requiresLease == true,
+                  entries[key]?.lifecycleSequence == lifecycleSequence,
+                  entries[key]?.serverRevision == serverRevision
+            else { return }
+            entries[key]?.state = .unavailable
+            publish(.unavailable, documentID: documentID)
+        }
+    }
+
+    func documentBecameTombstone(documentID: UUID) async {
+        for key in entries.keys where key.documentID == documentID {
+            guard var entry = entries[key] else { continue }
+            cancelTasks(for: key)
+            entry.lifecycleSequence &+= 1
+            entry.token = nil
+            entry.expiresAt = nil
+            entry.requiresLease = false
+            entry.serverRevision = nil
+            entry.state = .localOnly
+            entry.retryAttempt = 0
+            entries[key] = entry
+        }
+        publish(.localOnly, documentID: documentID)
+    }
+
     func offlineDisplayState(
         documentID: UUID
     ) -> EditLeaseDisplayState {
@@ -720,6 +851,8 @@ actor EditLeaseManager: EditLeaseManaging {
         deviceID: UUID,
         baseRevision: Int64
     ) async throws -> UUID? {
+        try GeneralSyncValidationScope.current.require(document: documentID)
+        try ReceiveValidationPolicy.current.requireSending()
         guard baseRevision > 0 else { return nil }
         let key = LeaseKey(documentID: documentID, deviceID: deviceID)
         if entries[key] == nil {
@@ -728,7 +861,10 @@ actor EditLeaseManager: EditLeaseManaging {
                 expiresAt: nil,
                 activeReferences: 0,
                 requiresLease: true,
-                state: .acquiring
+                state: .acquiring,
+                serverRevision: baseRevision,
+                lifecycleSequence: 0,
+                retryAttempt: 0
             )
         }
         return try await validToken(for: key)
@@ -803,6 +939,12 @@ actor EditLeaseManager: EditLeaseManaging {
             if shouldPublish {
                 publish(state, documentID: documentID)
             }
+            let expiration = Self.expirationDate(from: detail)
+            let seconds = max(
+                1,
+                expiration?.timeIntervalSince(now()) ?? 2
+            )
+            scheduleReacquire(for: key, after: .seconds(seconds))
             return
         }
         let shouldRelease: Bool
@@ -821,11 +963,16 @@ actor EditLeaseManager: EditLeaseManaging {
         }
         if case .remote(code: .documentNotFound, detail: _) = error,
            var entry = entries[key] {
+            cancelTasks(for: key)
+            entry.lifecycleSequence &+= 1
             entry.token = nil
             entry.expiresAt = nil
-            entry.state = .offlineEditing
+            entry.requiresLease = false
+            entry.serverRevision = nil
+            entry.retryAttempt = 0
+            entry.state = .unavailable
             entries[key] = entry
-            publish(.offlineEditing, documentID: documentID)
+            publish(.unavailable, documentID: documentID)
         } else if shouldRelease {
             await releaseAndRemove(key)
         } else if var entry = entries[key] {
@@ -836,6 +983,7 @@ actor EditLeaseManager: EditLeaseManaging {
     }
 
     func releaseAll() async {
+        guard ReceiveValidationPolicy.current.sendingAllowed else { return }
         let keys = Array(entries.keys)
         for key in keys {
             await releaseAndRemove(key)
@@ -852,6 +1000,7 @@ actor EditLeaseManager: EditLeaseManaging {
     }
 
     private func validToken(for key: LeaseKey) async throws -> UUID {
+        try GeneralSyncValidationScope.current.require(document: key.documentID)
         if let entry = entries[key],
            let token = entry.token,
            let expiresAt = entry.expiresAt,
@@ -868,8 +1017,12 @@ actor EditLeaseManager: EditLeaseManaging {
             entries[key]?.state = .acquiring
             publish(.acquiring, documentID: key.documentID)
         }
+        let lifecycleSequence = entries[key]?.lifecycleSequence
         let result = try await acquire(for: key)
-        guard entries[key] != nil else {
+        guard let current = entries[key],
+              current.lifecycleSequence == lifecycleSequence,
+              current.requiresLease
+        else {
             _ = try? await client.release(
                 documentID: key.documentID,
                 deviceID: key.deviceID,
@@ -880,6 +1033,7 @@ actor EditLeaseManager: EditLeaseManaging {
         entries[key]?.token = result.leaseToken
         entries[key]?.expiresAt = result.expiresAt
         entries[key]?.state = .held(expiresAt: result.expiresAt)
+        entries[key]?.retryAttempt = 0
         publish(
             .held(expiresAt: result.expiresAt),
             documentID: key.documentID
@@ -893,10 +1047,11 @@ actor EditLeaseManager: EditLeaseManaging {
     private func acquire(
         for key: LeaseKey
     ) async throws -> EditLeaseMutationResult {
-        if let task = acquisitionTasks[key] {
-            return try await task.value
+        if let acquisition = acquisitionTasks[key] {
+            return try await acquisition.task.value
         }
         let client = self.client
+        let id = UUID()
         let task = Task {
             try await client.acquire(
                 documentID: key.documentID,
@@ -904,13 +1059,17 @@ actor EditLeaseManager: EditLeaseManaging {
                 ttlSeconds: Self.leaseTTLSeconds
             )
         }
-        acquisitionTasks[key] = task
+        acquisitionTasks[key] = Acquisition(id: id, task: task)
         do {
             let result = try await task.value
-            acquisitionTasks[key] = nil
+            if acquisitionTasks[key]?.id == id {
+                acquisitionTasks[key] = nil
+            }
             return result
         } catch {
-            acquisitionTasks[key] = nil
+            if acquisitionTasks[key]?.id == id {
+                acquisitionTasks[key] = nil
+            }
             throw error
         }
     }
@@ -935,13 +1094,15 @@ actor EditLeaseManager: EditLeaseManaging {
     }
 
     private func heartbeat(_ key: LeaseKey) async {
+        guard ReceiveValidationPolicy.current.sendingAllowed else { return }
         guard
-            var entry = entries[key],
+            let entry = entries[key],
             entry.activeReferences > 0,
             let token = entry.token
         else {
             return
         }
+        let lifecycleSequence = entry.lifecycleSequence
         do {
             let result = try await client.renew(
                 documentID: key.documentID,
@@ -949,25 +1110,172 @@ actor EditLeaseManager: EditLeaseManaging {
                 leaseToken: token,
                 ttlSeconds: Self.leaseTTLSeconds
             )
-            entry.token = result.leaseToken
-            entry.expiresAt = result.expiresAt
-            entry.state = .held(expiresAt: result.expiresAt)
-            entries[key] = entry
-            publish(entry.state, documentID: key.documentID)
+            guard var current = entries[key],
+                  current.lifecycleSequence == lifecycleSequence,
+                  current.requiresLease,
+                  current.token == token
+            else { return }
+            current.token = result.leaseToken
+            current.expiresAt = result.expiresAt
+            current.state = .held(expiresAt: result.expiresAt)
+            current.retryAttempt = 0
+            entries[key] = current
+            publish(current.state, documentID: key.documentID)
             scheduleHeartbeat(for: key)
         } catch let error as SyncV2ClientError {
-            entry.state = Self.displayState(for: error)
-            if case let .remote(code, _) = error,
-               code == .leaseExpired || code == .leaseConflict {
-                entry.token = nil
-                entry.expiresAt = nil
+            guard entries[key]?.lifecycleSequence == lifecycleSequence else {
+                return
             }
-            entries[key] = entry
-            publish(entry.state, documentID: key.documentID)
+            handleHeartbeatFailure(error, for: key)
         } catch {
-            entry.state = .unavailable
-            entries[key] = entry
+            guard entries[key]?.lifecycleSequence == lifecycleSequence else {
+                return
+            }
+            entries[key]?.state = .unavailable
             publish(.unavailable, documentID: key.documentID)
+            scheduleTransientReacquire(for: key)
+        }
+    }
+
+    private func handleHeartbeatFailure(
+        _ error: SyncV2ClientError,
+        for key: LeaseKey
+    ) {
+        guard var entry = entries[key], entry.activeReferences > 0 else {
+            return
+        }
+        entry.state = Self.displayState(for: error)
+        entry.token = nil
+        entry.expiresAt = nil
+        entries[key] = entry
+        publish(entry.state, documentID: key.documentID)
+        switch error {
+        case .remote(code: .leaseExpired, detail: _):
+            scheduleReacquire(for: key, after: .zero)
+        case let .remote(code: .leaseConflict, detail: detail):
+            let expiration = Self.expirationDate(from: detail)
+            let seconds = max(
+                1,
+                expiration?.timeIntervalSince(now()) ?? 2
+            )
+            scheduleReacquire(for: key, after: .seconds(seconds))
+        case .networkUnavailable, .timedOut:
+            scheduleTransientReacquire(for: key)
+        case .remote(code: .documentNotFound, detail: _):
+            entry.lifecycleSequence &+= 1
+            entry.requiresLease = false
+            entry.serverRevision = nil
+            entry.retryAttempt = 0
+            entries[key] = entry
+        default:
+            break
+        }
+    }
+
+    private func scheduleRecoveryAfterAcquireFailure(
+        _ error: SyncV2ClientError,
+        for key: LeaseKey
+    ) {
+        switch error {
+        case .remote(code: .leaseExpired, detail: _):
+            scheduleReacquire(for: key, after: .zero)
+        case let .remote(code: .leaseConflict, detail: detail):
+            let expiration = Self.expirationDate(from: detail)
+            let seconds = max(
+                1,
+                expiration?.timeIntervalSince(now()) ?? 2
+            )
+            scheduleReacquire(for: key, after: .seconds(seconds))
+        case .networkUnavailable, .timedOut:
+            scheduleTransientReacquire(for: key)
+        default:
+            break
+        }
+    }
+
+    private func scheduleTransientReacquire(for key: LeaseKey) {
+        guard var entry = entries[key],
+              entry.requiresLease,
+              entry.activeReferences > 0,
+              entry.retryAttempt < Self.transientRetryDelays.count
+        else { return }
+        let delay = Self.transientRetryDelays[entry.retryAttempt]
+        entry.retryAttempt += 1
+        entries[key] = entry
+        scheduleReacquire(for: key, after: delay)
+    }
+
+    private func scheduleReacquire(
+        for key: LeaseKey,
+        after delay: Duration
+    ) {
+        retryTasks[key]?.cancel()
+        guard let entry = entries[key],
+              entry.requiresLease,
+              entry.activeReferences > 0
+        else { return }
+        let lifecycleSequence = entry.lifecycleSequence
+        let sleep = self.sleep
+        retryTasks[key] = Task { [weak self] in
+            do {
+                if delay > .zero {
+                    try await sleep(delay)
+                } else {
+                    await Task.yield()
+                }
+                try Task.checkCancellation()
+            } catch {
+                return
+            }
+            await self?.performScheduledReacquire(
+                key,
+                lifecycleSequence: lifecycleSequence
+            )
+        }
+    }
+
+    private func performScheduledReacquire(
+        _ key: LeaseKey,
+        lifecycleSequence: UInt64
+    ) async {
+        retryTasks[key] = nil
+        guard let entry = entries[key],
+              entry.lifecycleSequence == lifecycleSequence,
+              entry.requiresLease,
+              entry.activeReferences > 0,
+              entry.token == nil
+        else { return }
+        do {
+            _ = try await validToken(for: key)
+        } catch let error as SyncV2ClientError {
+            guard entries[key]?.lifecycleSequence == lifecycleSequence else {
+                return
+            }
+            entries[key]?.state = Self.displayState(for: error)
+            if let state = entries[key]?.state {
+                publish(state, documentID: key.documentID)
+            }
+            switch error {
+            case let .remote(code: .leaseConflict, detail: detail):
+                let expiration = Self.expirationDate(from: detail)
+                let seconds = max(
+                    1,
+                    expiration?.timeIntervalSince(now()) ?? 2
+                )
+                scheduleReacquire(for: key, after: .seconds(seconds))
+            case .networkUnavailable, .timedOut:
+                scheduleTransientReacquire(for: key)
+            case .remote(code: .documentNotFound, detail: _):
+                await documentBecameTombstone(
+                    documentID: key.documentID
+                )
+            default:
+                break
+            }
+        } catch {
+            entries[key]?.state = .unavailable
+            publish(.unavailable, documentID: key.documentID)
+            scheduleTransientReacquire(for: key)
         }
     }
 
@@ -975,7 +1283,7 @@ actor EditLeaseManager: EditLeaseManaging {
         let entry = entries.removeValue(forKey: key)
         cancelTasks(for: key)
         publish(.localOnly, documentID: key.documentID)
-        guard let token = entry?.token else { return }
+        guard ReceiveValidationPolicy.current.sendingAllowed, let token = entry?.token else { return }
         let client = self.client
         Task {
             _ = try? await client.release(
@@ -988,7 +1296,8 @@ actor EditLeaseManager: EditLeaseManaging {
 
     private func cancelTasks(for key: LeaseKey) {
         heartbeatTasks.removeValue(forKey: key)?.cancel()
-        acquisitionTasks.removeValue(forKey: key)?.cancel()
+        acquisitionTasks.removeValue(forKey: key)?.task.cancel()
+        retryTasks.removeValue(forKey: key)?.cancel()
     }
 
     private func publish(
@@ -1027,11 +1336,12 @@ actor EditLeaseManager: EditLeaseManaging {
             case .leaseExpired:
                 return .offlineEditing
             case .documentNotFound:
-                return .offlineEditing
+                return .unavailable
             case .forbidden, .invalidArgument,
                  .documentAlreadyExists, .revisionConflict,
                  .operationIDReused, .leaseRequired, .pathConflict,
-                 .folderNotFound, .folderAlreadyExists, .folderNotEmpty:
+                 .folderNotFound, .folderAlreadyExists, .folderNotEmpty,
+                 .parentFolderNotFound, .folderNameConflict, .folderCycle:
                 // 편집 점유는 문서에만 있다. 폴더 코드는 여기로 오지 않는다.
                 return .unavailable
             }

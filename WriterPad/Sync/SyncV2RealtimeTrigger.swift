@@ -23,6 +23,7 @@ protocol SyncV2RealtimeTriggering: Sendable {
             (SyncV2RealtimeConnectionStatus) -> Void
     ) async throws
     func stop() async
+    func resetConnection() async
 }
 
 enum SyncV2RealtimeConnectionStatus: Equatable, Sendable {
@@ -39,6 +40,10 @@ enum SyncV2RealtimeTriggerError: Error, Sendable {
 }
 
 extension SyncV2RealtimeTriggering {
+    func resetConnection() async {
+        await stop()
+    }
+
     func startAll(
         onChange: @escaping @Sendable () -> Void,
         onSubscribed: @escaping @Sendable () -> Void
@@ -84,7 +89,21 @@ struct SyncV2RealtimeSubscriptionGate {
     }
 }
 
+struct SyncV2RealtimePostgresScope: Equatable, Sendable {
+    let schema: String
+    let table: String?
+}
+
 actor LiveSyncV2RealtimeTrigger: SyncV2RealtimeTriggering {
+    /// publication 전체를 하나의 postgres_changes callback으로 받는다.
+    /// 테이블마다 callback을 추가하면 join 응답의 callback id 하나가
+    /// 어긋났을 때 같은 채널의 정상 알림까지 함께 사라질 수 있다.
+    /// 작품 필터는 event row의 project_id로 로컬에서 적용한다.
+    static let postgresScope = SyncV2RealtimePostgresScope(
+        schema: "public",
+        table: nil
+    )
+
     private let client: SupabaseClient
     private let subscriptionGate: SyncV2RealtimeConnectGate
     private var channel: RealtimeChannelV2?
@@ -164,6 +183,8 @@ actor LiveSyncV2RealtimeTrigger: SyncV2RealtimeTriggering {
         onStatus: @escaping @Sendable
             (SyncV2RealtimeConnectionStatus) -> Void
     ) async throws {
+        try GeneralSyncValidationScope.current.requireRealtime()
+        try ReceiveValidationPolicy.current.requireSending()
         await stop()
         let generation = UUID()
         channelGeneration = generation
@@ -174,33 +195,20 @@ actor LiveSyncV2RealtimeTrigger: SyncV2RealtimeTriggering {
                 "writerpad-documents-\($0.uuidString.lowercased())"
             } ?? "writerpad-documents-all"
         )
-        if let projectID {
-            changeSubscription = channel.onPostgresChange(
-                AnyAction.self,
-                schema: "public",
-                table: "documents",
-                filter:
-                    "project_id=eq.\(projectID.uuidString.lowercased())"
-            ) { _ in
-                Task {
-                    await self.receivedChange(
-                        generation: generation,
-                        callback: onChange
-                    )
-                }
-            }
-        } else {
-            changeSubscription = channel.onPostgresChange(
-                AnyAction.self,
-                schema: "public",
-                table: "documents"
-            ) { _ in
-                Task {
-                    await self.receivedChange(
-                        generation: generation,
-                        callback: onChange
-                    )
-                }
+        let scope = Self.postgresScope
+        changeSubscription = channel.onPostgresChange(
+            AnyAction.self,
+            schema: scope.schema,
+            table: scope.table
+        ) { action in
+            let eventProjectID = Self.eventProjectID(from: action)
+            Task {
+                await self.receivedChange(
+                    eventProjectID: eventProjectID,
+                    expectedProjectID: projectID,
+                    generation: generation,
+                    callback: onChange
+                )
             }
         }
         statusSubscription = channel.onStatusChange {
@@ -268,12 +276,63 @@ actor LiveSyncV2RealtimeTrigger: SyncV2RealtimeTriggering {
         hasSubscribed = false
     }
 
+    /// 채널 재구독만으로 빠져나오지 못하는 socket 상태를 비운다. 같은
+    /// SupabaseClient를 쓰는 background/workspace trigger가 공유 gate를
+    /// 사용하므로 reset 도중 다른 phx_join이 끼어들지 않는다.
+    func resetConnection() async {
+        do {
+            try await subscriptionGate.withSubscription {
+                await self.stop()
+                await self.client.realtimeV2.removeAllChannels()
+                // SDK disconnect가 ConnectionManager actor에 전달된 뒤 다음
+                // subscribe가 새 WebSocket을 만들도록 짧게 실행권을 넘긴다.
+                try await ContinuousClock().sleep(for: .milliseconds(100))
+            }
+        } catch {
+            // 상위 lifecycle의 다음 start/watchdog가 실패를 판정하고 기존
+            // backoff를 계속한다. reset 실패가 동기화 Task를 끝내면 안 된다.
+        }
+    }
+
     private func receivedChange(
+        eventProjectID: String?,
+        expectedProjectID: UUID?,
         generation: UUID,
         callback: @escaping @Sendable () -> Void
     ) {
-        guard channelGeneration == generation else { return }
+        guard channelGeneration == generation,
+              Self.shouldForward(
+                eventProjectID: eventProjectID,
+                expectedProjectID: expectedProjectID
+              )
+        else { return }
         callback()
+    }
+
+    static func shouldForward(
+        eventProjectID: String?,
+        expectedProjectID: UUID?
+    ) -> Bool {
+        guard let expectedProjectID else { return true }
+        // DELETE payload가 primary key만 포함하거나 새 publication 테이블에
+        // project_id가 없다면 누락시키지 않고 보수적으로 snapshot을 확인한다.
+        guard let eventProjectID,
+              let observedProjectID = UUID(uuidString: eventProjectID)
+        else { return true }
+        return observedProjectID == expectedProjectID
+    }
+
+    private static func eventProjectID(from action: AnyAction) -> String? {
+        let row: JSONObject
+        switch action {
+        case let .insert(insert):
+            row = insert.record
+        case let .update(update):
+            row = update.record
+        case let .delete(delete):
+            row = delete.oldRecord
+        }
+        return row["project_id"]?.stringValue
     }
 
     private func receivedStatus(

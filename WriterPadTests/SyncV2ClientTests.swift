@@ -469,7 +469,7 @@ final class EditLeaseManagerTests: XCTestCase {
     }
 
     @MainActor
-    func testViewingDocumentAcquiresLeaseOnlyAfterFirstMutation()
+    func testViewingServerLiveDocumentAcquiresLeaseBeforeFirstMutation()
         async throws {
         let environment = try AppEnvironment.testing()
         let project = try await environment.projectManager.createProject(
@@ -513,9 +513,14 @@ final class EditLeaseManagerTests: XCTestCase {
         )
 
         await model.select(node)
-        XCTAssertEqual(model.editLeaseState, .localOnly)
+        await waitUntil {
+            if case .held = model.editLeaseState {
+                return true
+            }
+            return false
+        }
         var acquireCount = await client.acquireCount()
-        XCTAssertEqual(acquireCount, 0)
+        XCTAssertEqual(acquireCount, 1)
 
         model.updateText("첫 수정")
         await waitUntil {
@@ -787,6 +792,116 @@ final class EditLeaseManagerTests: XCTestCase {
         XCTAssertEqual(finalReleaseCount, 1)
     }
 
+    func testLocalOnlyActiveReferencePromotesToLiveWithoutReferenceLeak()
+        async {
+        let documentID = UUID()
+        let deviceID = UUID()
+        let client = EditLeaseClientStub()
+        let manager = EditLeaseManager(
+            client: client,
+            revisionProvider: FixedRevisionProvider(revision: 0),
+            deviceIdentityProvider: FixedDeviceIdentityProvider(
+                identifier: DeviceIdentifier(uuid: deviceID)
+            )
+        )
+
+        _ = await manager.beginEditing(documentID: documentID)
+        await manager.ensureLeaseForActiveLiveDocument(
+            documentID: documentID,
+            serverRevision: 4
+        )
+        await manager.ensureLeaseForActiveLiveDocument(
+            documentID: documentID,
+            serverRevision: 4
+        )
+        let acquireCount = await client.acquireCount()
+        XCTAssertEqual(acquireCount, 1)
+
+        await manager.endEditing(documentID: documentID)
+        await waitForRelease(1, client: client)
+        let releaseCount = await client.releaseCount()
+        XCTAssertEqual(releaseCount, 1)
+    }
+
+    func testTombstoneInvalidatesLeaseAndLiveRestoreReacquiresOnce()
+        async {
+        let documentID = UUID()
+        let deviceID = UUID()
+        let client = EditLeaseClientStub()
+        let manager = EditLeaseManager(
+            client: client,
+            revisionProvider: FixedRevisionProvider(revision: 3),
+            deviceIdentityProvider: FixedDeviceIdentityProvider(
+                identifier: DeviceIdentifier(uuid: deviceID)
+            )
+        )
+
+        _ = await manager.beginEditing(documentID: documentID)
+        await manager.documentBecameTombstone(documentID: documentID)
+        await manager.ensureLeaseForActiveLiveDocument(
+            documentID: documentID,
+            serverRevision: 4
+        )
+        await manager.ensureLeaseForActiveLiveDocument(
+            documentID: documentID,
+            serverRevision: 4
+        )
+
+        let acquireCount = await client.acquireCount()
+        XCTAssertEqual(acquireCount, 2)
+        await manager.endEditing(documentID: documentID)
+        await waitForRelease(1, client: client)
+        let releaseCount = await client.releaseCount()
+        XCTAssertEqual(releaseCount, 1)
+    }
+
+    func testStaleAcquireResponseCannotOverwriteRestoredLiveLease()
+        async {
+        let documentID = UUID()
+        let deviceID = UUID()
+        let client = ControlledAcquireLeaseClient()
+        let manager = EditLeaseManager(
+            client: client,
+            revisionProvider: FixedRevisionProvider(revision: 3),
+            deviceIdentityProvider: FixedDeviceIdentityProvider(
+                identifier: DeviceIdentifier(uuid: deviceID)
+            )
+        )
+
+        let initial = Task {
+            await manager.beginEditing(documentID: documentID)
+        }
+        await client.waitForAcquireCount(1)
+        await manager.documentBecameTombstone(documentID: documentID)
+        let restored = Task {
+            await manager.ensureLeaseForActiveLiveDocument(
+                documentID: documentID,
+                serverRevision: 4
+            )
+        }
+        await client.waitForAcquireCount(2)
+
+        await client.completeAcquire(2)
+        await restored.value
+        await client.completeAcquire(1)
+        _ = await initial.value
+
+        let state = await manager.state(
+            documentID: documentID,
+            deviceID: deviceID
+        )
+        if case .held = state {
+            // expected
+        } else {
+            XCTFail("낡은 acquire 응답이 복원 lease를 덮었습니다: \(String(describing: state))")
+        }
+        await waitForControlledRelease(1, client: client)
+        let staleReleaseCount = await client.releaseCount()
+        XCTAssertEqual(staleReleaseCount, 1)
+        await manager.endEditing(documentID: documentID)
+        await waitForControlledRelease(2, client: client)
+    }
+
     func testDocumentTransitionDoesNotWaitForLeaseReleaseNetwork()
         async {
         let documentID = UUID()
@@ -937,7 +1052,7 @@ final class EditLeaseManagerTests: XCTestCase {
         await manager.endEditing(documentID: documentID)
     }
 
-    func testMissingServerDocumentUsesRecoveringStateAndReacquiresAfterCreate()
+    func testMissingServerDocumentWaitsForLiveRestoreBeforeReacquiring()
         async {
         let documentID = UUID()
         let deviceID = UUID()
@@ -959,10 +1074,9 @@ final class EditLeaseManagerTests: XCTestCase {
             documentID: documentID
         )
         await client.setAcquireError(nil)
-        await manager.commitSucceeded(
+        await manager.ensureLeaseForActiveLiveDocument(
             documentID: documentID,
-            deviceID: deviceID,
-            isDeleted: false
+            serverRevision: 2
         )
         let recoveredState = await manager.state(
             documentID: documentID,
@@ -971,7 +1085,7 @@ final class EditLeaseManagerTests: XCTestCase {
         let acquireCount = await client.acquireCount()
         await manager.endEditing(documentID: documentID)
 
-        XCTAssertEqual(missingState, .offlineEditing)
+        XCTAssertEqual(missingState, .unavailable)
         if case .held = recoveredState {
             // expected
         } else {
@@ -984,7 +1098,7 @@ final class EditLeaseManagerTests: XCTestCase {
     }
 
     @MainActor
-    func testEditorRefreshesOfflineLeaseAfterServerDocumentRecovery()
+    func testEditorRefreshesLeaseAfterServerDocumentLiveRestore()
         async throws {
         let environment = try AppEnvironment.testing()
         let project = try await environment.projectManager.createProject(
@@ -1035,20 +1149,18 @@ final class EditLeaseManagerTests: XCTestCase {
         )
 
         await model.select(node)
-        model.updateText("복구 후 동기화")
         for _ in 0..<100 {
-            if model.editLeaseState == .offlineEditing {
+            if model.editLeaseState == .unavailable {
                 break
             }
             try await Task.sleep(for: .milliseconds(2))
         }
-        XCTAssertEqual(model.editLeaseState, .offlineEditing)
+        XCTAssertEqual(model.editLeaseState, .unavailable)
 
         await client.setAcquireError(nil)
-        await manager.commitSucceeded(
+        await manager.ensureLeaseForActiveLiveDocument(
             documentID: document.id.rawValue,
-            deviceID: deviceID,
-            isDeleted: false
+            serverRevision: 2
         )
         for _ in 0..<100 {
             if case .held = model.editLeaseState {
@@ -1087,6 +1199,132 @@ final class EditLeaseManagerTests: XCTestCase {
         await manager.endEditing(documentID: documentID)
 
         XCTAssertEqual(renewCount, 1)
+    }
+
+    func testHeartbeatLeaseExpiredReacquiresExactlyOnce() async {
+        let documentID = UUID()
+        let deviceID = UUID()
+        let client = EditLeaseClientStub(
+            renewalErrors: [
+                .remote(code: .leaseExpired, detail: nil),
+            ]
+        )
+        let sleeper = OneShotLeaseSleeper()
+        let manager = EditLeaseManager(
+            client: client,
+            revisionProvider: FixedRevisionProvider(revision: 2),
+            deviceIdentityProvider: FixedDeviceIdentityProvider(
+                identifier: DeviceIdentifier(uuid: deviceID)
+            ),
+            sleep: { duration in
+                try await sleeper.sleep(duration)
+            }
+        )
+
+        _ = await manager.beginEditing(documentID: documentID)
+        await sleeper.waitUntilSleeping()
+        await sleeper.wake()
+        await waitForAcquire(2, client: client)
+
+        // RPC 호출 수 증가는 응답을 반영한 held 상태의 완료 사건이 아니다.
+        let updates = await manager.stateUpdates(documentID: documentID)
+        let reacquired = XCTestExpectation(description: "편집권 재획득 완료")
+        let observation = Task {
+            for await state in updates {
+                if case .held = state { reacquired.fulfill(); return }
+            }
+        }
+        await fulfillment(of: [reacquired], timeout: 2)
+        observation.cancel()
+
+        let acquireCount = await client.acquireCount()
+        let state = await manager.state(
+            documentID: documentID,
+            deviceID: deviceID
+        )
+        XCTAssertEqual(acquireCount, 2)
+        if case .held = state {
+            // expected
+        } else {
+            XCTFail("leaseExpired 뒤 한 번 재획득해야 합니다: \(String(describing: state))")
+        }
+        await manager.endEditing(documentID: documentID)
+    }
+
+    func testHeartbeatLeaseConflictWaitsUntilExpiryBeforeSingleRetry()
+        async {
+        let documentID = UUID()
+        let deviceID = UUID()
+        let client = EditLeaseClientStub(
+            renewalErrors: [
+                .remote(
+                    code: .leaseConflict,
+                    detail: #"{"expires_at":"1970-01-01T00:16:50Z"}"#
+                ),
+            ]
+        )
+        let sleeper = ManualLeaseSleeper()
+        let manager = EditLeaseManager(
+            client: client,
+            revisionProvider: FixedRevisionProvider(revision: 2),
+            deviceIdentityProvider: FixedDeviceIdentityProvider(
+                identifier: DeviceIdentifier(uuid: deviceID)
+            ),
+            now: { Date(timeIntervalSince1970: 1_000) },
+            sleep: { duration in
+                try await sleeper.sleep(duration)
+            }
+        )
+
+        _ = await manager.beginEditing(documentID: documentID)
+        await sleeper.waitForCallCount(1)
+        await sleeper.wakeNext()
+        await sleeper.waitForCallCount(2)
+        let beforeExpiry = await client.acquireCount()
+        let delays = await sleeper.recordedDurations()
+        XCTAssertEqual(beforeExpiry, 1)
+        XCTAssertEqual(delays.last, .seconds(10))
+
+        await sleeper.wakeNext()
+        await waitForAcquire(2, client: client)
+        let afterExpiry = await client.acquireCount()
+        XCTAssertEqual(afterExpiry, 2)
+        await manager.endEditing(documentID: documentID)
+    }
+
+    func testHeartbeatNetworkFailureRecoversWithoutConnectivityTransition()
+        async {
+        let documentID = UUID()
+        let deviceID = UUID()
+        let client = EditLeaseClientStub(
+            renewalErrors: [.networkUnavailable]
+        )
+        let sleeper = ManualLeaseSleeper()
+        let manager = EditLeaseManager(
+            client: client,
+            revisionProvider: FixedRevisionProvider(revision: 2),
+            deviceIdentityProvider: FixedDeviceIdentityProvider(
+                identifier: DeviceIdentifier(uuid: deviceID)
+            ),
+            sleep: { duration in
+                try await sleeper.sleep(duration)
+            }
+        )
+
+        _ = await manager.beginEditing(documentID: documentID)
+        await sleeper.waitForCallCount(1)
+        await sleeper.wakeNext()
+        await sleeper.waitForCallCount(2)
+        let delays = await sleeper.recordedDurations()
+        XCTAssertEqual(delays.last, .seconds(1))
+        let beforeRetry = await client.acquireCount()
+        XCTAssertEqual(beforeRetry, 1)
+
+        await sleeper.wakeNext()
+        await waitForAcquire(2, client: client)
+        let afterRetry = await client.acquireCount()
+        XCTAssertEqual(afterRetry, 2)
+        await manager.endEditing(documentID: documentID)
     }
 
     @MainActor
@@ -1212,9 +1450,7 @@ final class EditLeaseManagerTests: XCTestCase {
         XCTAssertEqual(model.editLeaseState, .localOnly)
 
         connectivity.send(isConnected: false)
-        await waitUntil {
-            model.editLeaseState == .offlineEditing
-        }
+        await waitForLeaseState(model) { $0 == .offlineEditing }
 
         XCTAssertEqual(model.editLeaseState, .offlineEditing)
     }
@@ -1250,6 +1486,30 @@ final class EditLeaseManagerTests: XCTestCase {
         client: EditLeaseClientStub
     ) async {
         for _ in 0..<100 {
+            if await client.releaseCount() >= expectedCount {
+                return
+            }
+            await Task.yield()
+        }
+    }
+
+    private func waitForAcquire(
+        _ expectedCount: Int,
+        client: EditLeaseClientStub
+    ) async {
+        for _ in 0..<200 {
+            if await client.acquireCount() >= expectedCount {
+                return
+            }
+            await Task.yield()
+        }
+    }
+
+    private func waitForControlledRelease(
+        _ expectedCount: Int,
+        client: ControlledAcquireLeaseClient
+    ) async {
+        for _ in 0..<200 {
             if await client.releaseCount() >= expectedCount {
                 return
             }
@@ -1627,6 +1887,38 @@ final class SyncV2CommitFolderClientTests: XCTestCase {
         XCTAssertNil(result.name)
     }
 
+    func testFolderRenameResponseDecodesServerOperationKind() throws {
+        let folderID = UUID()
+        let versionID = UUID()
+        let operationID = UUID()
+        let json = """
+        {
+          "status": "committed",
+          "folder_id": "\(folderID.uuidString.lowercased())",
+          "version_id": "\(versionID.uuidString.lowercased())",
+          "operation_id": "\(operationID.uuidString.lowercased())",
+          "operation_kind": "rename",
+          "revision": 2,
+          "parent_folder_id": null,
+          "name": "가 나 다 바",
+          "is_deleted": false,
+          "committed_at": "2026-08-09T12:00:00Z"
+        }
+        """
+
+        let result = try JSONDecoder().decode(
+            SyncV2CommitFolderResult.self,
+            from: Data(json.utf8)
+        )
+
+        XCTAssertEqual(result.folderID, folderID)
+        XCTAssertEqual(result.versionID, versionID)
+        XCTAssertEqual(result.operationID, operationID)
+        XCTAssertEqual(result.operationKind, .rename)
+        XCTAssertEqual(result.serverRevision, 2)
+        XCTAssertEqual(result.name, "가 나 다 바")
+    }
+
     private func folderParameters(
         folderID: UUID,
         operationID: UUID,
@@ -1988,6 +2280,122 @@ private enum FolderDispatchFixtureError: Error {
 }
 
 final class SyncV2DispatcherTests: XCTestCase {
+    func testRestrictedDispatchPreservesOtherPendingAndConflictsEvenWhenPrioritized() async throws {
+        let selected = ProjectID(rawValue: UUID()), other = ProjectID(rawValue: UUID())
+        let target = dispatchOperation(documentID: UUID(), sequence: 1, suffix: 100, localProjectID: selected)
+        let protected = (0..<7).map { dispatchOperation(documentID: UUID(), sequence: 1, suffix: $0, localProjectID: other) }
+        let store = DispatcherStoreStub(operations: [target] + protected), client = DispatcherClientStub()
+        for operation in protected.suffix(3) { await store.markConflict(operation, errorCode: "REVISION_CONFLICT", detail: "preserve") }
+        let before = await store.scopeSnapshot(excluding: [target.operationID])
+        let dispatcher = SyncV2Dispatcher(store: store, client: client, projectScope: .only([selected]))
+        await dispatcher.prioritizeProject(other)
+        await dispatcher.dispatchReadyOperations(now: Date())
+        let requests = await client.receivedRequests(), after = await store.scopeSnapshot(excluding: [target.operationID])
+        XCTAssertEqual(requests.map(\.operationID), [target.operationID])
+        XCTAssertEqual(before, after)
+        XCTAssertEqual(after.values.filter { $0 == "pending:0" }.count, 4)
+        XCTAssertEqual(after.values.filter { $0 == "conflict:0" }.count, 3)
+    }
+
+    func testRestrictedGeneralRouteReceivesOnlySelectedLocalProject() async {
+        let selected = ProjectID(rawValue: UUID()), other = ProjectID(rawValue: UUID())
+        let operations = [selected, other].enumerated().map { dispatchOperation(documentID: UUID(), sequence: 1, suffix: $0.offset, localProjectID: $0.element) }
+        let store = DispatcherStoreStub(operations: operations), client = DispatcherClientStub(), sender = GeneralRouteSpy()
+        let dispatcher = SyncV2Dispatcher(store: store, client: client, contractSender: sender, projectScope: .only([selected]))
+        await dispatcher.dispatchReadyOperations(now: Date())
+        let projects = await sender.projects, requests = await client.receivedRequests()
+        XCTAssertEqual(projects, [selected]); XCTAssertTrue(requests.isEmpty)
+    }
+
+    func testRestrictedStartupSkipsGlobalRecoveryAndGlobalNetworkRecovery() async throws {
+        let selected = ProjectID(rawValue: UUID()), other = ProjectID(rawValue: UUID())
+        let target = dispatchOperation(documentID: UUID(), sequence: 1, suffix: 1, localProjectID: selected)
+        let blocked = dispatchOperation(documentID: UUID(), sequence: 1, suffix: 2, localProjectID: other)
+        let store = DispatcherStoreStub(operations: [target, blocked]), client = DispatcherClientStub()
+        let hub = SyncV2NetworkRecoveryHub(), probe = ScopeRecoveryProbe()
+        await hub.install { await probe.called() }
+        let dispatcher = SyncV2Dispatcher(store: store, client: client, projectScope: .only([selected]), networkRecoveryHub: hub)
+        await dispatcher.start()
+        try await waitUntilCompleted(target, store: store)
+        await dispatcher.networkRecovered()
+        await dispatcher.stop()
+        let recoveries = await store.globalRecoveryCount(), signals = await probe.count
+        let requests = await client.receivedRequests()
+        XCTAssertEqual(recoveries, 0); XCTAssertEqual(signals, 0)
+        XCTAssertEqual(requests.map(\.operationID), [target.operationID])
+    }
+
+    func testRestrictedRetryOpportunitiesCannotReleaseOtherProject() async throws {
+        let selected = ProjectID(rawValue: UUID()), other = ProjectID(rawValue: UUID())
+        let target = dispatchOperation(documentID: UUID(), sequence: 1, suffix: 1, localProjectID: selected)
+        let protected = dispatchOperation(documentID: UUID(), sequence: 1, suffix: 2, localProjectID: other)
+        let store = DispatcherStoreStub(operations: [target, protected], initialStatus: .retryWait), client = DispatcherClientStub()
+        let dispatcher = SyncV2Dispatcher(store: store, client: client, projectScope: .only([selected]))
+        let before = await store.scopeSnapshot(excluding: [target.operationID])
+        await dispatcher.start()
+        await dispatcher.loginSucceeded()
+        try await waitUntilCompleted(target, store: store)
+        await dispatcher.appEnteredForeground()
+        await dispatcher.userRequestedRetry()
+        await dispatcher.networkRecovered()
+        await dispatcher.stop()
+        let after = await store.scopeSnapshot(excluding: [target.operationID]), scopes = await store.retryScopes()
+        XCTAssertEqual(before, after)
+        XCTAssertEqual(scopes, Array(repeating: Optional(selected), count: 4))
+    }
+
+    func testEmptyRestrictedScopeDoesNotRecoverRetryOrSend() async {
+        let operation = dispatchOperation(documentID: UUID(), sequence: 1, suffix: 1)
+        let store = DispatcherStoreStub(operations: [operation]), client = DispatcherClientStub()
+        let before = await store.scopeSnapshot(excluding: [])
+        let dispatcher = SyncV2Dispatcher(store: store, client: client, projectScope: .only([]))
+        await dispatcher.start(); await dispatcher.prioritizeProject(operation.localProjectID)
+        await dispatcher.loginSucceeded(); await dispatcher.appEnteredForeground()
+        await dispatcher.networkRecovered(); await dispatcher.userRequestedRetry()
+        await dispatcher.dispatchReadyOperations(now: Date()); await dispatcher.stop()
+        let after = await store.scopeSnapshot(excluding: []), scopes = await store.retryScopes(), recoveries = await store.globalRecoveryCount()
+        let requests = await client.receivedRequests()
+        XCTAssertEqual(before, after); XCTAssertTrue(scopes.isEmpty); XCTAssertEqual(recoveries, 0); XCTAssertTrue(requests.isEmpty)
+    }
+
+    func testProjectScopeCannotBypassReceiveValidationLock() async {
+        let selected = ProjectID(rawValue: UUID())
+        let operation = dispatchOperation(documentID: UUID(), sequence: 1, suffix: 1, localProjectID: selected)
+        let store = DispatcherStoreStub(operations: [operation]), client = DispatcherClientStub()
+        let before = await store.scopeSnapshot(excluding: [])
+        await ReceiveValidationPolicy.$override.withValue(ReceiveValidationPolicy(enabled: true, configuration: nil)) {
+            let dispatcher = SyncV2Dispatcher(store: store, client: client, projectScope: .only([selected]))
+            await dispatcher.start(); await dispatcher.loginSucceeded(); await dispatcher.networkRecovered()
+            await dispatcher.dispatchReadyOperations(now: Date()); await dispatcher.stop()
+        }
+        let after = await store.scopeSnapshot(excluding: []), recoveries = await store.globalRecoveryCount(), scopes = await store.retryScopes()
+        let requests = await client.receivedRequests()
+        XCTAssertEqual(before, after); XCTAssertEqual(recoveries, 0); XCTAssertTrue(scopes.isEmpty); XCTAssertTrue(requests.isEmpty)
+    }
+
+    private actor ScopeRecoveryProbe {
+        private(set) var count = 0
+        func called() { count += 1 }
+    }
+
+    private actor GeneralRouteSpy: SyncV2GeneralContractSending {
+        private(set) var projects: [ProjectID] = []
+        func handlesProject(_ projectID: ProjectID) -> Bool { true }
+        func drainGeneralContract(localProjectID: ProjectID) -> Bool { projects.append(localProjectID); return false }
+    }
+
+    func testGeneralRouteOwnsDrainBeforeLegacyQueueCanBeClaimed() async throws {
+        let operation = dispatchOperation(documentID: UUID(), sequence: 1, suffix: 15)
+        let store = DispatcherStoreStub(operations: [operation]), client = DispatcherClientStub(), sender = GeneralRouteSpy()
+        let dispatcher = SyncV2Dispatcher(store: store, client: client, contractSender: sender)
+        await dispatcher.dispatchReadyOperations(now: Date())
+        let requests = await client.receivedRequests(), projects = await sender.projects
+        XCTAssertTrue(requests.isEmpty)
+        XCTAssertEqual(projects.count, 1)
+        let completed = await store.completedOperationIDs()
+        XCTAssertTrue(completed.isEmpty)
+    }
+
     func testRetryPolicyIsExponentialCappedAndJittered() {
         let policy = SyncV2RetryPolicy(
             initialDelay: 2,
@@ -2302,7 +2710,7 @@ final class SyncV2DispatcherTests: XCTestCase {
             name: syncV2TreeOrderPath
         )
         let localContent =
-            "{\"tree_order\":{\"메인/메모장\":[\"둘째.txt\",\"첫째.txt\"]},\"version\":1}"
+            "{\"tree_order\":{\"<root>\":[\"메모장\",\"휴지통\"],\"메인/메모장\":[\"둘째.txt\",\"첫째.txt\"]},\"version\":1}"
         let operation = SyncV2DispatchOperation(
             operationID: UUID(),
             batchID: UUID(),
@@ -2333,7 +2741,7 @@ final class SyncV2DispatcherTests: XCTestCase {
                     documentID: documentID,
                     path: syncV2TreeOrderPath,
                     content:
-                        "{\"tree_order\":{\"메인/메모장\":[\"첫째.txt\"]},\"version\":1}"
+                        "{\"folder_paths\":[\"메인/윈-빈폴더\",\"메인/윈-든폴더\"],\"tree_order\":{\"<root>\":[\"메모장\",\"윈-빈폴더\",\"윈-든폴더\",\"휴지통\"],\"메인/메모장\":[\"첫째.txt\"],\"메인/윈-빈폴더\":[],\"메인/윈-든폴더\":[\"윈-문서.txt\"]},\"version\":1}"
                 )
             )
         )
@@ -2353,8 +2761,27 @@ final class SyncV2DispatcherTests: XCTestCase {
         )
         XCTAssertFalse(conflicts.contains(operation.operationID))
         XCTAssertEqual(rebase?.remoteRevision, 4)
-        XCTAssertEqual(rebase?.mergedContent, localContent)
         XCTAssertEqual(rebase?.mergedPath, syncV2TreeOrderPath)
+        let mergedData = try? XCTUnwrap(
+            rebase?.mergedContent.data(using: .utf8)
+        )
+        let mergedObject = mergedData.flatMap {
+            try? JSONSerialization.jsonObject(with: $0)
+                as? [String: Any]
+        }
+        let mergedOrder = mergedObject?["tree_order"]
+            as? [String: [String]]
+        let folderPaths = mergedObject?["folder_paths"] as? [String]
+        XCTAssertEqual(
+            mergedOrder?["<root>"],
+            ["메모장", "윈-빈폴더", "윈-든폴더", "휴지통"]
+        )
+        XCTAssertEqual(mergedOrder?["메인/윈-빈폴더"], [])
+        XCTAssertEqual(
+            mergedOrder?["메인/윈-든폴더"],
+            ["윈-문서.txt"]
+        )
+        XCTAssertTrue(folderPaths?.contains("메인/윈-빈폴더") == true)
     }
 
     private func waitForRelease(
@@ -3054,9 +3481,25 @@ private actor AutomaticRebaseSnapshotClientStub:
         guard snapshot?.documentID == documentID else { return nil }
         return snapshot
     }
+
+    /// 이 대역은 계약 순서를 다루지 않는다. 비어 있다고 답하는 것이 아니라
+    /// 다루지 않음을 여기 적어 둔다 — 기본 구현에 기대면 전달자 누락이 성공으로
+    /// 보인다.
+    func fetchTreeOrders(
+        projectID: UUID
+    ) async throws -> [SyncV2RemoteTreeOrder] {
+        []
+    }
 }
 
 private actor AutomaticRebaseStoreStub: SyncV2DispatchStoring {
+    func stalledFolderChanges(
+        localProjectID: ProjectID
+    ) async throws -> [SyncV2StalledFolderChange] {
+        _ = localProjectID
+        return []
+    }
+
     struct Recorded: Equatable {
         let remote: SyncV2RemoteDocumentSnapshot
         let local: SyncV2RebaseLocalSnapshot
@@ -3301,6 +3744,13 @@ private actor AutomaticRebaseOpenProviderStub:
 }
 
 private actor DispatcherStoreStub: SyncV2DispatchStoring {
+    func stalledFolderChanges(
+        localProjectID: ProjectID
+    ) async throws -> [SyncV2StalledFolderChange] {
+        _ = localProjectID
+        return []
+    }
+
     enum Status {
         case pending
         case inflight
@@ -3327,6 +3777,8 @@ private actor DispatcherStoreStub: SyncV2DispatchStoring {
     private var retries: [UUID: RetryRecord] = [:]
     private var rebases: [UUID: RebaseRecord] = [:]
     private var opportunities = 0
+    private var globalRecoveries = 0
+    private var requestedRetryScopes: [ProjectID?] = []
     private var missingRecoveries = 0
     private var missingProjectRecoveries = 0
 
@@ -3345,7 +3797,14 @@ private actor DispatcherStoreStub: SyncV2DispatchStoring {
         )
     }
 
-    func recoverInterruptedWork() {}
+    func recoverInterruptedWork() { globalRecoveries += 1 }
+    func globalRecoveryCount() -> Int { globalRecoveries }
+    func retryScopes() -> [ProjectID?] { requestedRetryScopes }
+    func scopeSnapshot(excluding ids: Set<UUID>) -> [UUID: String] {
+        Dictionary(uniqueKeysWithValues: statuses.filter { !ids.contains($0.key) }.map {
+            ($0.key, String(describing: $0.value) + ":" + String(operations[$0.key]?.attempts ?? -1))
+        })
+    }
 
     func readyLocalProjectIDs(now: Date) -> [ProjectID] {
         _ = now
@@ -3516,6 +3975,7 @@ private actor DispatcherStoreStub: SyncV2DispatchStoring {
     }
 
     func makeRetryWaitOperationsReady(localProjectID: ProjectID?) {
+        requestedRetryScopes.append(localProjectID)
         opportunities += 1
         for identifier in order where statuses[identifier] == .retryWait {
             if let localProjectID,
@@ -3837,6 +4297,104 @@ private struct FixedDeviceIdentityProvider: DeviceIdentityProviding {
     func prepareIdentity() async {}
 }
 
+private actor ControlledAcquireLeaseClient: EditLeaseClienting {
+    private var acquisitions = 0
+    private var releases = 0
+    private var acquireContinuations: [
+        Int: CheckedContinuation<EditLeaseMutationResult, Never>
+    ] = [:]
+    private var countWaiters: [
+        (count: Int, continuation: CheckedContinuation<Void, Never>)
+    ] = []
+    private var requests: [Int: (documentID: UUID, deviceID: UUID)] = [:]
+
+    func acquire(
+        documentID: UUID,
+        deviceID: UUID,
+        ttlSeconds: Int
+    ) async throws -> EditLeaseMutationResult {
+        _ = ttlSeconds
+        acquisitions += 1
+        let index = acquisitions
+        requests[index] = (documentID, deviceID)
+        let ready = countWaiters.filter { acquisitions >= $0.count }
+        countWaiters.removeAll { acquisitions >= $0.count }
+        ready.forEach { $0.continuation.resume() }
+        return await withCheckedContinuation { continuation in
+            acquireContinuations[index] = continuation
+        }
+    }
+
+    func renew(
+        documentID: UUID,
+        deviceID: UUID,
+        leaseToken: UUID,
+        ttlSeconds: Int
+    ) -> EditLeaseMutationResult {
+        _ = (leaseToken, ttlSeconds)
+        return result(documentID: documentID, deviceID: deviceID, index: 99)
+    }
+
+    func release(
+        documentID: UUID,
+        deviceID: UUID,
+        leaseToken: UUID
+    ) -> Bool {
+        _ = (documentID, deviceID, leaseToken)
+        releases += 1
+        return true
+    }
+
+    func inspect(
+        documentID: UUID,
+        deviceID: UUID
+    ) -> EditLeaseInspectionResult {
+        EditLeaseInspectionResult(
+            documentID: documentID,
+            state: .available,
+            expiresAt: nil
+        )
+    }
+
+    func waitForAcquireCount(_ count: Int) async {
+        guard acquisitions < count else { return }
+        await withCheckedContinuation { continuation in
+            countWaiters.append((count, continuation))
+        }
+    }
+
+    func completeAcquire(_ index: Int) {
+        guard let request = requests[index] else { return }
+        acquireContinuations.removeValue(forKey: index)?.resume(
+            returning: result(
+                documentID: request.documentID,
+                deviceID: request.deviceID,
+                index: index
+            )
+        )
+    }
+
+    func releaseCount() -> Int { releases }
+
+    private func result(
+        documentID: UUID,
+        deviceID: UUID,
+        index: Int
+    ) -> EditLeaseMutationResult {
+        EditLeaseMutationResult(
+            documentID: documentID,
+            leaseToken: UUID(
+                uuidString: String(
+                    format: "00000000-0000-0000-0000-%012d",
+                    index
+                )
+            )!,
+            deviceID: deviceID,
+            expiresAt: Date().addingTimeInterval(90)
+        )
+    }
+}
+
 private actor EditLeaseClientStub: EditLeaseClienting {
     private let token = UUID()
     private var acquireError: SyncV2ClientError?
@@ -3844,13 +4402,16 @@ private actor EditLeaseClientStub: EditLeaseClienting {
     private var releases = 0
     private var renewals = 0
     private var renewalWaiters: [CheckedContinuation<Void, Never>] = []
+    private var renewalErrors: [SyncV2ClientError]
     private let releaseGate: LeaseReleaseGate?
 
     init(
         acquireError: SyncV2ClientError? = nil,
+        renewalErrors: [SyncV2ClientError] = [],
         releaseGate: LeaseReleaseGate? = nil
     ) {
         self.acquireError = acquireError
+        self.renewalErrors = renewalErrors
         self.releaseGate = releaseGate
     }
 
@@ -3872,12 +4433,15 @@ private actor EditLeaseClientStub: EditLeaseClienting {
         deviceID: UUID,
         leaseToken: UUID,
         ttlSeconds: Int
-    ) -> EditLeaseMutationResult {
+    ) throws -> EditLeaseMutationResult {
         _ = (leaseToken, ttlSeconds)
         renewals += 1
         let waiters = renewalWaiters
         renewalWaiters.removeAll()
         waiters.forEach { $0.resume() }
+        if !renewalErrors.isEmpty {
+            throw renewalErrors.removeFirst()
+        }
         return result(documentID: documentID, deviceID: deviceID)
     }
 
@@ -4124,6 +4688,41 @@ private actor OneShotLeaseSleeper {
     }
 }
 
+private actor ManualLeaseSleeper {
+    private var durations: [Duration] = []
+    private var sleepContinuations:
+        [CheckedContinuation<Void, any Error>] = []
+    private var callCountWaiters: [
+        (count: Int, continuation: CheckedContinuation<Void, Never>)
+    ] = []
+
+    func sleep(_ duration: Duration) async throws {
+        durations.append(duration)
+        let ready = callCountWaiters.filter { durations.count >= $0.count }
+        callCountWaiters.removeAll { durations.count >= $0.count }
+        ready.forEach { $0.continuation.resume() }
+        try await withCheckedThrowingContinuation { continuation in
+            sleepContinuations.append(continuation)
+        }
+    }
+
+    func waitForCallCount(_ count: Int) async {
+        guard durations.count < count else { return }
+        await withCheckedContinuation { continuation in
+            callCountWaiters.append((count, continuation))
+        }
+    }
+
+    func wakeNext() {
+        guard !sleepContinuations.isEmpty else { return }
+        sleepContinuations.removeFirst().resume()
+    }
+
+    func recordedDurations() -> [Duration] {
+        durations
+    }
+}
+
 private actor MutableAuthenticationStateProvider {
     private var state: AuthenticationState
 
@@ -4172,5 +4771,54 @@ private final class EditLeaseConnectivityMonitorStub:
         let started = handler != nil
         lock.unlock()
         return started
+    }
+}
+
+
+extension SyncV2DispatcherTests {
+    func testReceiveGuardOverlappingStartupRetryAndDirectDrainPreserveAllStates() async throws {
+        for state in [DispatcherStoreStub.Status.pending, .inflight, .retryWait, .conflict] {
+            let operation = dispatchOperation(documentID: UUID(), sequence: 1, suffix: 15)
+            let store = DispatcherStoreStub(operations: [operation], initialStatus: state)
+            let client = DispatcherClientStub()
+            let dispatcher = SyncV2Dispatcher(store: store, client: client)
+            let policy = ReceiveValidationPolicy(enabled: true, configuration: nil)
+            await ReceiveValidationPolicy.$override.withValue(policy) {
+                await withTaskGroup(of: Void.self) { group in
+                    group.addTask { await dispatcher.start() }
+                    group.addTask { await dispatcher.loginSucceeded() }
+                    group.addTask { await dispatcher.appEnteredForeground() }
+                    group.addTask { await dispatcher.networkRecovered() }
+                    group.addTask { await dispatcher.userRequestedRetry() }
+                    group.addTask { await dispatcher.dispatchReadyOperations(now: Date()) }
+                }
+            }
+            let calls = await client.receivedRequests()
+            let opportunities = await store.immediateOpportunityCount()
+            let completed = await store.completedOperationIDs()
+            XCTAssertTrue(calls.isEmpty)
+            XCTAssertEqual(opportunities, 0)
+            XCTAssertTrue(completed.isEmpty)
+        }
+    }
+}
+
+
+extension EditLeaseManagerTests {
+    func testReceiveGuardBlocksAcquireDirectTokenAndCleanupWithGlobalEnabled() async throws {
+        let client = EditLeaseClientStub(), device = UUID(), document = UUID()
+        let manager = EditLeaseManager(client: client, revisionProvider: FixedRevisionProvider(revision: 4),
+            deviceIdentityProvider: FixedDeviceIdentityProvider(identifier: DeviceIdentifier(uuid: device)), isEnabled: { true })
+        let policy = ReceiveValidationPolicy(enabled: true, configuration: nil)
+        await ReceiveValidationPolicy.$override.withValue(policy) {
+            let state = await manager.beginEditing(documentID: document)
+            XCTAssertEqual(state, .localOnly)
+            do { _ = try await manager.leaseTokenForCommit(documentID: document, deviceID: device, baseRevision: 4); XCTFail() } catch {}
+            await manager.ensureLeaseForActiveLiveDocument(documentID: document, serverRevision: 4)
+            await manager.releaseAll()
+            await manager.endEditing(documentID: document)
+        }
+        let acquired = await client.acquireCount(), released = await client.releaseCount(), renewed = await client.renewCount()
+        XCTAssertEqual([acquired, released, renewed], [0, 0, 0])
     }
 }
