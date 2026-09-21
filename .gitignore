@@ -21,3 +21,4 @@ supabase/.temp/
 집필모드/
 집필모드.zip
 build/
+.build/
