@@ -422,3 +422,12 @@ marker 조회는 기존의 크기 제한·일반 파일·no-follow·nonblocking 
 하네스에는 실제 ProjectBackupStore와 관련 domain/protocol도 포함한다. 앱 전체 의존성을 피하기 위해 관련 없는 repository conformance 일부를 제외하고 외곽 validation policy에는 서버 경로 호출을 거부하는 최소 구현을 사용한다. 실제 iPad 다중 창 UI, 여러 프로세스 사이의 파일 잠금, 모든 동시 실행 순서를 검증했다는 뜻은 아니다. 전체 WriterPadTests의 기존 컴파일 제한은 유지한다.
 
 `7a9f583` 추출본에 이번 소스 수정만 적용한 WriterPad Debug / generic iOS Simulator / 서명 비활성 앱 빌드가 종료 코드 0으로 완료됐다. 기존 deprecated/concurrency 경고는 남아 있다. 실기기 설치·앱 실행·인증·앱 서버 요청은 수행하지 않았다.
+
+## 작품 목록 보호 수정본 실기기 확인 (2026-09-21)
+
+- 사용자가 Xcode에서 ChoCo 대상 WriterPad 빌드 성공을 확인했다. 설치 후보 bundle ID와 서명 검사가 통과했고 실행 파일 SHA-256은 `10e1c7240424fa2083151d7232a6c2c60f3b6bd89a6eee7eb6ec9a5242b0c709`였다.
+- 설치 전 백업은 `/Users/chocos/Documents/ReceivePromotion-catalogfix-before.yo69BbJx`에 저장했고 1,522개 파일의 SHA-256을 기록했다.
+- 수정본 설치 직후 `Documents`와 `Library/Application Support` 핵심 자료 1,494개가 설치 전과 byte-identical이었다.
+- 비행기 모드에서 기존 승격 작품이 한 개만 표시되고 `빈문서`와 `저장경계`의 본문이 유지되는 것을 사용자가 확인했다. 같은 package 재확인은 기존 완료 작품을 반환했고 중복 작품·문서를 만들지 않았다.
+- 최종 백업 `/Users/chocos/Documents/ReceivePromotion-catalogfix-verified.GQqs7wrf` 비교에서 `Documents` 777개 파일의 크기와 SHA-256이 모두 동일했다. 미완료 승격 marker와 staging 흔적도 없었다.
+- 이 확인에서는 인증과 서버 요청을 수행하지 않았다. 장애 주입에 의한 미완료 승격 숨김은 앞 절의 실제 LocalProjectManager·SwiftData 회귀 검사로 확인했고, 실기기에서는 정상 완료·재확인·자료 보존 경계를 확인했다.
