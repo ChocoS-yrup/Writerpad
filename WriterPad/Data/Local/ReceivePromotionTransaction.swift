@@ -249,7 +249,7 @@ actor ReceivePromotionTransaction: ReceivePromotionTransacting {
             project: project,
             date: now
         )
-        let provenanceData = try canonical(plan.provenance)
+        let provenanceData = try Self.canonical(plan.provenance)
         let stagingFolderName = ".writerpad-promotion-\(canonical(transactionID)).tmp"
         let stagingURL = pathResolver.projectsRootURL.appendingPathComponent(
             stagingFolderName,
@@ -366,6 +366,34 @@ actor ReceivePromotionTransaction: ReceivePromotionTransacting {
         }
     }
 
+    /// Catalog readers may observe registered metadata before the transaction
+    /// finishes. Marker removal, after the receipt is durable, is publication.
+    static func pendingProjectIDs(
+        at root: URL, fileManager: FileManager = .default
+    ) throws -> Set<ProjectID> {
+        guard fileManager.fileExists(atPath: root.path) else { return [] }
+        let urls = try fileManager.contentsOfDirectory(at: root, includingPropertiesForKeys: nil)
+            .filter { $0.lastPathComponent.hasPrefix(markerPrefix) }
+        var ids = Set<ProjectID>()
+        for url in urls {
+            do {
+                let data = try Self.readRegularFile(url)
+                let decoder = JSONDecoder()
+                decoder.dateDecodingStrategy = .iso8601
+                let marker = try decoder.decode(ReceivePromotionMarker.self, from: data)
+                guard try Self.canonical(marker) == data,
+                      marker.format == markerFormat,
+                      url.lastPathComponent == markerPrefix + marker.transactionID.uuidString.lowercased() + ".json",
+                      ids.insert(marker.project.id).inserted else {
+                    throw CocoaError(.fileReadCorruptFile)
+                }
+            } catch {
+                throw ReceivePromotionTransactionError.recoveryRequired(url.path)
+            }
+        }
+        return ids
+    }
+
     func recoverPendingPromotions() async throws {
         try beginOperation()
         defer { operationInProgress = false }
@@ -410,7 +438,7 @@ actor ReceivePromotionTransaction: ReceivePromotionTransacting {
                       marker.sourceKey == marker.provenance.sourceKey,
                       marker.packageFingerprint == marker.provenance.packageFingerprint,
                       marker.packageID == marker.provenance.packageID,
-                      marker.provenanceSHA256 == hasher.sha256(for: try canonical(marker.provenance))
+                      marker.provenanceSHA256 == hasher.sha256(for: try Self.canonical(marker.provenance))
                 else { throw CocoaError(.fileReadCorruptFile) }
             } catch {
                 throw ReceivePromotionTransactionError.recoveryRequired(markerURL.path)
@@ -712,7 +740,7 @@ private extension ReceivePromotionTransaction {
               provenance.packageFingerprint == receipt.packageFingerprint,
               provenance.transactionID == receipt.transactionID,
               provenance.documents == receipt.documents,
-              hasher.sha256(for: try canonical(provenance)) == receipt.provenanceSHA256
+              hasher.sha256(for: try Self.canonical(provenance)) == receipt.provenanceSHA256
         else {
             throw ReceivePromotionTransactionError.completedPromotionUnavailable
         }
@@ -792,14 +820,14 @@ private extension ReceivePromotionTransaction {
             from: provenanceURL
         )
         guard provenance == marker.provenance,
-              hasher.sha256(for: try canonical(provenance)) == marker.provenanceSHA256 else {
+              hasher.sha256(for: try Self.canonical(provenance)) == marker.provenanceSHA256 else {
             throw ReceivePromotionTransactionError.completedPromotionUnavailable
         }
         if let expectedPayloads {
             for payload in expectedPayloads {
                 let url = projectURL.appendingPathComponent("집필모드")
                     .appendingPathComponent(payload.path.rawValue)
-                let data = try readRegularFile(url)
+                let data = try Self.readRegularFile(url)
                 guard data == payload.data,
                       hasher.sha256(for: data) == payload.hash else {
                     throw ReceivePromotionTransactionError.completedPromotionUnavailable
@@ -828,7 +856,7 @@ private extension ReceivePromotionTransaction {
         for document in documents {
             let url = projectURL.appendingPathComponent("집필모드")
                 .appendingPathComponent(document.writerPadRelativePath.rawValue)
-            let data = try readRegularFile(url)
+            let data = try Self.readRegularFile(url)
             guard data.count == document.byteCount,
                   hasher.sha256(for: data) == document.editableBodySHA256,
                   String(data: data, encoding: .utf8) != nil else {
@@ -864,10 +892,10 @@ private extension ReceivePromotionTransaction {
     }
 
     func writeCanonical<T: Encodable>(_ value: T, to url: URL) throws {
-        try writeData(try canonical(value), to: url)
+        try writeData(try Self.canonical(value), to: url)
     }
 
-    func canonical<T: Encodable>(_ value: T) throws -> Data {
+    static func canonical<T: Encodable>(_ value: T) throws -> Data {
         let encoder = JSONEncoder()
         encoder.dateEncodingStrategy = .iso8601
         encoder.outputFormatting = [.sortedKeys, .withoutEscapingSlashes]
@@ -877,17 +905,17 @@ private extension ReceivePromotionTransaction {
     }
 
     func decodeCanonical<T: Codable>(_ type: T.Type, from url: URL) throws -> T {
-        let data = try readRegularFile(url)
+        let data = try Self.readRegularFile(url)
         let decoder = JSONDecoder()
         decoder.dateDecodingStrategy = .iso8601
         let decoded = try decoder.decode(type, from: data)
-        guard try canonical(decoded) == data else {
+        guard try Self.canonical(decoded) == data else {
             throw CocoaError(.fileReadCorruptFile)
         }
         return decoded
     }
 
-    func readRegularFile(_ url: URL) throws -> Data {
+    static func readRegularFile(_ url: URL) throws -> Data {
         let descriptor = Darwin.open(url.path, O_RDONLY | O_NOFOLLOW | O_CLOEXEC | O_NONBLOCK)
         guard descriptor >= 0 else { throw CocoaError(.fileReadNoSuchFile) }
         defer { Darwin.close(descriptor) }

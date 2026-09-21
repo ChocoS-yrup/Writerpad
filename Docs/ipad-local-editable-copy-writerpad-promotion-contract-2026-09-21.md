@@ -405,3 +405,20 @@ PR 커밋만 별도 디렉터리에 추출한 앱 빌드에서 `AppEnvironment`�
 테스트 하네스는 실제 schema·metadata/import 구현 및 project/document repository의 해당 conformance extension을 사용한다. unrelated conformance는 제외하고 외곽 protocol·EditorPane·ReceiveValidationPolicy에는 최소 선언을 사용했다. 해당 policy는 이 검사의 등록/복구 경로에서 호출되지 않는다. 목록 publisher는 여전히 테스트 대역이다. LocalProjectManager의 실제 catalog 동시 접근·다중 창 UI·전체 앱 테스트·실기기 동작까지 검증했다는 뜻은 아니다.
 
 `469f550` 추출본에 이번 수정만 적용한 WriterPad Debug / generic iOS Simulator / 서명 비활성 앱 빌드는 종료 코드 0으로 완료했다. 기존 경고는 남아 있다. 실기기 설치·앱 실행·인증·서버 요청은 수행하지 않았다.
+
+
+## PR #20 실제 작품 목록 공개·동시 조회 검토 (2026-09-21)
+
+`7a9f583` 기준의 실제 LocalProjectManager와 SwiftData를 연결해 세 가지 문제를 재현했다.
+
+1. **미완료 승격 공개**: metadata 등록 이후 목록을 새로 읽으면 완료 영수증과 marker 정리가 끝나기 전에 작품이 표시되고 선택됐다. 목록 조회는 승격 marker가 남은 작품을 제외한다. 거래의 publisher는 catalog 항목만 예약하고, 정상 영수증 기록과 marker 제거가 끝난 뒤 일반 목록에 공개한다. 숨겨진 작품의 직접 이름 변경도 차단한다.
+2. **동시 정렬의 catalog 덮어쓰기**: 정렬이 metadata 조회 전에 읽은 catalog를 저장하면, 기다리는 동안 승격 publisher가 추가한 예약 항목이 사라졌다. 조회·검증 후 저장 직전에 catalog를 다시 읽어 동시 추가 항목을 보존한다.
+3. **rollback된 작품의 재노출**: metadata 조회 결과를 반환하기 전에 복구가 작품과 marker를 삭제하면, 오래된 조회 결과가 작품을 다시 목록에 올렸다. metadata 조회 전후의 pending ID 합집합을 제외해 해당 조회에서는 숨기고 다음 새 조회에서 상태를 확인한다.
+
+marker 조회는 기존의 크기 제한·일반 파일·no-follow·nonblocking 읽기와 canonical JSON 검증을 사용한다. 손상된 marker는 목록을 재작성하기 전에 `recoveryRequired`로 차단한다. 목록 정리는 pending 작품의 예약 catalog 항목을 지우지 않는다.
+
+독립 macOS XCTest 총 38개(reader 14 + transaction 24)가 통과했다. 신규 5개 검사는 실제 LocalProjectManager 전체 소스와 실제 SwiftData를 사용해 등록 후·이동 후·영수증 후 중단, 선택/이름 변경 차단, 복구·재확인, 공개 직전 동시 목록 조회, 동시 정렬, rollback 중 오래된 snapshot, malformed marker 디스크 무변경을 확인한다. 세 결함은 수정 전 실패로 재현했고 continuation으로 실행 순서를 고정했다.
+
+하네스에는 실제 ProjectBackupStore와 관련 domain/protocol도 포함한다. 앱 전체 의존성을 피하기 위해 관련 없는 repository conformance 일부를 제외하고 외곽 validation policy에는 서버 경로 호출을 거부하는 최소 구현을 사용한다. 실제 iPad 다중 창 UI, 여러 프로세스 사이의 파일 잠금, 모든 동시 실행 순서를 검증했다는 뜻은 아니다. 전체 WriterPadTests의 기존 컴파일 제한은 유지한다.
+
+`7a9f583` 추출본에 이번 소스 수정만 적용한 WriterPad Debug / generic iOS Simulator / 서명 비활성 앱 빌드가 종료 코드 0으로 완료됐다. 기존 deprecated/concurrency 경고는 남아 있다. 실기기 설치·앱 실행·인증·앱 서버 요청은 수행하지 않았다.

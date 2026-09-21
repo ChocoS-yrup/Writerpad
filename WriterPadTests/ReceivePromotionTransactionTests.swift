@@ -172,6 +172,161 @@ final class ReceivePromotionTransactionTests: XCTestCase {
         XCTAssertEqual(harness.uuids.count, uuidCount)
     }
 
+    func testActualCatalogHidesInterruptedPromotionUntilRecoveryCompletes() async throws {
+        for point in [ReceivePromotionFaultPoint.afterMetadataRegistration, .afterPromotion, .afterReceiptWrite] {
+            let harness = makeHarness()
+            let container = try WriterPadMetadataStore.makeContainer(isStoredInMemoryOnly: true)
+            let repository = SwiftDataMetadataRepository(modelContainer: container)
+            let manager = LocalProjectManager(
+                projectRepository: repository, creationMetadataStore: repository,
+                workspaceStateRepository: repository, pathResolver: harness.resolver, clock: harness.clock
+            )
+            let existing = try await manager.createProject(named: "기존 작품")
+            let transaction = ReceivePromotionTransaction(
+                packageReader: harness.materializer, metadataStore: repository, projectPublisher: manager,
+                pathResolver: harness.resolver, clock: harness.clock,
+                faultPlan: .init(point: point, leavesTransactionForRecovery: true)
+            )
+            await assertError(.injectedFailure(recoveryPending: true)) {
+                _ = try await transaction.promote(from: harness.package.report, projectName: "미완료 승격")
+            }
+            let stored = try await repository.projects()
+            let pending = try XCTUnwrap(stored.first { $0.id != existing.id })
+            let visible = try await manager.projects()
+            XCTAssertEqual(visible.map(\.id), [existing.id])
+            do {
+                try await manager.selectProject(id: pending.id)
+                XCTFail("Pending promotion must not be selectable")
+            } catch let error as ProjectManagerError {
+                XCTAssertEqual(error, .missingProject(pending.id))
+            }
+            do {
+                _ = try await manager.renameProject(id: pending.id, to: "아직 변경 금지")
+                XCTFail("Pending promotion must not be renamed")
+            } catch let error as ProjectManagerError {
+                XCTAssertEqual(error, .missingProject(pending.id))
+            }
+            let recovery = ReceivePromotionTransaction(
+                packageReader: harness.materializer, metadataStore: repository, projectPublisher: manager,
+                pathResolver: harness.resolver, clock: harness.clock
+            )
+            try await recovery.recoverPendingPromotions()
+            let completed = try await recovery.promote(from: harness.package.report, projectName: "미완료 승격")
+            let final = try await manager.projects()
+            XCTAssertEqual(Set(final.map(\.id)), Set([existing.id, completed.project.id]))
+            XCTAssertEqual(final.count, 2)
+            let before = try snapshot(harness.root)
+            let replay = try await recovery.promote(from: harness.package.report, projectName: "미완료 승격")
+            XCTAssertTrue(replay.wasAlreadyCompleted)
+            XCTAssertEqual(try snapshot(harness.root), before)
+        }
+    }
+
+    func testCatalogSnapshotCannotResurfaceRolledBackPromotion() async throws {
+        let harness = makeHarness()
+        let container = try WriterPadMetadataStore.makeContainer(isStoredInMemoryOnly: true)
+        let repository = SwiftDataMetadataRepository(modelContainer: container)
+        let gate = ReceivePromotionPausingProjectRepository(repository)
+        let manager = LocalProjectManager(
+            projectRepository: gate, creationMetadataStore: repository,
+            workspaceStateRepository: repository, pathResolver: harness.resolver, clock: harness.clock
+        )
+        let transaction = ReceivePromotionTransaction(
+            packageReader: harness.materializer, metadataStore: repository, projectPublisher: manager,
+            pathResolver: harness.resolver, clock: harness.clock,
+            faultPlan: .init(point: .afterMetadataRegistration, leavesTransactionForRecovery: true)
+        )
+        await assertError(.injectedFailure(recoveryPending: true)) {
+            _ = try await transaction.promote(from: harness.package.report, projectName: "롤백할 작품")
+        }
+        await gate.pauseNextProjects()
+        let listing = Task { try await manager.projects() }
+        await gate.waitForPause()
+        try await transaction.recoverPendingPromotions()
+        await gate.resume()
+        let visible = try await listing.value
+        XCTAssertTrue(visible.isEmpty)
+        let stored = try await repository.projects()
+        XCTAssertTrue(stored.isEmpty)
+    }
+
+    func testMalformedPromotionMarkerBlocksCatalogWithoutWriting() async throws {
+        let harness = makeHarness()
+        let container = try WriterPadMetadataStore.makeContainer(isStoredInMemoryOnly: true)
+        let repository = SwiftDataMetadataRepository(modelContainer: container)
+        let manager = LocalProjectManager(
+            projectRepository: repository, creationMetadataStore: repository,
+            workspaceStateRepository: repository, pathResolver: harness.resolver, clock: harness.clock
+        )
+        _ = try await manager.createProject(named: "정상 작품")
+        let marker = harness.root.appendingPathComponent(".writerpad-promotion-transaction-" + UUID().uuidString.lowercased() + ".json")
+        try Data("{}\n".utf8).write(to: marker)
+        let before = try snapshot(harness.root)
+        do {
+            _ = try await manager.projects()
+            XCTFail("Malformed promotion marker must block catalog reconciliation")
+        } catch let error as ReceivePromotionTransactionError {
+            guard case .recoveryRequired = error else { throw error }
+        }
+        XCTAssertEqual(try snapshot(harness.root), before)
+    }
+
+    func testReorderDoesNotOverwriteConcurrentPromotionCatalogEntry() async throws {
+        let harness = makeHarness()
+        let container = try WriterPadMetadataStore.makeContainer(isStoredInMemoryOnly: true)
+        let repository = SwiftDataMetadataRepository(modelContainer: container)
+        let gate = ReceivePromotionPausingProjectRepository(repository)
+        let manager = LocalProjectManager(
+            projectRepository: gate, creationMetadataStore: repository,
+            workspaceStateRepository: repository, pathResolver: harness.resolver, clock: harness.clock
+        )
+        let existing = try await manager.createProject(named: "기존 작품")
+        await gate.pauseNextProjects()
+        let reorder = Task { try await manager.reorderProjects([existing.id]) }
+        await gate.waitForPause()
+        let publisher = ReceivePromotionPausingPublisher(manager)
+        let transaction = ReceivePromotionTransaction(
+            packageReader: harness.materializer, metadataStore: repository, projectPublisher: publisher,
+            pathResolver: harness.resolver, clock: harness.clock
+        )
+        let promotion = Task { try await transaction.promote(from: harness.package.report, projectName: "동시 승격") }
+        await publisher.waitForPause()
+        let catalog = harness.root.appendingPathComponent(".writerpad-project-catalog.json")
+        let reserved = try Data(contentsOf: catalog)
+        await gate.resume()
+        _ = try await reorder.value
+        XCTAssertEqual(try Data(contentsOf: catalog), reserved)
+        await publisher.resume()
+        let completed = try await promotion.value
+        let visible = try await manager.projects()
+        XCTAssertEqual(visible.map(\.id), [existing.id, completed.project.id])
+    }
+
+    func testConcurrentCatalogReadDoesNotExposePublishedButUncommittedProject() async throws {
+        let harness = makeHarness()
+        let container = try WriterPadMetadataStore.makeContainer(isStoredInMemoryOnly: true)
+        let repository = SwiftDataMetadataRepository(modelContainer: container)
+        let manager = LocalProjectManager(
+            projectRepository: repository, creationMetadataStore: repository,
+            workspaceStateRepository: repository, pathResolver: harness.resolver, clock: harness.clock
+        )
+        let publisher = ReceivePromotionPausingPublisher(manager)
+        let transaction = ReceivePromotionTransaction(
+            packageReader: harness.materializer, metadataStore: repository, projectPublisher: publisher,
+            pathResolver: harness.resolver, clock: harness.clock
+        )
+        let work = Task { try await transaction.promote(from: harness.package.report, projectName: "공개 직전") }
+        await publisher.waitForPause()
+        let before = try snapshot(harness.root)
+        let visible = try await manager.projects()
+        XCTAssertTrue(visible.isEmpty)
+        XCTAssertEqual(try snapshot(harness.root), before)
+        await publisher.resume()
+        let result = try await work.value
+        let completed = try await manager.projects()
+        XCTAssertEqual(completed.map(\.id), [result.project.id])
+    }
+
     @MainActor
     func testSwiftDataOrphansPreserveRollbackEvidence() async throws {
         let harness = makeHarness()
@@ -846,5 +1001,61 @@ private struct ReceivePromotionRepositoryPublisher: ReceivePromotionProjectPubli
             throw ReceivePromotionTransactionError.completedPromotionUnavailable
         }
         return ManagedProject(project: project, userOrder: 0, lifecycleState: .active)
+    }
+}
+
+private actor ReceivePromotionPausingPublisher: ReceivePromotionProjectPublishing {
+    let manager: LocalProjectManager
+    private var continuation: CheckedContinuation<Void, Never>?
+    private var waiter: CheckedContinuation<Void, Never>?
+    init(_ manager: LocalProjectManager) { self.manager = manager }
+    func publishPromotedProject(_ project: Project) async throws -> ManagedProject {
+        let result = try await manager.publishPromotedProject(project)
+        await withCheckedContinuation {
+            continuation = $0
+            waiter?.resume()
+            waiter = nil
+        }
+        return result
+    }
+    func waitForPause() async {
+        if continuation != nil { return }
+        await withCheckedContinuation { waiter = $0 }
+    }
+    func resume() {
+        continuation?.resume()
+        continuation = nil
+    }
+}
+
+private actor ReceivePromotionPausingProjectRepository: ProjectRepository {
+    let repository: SwiftDataMetadataRepository
+    private var pauseNext = false
+    private var continuation: CheckedContinuation<Void, Never>?
+    private var waiter: CheckedContinuation<Void, Never>?
+    init(_ repository: SwiftDataMetadataRepository) { self.repository = repository }
+    func pauseNextProjects() { pauseNext = true }
+    func projects() async throws -> [Project] {
+        let values = try await repository.projects()
+        if pauseNext {
+            pauseNext = false
+            await withCheckedContinuation {
+                continuation = $0
+                waiter?.resume()
+                waiter = nil
+            }
+        }
+        return values
+    }
+    func project(id: ProjectID) async throws -> Project? { try await repository.project(id: id) }
+    func save(_ project: Project) async throws { try await repository.save(project) }
+    func remove(id: ProjectID) async throws { try await repository.remove(id: id) }
+    func waitForPause() async {
+        if continuation != nil { return }
+        await withCheckedContinuation { waiter = $0 }
+    }
+    func resume() {
+        continuation?.resume()
+        continuation = nil
     }
 }
