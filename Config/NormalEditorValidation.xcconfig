@@ -1,0 +1,2 @@
+// A distinct candidate: no legacy/body/general-editor runner can receive this grant.
+OTHER_SWIFT_FLAGS = $(inherited) -DWRITERPAD_RECEIVE_VALIDATION -DWRITERPAD_NORMAL_EDITOR

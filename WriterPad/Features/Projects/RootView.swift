@@ -6,6 +6,15 @@ struct RootView: View {
     @AppStorage("writerpad.smart-pairs-enabled") private var smartPairsEnabled = true
 
     var body: some View {
+        if IntegratedEditorPlan.enabled {
+            if let session = environment.integratedEditorSession { IntegratedEditorWorkspaceView(session: session) }
+            else { Text("통합 집필 저장소를 열지 못했습니다.") }
+        } else if NormalEditorPlan.enabled {
+            if let session = environment.normalEditorSession { NormalEditorWorkspaceView(session: session) }
+            else { Text("일반 집필 준비를 열지 못했습니다. 저장소와 후보 설정을 확인하세요.") }
+        } else { ordinaryWorkspace }
+    }
+    private var ordinaryWorkspace: some View {
         ProjectWorkspaceView(
             projectManager: environment.projectManager,
             projectImporter: environment.projectImporter,

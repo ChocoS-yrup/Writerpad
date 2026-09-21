@@ -19,6 +19,16 @@ struct GeneralValidationLocalProbe: Sendable {
         let stage: GeneralValidationPlan.Stage?
         var savedForUpdate = false
     }
+    /// Foundation may enumerate `/private/var/...` for a root written as
+    /// `/var/...`. Normalize both sides before checking containment or deriving
+    /// an identity; slicing the unnormalized path can invent parent directories.
+    static func relativePath(of file: URL, under root: URL) throws -> String {
+        guard file.isFileURL, root.isFileURL else { throw GeneralValidationFailure.denied }
+        let base = root.resolvingSymlinksInPath().standardizedFileURL.pathComponents
+        let child = file.resolvingSymlinksInPath().standardizedFileURL.pathComponents
+        guard child.count > base.count, child.starts(with: base) else { throw GeneralValidationFailure.denied }
+        return child.dropFirst(base.count).joined(separator: "/")
+    }
     func capture(savedForUpdate: Bool = false) throws -> Snapshot {
         let (syncHash, stage, _) = try database(syncURL, checkPlan: true)
         guard !savedForUpdate || stage == .sendUpdate else { throw GeneralValidationFailure.denied }
@@ -34,20 +44,22 @@ struct GeneralValidationLocalProbe: Sendable {
             let value = try file.resourceValues(forKeys: Set(keys))
             guard value.isSymbolicLink != true else { throw GeneralValidationFailure.denied }
             guard files.count < 1_024 else { throw GeneralValidationFailure.denied }
+            let relative = "/" + (try Self.relativePath(of: file, under: root))
             if value.isDirectory == true {
-                files.append("directory:" + String(file.path.dropFirst(root.path.count))); continue
+                files.append("directory:" + relative); continue
             }
             guard value.isRegularFile == true else { throw GeneralValidationFailure.denied }
             guard files.count < 1_024, let size = value.fileSize, size <= 16_777_216 else { throw GeneralValidationFailure.denied }
             bytes += size; guard bytes <= 67_108_864 else { throw GeneralValidationFailure.denied }
-            let relative = String(file.path.dropFirst(root.path.count))
             files.append(relative + ":" + Self.hash(try Data(contentsOf: file)))
         }
         guard !enumerationFailed else { throw GeneralValidationFailure.denied }
         let bodyURL = root.appendingPathComponent("메인/원고/" + GeneralValidationPlan.name)
         if let stage {
             if stage == .receiveWindows {
-                guard !FileManager.default.fileExists(atPath: bodyURL.path) else { throw GeneralValidationFailure.denied }
+                if GeneralValidationPlan.editorEnabled {
+                    guard try Data(contentsOf: bodyURL) == Data(GeneralValidationPlan.initial.utf8) else { throw GeneralValidationFailure.denied }
+                } else { guard !FileManager.default.fileExists(atPath: bodyURL.path) else { throw GeneralValidationFailure.denied } }
             } else {
                 let expected = stage == .sendUpdate && !savedForUpdate ? GeneralValidationPlan.incoming : GeneralValidationPlan.outgoing
                 guard try Data(contentsOf: bodyURL) == Data(expected.utf8) else { throw GeneralValidationFailure.denied }
@@ -58,7 +70,16 @@ struct GeneralValidationLocalProbe: Sendable {
         return Snapshot(syncHash: syncHash, metadataHash: metadataHash,
                         filesHash: Self.hash(Data(((fileIdentityRoot ?? root).path + "\n" + files.sorted().joined(separator: "\n")).utf8)), stage: stage, savedForUpdate: savedForUpdate)
     }
-    private static func hash(_ data: Data) -> String { SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined() }
+    private static func hash(_ data: Data) -> String {
+        // The same complete SHA-256, with byte encoding rather than 32 locale
+        // formatter allocations per database row and per guard invocation.
+        let hex = Array("0123456789abcdef".utf8)
+        var bytes: [UInt8] = []; bytes.reserveCapacity(64)
+        for byte in SHA256.hash(data: data) {
+            bytes.append(hex[Int(byte >> 4)]); bytes.append(hex[Int(byte & 15)])
+        }
+        return String(decoding: bytes, as: UTF8.self)
+    }
     func metadataImage() throws -> GeneralValidationMetadataImage { try database(metadataURL, checkPlan: false).2 }
     private func database(_ url: URL, checkPlan: Bool) throws -> (String, GeneralValidationPlan.Stage?, GeneralValidationMetadataImage) {
         var db: OpaquePointer?
@@ -120,13 +141,14 @@ struct GeneralValidationLocalProbe: Sendable {
                 guard target[3] == GeneralValidationPlan.parent.uuidString.lowercased(), target[4] == GeneralValidationPlan.name, target[5] == "1", target[8] == "메인/원고/" + GeneralValidationPlan.name else { throw GeneralValidationFailure.denied }
                 let expected: String
                 switch target[1] {
-                case "1": stage = .sendUpdate; expected = GeneralValidationPlan.incoming
-                case "2": stage = .receiveFinal; expected = GeneralValidationPlan.outgoing
-                case "3": stage = nil; expected = GeneralValidationPlan.final
+                case String(GeneralValidationPlan.incomingRevision): stage = .sendUpdate; expected = GeneralValidationPlan.incoming
+                case String(GeneralValidationPlan.outgoingRevision): stage = .receiveFinal; expected = GeneralValidationPlan.outgoing
+                case String(GeneralValidationPlan.finalRevision): stage = nil; expected = GeneralValidationPlan.final
+                case "3" where GeneralValidationPlan.editorEnabled: stage = .receiveWindows; expected = GeneralValidationPlan.initial
                 default: throw GeneralValidationFailure.denied
                 }
                 guard target[2] == Self.hash(Data(expected.utf8)) else { throw GeneralValidationFailure.denied }
-            } else { guard docs.count == 1 else { throw GeneralValidationFailure.denied } }
+            } else { guard !GeneralValidationPlan.editorEnabled, docs.count == 1 else { throw GeneralValidationFailure.denied } }
             let order = try rows("SELECT server_revision,children_json,project_id,parent_folder_id FROM sync_tree_orders WHERE \(filter) AND tree_order_id='31eb06be-9cc9-55db-9a05-5882172474ce'")
             guard order.count == 1, order[0][0] == (target == nil ? "1" : "2"), order[0][2] == server,
                   order[0][3] == GeneralValidationPlan.parent.uuidString.lowercased(),
@@ -143,7 +165,8 @@ struct GeneralValidationLocalProbe: Sendable {
             let schema = try rows("PRAGMA table_info(\"\(safe)\")")
             let columns = schema.map { $0[1] }
             imageTables[name] = .init(columns: columns, schema: schema, rows: values)
-            let encoded = try values.map { try JSONEncoder().encode($0) }.map(Self.hash).sorted()
+            let encoder = JSONEncoder()
+            let encoded = try values.map { try encoder.encode($0) }.map(Self.hash).sorted()
             fingerprints.append(name + ":" + Self.hash(try JSONEncoder().encode(schema)) + ":" + Self.hash(Data(encoded.joined(separator: "\n").utf8)))
         }
         let digest = Self.hash(Data(fingerprints.joined(separator: "\n").utf8))
@@ -155,6 +178,7 @@ struct GeneralValidationLocalProbe: Sendable {
 /// local inspection does not restore authentication or authorize server traffic.
 @MainActor
 final class GeneralValidationScreenModel: ObservableObject {
+    @Published private(set) var editor: GeneralValidationEditor?
     @Published var email = ""
     @Published var password = ""
     @Published private(set) var busy = false
@@ -162,6 +186,10 @@ final class GeneralValidationScreenModel: ObservableObject {
     @Published private(set) var message = "로그인 후 계정과 로컬 기준을 확인하세요."
     @Published private(set) var stage: GeneralValidationPlan.Stage?
     @Published private(set) var executionReady = false
+    @Published private(set) var copyDiagnostic: GeneralValidationPlanningCopy.CopyDiagnostic?
+    @Published private(set) var recoveryAvailable: Bool
+    private let reviewedRecoverySHA256: String?
+    private let reviewedRecoveryID: UUID?
     var runtime: GeneralValidationRuntime?
     private var runtimePrepared: GeneralValidationRuntime.Prepared?
     private let auth: any AuthenticationServicing
@@ -172,6 +200,7 @@ final class GeneralValidationScreenModel: ObservableObject {
     private let projectEpoch: SyncV2ContractEpoch
     private let screenEpoch = SyncV2ContractEpoch()
     private let journalRoot: URL
+    private let expirySleep: @Sendable (TimeInterval) async throws -> Void
     private let now: @Sendable () -> TimeInterval
     private var foreground = false
     private var loginTask: Task<AuthenticationState, Never>?
@@ -180,6 +209,7 @@ final class GeneralValidationScreenModel: ObservableObject {
     private var execution: GeneralValidationExecution?
     private var transition: GeneralValidationLocalTransition?
     private var expiry: Task<Void, Never>?
+    private var completionMessage: String?
     private struct Prepared {
         let snapshot: GeneralValidationLocalProbe.Snapshot
         let probe: GeneralValidationLocalProbe
@@ -189,9 +219,16 @@ final class GeneralValidationScreenModel: ObservableObject {
          journalRoot: URL, binding: @escaping @Sendable () async throws -> ProjectSyncBinding?,
          queueIsEmpty: @escaping @Sendable () async throws -> Bool,
          probe: @escaping @Sendable () async throws -> GeneralValidationLocalProbe,
-         now: @escaping @Sendable () -> TimeInterval = { ProcessInfo.processInfo.systemUptime }) {
+         reviewedRecoverySHA256: String? = nil,
+         reviewedRecoveryID: UUID? = nil,
+         now: @escaping @Sendable () -> TimeInterval = { ProcessInfo.processInfo.systemUptime },
+         expirySleep: @escaping @Sendable (TimeInterval) async throws -> Void = { try await Task.sleep(for: .seconds($0)) }) {
+        self.expirySleep = expirySleep
         self.auth = auth; self.bindingEpoch = bindingEpoch; self.projectEpoch = projectEpoch
         self.journalRoot = journalRoot; self.binding = binding; self.queueIsEmpty = queueIsEmpty; self.probe = probe; self.now = now
+        self.reviewedRecoverySHA256 = reviewedRecoverySHA256
+        self.reviewedRecoveryID = reviewedRecoveryID
+        self.recoveryAvailable = !GeneralValidationPlan.editorEnabled && reviewedRecoverySHA256 != nil
     }
     func setForeground(_ active: Bool) {
         foreground = active
@@ -237,7 +274,13 @@ final class GeneralValidationScreenModel: ObservableObject {
         runtimePrepared?.capability.stop(); runtimePrepared = nil; executionReady = false
         screenEpoch.advance(); expiry?.cancel(); expiry = nil; execution?.stop(); execution = nil
         transition?.stop(); transition = nil
-        prepared = nil; ready = false; stage = nil; message = reason
+        prepared = nil; ready = false; stage = nil
+        // Authentication/lifecycle expiry ends authority, not a verified result.
+        message = completionMessage ?? reason
+    }
+    private func finishPreparation(_ result: String) {
+        completionMessage = result
+        invalidate()
     }
     func observeAuthentication() async {
         let stream = await auth.stateUpdates()
@@ -246,10 +289,49 @@ final class GeneralValidationScreenModel: ObservableObject {
             if ready { do { try validatePrepared() } catch { invalidate() } }
         }
     }
+    /// Offline copy only: no authentication, handshake, stage reservation or product apply.
+    /// Existing stopped journals remain in place and still prevent a receive retry.
+    func archiveReviewedReceiveStop() async {
+        guard foreground, !busy, recoveryAvailable, let hash = reviewedRecoverySHA256 else { return }
+        recoveryAvailable = false
+        invalidate("중단 기록을 확인하고 있습니다. 송수신하지 않습니다.")
+        password = ""; busy = true
+        defer { busy = false }
+        let epoch = screenEpoch.value
+        do {
+            let source = try await probe(), before = try source.capture()
+            guard before.stage == .receiveWindows, !before.savedForUpdate, try await queueIsEmpty() else { throw GeneralValidationFailure.denied }
+            try GeneralValidationJournal.archiveReviewedFirstReceive(root: journalRoot, expectedSHA256: hash, recoveryID: reviewedRecoveryID) {
+                guard foreground, screenEpoch.value == epoch, try source.capture() == before else { throw GeneralValidationFailure.denied }
+            }
+            message = "중단 기록을 보존했습니다. 로그인 후 계정·로컬 기준을 다시 확인하세요. 송수신하지 않았습니다."
+        } catch { message = "중단 기록 보존·재개 준비에 실패했습니다. 재시도하지 말고 기록을 확인하세요." }
+    }
+    func diagnosePlanningCopy() async {
+        guard foreground, !busy else { return }
+        invalidate("로컬 복제 진단 중입니다. 송수신하지 않습니다.")
+        password = ""; copyDiagnostic = nil; busy = true
+        defer { busy = false }
+        let version = screenEpoch.value
+        do {
+            let source = try await probe()
+            guard foreground, screenEpoch.value == version else { throw GeneralValidationFailure.denied }
+            _ = try source.capture()
+            let parent = journalRoot.appendingPathComponent("copy-diagnostics")
+            try FileManager.default.createDirectory(at: parent, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
+            _ = try GeneralValidationPlanningCopy.create(from: source, in: parent) { self.copyDiagnostic = $0 }
+            message = "로컬 복제 진단 완료. 전체 해시 일치. 송수신하지 않았습니다."
+        } catch {
+            if let diagnostic = copyDiagnostic {
+                let code = diagnostic.errorCode.map { " \($0)" } ?? ""
+                message = "로컬 복제 진단 중단: \(diagnostic.phase.rawValue) · \(diagnostic.database ?? "workspace") · \(diagnostic.errorFamily ?? "validation")\(code). 송수신하지 않았습니다."
+            } else { message = "로컬 복제 진단을 시작하지 못했습니다. 로컬 기준과 저장 공간을 확인하세요. 송수신하지 않았습니다." }
+        }
+    }
     func prepareExecution() async {
         guard !busy, foreground, let runtime else { return }
         await prepare()
-        guard ready, let prepared else { return }
+        guard ready, stage != nil, let prepared else { return }
         busy = true; defer { busy = false }
         do {
             let value = try await runtime.prepare(probe: prepared.probe, snapshot: prepared.snapshot, current: prepared.current)
@@ -258,28 +340,44 @@ final class GeneralValidationScreenModel: ObservableObject {
             message = "인증 준비 완료. 승인된 단계만 실행하세요."
         } catch { invalidate("실행 준비를 중단했습니다. 로그인·시험 관문·계약 응답을 확인하세요.") }
     }
+    func openEditor() async {
+        guard GeneralValidationPlan.editorEnabled, foreground, !busy, stage == .sendUpdate,
+              editor == nil, let runtime else { return }
+        busy = true; defer { busy = false }
+        do {
+            try validatePrepared()
+            editor = try await runtime.makeEditor()
+            try validatePrepared()
+            message = "마지막 줄 뒤에 iPad 일반 편집 검증 20260913을 입력하고 줄바꿈 1개를 추가하세요."
+        } catch { invalidate("지정 문서 편집기를 열지 못했습니다. 저장하지 않았습니다.") }
+    }
     func execute(_ requested: GeneralValidationPlan.Stage) async {
         guard foreground, !busy, executionReady, stage == requested,
               let prepared, let runtimePrepared, let runtime else { return }
+        if GeneralValidationPlan.editorEnabled && requested == .sendUpdate {
+            do { guard let editor else { throw GeneralValidationEditor.Failure.wrongDraft }; _ = try editor.draft() }
+            catch { message = "저장하지 않았습니다. 지정 문서의 추가 줄·마지막 줄바꿈과 한글 조합 완료를 확인하세요."; return }
+        }
         busy = true; defer { busy = false }
         do {
             try validatePrepared()
             let result = try await runtime.run(stage: requested, prepared: runtimePrepared, probe: prepared.probe,
-                before: prepared.snapshot, journalRoot: journalRoot)
+                before: prepared.snapshot, journalRoot: journalRoot, editor: editor)
             try prepared.current()
             self.prepared = Prepared(snapshot: result, probe: prepared.probe, current: prepared.current)
             stage = result.stage
             switch requested {
-            case .receiveWindows: message = "Windows 본문 revision 1 · 100바이트 수신 완료. 다음은 iPad 저장·송신 1회입니다."
-            case .sendUpdate: message = "iPad 본문 revision 2 · 128바이트 저장·송신 완료. Windows revision 3 송신을 기다리세요."
+            case .receiveWindows: message = GeneralValidationPlan.editorEnabled ? "Windows 본문 revision 4 · 197바이트 수신 완료. 지정 문서를 일반 편집하세요." : "Windows 본문 revision 1 · 100바이트 수신 완료. 다음은 iPad 저장·송신 1회입니다."
+            case .sendUpdate: message = GeneralValidationPlan.editorEnabled ? "iPad 본문 revision 5 · 232바이트 일반 저장·송신 완료. Windows revision 6 송신을 기다리세요." : "iPad 본문 revision 2 · 128바이트 저장·송신 완료. Windows revision 3 송신을 기다리세요."
             case .receiveFinal:
-                message = "최종 수신 완료. revision 3 · 159바이트 · 5줄 본문 대조 일치."
-                executionReady = false; runtimePrepared.capability.stop()
+                finishPreparation(GeneralValidationPlan.editorEnabled ? "최종 수신 완료. revision 6 · 269바이트 · 8줄 본문 대조 일치." : "최종 수신 완료. revision 3 · 159바이트 · 5줄 본문 대조 일치.")
             }
         } catch { invalidate("검증을 중단했습니다. 재시도하지 말고 실행 기록과 로컬 저장 상태를 확인하세요.") }
     }
     func prepare() async {
         guard foreground, !busy else { return }
+        // An explicit fresh inspection may discover a changed local baseline.
+        completionMessage = nil
         invalidate(); busy = true
         defer { busy = false }
         do {
@@ -311,12 +409,19 @@ final class GeneralValidationScreenModel: ObservableObject {
                FileManager.default.fileExists(atPath: GeneralValidationJournal.url(root: journalRoot, stage: stage).path) {
                 throw GeneralValidationFailure.alreadyReserved
             }
+            guard first.stage != nil else {
+                finishPreparation("모든 단계가 완료되어 잠겨 있습니다. 완료 요청을 재실행하지 않습니다.")
+                return
+            }
             prepared = Prepared(snapshot: first, probe: probe, current: current)
             stage = first.stage; ready = true
             message = "계정·로컬 기준 확인 완료. 송수신은 잠겨 있습니다."
+            let sleep = expirySleep
             expiry = Task { [weak self] in
-                do { try await Task.sleep(for: .seconds(lifetime)) } catch { return }
-                self?.invalidate("준비 유효 시간이 끝났습니다. 다시 확인하세요.")
+                do { try await sleep(lifetime) } catch { return }
+                guard !Task.isCancelled, let self, self.screenEpoch.value == screenVersion,
+                      self.ready, self.stage != nil else { return }
+                self.invalidate("준비 유효 시간이 끝났습니다. 다시 확인하세요.")
             }
         } catch GeneralValidationFailure.alreadyReserved {
             invalidate("이 단계의 실행 기록이 있습니다. 기록 확인 전에는 재실행할 수 없습니다.")
@@ -382,7 +487,7 @@ struct GeneralValidationSection: View {
     var body: some View {
         Section("일반 시험 작품 검증") {
             Text("일반동기화 검증 20260910")
-            Text("본문 1개 · Windows 1 → iPad 2 → Windows 3").font(.footnote)
+            Text(GeneralValidationPlan.editorEnabled ? "일반 편집 · Windows 4 → iPad 5 → Windows 6" : "본문 1개 · Windows 1 → iPad 2 → Windows 3").font(.footnote)
             TextField("이메일", text: $model.email)
                 .textContentType(.username).keyboardType(.emailAddress)
                 .textInputAutocapitalization(.never).autocorrectionDisabled()
@@ -397,11 +502,25 @@ struct GeneralValidationSection: View {
             Button("인증·실행 준비") { Task { await model.prepareExecution() } }.disabled(model.busy || model.runtime == nil)
             Button("1. Windows 변경 수신") { Task { await model.execute(.receiveWindows) } }
                 .disabled(model.busy || !model.executionReady || model.stage != .receiveWindows)
-            Button("2. 합성 본문 저장·송신 1회") { Task { await model.execute(.sendUpdate) } }
+            if GeneralValidationPlan.editorEnabled {
+                Button("지정 문서 일반 편집기 열기") { Task { await model.openEditor() } }
+                    .disabled(model.busy || !model.ready || model.stage != .sendUpdate || model.editor != nil)
+                if let editor = model.editor {
+                    GeneralValidationEditorView(model: editor.model,
+                        enabled: !model.busy && model.ready && model.stage == .sendUpdate)
+                }
+            }
+            Button(GeneralValidationPlan.editorEnabled ? "2. 일반 편집 저장·송신 1회" : "2. 합성 본문 저장·송신 1회") { Task { await model.execute(.sendUpdate) } }
                 .disabled(model.busy || !model.executionReady || model.stage != .sendUpdate)
-            Button("3. Windows 최종 변경 수신·5줄 대조") { Task { await model.execute(.receiveFinal) } }
+            Button(GeneralValidationPlan.editorEnabled ? "3. Windows 최종 변경 수신·8줄 대조" : "3. Windows 최종 변경 수신·5줄 대조") { Task { await model.execute(.receiveFinal) } }
                 .disabled(model.busy || !model.executionReady || model.stage != .receiveFinal)
             Text(model.message).font(.footnote)
+            Button("로컬 복제 진단") { Task { await model.diagnosePlanningCopy() } }
+                .disabled(model.busy)
+            if model.recoveryAvailable {
+                Button("중단 기록 보존·첫 수신 재개 준비") { Task { await model.archiveReviewedReceiveStop() } }
+                    .disabled(model.busy)
+            }
             if model.ready { Button("준비 중단") { model.invalidate() } }
             Text("송수신 실행 범위 확인과 승인 후 진행할 수 있습니다.").font(.footnote)
         }

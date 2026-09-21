@@ -1,0 +1,4 @@
+// Local synthetic workspace. No remote execution/binding or shared app groups.
+OTHER_SWIFT_FLAGS = $(inherited) -DWRITERPAD_AUTOSAVE_ISOLATED
+PRODUCT_BUNDLE_IDENTIFIER = com.chocos.writerpad.autosavevalidation
+CODE_SIGNING_ALLOWED = NO

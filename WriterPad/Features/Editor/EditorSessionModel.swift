@@ -1,6 +1,36 @@
 import Foundation
 import SwiftUI
 
+enum EditorInputSource: String, Codable, Sendable {
+    case paste, enter, key, ime, other
+    case localLoad = "local_load", remoteSnapshot = "remote_snapshot", draftRestore = "draft_restore"
+}
+enum EditorSaveBoundary: String, Codable, Sendable {
+    case input, autosaveTimer, saveButton, saveShortcut, documentTransition, sceneInactive
+    case synchronization, compositionResume, remoteSnapshot, other
+}
+struct EditorBodyDiagnostic: Codable, Equatable, Sendable {
+    let utf8Bytes: Int
+    let endsLF: Bool
+    let sha256: String
+    init(_ text: String) {
+        let bytes = Data(text.utf8)
+        utf8Bytes = bytes.count; endsLF = bytes.last == 10
+        sha256 = SHA256ContentHasher().sha256(for: bytes).rawValue
+    }
+}
+/// No manuscript content. Each event describes the captured save snapshot, not later input.
+struct EditorBoundaryDiagnostic: Codable, Sendable {
+    let documentID: DocumentID
+    let inputSource: EditorInputSource
+    let boundary: EditorSaveBoundary
+    let stage: String
+    let before: EditorBodyDiagnostic?
+    let after: EditorBodyDiagnostic
+    let changed: Bool?
+    let recordedAt: Date
+}
+
 @MainActor
 final class SyncV2EditorSessionRegistry:
     SyncV2OpenLocalSnapshotProviding {
@@ -162,6 +192,13 @@ final class EditorSessionModel: ObservableObject {
     /// 같은 문서를 표시하는 두 세션도 실제 저장 제출 순서대로 generation을 공유한다.
     private static var nextSaveGeneration: UInt64 = 0
 
+    @Published private(set) var draftPersistenceError: String?
+    @Published private(set) var boundaryDiagnosticError: String?
+    private let observeBoundary: (@MainActor (EditorBoundaryDiagnostic) throws -> Void)?
+    private var inputSource: EditorInputSource = .localLoad
+    private var savedBodyDiagnostic: EditorBodyDiagnostic?
+    private var pendingCompositionBoundary: EditorSaveBoundary = .compositionResume
+    private let preserveDraft: (@MainActor (DocumentID, String, TextCursorState) throws -> Void)?
     @Published private(set) var text = ""
     private(set) var textBuffer = ManuscriptTextBuffer()
     @Published var cursor = TextCursorState.start
@@ -231,6 +268,9 @@ final class EditorSessionModel: ObservableObject {
     private var sessionCursors: [DocumentID: TextCursorState] = [:]
     private var sessionContentHashes: [DocumentID: ContentHash] = [:]
 
+    private let manualSaveOnly: Bool
+    private let saveGenerationProvider: (@Sendable () throws -> UInt64)?
+
     init(
         documentRepository: any DocumentRepository,
         documentStore: any LocalDocumentStoring,
@@ -242,6 +282,10 @@ final class EditorSessionModel: ObservableObject {
         editLeaseManager: (any EditLeaseManaging)? = nil,
         editLeaseConnectivityMonitor:
             (any EditLeaseConnectivityMonitoring)? = nil,
+        manualSaveOnly: Bool = false,
+        observeBoundary: (@MainActor (EditorBoundaryDiagnostic) throws -> Void)? = nil,
+        preserveDraft: (@MainActor (DocumentID, String, TextCursorState) throws -> Void)? = nil,
+        saveGenerationProvider: (@Sendable () throws -> UInt64)? = nil,
         autosaveDelay: Duration = AutosaveDebouncer.defaultDelay,
         autosaveSleep: @escaping AutosaveSleep = { duration in
             try await ContinuousClock().sleep(for: duration)
@@ -254,6 +298,10 @@ final class EditorSessionModel: ObservableObject {
             try await ContinuousClock().sleep(for: duration)
         }
     ) {
+        self.manualSaveOnly = manualSaveOnly
+        self.observeBoundary = observeBoundary
+        self.preserveDraft = preserveDraft
+        self.saveGenerationProvider = saveGenerationProvider
         self.statisticsNow = statisticsNow
         self.statisticsSleep = statisticsSleep
         self.documentRepository = documentRepository
@@ -323,9 +371,12 @@ final class EditorSessionModel: ObservableObject {
         await performSearchNavigation(navigation)
     }
 
-    func updateText(_ updatedText: String) {
+    func updateText(_ updatedText: String, source: EditorInputSource = .other) {
         guard !isReadOnly else { return }
+        let before = observeBoundary == nil ? nil : EditorBodyDiagnostic(currentText)
         guard setText(updatedText, statisticsUpdate: .deferred) else { return }
+        inputSource = source
+        recordBoundary(.input, stage: "changed", before: before)
         storeCurrentDraft()
         markDirtyAndScheduleAutosave()
     }
@@ -333,9 +384,12 @@ final class EditorSessionModel: ObservableObject {
     /// TextKit이 보고한 실제 UTF-16 변경만 참조형 버퍼에 반영한다. 정상 입력에서는
     /// `UITextView.text`와 SwiftUI `String`을 만들거나 게시하지 않는다.
     @discardableResult
-    func applyTextMutation(_ mutation: SharedEditorTextChange.Mutation) -> Bool {
+    func applyTextMutation(_ mutation: SharedEditorTextChange.Mutation, source: EditorInputSource = .other) -> Bool {
         guard !isReadOnly else { return false }
+        let before = observeBoundary == nil ? nil : EditorBodyDiagnostic(currentText)
         guard textBuffer.apply(mutation) else { return false }
+        inputSource = source
+        recordBoundary(.input, stage: "changed", before: before)
         refreshDocumentSearchAfterTextChange()
         statisticsTask?.cancel()
         statisticsGeneration &+= 1
@@ -483,6 +537,9 @@ final class EditorSessionModel: ObservableObject {
             )
         }
         let previous = textBuffer.snapshot()
+        inputSource = .remoteSnapshot
+        if observeBoundary != nil { savedBodyDiagnostic = EditorBodyDiagnostic(content) }
+        recordBoundary(.remoteSnapshot, stage: "applied", before: observeBoundary == nil ? nil : EditorBodyDiagnostic(previous), text: content)
         guard previous != content else { return true }
         autosaveDebouncer.cancel()
         updateCursor(TextCursorState(location: UInt(content.utf16.count), selectionLength: 0))
@@ -626,7 +683,7 @@ final class EditorSessionModel: ObservableObject {
         else { return false }
         if !composing, pendingSaveAfterComposition {
             pendingSaveAfterComposition = false
-            _ = await saveNow()
+            _ = await saveNow(boundary: pendingCompositionBoundary)
         }
         return true
     }
@@ -709,7 +766,7 @@ final class EditorSessionModel: ObservableObject {
     func updateSceneActivity(_ active: Bool) async {
         guard active != isSceneActive else { return }
         if !active {
-            _ = await saveNow()
+            _ = await saveNow(boundary: .sceneInactive)
             _ = await persistSessionState()
             await synchronizeEditLease(to: nil)
         }
@@ -833,21 +890,24 @@ final class EditorSessionModel: ObservableObject {
     }
 
     @discardableResult
-    func saveNow(backupReason: BackupReason = .automaticSave) async -> Bool {
+    func saveNow(backupReason: BackupReason = .automaticSave, boundary: EditorSaveBoundary = .other) async -> Bool {
         autosaveDebouncer.cancel()
         guard !isReadOnly else { return await persistSessionState() }
-        return await performSaveNow(backupReason: backupReason)
+        return await performSaveNow(backupReason: backupReason, boundary: backupReason == .documentTransition ? .documentTransition : boundary)
     }
 
     @discardableResult
-    private func performSaveNow(backupReason: BackupReason = .automaticSave) async -> Bool {
+    private func performSaveNow(backupReason: BackupReason = .automaticSave, boundary: EditorSaveBoundary = .other) async -> Bool {
         guard let currentDocumentID else { return true }
         guard !isReadOnly else { return await persistSessionState() }
         guard !isComposing else {
             pendingSaveAfterComposition = true
+            pendingCompositionBoundary = boundary
+            recordBoundary(boundary, stage: "deferredComposition", before: savedBodyDiagnostic)
             return true
         }
         guard dirtyGeneration > lastSavedDirtyGeneration else {
+            recordBoundary(boundary, stage: "unchanged", before: savedBodyDiagnostic)
             if case let .failed(generation, _) = syncHandoffState {
                 if let document = try? await documentRepository.document(
                     id: currentDocumentID
@@ -869,6 +929,9 @@ final class EditorSessionModel: ObservableObject {
         let snapshotText = snapshotBuffer.snapshot()
         let snapshotCursor = cursor
         let snapshotDirtyGeneration = dirtyGeneration
+        let snapshotSource = inputSource
+        let previousBody = savedBodyDiagnostic
+        recordBoundary(boundary, stage: "started", before: previousBody, text: snapshotText, source: snapshotSource)
         do {
             guard let document = try await documentRepository.document(id: currentDocumentID),
                   document.kind == .text
@@ -877,12 +940,15 @@ final class EditorSessionModel: ObservableObject {
                     selectedDisplayName ?? currentDocumentID.rawValue.uuidString
                 )
             }
-            Self.nextSaveGeneration = max(
-                Self.nextSaveGeneration &+ 1,
-                snapshotDirtyGeneration,
-                DispatchTime.now().uptimeNanoseconds
-            )
-            saveGeneration = Self.nextSaveGeneration
+            if let saveGenerationProvider {
+                saveGeneration = try saveGenerationProvider()
+            } else {
+                Self.nextSaveGeneration = max(
+                    Self.nextSaveGeneration &+ 1, snapshotDirtyGeneration,
+                    DispatchTime.now().uptimeNanoseconds
+                )
+                saveGeneration = Self.nextSaveGeneration
+            }
             let generation = saveGeneration
             saveState = SaveStateMachine.reduce(
                 saveState,
@@ -898,6 +964,8 @@ final class EditorSessionModel: ObservableObject {
                     cursor: snapshotCursor
                 )
             )
+            recordBoundary(boundary, stage: "saved", before: previousBody, text: snapshotText, source: snapshotSource, documentID: receipt.documentID)
+            if observeBoundary != nil { savedBodyDiagnostic = EditorBodyDiagnostic(snapshotText) }
             sessionContentHashes[receipt.documentID] = receipt.contentHash
             if let durableRecordResult = receipt.durableRecordResult {
                 apply(
@@ -939,10 +1007,11 @@ final class EditorSessionModel: ObservableObject {
             // 로컬 저장을 완료해야 문서 전환 호출자에 성공을 반환한다.
             if self.currentDocumentID == currentDocumentID,
                dirtyGeneration > snapshotDirtyGeneration {
-                return await performSaveNow(backupReason: backupReason)
+                return await performSaveNow(backupReason: backupReason, boundary: boundary)
             }
             return true
         } catch {
+            recordBoundary(boundary, stage: "failed", before: previousBody, text: snapshotText, source: snapshotSource, documentID: currentDocumentID)
             saveState = SaveStateMachine.reduce(
                 saveState,
                 event: .saveFailed(generation: saveGeneration, message: error.localizedDescription)
@@ -952,6 +1021,23 @@ final class EditorSessionModel: ObservableObject {
         }
     }
 
+    func recordSaveBoundaryAttempt(_ boundary: EditorSaveBoundary, stage: String) {
+        recordBoundary(boundary, stage: stage, before: savedBodyDiagnostic)
+    }
+    var observesInputBoundaries: Bool { observeBoundary != nil }
+    func noteInputSource(_ source: EditorInputSource) { inputSource = source }
+    var observedInputSource: EditorInputSource { inputSource }
+    private func recordBoundary(_ boundary: EditorSaveBoundary, stage: String, before: EditorBodyDiagnostic?,
+                                text: String? = nil, source: EditorInputSource? = nil, documentID: DocumentID? = nil) {
+        guard let observeBoundary, let id = documentID ?? currentDocumentID else { return }
+        let after = EditorBodyDiagnostic(text ?? currentText)
+        do {
+            try observeBoundary(.init(documentID: id, inputSource: source ?? inputSource,
+                boundary: boundary, stage: stage, before: before, after: after,
+                changed: before.map { $0 != after }, recordedAt: Date()))
+            boundaryDiagnosticError = nil
+        } catch { boundaryDiagnosticError = "저장 경계 진단 기록 실패. 본문 저장 상태를 함께 확인하세요." }
+    }
     private func markDirtyAndScheduleAutosave() {
         guard !isReadOnly else { return }
         dirtyGeneration = max(
@@ -963,9 +1049,14 @@ final class EditorSessionModel: ObservableObject {
             saveState,
             event: .edited(generation: dirtyGeneration)
         )
+        if let preserveDraft, let currentDocumentID {
+            do { try preserveDraft(currentDocumentID, currentText, cursor); draftPersistenceError = nil }
+            catch { draftPersistenceError = "초안 보존 실패. 앱을 종료하지 말고 내용을 별도로 보관하세요." }
+        }
         startEditLeaseAfterFirstMutationIfNeeded()
+        guard !manualSaveOnly else { return }
         autosaveDebouncer.schedule { [weak self] in
-            _ = await self?.performSaveNow()
+            _ = await self?.performSaveNow(boundary: .autosaveTimer)
         }
     }
 
@@ -1127,6 +1218,8 @@ final class EditorSessionModel: ObservableObject {
         // 바뀐 채 이전 UITextView와 본문이 화면에 남을 수 있다.
         self.isReadOnly = isReadOnly
         currentDocumentID = documentID
+        if observeBoundary != nil { savedBodyDiagnostic = isUnsavedDraft ? nil : EditorBodyDiagnostic(text) }
+        inputSource = isUnsavedDraft ? .draftRestore : .localLoad
         setText(text, statisticsUpdate: .immediate)
         self.cursor = cursor
         sessionCursors[documentID] = cursor
@@ -1346,7 +1439,7 @@ final class EditorSessionModel: ObservableObject {
         preservingUTF8: Bool = false
     ) -> Bool {
         let previous = textBuffer.snapshot()
-        guard preservingUTF8 ? Data(previous.utf8) != Data(updatedText.utf8) : previous != updatedText else { return false }
+        guard (preservingUTF8 || preserveDraft != nil) ? Data(previous.utf8) != Data(updatedText.utf8) : previous != updatedText else { return false }
         text = updatedText
         textBuffer = ManuscriptTextBuffer(updatedText)
         if !documentSearch.query.isEmpty {

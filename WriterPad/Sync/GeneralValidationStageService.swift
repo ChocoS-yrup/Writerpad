@@ -125,6 +125,7 @@ struct GeneralValidationMetadataReplay: Sendable {
 /// mutation; they do not authorize either a save or a network request.
 struct GeneralValidationRuntimeValues: Sendable {
     let date: Date
+    var editorGeneration: UInt64 { UInt64(date.timeIntervalSince1970 * 1_000_000_000) }
     let batch: UUID
     let operation: UUID
     init(date: Date = Date(), batch: UUID = UUID(), operation: UUID = UUID()) {
@@ -137,13 +138,96 @@ struct GeneralValidationRuntimeValues: Sendable {
 /// copying only the main DB file would silently lose that state. No migration,
 /// checkpoint, credential restoration or network client is performed here.
 struct GeneralValidationPlanningCopy: Sendable {
-    enum Failure: Error { case originalChanged, copyMismatch, baselineRead, copyRead }
+    enum Failure: String, Error { case originalChanged, copyMismatch, baselineRead, copyRead }
+    enum CopyPhase: String, Codable, Sendable {
+        case sourceValidation, baselineRead, createRoot, createWorkspace
+        case databaseProperties, openSource, openDestination, backupInit, backupStep, backupFinish, journalMode, databasePermissions
+        case enumerateWorkspace, entryProperties, entryValidation, copyDirectory, copyFile, filePermissions
+        case verifySource, readCopy, verifyCopy, verifySourceFinal
+    }
+    struct CopyDiagnostic: Codable, Sendable {
+        let version: Int
+        var outcome: String
+        var phase: CopyPhase
+        var database: String?
+        var entry: Int
+        var directoriesCopied: Int
+        var filesCopied: Int
+        var bytesCopied: Int
+        var errorFamily: String?
+        var errorCode: Int?
+        var validationFailure: String?
+        var sqliteResult: Int32?
+        var syncHashMatches: Bool?
+        var metadataHashMatches: Bool?
+        var filesHashMatches: Bool?
+    }
+#if DEBUG && WRITERPAD_ISOLATED_TESTS
+    @TaskLocal static var diagnosticProbe: (@Sendable (CopyPhase, URL?) throws -> Void)?
+#endif
+    /// Only fixed phase names, counts and numeric error codes are persisted.
+    /// Never encode NSError descriptions/userInfo, paths, SQL, contents or credentials.
+    private final class Diagnostic {
+        var root: URL?
+        var value = CopyDiagnostic(version: 1, outcome: "incomplete", phase: .sourceValidation,
+            entry: 0, directoriesCopied: 0, filesCopied: 0, bytesCopied: 0)
+        func enter(_ phase: CopyPhase, database: String? = nil) throws {
+            value.phase = phase; value.database = database; value.sqliteResult = nil
+#if DEBUG && WRITERPAD_ISOLATED_TESTS
+            try GeneralValidationPlanningCopy.diagnosticProbe?(phase, root)
+#endif
+        }
+        func capture(_ error: Error) {
+            if let failure = error as? Failure { value.validationFailure = failure.rawValue }
+            guard value.errorFamily == nil else { return }
+            if let result = value.sqliteResult, result != SQLITE_OK, result != SQLITE_DONE {
+                value.errorFamily = "sqlite"; value.errorCode = Int(result); return
+            }
+            if error is CancellationError { value.errorFamily = "cancelled"; return }
+            if error is Failure || error is GeneralValidationFailure { value.errorFamily = "validation"; return }
+            let error = error as NSError
+            switch error.domain {
+            case NSCocoaErrorDomain: value.errorFamily = "cocoa"; value.errorCode = error.code
+            case NSPOSIXErrorDomain: value.errorFamily = "posix"; value.errorCode = error.code
+            default: value.errorFamily = "other"
+            }
+        }
+        func persist(outcome: String) throws {
+            value.outcome = outcome
+            guard let root else { return }
+            let encoder = JSONEncoder(); encoder.outputFormatting = [.sortedKeys]
+            let data = try encoder.encode(value)
+            let fd = open(root.appendingPathComponent("copy-diagnostic.json").path,
+                O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW, S_IRUSR | S_IWUSR)
+            guard fd >= 0 else { throw GeneralValidationFailure.storage }
+            let handle = FileHandle(fileDescriptor: fd, closeOnDealloc: true)
+            try handle.write(contentsOf: data); try handle.synchronize()
+        }
+    }
     let root: URL
     let probe: GeneralValidationLocalProbe
     let baseline: GeneralValidationLocalProbe.Snapshot
     private let original: GeneralValidationLocalProbe
 
-    static func create(from original: GeneralValidationLocalProbe, in parent: URL, savedForUpdate: Bool = false) throws -> Self {
+    static func create(from original: GeneralValidationLocalProbe, in parent: URL, savedForUpdate: Bool = false,
+                       onDiagnostic: (CopyDiagnostic) -> Void = { _ in }) throws -> Self {
+        let diagnostic = Diagnostic()
+        do {
+            let result = try make(from: original, in: parent, savedForUpdate: savedForUpdate, diagnostic: diagnostic)
+            try diagnostic.persist(outcome: "complete")
+            onDiagnostic(diagnostic.value)
+            return result
+        } catch {
+            diagnostic.capture(error)
+            // A diagnostic write failure never permits a failed copy to proceed.
+            try? diagnostic.persist(outcome: "failed")
+            onDiagnostic(diagnostic.value)
+            throw error
+        }
+    }
+    private static func make(from original: GeneralValidationLocalProbe, in parent: URL,
+                             savedForUpdate: Bool, diagnostic: Diagnostic) throws -> Self {
+        try diagnostic.enter(.sourceValidation)
         try Task.checkCancellation()
         guard original.fileIdentityRoot == nil else { throw GeneralValidationFailure.denied }
         let manager = FileManager.default
@@ -158,62 +242,92 @@ struct GeneralValidationPlanningCopy: Sendable {
               !inside(original.syncURL.resolvingSymlinksInPath(), workspace),
               !inside(original.metadataURL.resolvingSymlinksInPath(), workspace) else { throw GeneralValidationFailure.denied }
         let before: GeneralValidationLocalProbe.Snapshot
-        do { before = try original.capture(savedForUpdate: savedForUpdate) } catch { throw Failure.baselineRead }
+        try diagnostic.enter(.baselineRead)
+        do { before = try original.capture(savedForUpdate: savedForUpdate) } catch { diagnostic.capture(error); throw Failure.baselineRead }
         let root = parent.appendingPathComponent("planning-" + UUID().uuidString)
         // Never reuse or clear a previous attempt. Failed copies remain evidence.
+        try diagnostic.enter(.createRoot)
         try manager.createDirectory(at: root, withIntermediateDirectories: false, attributes: [.posixPermissions: 0o700])
+        diagnostic.root = root
+        try diagnostic.enter(.createWorkspace)
         let copyWorkspace = root.appendingPathComponent("workspace")
         try manager.createDirectory(at: copyWorkspace, withIntermediateDirectories: false, attributes: [.posixPermissions: 0o700])
-        try copyDatabase(original.syncURL, to: root.appendingPathComponent("sync.sqlite3"))
-        try copyDatabase(original.metadataURL, to: root.appendingPathComponent("metadata.sqlite3"))
+        try copyDatabase(original.syncURL, to: root.appendingPathComponent("sync.sqlite3"), role: "sync", diagnostic: diagnostic)
+        try copyDatabase(original.metadataURL, to: root.appendingPathComponent("metadata.sqlite3"), role: "metadata", diagnostic: diagnostic)
         let keys: Set<URLResourceKey> = [.isRegularFileKey, .isDirectoryKey, .isSymbolicLinkKey, .fileSizeKey]
+        try diagnostic.enter(.enumerateWorkspace)
         var failed = false
         guard let files = manager.enumerator(at: workspace, includingPropertiesForKeys: Array(keys),
-            errorHandler: { _, _ in failed = true; return false }) else { throw GeneralValidationFailure.denied }
+            errorHandler: { _, error in diagnostic.value.phase = .enumerateWorkspace; diagnostic.capture(error); failed = true; return false }) else { throw GeneralValidationFailure.denied }
         var count = 0, bytes = 0
         for case let source as URL in files {
+            diagnostic.value.entry = count + 1
+            try diagnostic.enter(.entryProperties)
             try Task.checkCancellation()
             let values = try source.resourceValues(forKeys: keys)
             count += 1
+            try diagnostic.enter(.entryValidation)
             guard count <= 1_024, values.isSymbolicLink != true else { throw GeneralValidationFailure.denied }
-            let relative = String(source.path.dropFirst(workspace.path.count + 1))
+            let relative = try GeneralValidationLocalProbe.relativePath(of: source, under: workspace)
             let destination = copyWorkspace.appendingPathComponent(relative)
             if values.isDirectory == true {
+                try diagnostic.enter(.copyDirectory)
                 try manager.createDirectory(at: destination, withIntermediateDirectories: false, attributes: [.posixPermissions: 0o700])
+                diagnostic.value.directoriesCopied += 1
             } else {
                 guard values.isRegularFile == true, let size = values.fileSize, size <= 16_777_216 else { throw GeneralValidationFailure.denied }
                 bytes += size; guard bytes <= 67_108_864 else { throw GeneralValidationFailure.denied }
+                try diagnostic.enter(.copyFile)
                 try manager.copyItem(at: source, to: destination)
+                diagnostic.value.filesCopied += 1; diagnostic.value.bytesCopied += size
+                try diagnostic.enter(.filePermissions)
                 try manager.setAttributes([.posixPermissions: 0o600], ofItemAtPath: destination.path)
             }
         }
         guard !failed else { throw GeneralValidationFailure.denied }
         let probe = GeneralValidationLocalProbe(syncURL: root.appendingPathComponent("sync.sqlite3"),
             metadataURL: root.appendingPathComponent("metadata.sqlite3"), workspace: copyWorkspace, fileIdentityRoot: workspace)
+        try diagnostic.enter(.verifySource)
         guard try original.capture(savedForUpdate: savedForUpdate) == before else { throw Failure.originalChanged }
         let copied: GeneralValidationLocalProbe.Snapshot
-        do { copied = try probe.capture(savedForUpdate: savedForUpdate) } catch { throw Failure.copyRead }
+        try diagnostic.enter(.readCopy)
+        do { copied = try probe.capture(savedForUpdate: savedForUpdate) } catch { diagnostic.capture(error); throw Failure.copyRead }
+        try diagnostic.enter(.verifyCopy)
+        diagnostic.value.syncHashMatches = copied.syncHash == before.syncHash
+        diagnostic.value.metadataHashMatches = copied.metadataHash == before.metadataHash
+        diagnostic.value.filesHashMatches = copied.filesHash == before.filesHash
         guard copied == before else { throw Failure.copyMismatch }
+        try diagnostic.enter(.verifySourceFinal)
         guard try original.capture(savedForUpdate: savedForUpdate) == before else { throw Failure.originalChanged }
         return Self(root: root, probe: probe, baseline: before, original: original)
     }
 
-    private static func copyDatabase(_ source: URL, to destination: URL) throws {
+    private static func copyDatabase(_ source: URL, to destination: URL, role: String, diagnostic: Diagnostic) throws {
+        try diagnostic.enter(.databaseProperties, database: role)
         let values = try source.resourceValues(forKeys: [.isRegularFileKey, .isSymbolicLinkKey])
         guard values.isRegularFile == true, values.isSymbolicLink != true else { throw GeneralValidationFailure.denied }
         var input: OpaquePointer?, output: OpaquePointer?
         defer { if let input { sqlite3_close_v2(input) }; if let output { sqlite3_close_v2(output) } }
-        guard sqlite3_open_v2(source.path, &input, SQLITE_OPEN_READONLY | SQLITE_OPEN_FULLMUTEX, nil) == SQLITE_OK,
-              let input else { throw GeneralValidationFailure.storage }
-        guard sqlite3_open_v2(destination.path, &output, SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_FULLMUTEX, nil) == SQLITE_OK,
-              let output else { throw GeneralValidationFailure.storage }
-        guard let backup = sqlite3_backup_init(output, "main", input, "main") else { throw GeneralValidationFailure.storage }
+        try diagnostic.enter(.openSource, database: role)
+        diagnostic.value.sqliteResult = sqlite3_open_v2(source.path, &input, SQLITE_OPEN_READONLY | SQLITE_OPEN_FULLMUTEX, nil)
+        guard diagnostic.value.sqliteResult == SQLITE_OK, let input else { throw GeneralValidationFailure.storage }
+        try diagnostic.enter(.openDestination, database: role)
+        diagnostic.value.sqliteResult = sqlite3_open_v2(destination.path, &output, SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_FULLMUTEX, nil)
+        guard diagnostic.value.sqliteResult == SQLITE_OK, let output else { throw GeneralValidationFailure.storage }
+        try diagnostic.enter(.backupInit, database: role)
+        guard let backup = sqlite3_backup_init(output, "main", input, "main") else {
+            diagnostic.value.sqliteResult = sqlite3_extended_errcode(output); throw GeneralValidationFailure.storage
+        }
+        // Finish even when step fails; never retry a busy or locked source.
         let step = sqlite3_backup_step(backup, -1), finish = sqlite3_backup_finish(backup)
-        // Busy/locked is a stopped plan, never an implicit retry.
-        guard step == SQLITE_DONE, finish == SQLITE_OK else { throw GeneralValidationFailure.storage }
-        // The backup may inherit WAL mode without initialized sidecars. Make
-        // only the destination self-contained before its first read-only open.
-        guard sqlite3_exec(output, "PRAGMA journal_mode=DELETE", nil, nil, nil) == SQLITE_OK else { throw GeneralValidationFailure.storage }
+        try diagnostic.enter(.backupStep, database: role); diagnostic.value.sqliteResult = step
+        guard step == SQLITE_DONE else { throw GeneralValidationFailure.storage }
+        try diagnostic.enter(.backupFinish, database: role); diagnostic.value.sqliteResult = finish
+        guard finish == SQLITE_OK else { throw GeneralValidationFailure.storage }
+        try diagnostic.enter(.journalMode, database: role)
+        diagnostic.value.sqliteResult = sqlite3_exec(output, "PRAGMA journal_mode=DELETE", nil, nil, nil)
+        guard diagnostic.value.sqliteResult == SQLITE_OK else { throw GeneralValidationFailure.storage }
+        try diagnostic.enter(.databasePermissions, database: role)
         try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: destination.path)
     }
 
@@ -547,7 +661,7 @@ struct GeneralValidationRemoteSnapshot: SyncV2SnapshotClienting {
               !target.isDeleted, target.deletedAt == nil, target.parentFolderID == GeneralValidationPlan.parent,
               target.name == GeneralValidationPlan.name, target.structureRevision == 1,
               target.relativePath == "메인/원고/" + GeneralValidationPlan.name,
-              target.revision == (stage == .receiveWindows ? 1 : 3),
+              target.revision == (stage == .receiveWindows ? GeneralValidationPlan.incomingRevision : GeneralValidationPlan.finalRevision),
               Data(target.content.utf8) == Data((stage == .receiveWindows ? GeneralValidationPlan.incoming : GeneralValidationPlan.final).utf8)
         else { throw GeneralValidationFailure.denied }
         for order in orders {
@@ -631,7 +745,7 @@ actor GeneralValidationStageService {
             // Validate the same response again before passing it to local completion.
             guard let contract = try GeneralValidationExecution.Frozen(request: request, stage: .sendUpdate).contract,
                   try SyncV2Contract.validateDocumentCommitResponse(request: contract, response: json) == .committed,
-                  json.objectValue?["results"]?.arrayValue?.first?.objectValue?["result_revision"] == .int(2) else { throw GeneralValidationFailure.denied }
+                  json.objectValue?["results"]?.arrayValue?.first?.objectValue?["result_revision"] == .int(Int(GeneralValidationPlan.outgoingRevision)) else { throw GeneralValidationFailure.denied }
             try await transition.advance { authorize in try await finish(json, authorize) }
             try run.completeAfterLocalValidation { try transition.requireFinished() }
         } catch {

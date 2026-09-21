@@ -180,7 +180,8 @@ final class ReceiveValidationPolicyTests: XCTestCase {
     }
 }
 private final class GuardTestClock: @unchecked Sendable {
-    private let lock = NSLock(); private var time = Date(timeIntervalSince1970: 1000)
+    private let lock = NSLock(); private var time: Date
+    init(time: Date = Date(timeIntervalSince1970: 1000)) { self.time = time }
     var value: Date { lock.withLock { time } }
     func advance(_ seconds: Double) { lock.withLock { time.addTimeInterval(seconds) } }
 }
@@ -984,9 +985,9 @@ final class GeneralValidationScreenTests: XCTestCase {
         defer { sqlite3_close_v2(db) }
         guard sqlite3_exec(db, sql, nil, nil, nil) == SQLITE_OK else { throw GeneralValidationFailure.denied }
     }
-    private func fixture(queueEmpty: Bool = true, bindingMatches: Bool = true,
+    private func fixture(queueEmpty: Bool = true, bindingMatches: Bool = true, directory: URL? = nil,
                          clock: @escaping @Sendable () -> TimeInterval = { ProcessInfo.processInfo.systemUptime }) throws -> Fixture {
-        let root = FileManager.default.temporaryDirectory.appendingPathComponent("screen-fixture-\(UUID())")
+        let root = directory ?? FileManager.default.temporaryDirectory.appendingPathComponent("screen-fixture-\(UUID())")
         let workspace = root.appendingPathComponent("workspace"), sync = root.appendingPathComponent("sync.sqlite3"), metadata = root.appendingPathComponent("metadata.sqlite3")
         try FileManager.default.createDirectory(at: workspace, withIntermediateDirectories: true)
         addTeardownBlock { try? FileManager.default.removeItem(at: root) }
@@ -1273,7 +1274,7 @@ extension GeneralValidationScreenTests {
             let parent = f.probe.workspace.appendingPathComponent("메인/원고")
             try FileManager.default.createDirectory(at:parent,withIntermediateDirectories:true)
             try Data(content.utf8).write(to:parent.appendingPathComponent(GeneralValidationPlan.name))
-            await f.model.prepare(); XCTAssertTrue(f.model.ready); XCTAssertEqual(f.model.stage,expected)
+            await f.model.prepare(); XCTAssertEqual(f.model.ready, expected != nil); XCTAssertEqual(f.model.stage,expected)
             try sql(f.probe.syncURL,"UPDATE sync_folders SET name='wrong parent' WHERE folder_id='\(GeneralValidationPlan.parent.uuidString.lowercased())'")
             await f.model.prepare(); XCTAssertFalse(f.model.ready)
         }
@@ -1324,15 +1325,18 @@ extension GeneralValidationJournalTests {
         return GeneralValidationRemoteBaseline(control: .init(documentID: GeneralValidationRemoteBaseline.controlID,
             relativePath: syncV2TreeOrderPath, content: generalStageControlFixture, revision: 1, isDeleted: false, deletedAt: nil, updatedAt: date), folders: folders, orders: orders)
     }
-    private func stagePayloads(final: Bool = false) throws -> [Data] {
-        let b = try stageBaseline(), date = Date(timeIntervalSince1970: 10)
+    private func stagePayloads(final: Bool = false, baseline: GeneralValidationRemoteBaseline? = nil) throws -> [Data] {
+        let b = try baseline ?? stageBaseline(), date = Date(timeIntervalSince1970: 10)
         let doc = SyncV2RemoteDocumentSnapshot(documentID: GeneralValidationPlan.document,
             relativePath: "메인/원고/" + GeneralValidationPlan.name, content: final ? GeneralValidationPlan.final : GeneralValidationPlan.incoming,
-            revision: final ? 3 : 1, isDeleted: false, deletedAt: nil, updatedAt: date,
+            revision: final ? GeneralValidationPlan.finalRevision : GeneralValidationPlan.incomingRevision, isDeleted: false, deletedAt: nil, updatedAt: date,
             parentFolderID: GeneralValidationPlan.parent, name: GeneralValidationPlan.name, structureRevision: 1)
         let orders = b.orders.map { order in order.treeOrderID == GeneralValidationRemoteBaseline.orderID
             ? SyncV2RemoteTreeOrder(treeOrderID: order.treeOrderID, parentFolderID: order.parentFolderID, children: [GeneralValidationPlan.document], revision: 2, updatedAt: date) : order }
-        let encoder = JSONEncoder(); encoder.dateEncodingStrategy = .iso8601
+        let encoder = JSONEncoder(); encoder.dateEncodingStrategy = .custom { date, encoder in
+            let formatter = ISO8601DateFormatter(); formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+            var value = encoder.singleValueContainer(); try value.encode(formatter.string(from: date))
+        }
         return try [encoder.encode([b.control, doc]), encoder.encode(b.folders), encoder.encode(orders)]
     }
     private func stageReads() -> [URLRequest] {
@@ -1383,8 +1387,10 @@ extension GeneralValidationJournalTests {
         let service = GeneralValidationStageService(root: root, exchange: exchange(payloads: [try receipt(contract)]), current: {})
         try await service.send(bearer: bearer, transition: transition) { authorize in
             try authorize()
-            let text = try String(contentsOf: marker, encoding: .utf8)
-            XCTAssertTrue(text.contains("reserved")); XCTAssertFalse(text.contains("attempt"))
+            let entries = try Data(contentsOf: marker).split(separator: 10).map {
+                try JSONDecoder().decode(GeneralValidationJournal.Row.self, from: Data($0))
+            }
+            XCTAssertEqual(entries.map(\.event), [.reserved])
             state.advance(); return request
         } finish: { json, authorize in
             try authorize(); XCTAssertEqual(json.objectValue?["batch_id"], .string(contract.batchID.uuidString.lowercased()))
@@ -2011,7 +2017,7 @@ private actor GeneralRuntimeWire {
                 "kind": .string("document_commit_success"), "batch_id": .string(contract.batchID.uuidString.lowercased()),
                 "batch_payload_sha256": .string(contract.batchPayloadSHA256), "status": .string("committed"), "applied": .bool(true),
                 "results": .array([.object(["sequence": .int(1), "operation_id": intent["operation_id"]!,
-                    "document_id": intent["document_id"]!, "result_revision": .int(2), "structure_revision": .int(1),
+                    "document_id": intent["document_id"]!, "result_revision": .int(Int(GeneralValidationPlan.outgoingRevision)), "structure_revision": .int(1),
                     "parent_folder_id": payload["parent_folder_id"]!, "name": payload["name"]!,
                     "content_sha256": payload["content_sha256"]!, "content_byte_count": payload["content_byte_count"]!, "is_deleted": .bool(false)])])]))
         } else {
@@ -2022,14 +2028,49 @@ private actor GeneralRuntimeWire {
     }
 }
 extension GeneralValidationJournalTests {
+    private func preservedEditorFixture() async throws -> GeneralProductFixture {
+        let source = URL(fileURLWithPath: "/tmp/writerpad-general-editor-offline-20260913")
+        guard FileManager.default.fileExists(atPath: source.path) else { throw XCTSkip("Optional preserved local fixture is absent") }
+        let input = GeneralValidationLocalProbe(syncURL: source.appendingPathComponent("sync.sqlite3"),
+            metadataURL: source.appendingPathComponent("metadata.sqlite3"), workspace: source.appendingPathComponent("workspace"))
+        let copy = try GeneralValidationPlanningCopy.create(from: input, in: root())
+        let coordinator = SyncV2ProjectUploadPullCoordinator(), identity = GeneralProductIdentity(id: .init(uuid: UUID()))
+        let store = LazySyncV2ProjectBindingStore(databaseURL: copy.probe.syncURL, deviceIdentityProvider: identity, uploadPullCoordinator: coordinator)
+        let repository = SwiftDataMetadataRepository(modelContainer: try WriterPadMetadataStore.makeContainer(isStoredInMemoryOnly: false, storeURL: copy.probe.metadataURL))
+        // Match the fixture helper's metadata path, keeping the backup-generated DB name.
+        let expected = copy.root.appendingPathComponent("metadata.sqlite3")
+        guard copy.probe.metadataURL.standardizedFileURL == expected.standardizedFileURL else { throw GeneralValidationFailure.denied }
+        let local = LocalDocumentStore(workspaceLocator: FixedWorkspaceLocator(root: copy.probe.workspace), metadataUpdater: repository)
+        return .init(root: copy.root, workspace: copy.probe.workspace, database: copy.probe.syncURL, store: store, repository: repository,
+            local: local, identity: identity, coordinator: coordinator, other: .init(rawValue: UUID()))
+    }
+    private func seedEditorBaseline(_ f: GeneralProductFixture) async throws {
+        let date = Date(timeIntervalSince1970: 10), content = GeneralValidationPlan.initial
+        let snapshot = SyncV2RemoteDocumentSnapshot(documentID: GeneralValidationPlan.document,
+            relativePath: "메인/원고/" + GeneralValidationPlan.name, content: content, revision: 3,
+            isDeleted: false, deletedAt: nil, updatedAt: date, parentFolderID: GeneralValidationPlan.parent,
+            name: GeneralValidationPlan.name, structureRevision: 1)
+        try Data(content.utf8).write(to: f.body)
+        try await f.repository.save(DocumentNode(id: .init(rawValue: GeneralValidationPlan.document), projectID: GeneralValidationPlan.local,
+            kind: .text, parentID: .init(rawValue: GeneralValidationPlan.parent), relativePath: .init(rawValue: snapshot.relativePath),
+            userOrder: 0, modifiedAt: date, contentHash: SHA256ContentHasher().sha256(for: Data(content.utf8))))
+        _ = try await f.store.applySnapshotBaseline(localProjectID: GeneralValidationPlan.local, serverProjectID: GeneralValidationPlan.server,
+            snapshot: snapshot, expectedRevision: nil)
+        try await f.store.applyTreeOrderSnapshotBaselines(localProjectID: GeneralValidationPlan.local, serverProjectID: GeneralValidationPlan.server,
+            treeOrders: [.init(treeOrderID: GeneralValidationRemoteBaseline.orderID, parentFolderID: GeneralValidationPlan.parent,
+                children: [GeneralValidationPlan.document], revision: 2, updatedAt: date)])
+    }
     @MainActor
-    private func runtimeFixture(gateOpen: Bool = true) async throws -> (GeneralProductFixture, GeneralValidationScreenModel, ReceiveValidationPolicy, GeneralRuntimeWire, GeneralJournalFlag, URL) {
-        let f = try await productFixture(diskMetadata: true)
+    private func runtimeFixture(gateOpen: Bool = true, preserved: Bool = false, policyNow: @escaping @Sendable () -> Date = { Date() },
+                                expirySleep: @escaping @Sendable (TimeInterval) async throws -> Void = { try await Task.sleep(for: .seconds($0)) }) async throws -> (GeneralProductFixture, GeneralValidationScreenModel, ReceiveValidationPolicy, GeneralRuntimeWire, GeneralJournalFlag, URL) {
+        let f = try await preserved ? preservedEditorFixture() : productFixture(diskMetadata: true)
+        let baseline = try preserved ? GeneralValidationRemoteBaseline.preserved() : stageBaseline()
+        if GeneralValidationPlan.editorEnabled && !preserved { try await seedEditorBaseline(f) }
         let bindingValue = try await f.store.binding(for: GeneralValidationPlan.local), binding = try XCTUnwrap(bindingValue)
         let account = try XCTUnwrap(binding.ownerSubject)
-        let auth = ScreenAuthStub(account: account), wire = GeneralRuntimeWire(payloads: try stagePayloads())
+        let auth = ScreenAuthStub(account: account), wire = GeneralRuntimeWire(payloads: try stagePayloads(baseline: baseline))
         let policy = ReceiveValidationPolicy(enabled: true, configuration: .init(version: 1, revision: UUID(),
-            endpoint: ReceiveValidationPolicy.Configuration.staging, accountID: account), network: { try await wire.send($0) })
+            endpoint: ReceiveValidationPolicy.Configuration.staging, accountID: account), now: policyNow, network: { try await wire.send($0) })
         let ticket = try policy.beginAuthentication(foreground: true, endpoint: ReceiveValidationPolicy.Configuration.staging)
         try policy.verifyAccount(account, ticket: ticket)
         let configuration = SupabasePublicConfiguration(url: URL(string: ReceiveValidationPolicy.Configuration.staging)!, publishableKey: "synthetic-public")
@@ -2040,13 +2081,13 @@ extension GeneralValidationJournalTests {
         if !gateOpen { flag.invalidate() }
         let bindingEpoch = SyncV2ContractEpoch(), projectEpoch = SyncV2ContractEpoch()
         let probe = GeneralValidationLocalProbe(syncURL: f.database, metadataURL: f.root.appendingPathComponent("metadata.sqlite3"), workspace: f.workspace)
-        let journal = f.root.appendingPathComponent("runtime-journal"), baseline = try stageBaseline()
+        let journal = f.root.appendingPathComponent("runtime-journal")
         let model = GeneralValidationScreenModel(auth: auth, bindingEpoch: bindingEpoch, projectEpoch: projectEpoch, journalRoot: journal,
             binding: { binding }, queueIsEmpty: {
                 let legacy = try await f.store.uploadQueueSnapshot(localProjectID: GeneralValidationPlan.local)
                 let general = try await f.store.generalQueueStatus(localProjectID: GeneralValidationPlan.local)
                 return legacy == .idle && general.pendingCount == 0 && general.attentionCount == 0 && general.retryCount == 0
-            }, probe: { probe })
+            }, probe: { probe }, expirySleep: expirySleep)
         let defaults = UserDefaults(suiteName: "general-runtime-" + UUID().uuidString)!
         ContractPathGate.setOpen(gateOpen, for: GeneralValidationPlan.local, in: defaults)
         let authority = f.coordinator.contractStructureAuthority
@@ -2180,3 +2221,679 @@ extension ReceiveValidationPolicyTests {
         }
     }
 }
+
+#if WRITERPAD_ISOLATED_TESTS
+extension GeneralValidationScreenTests {
+    func testWorkspaceRelativePathHandlesPrivateSystemAliasInBothDirections() throws {
+        // A real existing path is required: Foundation does not resolve every
+        // nonexistent alias consistently. This runs only in the isolated suite.
+        let directory = URL(fileURLWithPath: "/tmp/writerpad-relative-path-\(UUID())", isDirectory: true)
+        let f = try fixture(directory: directory), root = f.probe.workspace
+        let privateRoot = URL(fileURLWithPath: "/private" + root.path, isDirectory: true)
+        let name = "메인/원고/합성 % #.txt"
+        try FileManager.default.createDirectory(at: root.appendingPathComponent("메인/원고"), withIntermediateDirectories: true)
+        try Data("alias fixture".utf8).write(to: root.appendingPathComponent(name))
+        XCTAssertEqual(try GeneralValidationLocalProbe.relativePath(of: privateRoot.appendingPathComponent(name), under: root), name)
+        XCTAssertEqual(try GeneralValidationLocalProbe.relativePath(of: root.appendingPathComponent(name), under: privateRoot), name)
+        let before = try f.probe.capture()
+        let copy = try GeneralValidationPlanningCopy.create(from: f.probe, in: f.root)
+        XCTAssertEqual(try f.probe.capture(), before)
+        XCTAssertEqual(try copy.probe.capture(), before)
+        XCTAssertEqual(try copyDiagnostic(copy.root).filesHashMatches, true)
+    }
+    func testWorkspaceRelativePathRejectsSiblingTraversalAndSymlinkEscape() throws {
+        let f = try fixture(), root = f.probe.workspace
+        XCTAssertThrowsError(try GeneralValidationLocalProbe.relativePath(of: root, under: root))
+        XCTAssertThrowsError(try GeneralValidationLocalProbe.relativePath(of: f.root.appendingPathComponent("workspace-other/file"), under: root))
+        XCTAssertThrowsError(try GeneralValidationLocalProbe.relativePath(of: root.appendingPathComponent("../outside/file"), under: root))
+        let link = root.appendingPathComponent("escape")
+        try FileManager.default.createSymbolicLink(at: link, withDestinationURL: f.root)
+        XCTAssertThrowsError(try GeneralValidationLocalProbe.relativePath(of: link.appendingPathComponent("sync.sqlite3"), under: root))
+        XCTAssertThrowsError(try GeneralValidationPlanningCopy.create(from: f.probe, in: f.root))
+    }
+    func testPlanningCopyThroughAncestorAliasPreservesNamesAndDetectsRenames() throws {
+        let f = try fixture(), manager = FileManager.default
+        let nested = f.probe.workspace.appendingPathComponent("메인/원고")
+        try manager.createDirectory(at: nested, withIntermediateDirectories: true)
+        let name = "합성 % #.txt", data = Data("같은 바이트".utf8)
+        try data.write(to: nested.appendingPathComponent(name))
+        let alias = f.root.appendingPathComponent("ancestor-alias")
+        try manager.createSymbolicLink(at: alias, withDestinationURL: f.root)
+        let alternate = GeneralValidationLocalProbe(syncURL: f.probe.syncURL, metadataURL: f.probe.metadataURL,
+            workspace: alias.appendingPathComponent("workspace"))
+        let before = try f.probe.capture()
+        XCTAssertEqual(try alternate.capture(), before)
+        let copy = try GeneralValidationPlanningCopy.create(from: alternate, in: f.root)
+        XCTAssertEqual(try copy.probe.capture(), before)
+        XCTAssertEqual(try Data(contentsOf: copy.probe.workspace.appendingPathComponent("메인/원고/" + name)), data)
+        try manager.moveItem(at: nested.appendingPathComponent(name), to: nested.appendingPathComponent("이름 변경.txt"))
+        XCTAssertNotEqual(try f.probe.capture().filesHash, before.filesHash)
+        XCTAssertThrowsError(try copy.requireOriginalUnchanged())
+    }
+    private func copyDiagnostic(_ root: URL) throws -> GeneralValidationPlanningCopy.CopyDiagnostic {
+        try JSONDecoder().decode(GeneralValidationPlanningCopy.CopyDiagnostic.self,
+            from: Data(contentsOf: root.appendingPathComponent("copy-diagnostic.json")))
+    }
+    func testPlanningDiagnosticSuccessPreservesUnicodeFilesAndFullHashes() throws {
+        let f = try fixture()
+        let nested = f.probe.workspace.appendingPathComponent("메인/원고".decomposedStringWithCanonicalMapping)
+        try FileManager.default.createDirectory(at: nested, withIntermediateDirectories: true)
+        let contents = Data("합성 로컬 설정\n".utf8)
+        try contents.write(to: f.probe.workspace.appendingPathComponent("설정.json".decomposedStringWithCanonicalMapping))
+        let before = try f.probe.capture()
+        let copy = try GeneralValidationPlanningCopy.create(from: f.probe, in: f.root)
+        let report = try copyDiagnostic(copy.root)
+        XCTAssertEqual(report.outcome, "complete")
+        XCTAssertEqual(report.directoriesCopied, 2); XCTAssertEqual(report.filesCopied, 1)
+        XCTAssertEqual(report.bytesCopied, contents.count)
+        XCTAssertEqual(report.syncHashMatches, true); XCTAssertEqual(report.metadataHashMatches, true)
+        XCTAssertEqual(report.filesHashMatches, true)
+        XCTAssertNil(report.errorFamily)
+        XCTAssertEqual(try f.probe.capture(), before)
+        XCTAssertEqual(try copy.probe.capture(), before)
+        let mode = try FileManager.default.attributesOfItem(atPath: copy.root.appendingPathComponent("copy-diagnostic.json").path)[.posixPermissions] as? NSNumber
+        XCTAssertEqual(mode?.intValue, 0o600)
+    }
+    func testPlanningDiagnosticCapturesCopyFailureWithoutSecretsOrClearingReservation() throws {
+        let f = try fixture()
+        try FileManager.default.createDirectory(at: f.probe.workspace.appendingPathComponent("empty"), withIntermediateDirectories: false)
+        let before = try f.probe.capture()
+        let reservation = try GeneralValidationJournal(root: f.root, stage: .receiveWindows)
+        let reservedBytes = try Data(contentsOf: reservation.url)
+        XCTAssertThrowsError(try GeneralValidationPlanningCopy.$diagnosticProbe.withValue({ phase, _ in
+            if phase == .copyDirectory {
+                throw NSError(domain: NSCocoaErrorDomain, code: NSFileWriteNoPermissionError,
+                    userInfo: [NSLocalizedDescriptionKey: "synthetic-password-secret", NSFilePathErrorKey: "/private/synthetic-user-manuscript.txt"])
+            }
+        }) { try GeneralValidationPlanningCopy.create(from: f.probe, in: f.root) })
+        let failedRoot = try XCTUnwrap(FileManager.default.contentsOfDirectory(at: f.root, includingPropertiesForKeys: nil).first { $0.lastPathComponent.hasPrefix("planning-") })
+        let report = try copyDiagnostic(failedRoot)
+        XCTAssertEqual(report.outcome, "failed"); XCTAssertEqual(report.phase, .copyDirectory)
+        XCTAssertEqual(report.errorFamily, "cocoa"); XCTAssertEqual(report.errorCode, NSFileWriteNoPermissionError)
+        XCTAssertEqual(report.entry, 1); XCTAssertEqual(report.directoriesCopied, 0)
+        let bytes = try Data(contentsOf: failedRoot.appendingPathComponent("copy-diagnostic.json"))
+        let text = String(decoding: bytes, as: UTF8.self)
+        XCTAssertFalse(text.contains("synthetic-password")); XCTAssertFalse(text.contains("synthetic-user"))
+        XCTAssertFalse(text.contains(f.root.path)); XCTAssertFalse(text.contains("userInfo"))
+        XCTAssertEqual(try Data(contentsOf: reservation.url), reservedBytes)
+        XCTAssertEqual(try f.probe.capture(), before)
+        XCTAssertThrowsError(try GeneralValidationJournal(root: f.root, stage: .receiveWindows))
+        let next = try GeneralValidationPlanningCopy.create(from: f.probe, in: f.root)
+        XCTAssertNotEqual(next.root, failedRoot)
+        XCTAssertEqual(try Data(contentsOf: failedRoot.appendingPathComponent("copy-diagnostic.json")), bytes)
+        XCTAssertEqual(try Data(contentsOf: reservation.url), reservedBytes)
+    }
+    func testPlanningDiagnosticStillRejectsFullFileHashMismatch() throws {
+        let f = try fixture(), before = try f.probe.capture()
+        XCTAssertThrowsError(try GeneralValidationPlanningCopy.$diagnosticProbe.withValue({ phase, root in
+            if phase == .readCopy, let root {
+                try Data("unplanned".utf8).write(to: root.appendingPathComponent("workspace/unplanned.txt"))
+            }
+        }) { try GeneralValidationPlanningCopy.create(from: f.probe, in: f.root) }) { error in
+            XCTAssertEqual(error as? GeneralValidationPlanningCopy.Failure, .copyMismatch)
+        }
+        let failedRoot = try XCTUnwrap(FileManager.default.contentsOfDirectory(at: f.root, includingPropertiesForKeys: nil).first { $0.lastPathComponent.hasPrefix("planning-") })
+        let report = try copyDiagnostic(failedRoot)
+        XCTAssertEqual(report.phase, .verifyCopy); XCTAssertEqual(report.validationFailure, "copyMismatch")
+        XCTAssertEqual(report.syncHashMatches, true); XCTAssertEqual(report.metadataHashMatches, true)
+        XCTAssertEqual(report.filesHashMatches, false)
+        XCTAssertEqual(try f.probe.capture(), before)
+    }
+    func testOfflineCopyDiagnosticPreservesStoppedJournalWithoutAuthenticationOrGrant() async throws {
+        let f = try fixture(), before = try f.probe.capture()
+        try FileManager.default.createDirectory(at: f.journal, withIntermediateDirectories: false)
+        let stopped = try GeneralValidationJournal(root: f.journal, stage: .receiveWindows)
+        try stopped.append(.stopped, sequence: 0)
+        let record = try Data(contentsOf: stopped.url)
+        await f.model.diagnosePlanningCopy()
+        XCTAssertEqual(f.model.copyDiagnostic?.outcome, "complete")
+        XCTAssertEqual(f.model.message, "로컬 복제 진단 완료. 전체 해시 일치. 송수신하지 않았습니다.")
+        XCTAssertFalse(f.model.executionReady); XCTAssertFalse(f.model.ready); XCTAssertNil(f.model.stage)
+        XCTAssertEqual(try f.probe.capture(), before)
+        XCTAssertEqual(try Data(contentsOf: stopped.url), record)
+        XCTAssertThrowsError(try GeneralValidationJournal(root: f.journal, stage: .receiveWindows))
+        let calls = await f.auth.networkCalls; XCTAssertEqual(calls, 0)
+        let diagnostic = f.model.copyDiagnostic
+        f.model.setForeground(false)
+        await f.model.diagnosePlanningCopy()
+        XCTAssertEqual(f.model.copyDiagnostic?.outcome, diagnostic?.outcome)
+        XCTAssertEqual(try Data(contentsOf: stopped.url), record)
+    }
+    func testOfflineCopyDiagnosticShowsOnlySanitizedFailureAndNeverEnablesExecution() async throws {
+        let f = try fixture()
+        try FileManager.default.createDirectory(at: f.probe.workspace.appendingPathComponent("empty"), withIntermediateDirectories: false)
+        let before = try f.probe.capture()
+        await GeneralValidationPlanningCopy.$diagnosticProbe.withValue({ phase, _ in
+            if phase == .copyDirectory {
+                throw NSError(domain: NSCocoaErrorDomain, code: NSFileWriteNoPermissionError,
+                    userInfo: [NSLocalizedDescriptionKey: "synthetic-secret-password"])
+            }
+        }) { await f.model.diagnosePlanningCopy() }
+        XCTAssertEqual(f.model.copyDiagnostic?.phase, .copyDirectory)
+        XCTAssertEqual(f.model.copyDiagnostic?.outcome, "failed")
+        XCTAssertTrue(f.model.message.contains("copyDirectory")); XCTAssertTrue(f.model.message.contains("cocoa"))
+        XCTAssertFalse(f.model.message.contains("synthetic-secret"))
+        XCTAssertFalse(f.model.executionReady); XCTAssertFalse(f.model.ready)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: GeneralValidationJournal.url(root: f.journal, stage: .receiveWindows).path))
+        XCTAssertEqual(try f.probe.capture(), before)
+        let calls = await f.auth.networkCalls; XCTAssertEqual(calls, 0)
+    }
+
+}
+#endif
+
+#if WRITERPAD_ISOLATED_TESTS
+extension GeneralValidationScreenTests {
+    private func stoppedReceive(_ root: URL, terminal: GeneralValidationJournal.Event = .stopped) throws -> (URL, Data, String) {
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        let journal = try GeneralValidationJournal(root: root, stage: .receiveWindows)
+        for sequence in 1...3 {
+            let hash = String(repeating: String(sequence), count: 64)
+            try journal.append(.attempt, sequence: sequence, requestSHA256: hash)
+            try journal.append(.responseAccepted, sequence: sequence, requestSHA256: hash)
+        }
+        try journal.append(terminal, sequence: 3)
+        let bytes = try Data(contentsOf: journal.url)
+        return (journal.url, bytes, SHA256ContentHasher().sha256(for: bytes).rawValue)
+    }
+    func testReviewedRecoveryRequiresOneExactLaunchArgument() {
+        let flag = GeneralValidationJournal.reviewedRecoveryArgument, hash = String(repeating: "a", count: 64)
+        XCTAssertNil(GeneralValidationJournal.reviewedRecoveryHash(arguments: []))
+        XCTAssertNil(GeneralValidationJournal.reviewedRecoveryHash(arguments: [flag]))
+        XCTAssertNil(GeneralValidationJournal.reviewedRecoveryHash(arguments: [flag, hash.uppercased()]))
+        XCTAssertNil(GeneralValidationJournal.reviewedRecoveryHash(arguments: [flag, hash, flag, hash]))
+        XCTAssertEqual(GeneralValidationJournal.reviewedRecoveryHash(arguments: ["app", flag, hash]), hash)
+    }
+    func testReviewedRecoveryPreservesExactFailedRecordAndKeepsSingleAttemptGuard() throws {
+        let f = try fixture(), before = try f.probe.capture()
+        let (url, bytes, hash) = try stoppedReceive(f.journal)
+        try GeneralValidationJournal.archiveReviewedFirstReceive(root: f.journal, expectedSHA256: hash) {
+            XCTAssertEqual(try f.probe.capture(), before)
+        }
+        let archive = f.journal.appendingPathComponent("reviewed-stop-" + hash + ".jsonl")
+        XCTAssertEqual(try Data(contentsOf: archive), bytes)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: url.path))
+        XCTAssertEqual(try f.probe.capture(), before)
+        try bytes.write(to: url, options: .withoutOverwriting)
+        let newBytes = bytes
+        XCTAssertThrowsError(try GeneralValidationJournal(root: f.journal, stage: .receiveWindows))
+        XCTAssertThrowsError(try GeneralValidationJournal.archiveReviewedFirstReceive(root: f.journal, expectedSHA256: hash) {})
+        XCTAssertEqual(try Data(contentsOf: url), newBytes)
+        XCTAssertEqual(try Data(contentsOf: archive), bytes)
+    }
+    func testReviewedRecoveryRejectsWrongHashAndCompletedRecord() throws {
+        for terminal in [GeneralValidationJournal.Event.stopped, .completed] {
+            let f = try fixture(), (url, bytes, hash) = try stoppedReceive(f.journal, terminal: terminal)
+            let expected = terminal == .stopped ? String(repeating: "0", count: 64) : hash
+            XCTAssertThrowsError(try GeneralValidationJournal.archiveReviewedFirstReceive(root: f.journal, expectedSHA256: expected) {})
+            XCTAssertEqual(try Data(contentsOf: url), bytes)
+        }
+    }
+    func testReviewedRecoveryRejectsLaterStageAndLocalDrift() throws {
+        let f = try fixture(), (url, bytes, hash) = try stoppedReceive(f.journal)
+        XCTAssertThrowsError(try GeneralValidationJournal.archiveReviewedFirstReceive(root: f.journal, expectedSHA256: hash) {
+            throw GeneralValidationFailure.denied
+        })
+        XCTAssertEqual(try Data(contentsOf: url), bytes)
+        for stage in [GeneralValidationPlan.Stage.sendUpdate, .receiveFinal] {
+            let future = GeneralValidationJournal.url(root: f.journal, stage: stage)
+            try Data("preserved later-stage stop".utf8).write(to: future)
+            XCTAssertThrowsError(try GeneralValidationJournal.archiveReviewedFirstReceive(root: f.journal, expectedSHA256: hash) {})
+            XCTAssertEqual(try Data(contentsOf: url), bytes)
+            try FileManager.default.removeItem(at: future)
+        }
+    }
+    func testReviewedRecoveryRejectsRecordChangedDuringLocalValidation() throws {
+        let f = try fixture(), (url, bytes, hash) = try stoppedReceive(f.journal)
+        var changed = bytes; changed[0] = UInt8(ascii: " ")
+        XCTAssertThrowsError(try GeneralValidationJournal.archiveReviewedFirstReceive(root: f.journal, expectedSHA256: hash) {
+            let handle = try FileHandle(forWritingTo: url)
+            try handle.write(contentsOf: changed); try handle.close()
+        })
+        XCTAssertEqual(try Data(contentsOf: url), changed)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: f.journal.appendingPathComponent("reviewed-stop-" + hash + ".jsonl").path))
+    }
+    func testReviewedRecoveryScreenDoesNotAuthenticateOrAuthorizeExecution() async throws {
+        let f = try fixture(), before = try f.probe.capture()
+        let (_, bytes, hash) = try stoppedReceive(f.journal)
+        let model = GeneralValidationScreenModel(auth: f.auth, bindingEpoch: f.bindingEpoch, projectEpoch: f.projectEpoch,
+            journalRoot: f.journal, binding: { nil }, queueIsEmpty: { true }, probe: { f.probe }, reviewedRecoverySHA256: hash)
+        XCTAssertFalse(f.model.recoveryAvailable)
+        await model.archiveReviewedReceiveStop() // Foreground required; no attempt consumed.
+        XCTAssertTrue(model.recoveryAvailable)
+        model.setForeground(true)
+        await model.archiveReviewedReceiveStop()
+        XCTAssertFalse(model.recoveryAvailable); XCTAssertFalse(model.ready); XCTAssertFalse(model.executionReady)
+        XCTAssertNil(model.stage)
+        XCTAssertTrue(model.message.hasPrefix("중단 기록을 보존했습니다."))
+        XCTAssertEqual(try Data(contentsOf: f.journal.appendingPathComponent("reviewed-stop-" + hash + ".jsonl")), bytes)
+        XCTAssertEqual(try f.probe.capture(), before)
+        let calls = await f.auth.networkCalls; XCTAssertEqual(calls, 0)
+        let newJournal = try GeneralValidationJournal(root: f.journal, stage: .receiveWindows)
+        let newBytes = try Data(contentsOf: newJournal.url)
+        await model.archiveReviewedReceiveStop()
+        XCTAssertEqual(try Data(contentsOf: newJournal.url), newBytes)
+    }
+    func testReviewedRecoveryScreenRejectsPendingQueueWithoutMovingRecord() async throws {
+        let f = try fixture(), (url, bytes, hash) = try stoppedReceive(f.journal)
+        let model = GeneralValidationScreenModel(auth: f.auth, bindingEpoch: f.bindingEpoch, projectEpoch: f.projectEpoch,
+            journalRoot: f.journal, binding: { nil }, queueIsEmpty: { false }, probe: { f.probe }, reviewedRecoverySHA256: hash)
+        model.setForeground(true); await model.archiveReviewedReceiveStop()
+        XCTAssertFalse(model.recoveryAvailable); XCTAssertFalse(model.ready); XCTAssertFalse(model.executionReady)
+        XCTAssertEqual(try Data(contentsOf: url), bytes)
+        let calls = await f.auth.networkCalls; XCTAssertEqual(calls, 0)
+    }
+}
+#endif
+
+#if WRITERPAD_ISOLATED_TESTS
+extension GeneralValidationScreenTests {
+    func testReviewedRecoveryIDPreservesIdenticalLegacyStopsAndCannotBeReused() throws {
+        let f = try fixture(), (url, generated, _) = try stoppedReceive(f.journal)
+        // Simulate the old writer, which emitted no execution identity/date.
+        let rows = try generated.split(separator: 10).map { data -> Data in
+            var row = try JSONSerialization.jsonObject(with: Data(data)) as! [String: Any]
+            row.removeValue(forKey: "attemptID"); row.removeValue(forKey: "startedAt")
+            return try JSONSerialization.data(withJSONObject: row, options: [.sortedKeys])
+        }
+        var bytes = Data(); for row in rows { bytes.append(row); bytes.append(10) }
+        try bytes.write(to: url)
+        let hash = SHA256ContentHasher().sha256(for: bytes).rawValue, id = UUID()
+        let legacy = f.journal.appendingPathComponent("reviewed-stop-" + hash + ".jsonl")
+        try bytes.write(to: legacy, options: .withoutOverwriting)
+        try GeneralValidationJournal.archiveReviewedFirstReceive(root: f.journal, expectedSHA256: hash, recoveryID: id) {}
+        let second = f.journal.appendingPathComponent("reviewed-stop-" + id.uuidString.lowercased() + ".jsonl")
+        XCTAssertEqual(try Data(contentsOf: legacy), bytes); XCTAssertEqual(try Data(contentsOf: second), bytes)
+        let (_, next, nextHash) = try stoppedReceive(f.journal)
+        XCTAssertNotEqual(nextHash, hash)
+        XCTAssertThrowsError(try GeneralValidationJournal.archiveReviewedFirstReceive(root: f.journal, expectedSHA256: nextHash, recoveryID: id) {})
+        XCTAssertEqual(try Data(contentsOf: url), next)
+        XCTAssertEqual(try Data(contentsOf: legacy), bytes); XCTAssertEqual(try Data(contentsOf: second), bytes)
+    }
+    func testRecoveryIDParserFailsClosedAndNewJournalIdentifiesEachAttempt() throws {
+        let hash = String(repeating: "a", count: 64), flag = GeneralValidationJournal.reviewedRecoveryArgument
+        let idFlag = GeneralValidationJournal.reviewedRecoveryIDArgument, id = UUID().uuidString.lowercased()
+        let args = [flag, hash, idFlag, id]
+        XCTAssertEqual(GeneralValidationJournal.reviewedRecoveryID(arguments: args), UUID(uuidString: id))
+        XCTAssertEqual(GeneralValidationJournal.reviewedRecoveryHash(arguments: args), hash)
+        for invalid in [[flag, hash, idFlag], [flag, hash, idFlag, "invalid"], args + [idFlag, id]] {
+            XCTAssertNil(GeneralValidationJournal.reviewedRecoveryHash(arguments: invalid))
+        }
+        let f = try fixture(), (_, bytes, hash1) = try stoppedReceive(f.journal)
+        let rows = try bytes.split(separator: 10).map { try JSONDecoder().decode(GeneralValidationJournal.Row.self, from: Data($0)) }
+        XCTAssertNotNil(rows.first?.attemptID); XCTAssertNotNil(rows.first?.startedAt)
+        XCTAssertTrue(rows.allSatisfy { $0.attemptID == rows.first?.attemptID && $0.startedAt == rows.first?.startedAt })
+        try GeneralValidationJournal.archiveReviewedFirstReceive(root: f.journal, expectedSHA256: hash1) {}
+        let (_, _, hash2) = try stoppedReceive(f.journal); XCTAssertNotEqual(hash1, hash2)
+    }
+    func testRecoveryRejectsMixedAttemptIdentities() throws {
+        let f = try fixture(), (url, bytes, _) = try stoppedReceive(f.journal)
+        var rows = try bytes.split(separator: 10).map { try JSONSerialization.jsonObject(with: Data($0)) as! [String: Any] }
+        rows[2]["attemptID"] = UUID().uuidString
+        var changed = Data()
+        for row in rows { changed.append(try JSONSerialization.data(withJSONObject: row, options: [.sortedKeys])); changed.append(10) }
+        try changed.write(to: url)
+        let hash = SHA256ContentHasher().sha256(for: changed).rawValue
+        XCTAssertThrowsError(try GeneralValidationJournal.archiveReviewedFirstReceive(root: f.journal, expectedSHA256: hash, recoveryID: UUID()) {})
+        XCTAssertEqual(try Data(contentsOf: url), changed)
+    }
+    func testFailureDiagnosticKeepsOnlyCodesAndCannotOverwrite() throws {
+        let f = try fixture(); try FileManager.default.createDirectory(at: f.journal, withIntermediateDirectories: true)
+        let journal = try GeneralValidationJournal(root: f.journal, stage: .receiveWindows)
+        let diagnostic = GeneralValidationFailureDiagnostic(); diagnostic.enter(.prediction, .snapshotBaseline)
+        let error = NSError(domain: NSCocoaErrorDomain, code: 4, userInfo: [NSLocalizedDescriptionKey: "secret-password-and-body", NSFilePathErrorKey: "/private/account/path"])
+        try diagnostic.preserve(error: error, journal: journal, root: f.journal)
+        let url = f.journal.appendingPathComponent("failure-" + journal.attemptID.uuidString.lowercased() + ".json")
+        let bytes = try Data(contentsOf: url), text = String(decoding: bytes, as: UTF8.self)
+        XCTAssertFalse(text.contains("secret")); XCTAssertFalse(text.contains("/private"))
+        let record = try JSONDecoder().decode(GeneralValidationFailureDiagnostic.Record.self, from: bytes)
+        XCTAssertEqual(record.errorFamily, "cocoa"); XCTAssertEqual(record.errorCode, 4)
+        XCTAssertEqual(record.area, .prediction); XCTAssertEqual(record.step, .snapshotBaseline); XCTAssertFalse(record.originalApplyStarted)
+        XCTAssertThrowsError(try diagnostic.preserve(error: error, journal: journal, root: f.journal))
+        XCTAssertEqual(try Data(contentsOf: url), bytes)
+        let sql = diagnostic.record(error: SyncV2StoreError.sqlite(code: 2067), attemptID: journal.attemptID, stage: .receiveWindows)
+        XCTAssertEqual(sql.errorCode, 2067); XCTAssertEqual(sql.errorFamily, "sqlite")
+    }
+}
+extension GeneralValidationJournalTests {
+    @MainActor
+    func testRuntimePredictionBaselineFailurePreservesOriginalAndDetailedEvidence() async throws {
+        let (f, model, policy, wire, flag, journal) = try await runtimeFixture()
+        let probe = GeneralValidationLocalProbe(syncURL: f.database, metadataURL: f.root.appendingPathComponent("metadata.sqlite3"), workspace: f.workspace)
+        let before = try probe.capture()
+        await ReceiveValidationPolicy.$override.withValue(policy) { await model.prepareExecution() }
+        XCTAssertTrue(model.executionReady, model.message)
+        await ReceiveValidationPolicy.$mutationProbe.withValue({ name in if name == "baseline" { flag.invalidate() } }) {
+            await model.execute(.receiveWindows)
+        }
+        XCTAssertFalse(model.executionReady); XCTAssertEqual(try probe.capture(), before)
+        let files = try FileManager.default.contentsOfDirectory(at: journal, includingPropertiesForKeys: nil).filter { $0.lastPathComponent.hasPrefix("failure-") }
+        XCTAssertEqual(files.count, 1)
+        let record = try JSONDecoder().decode(GeneralValidationFailureDiagnostic.Record.self, from: Data(contentsOf: XCTUnwrap(files.first)))
+        XCTAssertEqual(record.area, .prediction); XCTAssertEqual(record.step, .snapshotBaseline)
+        XCTAssertEqual(record.errorFamily, "generalValidation.denied"); XCTAssertFalse(record.originalApplyStarted)
+        let rows = try Data(contentsOf: GeneralValidationJournal.url(root: journal, stage: .receiveWindows)).split(separator: 10).map { try JSONDecoder().decode(GeneralValidationJournal.Row.self, from: Data($0)) }
+        XCTAssertEqual(rows.last?.event, .stopped); XCTAssertEqual(rows.first?.attemptID, record.attemptID)
+        let paths = await wire.paths; XCTAssertEqual(paths, ["get_sync_handshake", "documents", "folders", "tree_orders"])
+        await model.execute(.receiveWindows)
+        let finalPaths = await wire.paths; XCTAssertEqual(finalPaths, paths)
+        XCTAssertFalse(policy.sendingAllowed)
+    }
+}
+#endif
+#if WRITERPAD_ISOLATED_TESTS
+extension GeneralValidationScreenTests {
+    func testFullMetadataHashStillDetectsChangesAmongThousandsOfUnrelatedRows() throws {
+        let f = try fixture()
+        try sql(f.probe.metadataURL, "WITH RECURSIVE n(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM n WHERE x<6200) INSERT INTO metadata SELECT 'history-'||x,'preserved-'||x FROM n;")
+        let before = try f.probe.capture()
+        try sql(f.probe.metadataURL, "UPDATE metadata SET value='changed' WHERE id='history-6199';")
+        let changed = try f.probe.capture()
+        XCTAssertNotEqual(changed.metadataHash, before.metadataHash)
+        XCTAssertEqual(changed.syncHash, before.syncHash); XCTAssertEqual(changed.filesHash, before.filesHash)
+        try sql(f.probe.metadataURL, "UPDATE metadata SET value='preserved-6199' WHERE id='history-6199';")
+        XCTAssertEqual(try f.probe.capture(), before)
+    }
+    func testCancelledGeneralCapabilityCannotAuthorizeLateMutation() async throws {
+        let account = UUID()
+        let policy = ReceiveValidationPolicy(enabled: true, configuration: .init(version: 1, revision: UUID(), endpoint: ReceiveValidationPolicy.Configuration.staging, accountID: account))
+        let ticket = try XCTUnwrap(policy.beginAuthentication(foreground: true, endpoint: ReceiveValidationPolicy.Configuration.staging))
+        let capability = try GeneralValidationCapability(policy: policy, ticket: ticket, bearer: "Bearer synthetic", current: {})
+        let task = Task {
+            withUnsafeCurrentTask { $0?.cancel() }
+            do { try capability.check(); return false } catch is CancellationError { return true } catch { return false }
+        }
+        let denied = await task.value; XCTAssertTrue(denied)
+    }
+}
+#endif
+
+#if WRITERPAD_EDITOR_VALIDATION
+extension GeneralValidationJournalTests {
+    func testEditorAgreementBytesAndHashes() {
+        for (text, bytes, hash) in [
+            (GeneralValidationPlan.initial, 159, "c1b3b5460ab657ca64c52e8556c798561015214d56ae74656d476fc181784a22"),
+            (GeneralValidationPlan.incoming, 197, "452930a7b467d927a24fbb0465605547f0c7169c077849fbfbd5a937e79ac203"),
+            (GeneralValidationPlan.outgoing, 232, "81ba681bdafb5bbf29751c095d35b911730628a6a59b9f598579e936a8c2cc31"),
+            (GeneralValidationPlan.final, 269, "82a4dfd0ec8af9e46475d339c6bf779bef995dd70844eb292f8419aec2bdbbaa")
+        ] {
+            XCTAssertEqual(text.utf8.count, bytes)
+            XCTAssertEqual(SHA256ContentHasher().sha256(for: Data(text.utf8)).rawValue, hash)
+        }
+        XCTAssertEqual(GeneralValidationPlan.id, "general-editor-20260913-v1")
+        XCTAssertEqual(GeneralValidationPlan.final.filter { $0 == "\n" }.count, 8)
+    }
+    @MainActor
+    func testEditorFullRuntimeOrdinarySaveAndTwoReceives() async throws {
+        let (f, model, policy, wire, _, journal) = try await runtimeFixture()
+        let other = try f.otherRows()
+        await ReceiveValidationPolicy.$override.withValue(policy) { await model.prepareExecution() }
+        XCTAssertTrue(model.executionReady, model.message)
+        await model.execute(.receiveWindows)
+        XCTAssertEqual(model.stage, .sendUpdate, model.message)
+        await model.openEditor()
+        let editor = try XCTUnwrap(model.editor)
+        editor.model.updateText(GeneralValidationPlan.outgoing)
+        editor.model.updateCursor(.init(location: UInt(GeneralValidationPlan.outgoing.utf16.count), selectionLength: 0))
+        await model.execute(.sendUpdate)
+        XCTAssertEqual(model.stage, .receiveFinal, model.message)
+        await model.execute(.sendUpdate)
+        await wire.setPayloads(try stagePayloads(final: true))
+        await model.execute(.receiveFinal)
+        XCTAssertNil(model.stage, model.message)
+        XCTAssertTrue(model.message.contains("269바이트 · 8줄"), model.message)
+        XCTAssertEqual(try Data(contentsOf: f.body), Data(GeneralValidationPlan.final.utf8))
+        XCTAssertEqual(try f.otherRows(), other)
+        XCTAssertFalse(policy.sendingAllowed)
+        let paths = await wire.paths
+        XCTAssertEqual(paths, ["get_sync_handshake", "documents", "folders", "tree_orders", "document_commit", "documents", "folders", "tree_orders"])
+        var ids = Set<UUID>()
+        for stage in [GeneralValidationPlan.Stage.receiveWindows, .sendUpdate, .receiveFinal] {
+            let rows = try Data(contentsOf: GeneralValidationJournal.url(root: journal, stage: stage)).split(separator: 10)
+                .map { try JSONDecoder().decode(GeneralValidationJournal.Row.self, from: Data($0)) }
+            XCTAssertEqual(rows.last?.event, .completed)
+            XCTAssertEqual(rows.filter { $0.event == .attempt }.count, stage == .sendUpdate ? 1 : 3)
+            ids.insert(try XCTUnwrap(rows.first?.attemptID))
+        }
+        XCTAssertEqual(ids.count, 3)
+        await ReceiveValidationPolicy.$override.withValue(policy) { await model.prepareExecution() }
+        let after = await wire.paths
+        XCTAssertEqual(after, paths, "Completed validation must not obtain another handshake")
+    }
+    @MainActor
+    func testEditorTypingAndUnauthorizedSaveDoNotWriteOrEnqueue() async throws {
+        let (f, model, policy, wire, _, journal) = try await runtimeFixture()
+        await ReceiveValidationPolicy.$override.withValue(policy) { await model.prepareExecution() }
+        await model.execute(.receiveWindows); await model.openEditor()
+        let editor = try XCTUnwrap(model.editor)
+        let probe = GeneralValidationLocalProbe(syncURL: f.database, metadataURL: f.root.appendingPathComponent("metadata.sqlite3"), workspace: f.workspace)
+        let before = try probe.capture()
+        editor.model.updateText(GeneralValidationPlan.outgoing)
+        try await Task.sleep(for: .seconds(1))
+        let unauthorized = await editor.model.saveNow()
+        XCTAssertFalse(unauthorized)
+        XCTAssertEqual(try probe.capture(), before)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: GeneralValidationJournal.url(root: journal, stage: .sendUpdate).path))
+        let paths = await wire.paths; XCTAssertFalse(paths.contains("document_commit"))
+    }
+    @MainActor
+    func testEditorWrongBytesAndCompositionRejectedBeforeReservation() async throws {
+        let (f, model, policy, wire, _, journal) = try await runtimeFixture()
+        await ReceiveValidationPolicy.$override.withValue(policy) { await model.prepareExecution() }
+        await model.execute(.receiveWindows); await model.openEditor()
+        let editor = try XCTUnwrap(model.editor)
+        for text in [GeneralValidationPlan.incoming, GeneralValidationPlan.outgoing + "\n",
+                     GeneralValidationPlan.outgoing.replacingOccurrences(of: "\n", with: "\r\n")] {
+            editor.model.updateText(text); await model.execute(.sendUpdate)
+            XCTAssertEqual(model.stage, .sendUpdate)
+            XCTAssertEqual(try Data(contentsOf: f.body), Data(GeneralValidationPlan.incoming.utf8))
+        }
+        editor.model.updateText(GeneralValidationPlan.outgoing)
+        _ = await editor.model.updateCompositionState(true)
+        await model.execute(.sendUpdate)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: GeneralValidationJournal.url(root: journal, stage: .sendUpdate).path))
+        let paths = await wire.paths; XCTAssertFalse(paths.contains("document_commit"))
+    }
+    @MainActor
+    func testEditorRenewalKeepsCompletedStepsAndDraft() async throws {
+        let clock = GuardTestClock(time: Date())
+        let (f, model, policy, wire, _, journal) = try await runtimeFixture(policyNow: { clock.value })
+        await ReceiveValidationPolicy.$override.withValue(policy) { await model.prepareExecution() }
+        await model.execute(.receiveWindows); await model.openEditor()
+        let editor = try XCTUnwrap(model.editor)
+        editor.model.updateText(GeneralValidationPlan.outgoing)
+        let receiveURL = GeneralValidationJournal.url(root: journal, stage: .receiveWindows), before = try Data(contentsOf: receiveURL)
+        clock.advance(301)
+        await model.execute(.sendUpdate)
+        XCTAssertFalse(model.executionReady)
+        model.email = "synthetic@example.invalid"; model.password = "synthetic-password"
+        await ReceiveValidationPolicy.$override.withValue(policy) { await model.signIn(); await model.prepareExecution() }
+        XCTAssertEqual(model.stage, .sendUpdate, model.message)
+        XCTAssertEqual(try Data(contentsOf: receiveURL), before)
+        XCTAssertTrue(model.editor === editor)
+        await model.execute(.receiveWindows)
+        await model.execute(.sendUpdate)
+        XCTAssertEqual(model.stage, .receiveFinal, model.message)
+        let sentURL = GeneralValidationJournal.url(root: journal, stage: .sendUpdate), sent = try Data(contentsOf: sentURL)
+        clock.advance(301)
+        await model.execute(.receiveFinal)
+        XCTAssertFalse(model.executionReady)
+        model.password = "synthetic-password"
+        await ReceiveValidationPolicy.$override.withValue(policy) { await model.signIn(); await model.prepareExecution() }
+        XCTAssertEqual(model.stage, .receiveFinal, model.message)
+        XCTAssertEqual(try Data(contentsOf: sentURL), sent)
+        await model.execute(.sendUpdate)
+        await wire.setPayloads(try stagePayloads(final: true)); await model.execute(.receiveFinal)
+        XCTAssertEqual(try Data(contentsOf: f.body), Data(GeneralValidationPlan.final.utf8))
+        let paths = await wire.paths
+        XCTAssertEqual(paths.filter { $0 == "document_commit" }.count, 1)
+        XCTAssertEqual(paths.filter { $0 == "documents" }.count, 2)
+        XCTAssertEqual(paths.filter { $0 == "get_sync_handshake" }.count, 3)
+    }
+    @MainActor
+    func testEditorLostCommitResponsePreservesOriginalAndStopsReplay() async throws {
+        let (f, model, policy, wire, _, journal) = try await runtimeFixture()
+        await ReceiveValidationPolicy.$override.withValue(policy) { await model.prepareExecution() }
+        await model.execute(.receiveWindows); await model.openEditor()
+        try XCTUnwrap(model.editor).model.updateText(GeneralValidationPlan.outgoing)
+        await wire.setFailure(); await model.execute(.sendUpdate)
+        XCTAssertFalse(model.executionReady)
+        XCTAssertEqual(try Data(contentsOf: f.body), Data(GeneralValidationPlan.outgoing.utf8))
+        XCTAssertEqual(try generalProductRows(f.database, "SELECT status FROM sync_contract_batches"), ["processing"])
+        let failures = try FileManager.default.contentsOfDirectory(at: journal, includingPropertiesForKeys: nil).filter { $0.lastPathComponent.hasPrefix("failure-") }
+        let failure = try JSONDecoder().decode(GeneralValidationFailureDiagnostic.Record.self, from: Data(contentsOf: XCTUnwrap(failures.first)))
+        XCTAssertTrue(failure.originalApplyStarted)
+        XCTAssertEqual(failure.originalBodyMatch, "outgoing")
+        XCTAssertEqual(failure.errorFamily, "url")
+        XCTAssertEqual(failure.errorCode, URLError.networkConnectionLost.rawValue)
+        XCTAssertEqual(failure.area, .responses); XCTAssertEqual(failure.step, .transport)
+        await ReceiveValidationPolicy.$override.withValue(policy) { await model.prepareExecution() }
+        await model.execute(.sendUpdate)
+        let paths = await wire.paths; XCTAssertEqual(paths.filter { $0 == "document_commit" }.count, 1)
+    }
+    func testEditorLegacyRecoveryUnavailable() throws {
+        let root = try root()
+        XCTAssertThrowsError(try GeneralValidationJournal.archiveReviewedFirstReceive(root: root,
+            expectedSHA256: String(repeating: "a", count: 64), validateLocal: {}))
+    }
+    @MainActor
+    func testEditorClosedGatePreventsHandshakeAndMutation() async throws {
+        let (f, model, policy, wire, _, _) = try await runtimeFixture(gateOpen: false)
+        await ReceiveValidationPolicy.$override.withValue(policy) { await model.prepareExecution() }
+        XCTAssertFalse(model.executionReady)
+        await model.execute(.receiveWindows); await model.openEditor()
+        XCTAssertNil(model.editor)
+        XCTAssertEqual(try Data(contentsOf: f.body), Data(GeneralValidationPlan.initial.utf8))
+        let paths = await wire.paths; XCTAssertTrue(paths.isEmpty)
+    }
+    @MainActor
+    func testEditorBackgroundInvalidationKeepsDraftWithoutSaving() async throws {
+        let (f, model, policy, wire, _, journal) = try await runtimeFixture()
+        await ReceiveValidationPolicy.$override.withValue(policy) { await model.prepareExecution() }
+        await model.execute(.receiveWindows); await model.openEditor()
+        let editor = try XCTUnwrap(model.editor)
+        editor.model.updateText(GeneralValidationPlan.outgoing)
+        model.setForeground(false)
+        await model.execute(.sendUpdate)
+        let saved = await editor.model.saveNow(); XCTAssertFalse(saved)
+        XCTAssertEqual(try Data(contentsOf: f.body), Data(GeneralValidationPlan.incoming.utf8))
+        XCTAssertEqual(editor.model.currentText, GeneralValidationPlan.outgoing)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: GeneralValidationJournal.url(root: journal, stage: .sendUpdate).path))
+        let paths = await wire.paths; XCTAssertFalse(paths.contains("document_commit"))
+    }
+    @MainActor
+    func testEditorPreservedRevisionThreeFullHashRoundtripOffline() async throws {
+        let (f, model, policy, wire, _, journal) = try await runtimeFixture(preserved: true)
+        await ReceiveValidationPolicy.$override.withValue(policy) { await model.prepareExecution() }
+        XCTAssertTrue(model.executionReady, model.message)
+        await model.execute(.receiveWindows)
+        if model.stage != .sendUpdate {
+            let paths = await wire.paths; print("EDITOR_OFFLINE_PATHS", paths)
+            for file in (try? FileManager.default.contentsOfDirectory(at: journal, includingPropertiesForKeys: nil)) ?? [] where file.lastPathComponent.hasPrefix("failure-") {
+                print("EDITOR_OFFLINE_FAILURE", String(decoding: try Data(contentsOf: file), as: UTF8.self))
+            }
+        }
+        XCTAssertEqual(model.stage, .sendUpdate, model.message)
+        await model.openEditor()
+        let editor = try XCTUnwrap(model.editor)
+        editor.model.updateText(GeneralValidationPlan.outgoing)
+        await model.execute(.sendUpdate)
+        XCTAssertEqual(model.stage, .receiveFinal, model.message)
+        await wire.setPayloads(try stagePayloads(final: true, baseline: .preserved()))
+        await model.execute(.receiveFinal)
+        XCTAssertTrue(model.message.contains("269바이트 · 8줄"), model.message)
+        XCTAssertEqual(try Data(contentsOf: f.body), Data(GeneralValidationPlan.final.utf8))
+        let paths = await wire.paths
+        XCTAssertEqual(paths.filter { $0 == "document_commit" }.count, 1)
+        XCTAssertEqual(paths.filter { $0 == "documents" }.count, 2)
+    }
+
+}
+#endif
+
+#if WRITERPAD_EDITOR_VALIDATION
+/// Deliberately resumes even a cancelled waiter, exercising queued callbacks.
+private actor GeneralCompletionExpirySleeper {
+    private var waits: [Int: CheckedContinuation<Void, Never>] = [:]
+    private var observers: [(Int, CheckedContinuation<Void, Never>)] = []
+    private(set) var count = 0
+    func sleep() async {
+        count += 1
+        let id = count
+        await withCheckedContinuation { continuation in
+            waits[id] = continuation
+            let ready = observers.filter { $0.0 <= count }
+            observers.removeAll { $0.0 <= count }
+            ready.forEach { $0.1.resume() }
+        }
+    }
+    func scheduled(_ count: Int) async {
+        if self.count >= count { return }
+        await withCheckedContinuation { observers.append((count, $0)) }
+    }
+    func resume(_ id: Int) { waits.removeValue(forKey: id)?.resume() }
+}
+extension GeneralValidationJournalTests {
+    @MainActor
+    func testEditorCompletionKeepsMessageAfterLateExpiryAndForegroundChange() async throws {
+        let sleeper = GeneralCompletionExpirySleeper()
+        let (f, model, policy, wire, _, journal) = try await runtimeFixture(expirySleep: { _ in await sleeper.sleep() })
+        await ReceiveValidationPolicy.$override.withValue(policy) { await model.prepareExecution() }
+        await sleeper.scheduled(1)
+        await model.execute(.receiveWindows); await model.openEditor()
+        try XCTUnwrap(model.editor).model.updateText(GeneralValidationPlan.outgoing)
+        await model.execute(.sendUpdate)
+        await wire.setPayloads(try stagePayloads(final: true)); await model.execute(.receiveFinal)
+        let completed = model.message
+        XCTAssertTrue(completed.contains("269바이트 · 8줄"), completed)
+        XCTAssertFalse(model.ready); XCTAssertFalse(model.executionReady)
+        let before = try Data(contentsOf: f.body)
+        let records = try [GeneralValidationPlan.Stage.receiveWindows, .sendUpdate, .receiveFinal].map {
+            try Data(contentsOf: GeneralValidationJournal.url(root: journal, stage: $0))
+        }
+        let paths = await wire.paths
+        await sleeper.resume(1)
+        // Let the queued main-actor callback run without waiting five minutes.
+        for _ in 0..<20 { await Task.yield() }
+        XCTAssertEqual(model.message, completed)
+        model.setForeground(false); model.setForeground(true)
+        XCTAssertEqual(model.message, completed)
+        for stage in [GeneralValidationPlan.Stage.receiveWindows, .sendUpdate, .receiveFinal] { await model.execute(stage) }
+        XCTAssertEqual(try Data(contentsOf: f.body), before)
+        XCTAssertEqual(try [GeneralValidationPlan.Stage.receiveWindows, .sendUpdate, .receiveFinal].map {
+            try Data(contentsOf: GeneralValidationJournal.url(root: journal, stage: $0))
+        }, records)
+        await ReceiveValidationPolicy.$override.withValue(policy) { await model.prepareExecution() }
+        XCTAssertTrue(model.message.contains("모든 단계가 완료"), model.message)
+        XCTAssertFalse(model.ready); XCTAssertFalse(model.executionReady)
+        let scheduled = await sleeper.count; XCTAssertEqual(scheduled, 1, "Completed baseline must not start a new expiry timer")
+        let after = await wire.paths; XCTAssertEqual(after, paths)
+        // Release any incorrectly created timer when demonstrating the old bug.
+        for id in 2...3 { await sleeper.resume(id) }
+    }
+    @MainActor
+    func testEditorExpiryStillLocksIncompleteStageAndIgnoresReplacedTimer() async throws {
+        let sleeper = GeneralCompletionExpirySleeper()
+        let (f, model, policy, wire, _, journal) = try await runtimeFixture(expirySleep: { _ in await sleeper.sleep() })
+        await ReceiveValidationPolicy.$override.withValue(policy) { await model.prepareExecution() }
+        await sleeper.scheduled(1)
+        await model.execute(.receiveWindows)
+        let record = try Data(contentsOf: GeneralValidationJournal.url(root: journal, stage: .receiveWindows))
+        await ReceiveValidationPolicy.$override.withValue(policy) { await model.prepareExecution() }
+        await sleeper.scheduled(2)
+        await sleeper.resume(1)
+        for _ in 0..<20 { await Task.yield() }
+        XCTAssertTrue(model.executionReady, "A cancelled old timer must not end new authority")
+        XCTAssertEqual(model.stage, .sendUpdate)
+        await sleeper.resume(2)
+        for _ in 0..<20 { await Task.yield() }
+        XCTAssertFalse(model.ready); XCTAssertFalse(model.executionReady)
+        XCTAssertTrue(model.message.contains("준비 유효 시간이 끝났습니다"), model.message)
+        await model.execute(.sendUpdate)
+        XCTAssertEqual(try Data(contentsOf: f.body), Data(GeneralValidationPlan.incoming.utf8))
+        XCTAssertEqual(try Data(contentsOf: GeneralValidationJournal.url(root: journal, stage: .receiveWindows)), record)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: GeneralValidationJournal.url(root: journal, stage: .sendUpdate).path))
+        let paths = await wire.paths; XCTAssertFalse(paths.contains("document_commit"))
+    }
+}
+#endif

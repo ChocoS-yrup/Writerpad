@@ -126,15 +126,23 @@ final class WriterPadStartupModel: ObservableObject {
 @main
 @MainActor
 struct WriterPadApp: App {
+#if WRITERPAD_AUTOSAVE_ISOLATED
+    @StateObject private var isolation = AutoSaveIsolationSession()
+#else
     @StateObject private var startup = WriterPadStartupModel()
+#endif
 
     var body: some Scene {
         WindowGroup {
+#if WRITERPAD_AUTOSAVE_ISOLATED
+            AutoSaveIsolationView(session: isolation)
+#else
             if let environment = startup.environment {
                 WriterPadRunningView(environment: environment)
             } else {
                 WriterPadStartupRecoveryView(startup: startup)
             }
+#endif
         }
         .commands { WriterPadCommands() }
     }
@@ -223,6 +231,7 @@ private struct WriterPadRunningView: View {
     }
 
     private func startCloudServices() async {
+        guard !NormalEditorPlan.enabled, !IntegratedEditorPlan.enabled else { return }
 #if !WRITERPAD_ISOLATED_TESTS
         await WriterPadCloudStartup.start(
             syncEnabled: GlobalSyncPreference.isEnabled(),
@@ -259,6 +268,7 @@ private struct WriterPadRunningView: View {
     private func applyAuthenticationState(
         _ state: AuthenticationState
     ) async {
+        guard !NormalEditorPlan.enabled, !IntegratedEditorPlan.enabled else { return }
         switch state {
         case .authenticated:
             guard GlobalSyncPreference.isEnabled() else { return }

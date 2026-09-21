@@ -17,7 +17,7 @@ struct GeneralSyncValidationScope: Sendable {
     @TaskLocal static var override: GeneralSyncValidationScope?
     static var current: Self { override ?? built }
     static let built: Self = {
-#if DEBUG && WRITERPAD_GENERAL_VALIDATION
+#if DEBUG && (WRITERPAD_GENERAL_VALIDATION || WRITERPAD_NORMAL_EDITOR || WRITERPAD_INTEGRATED_EDITOR)
         Self(restricted: true, selection: .init(
             local: ProjectID(rawValue: UUID(uuidString: "a9452cd1-4474-40b5-80ca-fbb7871e98e5")!),
             server: UUID(uuidString: "d8f50b5f-ae0e-42f8-9296-5d5885a5b304")!,
@@ -54,6 +54,8 @@ struct GeneralSyncValidationScope: Sendable {
     }
     func authorize(_ request: URLRequest) throws {
         guard restricted else { return }
+        if let integrated = IntegratedEditorAuthority.current { try integrated.authorize(request); return }
+        if let normal = NormalEditorAuthority.current { try normal.authorize(request); return }
         guard let selection, let url = request.url,
               let parts = URLComponents(url: url, resolvingAgainstBaseURL: false),
               parts.scheme == "https", parts.port == nil, parts.user == nil,

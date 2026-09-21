@@ -746,6 +746,7 @@ actor LocalSyncV2SnapshotApplier: SyncV2LocalSnapshotApplying {
                 : (current?.cursor ?? .start),
             isExpanded: current?.isExpanded ?? false
         )
+        GeneralValidationFailureDiagnostic.mark(.metadataSave)
         try await documentRepository.save(node)
 
         if let current, current.relativePath != path {

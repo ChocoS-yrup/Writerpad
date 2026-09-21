@@ -859,6 +859,27 @@ private enum BundledEditorFonts {
     }()
 }
 
+/// Used only when the integrated editor requests input diagnostics. A scoped source never
+/// labels a later, unrelated text callback as an earlier paste/key/IME event.
+final class BoundaryTrackingTextView: SmartTextView {
+    private(set) var boundaryInputSource: EditorInputSource?
+    private func observing(_ source: EditorInputSource, _ body: () -> Void) {
+        let previous = boundaryInputSource
+        if previous == nil { boundaryInputSource = source }
+        defer { boundaryInputSource = previous }
+        body()
+    }
+    override func paste(_ sender: Any?) { observing(.paste) { super.paste(sender) } }
+    override func insertText(_ text: String) {
+        observing(markedTextRange != nil ? .ime : text == "\n" ? .enter : .key) { super.insertText(text) }
+    }
+    override func deleteBackward() { observing(markedTextRange != nil ? .ime : .key) { super.deleteBackward() } }
+    override func setMarkedText(_ markedText: String?, selectedRange: NSRange) {
+        observing(.ime) { super.setMarkedText(markedText, selectedRange: selectedRange) }
+    }
+    override func unmarkText() { observing(.ime) { super.unmarkText() } }
+}
+
 /// SwiftUI 상태와 단일 UITextView 인스턴스를 연결하는 TextKit 편집기다.
 struct iPadTextEditor: UIViewRepresentable {
     @Binding var text: String
@@ -891,13 +912,14 @@ struct iPadTextEditor: UIViewRepresentable {
     var onEditorCommand: (WriterPadEditorCommand) -> Void = { _ in }
     var onCompositionStateChange: (DocumentID, Bool) -> Void = { _, _ in }
     var onFocusChange: (Bool) -> Void = { _ in }
+    var onInputSource: ((DocumentID, EditorInputSource) -> Void)? = nil
 
     func makeCoordinator() -> Coordinator {
         Coordinator(parent: self)
     }
 
     func makeUIView(context: Context) -> SmartTextView {
-        let textView = SmartTextView()
+        let textView: SmartTextView = onInputSource == nil ? SmartTextView() : BoundaryTrackingTextView()
         textView.delegate = context.coordinator
         textView.textStorage.delegate = context.coordinator
         textView.onEditorCommand = self.onEditorCommand
@@ -1083,6 +1105,10 @@ struct iPadTextEditor: UIViewRepresentable {
             guard !isApplyingExternalState else { return }
             guard let sourceDocumentID = tracker.appliedSnapshot?.documentID
             else { return }
+            if let onInputSource = parent.onInputSource {
+                let observed = (textView as? BoundaryTrackingTextView)?.boundaryInputSource
+                onInputSource(sourceDocumentID, observed ?? (Self.hasActiveMarkedText(in: textView) ? .ime : .other))
+            }
             let resultingLength = textView.textStorage.length
             let processed = processedTextMutations
             processedTextMutations.removeAll(keepingCapacity: true)

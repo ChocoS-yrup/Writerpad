@@ -1340,6 +1340,11 @@ actor SyncV2SnapshotPullService: SyncV2SnapshotPulling {
         }
 
         try ReceiveValidationPolicy.current.requireApplication(local: localProjectID, server: serverProjectID)
+        if let integrated = IntegratedEditorAuthority.current,
+           integrated.journal.state().members.contains(snapshot.documentID), !snapshot.isDeleted {
+            try integrated.journal.checkpoint("afterOriginalApply")
+        }
+        GeneralValidationFailureDiagnostic.mark(.snapshotBaseline)
         let committed = try await stateStore.applySnapshotBaseline(
             localProjectID: localProjectID,
             serverProjectID: serverProjectID,

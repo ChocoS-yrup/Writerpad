@@ -172,26 +172,42 @@ struct SyncV2GeneralCommitReceipt: Equatable, Sendable {
     let batch: SyncV2JSON
     let result: SyncV2JSON
 
-    func validatedResponse(for pending: SyncV2PendingContractBatch, accountID: UUID) throws -> SyncV2JSON {
-        let request = pending.request.json.objectValue
-        guard let storedBatch = batch.objectValue, let originalBatch = request?["batch"]?.objectValue,
-              let storedResult = result.objectValue,
-              storedBatch["project_id"] == request?["project_id"],
-              storedBatch["writer_user_id"] == .string(accountID.uuidString.lowercased()),
-              storedBatch["project_sync_mode"] == request?["project_sync_mode"],
-              storedBatch["migration_epoch"] == request?["migration_epoch"],
-              storedBatch["request_sha256"] == .string(try pending.request.json.sha256Hex()),
-              storedResult["batch_id"] == originalBatch["batch_id"],
-              storedResult["applied"] == .bool(true), let response = storedResult["response"],
-              storedResult["response_sha256"] == .string(try response.sha256Hex()) else {
-            throw SyncV2ContractStructureError.invalidRecoveryReceipt
-        }
-        for key in ["batch_id", "writer_device_id", "client_build_id", "sync_protocol_version", "contract_version",
-                    "canonical_contract_sha256", "client_capabilities", "batch_payload_sha256"] {
-            guard let expected = originalBatch[key], storedBatch[key] == expected else {
+    func validatedResponse(for pending: SyncV2PendingContractBatch, accountID: UUID,
+                           mismatch: ((String) throws -> Void)? = nil) throws -> SyncV2JSON {
+        func require(_ condition: Bool, _ field: String) throws {
+            guard condition else {
+                try mismatch?(field)
                 throw SyncV2ContractStructureError.invalidRecoveryReceipt
             }
         }
+        let request = pending.request.json.objectValue
+        guard let storedBatch = batch.objectValue, let originalBatch = request?["batch"]?.objectValue, let storedResult = result.objectValue else {
+            try mismatch?("receipt.object")
+            throw SyncV2ContractStructureError.invalidRecoveryReceipt
+        }
+        for key in ["project_id", "project_sync_mode", "migration_epoch"] { try require(storedBatch[key] == request?[key], "batch." + key) }
+        try require(storedBatch["writer_user_id"] == .string(accountID.uuidString.lowercased()), "batch.writer_user_id")
+        try require(storedBatch["request_sha256"] == .string(try pending.request.json.sha256Hex()), "batch.request_sha256")
+        try require(storedResult["batch_id"] == originalBatch["batch_id"], "result.batch_id")
+        try require(storedResult["applied"] == .bool(true), "result.applied")
+        guard let response = storedResult["response"] else {
+            try mismatch?("result.response"); throw SyncV2ContractStructureError.invalidRecoveryReceipt
+        }
+        try require(storedResult["response_sha256"] == .string(try response.sha256Hex()), "result.response_sha256")
+        for key in ["batch_id", "writer_device_id", "client_build_id", "sync_protocol_version", "contract_version",
+                    "canonical_contract_sha256", "batch_payload_sha256"] {
+            try require(originalBatch[key] != nil && storedBatch[key] == originalBatch[key], "batch." + key)
+        }
+        // The server stores capabilities sorted. Compare membership, without changing the immutable wire/hash.
+        func capabilities(_ value: SyncV2JSON?) -> Set<String>? {
+            guard let array = value?.arrayValue else { return nil }
+            let strings = array.compactMap(\.stringValue), members = Set(strings)
+            guard strings.count == array.count, members.count == strings.count else { return nil }
+            return members
+        }
+        let originalCapabilities = capabilities(originalBatch["client_capabilities"])
+        let storedCapabilities = capabilities(storedBatch["client_capabilities"])
+        try require(originalCapabilities != nil && storedCapabilities != nil && originalCapabilities == storedCapabilities, "batch.client_capabilities")
         if request?["kind"] == .string("document_commit_request") {
             try SyncV2Contract.validateDocumentCommitResponse(request: pending.request, response: response)
         } else {

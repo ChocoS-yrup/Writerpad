@@ -79,6 +79,8 @@ actor LocalBinderCommandService: BinderCommanding {
     let backupStore: (any BackupStoring)?
     let backupPolicyStore: (any BackupPolicyStoring)?
     let faultPlan: BinderCommandFaultPlan?
+    let recoverProjectAliases: Bool
+    let shouldRecover: @Sendable (BinderCommandJournal) -> Bool
     var volumeCreationProjects: Set<ProjectID> = []
     let hierarchyLogger = Logger(
         subsystem: "com.chocos.writerpad",
@@ -101,7 +103,9 @@ actor LocalBinderCommandService: BinderCommanding {
             SyncV2DocumentMutationGate(),
         backupStore: (any BackupStoring)? = nil,
         backupPolicyStore: (any BackupPolicyStoring)? = nil,
-        faultPlan: BinderCommandFaultPlan? = nil
+        faultPlan: BinderCommandFaultPlan? = nil,
+        recoverProjectAliases: Bool = true,
+        shouldRecover: @escaping @Sendable (BinderCommandJournal) -> Bool = { _ in true }
     ) {
         self.metadataStore = metadataStore
         self.workspaceStateRepository = workspaceStateRepository
@@ -119,6 +123,8 @@ actor LocalBinderCommandService: BinderCommanding {
         self.backupStore = backupStore
         self.backupPolicyStore = backupPolicyStore
         self.faultPlan = faultPlan
+        self.shouldRecover = shouldRecover
+        self.recoverProjectAliases = recoverProjectAliases
     }
 
     func recoverPendingTransactions(in projectID: ProjectID) async throws {
@@ -138,7 +144,7 @@ actor LocalBinderCommandService: BinderCommanding {
                     BinderCommandJournal.self,
                     from: Data(contentsOf: url)
                 )
-                guard journal.projectID == projectID else { continue }
+                guard journal.projectID == projectID, shouldRecover(journal) else { continue }
                 switch journal.phase {
                 case .prepared:
                     try await rollback(journal, workspaceRoot: workspaceRoot)
@@ -178,6 +184,7 @@ actor LocalBinderCommandService: BinderCommanding {
                 throw BinderCommandError.recoveryRequired(url.path)
             }
         }
+        guard recoverProjectAliases else { return }
         try await removeEmptyLegacySyncRootAliases(
             in: projectID,
             workspaceRoot: workspaceRoot

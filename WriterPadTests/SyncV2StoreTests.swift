@@ -9515,6 +9515,8 @@ func makeGeneralCommitResponseForTesting(_ pending: SyncV2PendingContractBatch) 
 func makeGeneralCommitReceiptForTesting(_ pending: SyncV2PendingContractBatch, accountID: UUID, response: SyncV2JSON) throws -> SyncV2GeneralCommitReceipt {
     let request = pending.request.json.objectValue!
     var batch = request["batch"]!.objectValue!
+    // Match the actual server INSERT, not the order used by the request builder.
+    batch["client_capabilities"] = .array(batch["client_capabilities"]!.arrayValue!.sorted { $0.stringValue! < $1.stringValue! })
     batch["project_id"] = request["project_id"]
     batch["project_sync_mode"] = request["project_sync_mode"]
     batch["migration_epoch"] = request["migration_epoch"]

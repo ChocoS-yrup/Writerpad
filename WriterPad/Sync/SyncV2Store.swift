@@ -10986,6 +10986,7 @@ actor SyncV2Store:
             append(.document, id, .rename, .object(["name": target.documents[id]!["name"]!]), 0)
         }
         for parent in target.orders.keys.sorted(by: { ($0?.uuidString ?? "") < ($1?.uuidString ?? "") }) {
+            if let integrated = IntegratedEditorAuthority.current, !integrated.includesOrderParent(parent) { continue }
             let desired = target.orders[parent]!
             if old.orders[parent]?["children"] == desired["children"] { continue }
             guard let id = desired["tree_order_id"]?.stringValue.flatMap(UUID.init(uuidString:)) else { throw SyncV2GeneralConflictError.unsupported }
@@ -11201,6 +11202,45 @@ actor SyncV2Store:
     /// 편집은 추측하지 않고 거부한다.
     /// 로컬 성공 기록은 먼저 보존한다. 앞선 본문 응답이 오기 전에 다음 저장의
     /// base revision을 확정하면 빠른 타이핑이 자기 자신과 충돌하므로 claim 때 만든다.
+    func normalEditorStructure() throws -> SyncV2PreparationSnapshot {
+        // A coherent local read must not request the write authorization used by transaction().
+        try execute("BEGIN DEFERRED;")
+        defer { try? execute("ROLLBACK;") }
+        let snapshot = try generalStoredBaseline(localProjectID: NormalEditorPlan.local, inTransaction: true)
+        let orders = snapshot.treeOrders.filter { $0.objectValue?["parent_folder_id"] == .string(NormalEditorPlan.parent.uuidString.lowercased()) }
+        guard orders.count == 1, orders[0].objectValue?["revision"] == .int(2),
+              orders[0].objectValue?["children"] == .array([.string(NormalEditorPlan.document.uuidString.lowercased())]) else { throw NormalEditorError.target }
+        return snapshot
+    }
+    /// Exact single-document baseline; reads only and never substitutes current TXT for base_content.
+    func normalEditorBaseline() throws -> SyncV2RemoteDocumentSnapshot {
+        try withStatement("SELECT base_content,base_hash,server_revision,server_path,parent_folder_id,name,structure_revision,is_deleted FROM sync_documents WHERE local_project_id=? AND project_id=? AND document_id=?;") { st in
+            try bind(NormalEditorPlan.local.rawValue.uuidString.lowercased(), at: 1, to: st)
+            try bind(NormalEditorPlan.server.uuidString.lowercased(), at: 2, to: st)
+            try bind(NormalEditorPlan.document.uuidString.lowercased(), at: 3, to: st)
+            guard sqlite3_step(st) == SQLITE_ROW, let text = columnText(st, at: 0),
+                  columnText(st, at: 1) == NormalEditorPlan.hash(text),
+                  let path = columnText(st, at: 3), let name = columnText(st, at: 5),
+                  let parent = columnText(st, at: 4).flatMap(UUID.init(uuidString:)) else { throw NormalEditorError.baseline }
+            let snapshot = SyncV2RemoteDocumentSnapshot(documentID: NormalEditorPlan.document, relativePath: path, content: text,
+                revision: sqlite3_column_int64(st, 2), isDeleted: sqlite3_column_int(st, 7) != 0, deletedAt: nil,
+                updatedAt: Date(timeIntervalSince1970: 0), parentFolderID: parent, name: name, structureRevision: sqlite3_column_int64(st, 6))
+            try NormalEditorPlan.validate(snapshot); return snapshot
+        }
+    }
+    func normalEditorPending(batchID: UUID) throws -> SyncV2PendingContractBatch? {
+        try withStatement("SELECT request_json,status FROM sync_contract_batches WHERE batch_id=? AND local_project_id=? AND project_id=?;") { st in
+            try bind(batchID.uuidString.lowercased(), at: 1, to: st)
+            try bind(NormalEditorPlan.local.rawValue.uuidString.lowercased(), at: 2, to: st)
+            try bind(NormalEditorPlan.server.uuidString.lowercased(), at: 3, to: st)
+            let result = sqlite3_step(st)
+            if result == SQLITE_DONE { return nil }
+            guard result == SQLITE_ROW, let json = columnText(st, at: 0),
+                  ["ready", "processing", "completed"].contains(columnText(st, at: 1) ?? "") else { throw NormalEditorError.queue }
+            return .init(localProjectID: NormalEditorPlan.local, serverProjectID: NormalEditorPlan.server,
+                request: try SyncV2ContractRequest(storedJSON: JSONDecoder().decode(SyncV2JSON.self, from: Data(json.utf8))))
+        }
+    }
     func enqueueGeneralContract(_ batch: LocalMutationBatch, binding: ProjectSyncBinding,
         handshake: SyncV2ValidatedHandshake, writerDeviceID: UUID,
         authorize: @Sendable () throws -> Void = {}) throws -> [UUID] {
@@ -11467,6 +11507,7 @@ actor SyncV2Store:
             let live = nodes.filter(\.isIncludedInTree), liveIDs = Set(live.map { $0.id.rawValue.uuidString.lowercased() })
             let parents = Set(tree.orders.keys).union([nil]).union(live.filter { $0.kind == .folder }.map { Optional($0.id.rawValue) })
             for parent in parents.sorted(by: { ($0?.uuidString ?? "") < ($1?.uuidString ?? "") }) {
+                if let integrated = IntegratedEditorAuthority.current, !integrated.includesOrderParent(parent) { continue }
                 let old = tree.orders[parent]
                 let values: [SyncV2JSON]
                 if step == .removeOrders {
@@ -11663,6 +11704,7 @@ actor SyncV2Store:
         let live = nodes.filter(\.isIncludedInTree)
         let parents: [UUID?] = [nil] + live.filter { $0.kind == .folder }.map { Optional($0.id.rawValue) }
         for parent in parents {
+            if let integrated = IntegratedEditorAuthority.current, !integrated.includesOrderParent(parent) { continue }
             let isTopLevel = live.first(where: { $0.id.rawValue == parent }).map { $0.kind == .folder && $0.relativePath == BinderHierarchyPolicy.topLevelPath } ?? false
             let children = live.filter { $0.parentID?.rawValue == parent }.sorted { lhs, rhs in
                 if isTopLevel {
@@ -12347,6 +12389,8 @@ actor SyncV2Store:
         _ pending: SyncV2PendingContractBatch,
         response: SyncV2JSON,
         recoveringGeneral: Bool = false,
+        normalRecovery: Bool = false,
+        integratedRecovery: Bool = false,
         authorize: @Sendable () throws -> Void = {}
     ) async throws {
         if pending.request.json.objectValue?["kind"] == .string("document_commit_request") {
@@ -12370,7 +12414,21 @@ actor SyncV2Store:
             }
             // 늦게 다시 도착한 완료 콜백이 다음 저장의 기준선을 되돌리지 않는다.
             if storedStatus == "completed" { return }
-            if recoveringGeneral {
+            if integratedRecovery {
+                guard let authority = IntegratedEditorAuthority.current,
+                      pending.localProjectID == IntegratedEditorPlan.local, pending.serverProjectID == IntegratedEditorPlan.server,
+                      ["ready", "processing"].contains(storedStatus), let index = authority.journal.state().activeWire else { throw IntegratedEditorError.queue }
+                let wire = authority.journal.state().wires[index]
+                guard wire.phase == .responseStored, wire.request == pending.request.json, wire.response == response,
+                      try wire.request.sha256Hex() == wire.hash else { throw IntegratedEditorError.queue }
+                try authority.requireMutation(sending: true); try authorize()
+            } else if normalRecovery {
+                guard let normal = NormalEditorAuthority.current,
+                      pending.localProjectID == NormalEditorPlan.local, pending.serverProjectID == NormalEditorPlan.server,
+                      ["ready", "processing"].contains(storedStatus),
+                      try normalEditorPending(batchID: pending.request.batchID) == pending else { throw NormalEditorError.request }
+                try normal.requireMutation(sending: true); try authorize()
+            } else if recoveringGeneral {
                 guard storedStatus == "ready", try recoverableGeneralContract(localProjectID: pending.localProjectID) == pending else {
                     throw SyncV2ContractStructureError.invalidStoredRequest
                 }
@@ -12452,7 +12510,7 @@ actor SyncV2Store:
                 )
                 try stepDone(statement)
             }
-            if recoveringGeneral { try authorize() }
+            if recoveringGeneral || normalRecovery { try authorize() }
         }
     }
 
@@ -13286,6 +13344,24 @@ actor LazySyncV2ProjectBindingStore:
         }
     }
 
+    func normalEditorStructure() async throws -> SyncV2PreparationSnapshot {
+        guard let store = await resolvedStore() else { throw NormalEditorError.storage }
+        return try await store.normalEditorStructure()
+    }
+    func normalEditorBaseline() async throws -> SyncV2RemoteDocumentSnapshot {
+        guard let store = await resolvedStore() else { throw NormalEditorError.storage }
+        return try await store.normalEditorBaseline()
+    }
+    func normalEditorPending(batchID: UUID) async throws -> SyncV2PendingContractBatch? {
+        guard let store = await resolvedStore() else { throw NormalEditorError.storage }
+        return try await store.normalEditorPending(batchID: batchID)
+    }
+    func completeNormalEditorRequest(_ request: SyncV2ContractRequest, response: SyncV2JSON,
+        authorize: @escaping @Sendable () throws -> Void) async throws {
+        guard let store = await resolvedStore(), let pending = try await store.normalEditorPending(batchID: request.batchID),
+              pending.request == request else { throw NormalEditorError.request }
+        try await store.completeContractStructure(pending, response: response, normalRecovery: true, authorize: authorize)
+    }
     func generalQueueStatus(localProjectID: ProjectID) async throws -> SyncV2GeneralQueueStatus {
         guard let store = await resolvedStore() else { throw SyncV2ContractStructureError.unavailable }
         return try await store.generalQueueStatus(localProjectID: localProjectID)
@@ -14514,4 +14590,63 @@ private enum ResourceError: Error {
     case missing
     case invalidUTF8
     case markerMissing
+}
+
+// Integrated editor reuses the general contract queue and its composite-step machinery.
+extension SyncV2Store {
+    func integratedBaseline() throws -> SyncV2PreparationSnapshot {
+        try execute("BEGIN DEFERRED;")
+        defer { try? execute("ROLLBACK;") }
+        let snapshot = try generalStoredBaseline(localProjectID: IntegratedEditorPlan.local, inTransaction: true)
+        try execute("COMMIT;")
+        return snapshot
+    }
+    func integratedBaseContents() throws -> [UUID: String] {
+        try withStatement("SELECT document_id,base_content,base_hash FROM sync_documents WHERE local_project_id=? AND project_id=?;") { st in
+            try bind(IntegratedEditorPlan.local.rawValue.uuidString.lowercased(), at: 1, to: st)
+            try bind(IntegratedEditorPlan.server.uuidString.lowercased(), at: 2, to: st)
+            var values: [UUID: String] = [:]
+            while sqlite3_step(st) == SQLITE_ROW {
+                guard let id = columnText(st, at: 0).flatMap(UUID.init(uuidString:)), let text = columnText(st, at: 1),
+                      IntegratedEditorPlan.hash(text) == columnText(st, at: 2) else { throw IntegratedEditorError.corrupt }
+                values[id] = text
+            }
+            return values
+        }
+    }
+    func integratedClaimedHead() throws -> SyncV2PendingContractBatch? {
+        try withStatement("""
+            SELECT b.request_json FROM sync_contract_local_batches l JOIN sync_contract_batches b USING(batch_id)
+            WHERE l.local_project_id=? AND l.status <> 'completed'
+            AND b.status IN ('ready','processing') AND b.attempts>0
+            AND l.queue_id=(SELECT queue_id FROM sync_contract_local_batches WHERE local_project_id=? AND status<>'completed' ORDER BY COALESCE(dispatch_order,queue_id),queue_id LIMIT 1);
+            """) { st in
+            let local = IntegratedEditorPlan.local.rawValue.uuidString.lowercased()
+            try bind(local, at: 1, to: st); try bind(local, at: 2, to: st)
+            let step = sqlite3_step(st); if step == SQLITE_DONE { return nil }
+            guard step == SQLITE_ROW, let json = columnText(st, at: 0) else { throw IntegratedEditorError.queue }
+            return .init(localProjectID: IntegratedEditorPlan.local, serverProjectID: IntegratedEditorPlan.server,
+                request: try SyncV2ContractRequest(storedJSON: JSONDecoder().decode(SyncV2JSON.self, from: Data(json.utf8))))
+        }
+    }
+}
+extension LazySyncV2ProjectBindingStore {
+    func integratedBaseline() async throws -> SyncV2PreparationSnapshot {
+        guard let store = await resolvedStore() else { throw IntegratedEditorError.queue }
+        return try await store.integratedBaseline()
+    }
+    func integratedBaseContents() async throws -> [UUID: String] {
+        guard let store = await resolvedStore() else { throw IntegratedEditorError.queue }
+        return try await store.integratedBaseContents()
+    }
+    func integratedClaimedHead() async throws -> SyncV2PendingContractBatch? {
+        guard let store = await resolvedStore() else { throw IntegratedEditorError.queue }
+        return try await store.integratedClaimedHead()
+    }
+    func completeIntegratedRequest(_ request: SyncV2ContractRequest, response: SyncV2JSON) async throws {
+        guard let store = await resolvedStore(), let authority = IntegratedEditorAuthority.current else { throw IntegratedEditorError.locked }
+        try await store.completeContractStructure(.init(localProjectID: IntegratedEditorPlan.local,
+            serverProjectID: IntegratedEditorPlan.server, request: request), response: response,
+            integratedRecovery: true, authorize: { try authority.requireMutation(sending: true) })
+    }
 }
