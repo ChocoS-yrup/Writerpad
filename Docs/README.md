@@ -3,9 +3,9 @@
 ## 현재 상태
 
 - 현재 단계: 1~7단계 로컬 기능과 성능 기준선, SyncV2 클라이언트·서버 계약, 오프라인 수신·편집·WriterPad 승격 경로 구현 완료
-- 다음 단계: 운영 Supabase 마이그레이션 적용과 실제 서버 종단간 검증은 별도 승인·실행 계획으로 진행
+- 다음 단계: 제품 계약 문서 정리와 `main` 기준 전체 회귀 검증을 진행
 - 제품 코드: SwiftUI 앱·SwiftData 메타데이터 저장소·SyncV2·오프라인 수신/승격 경계와 테스트 타깃 통합 완료
-- Git: 2026-09-21 저장소 통합 완료, `main` 기준선 `2d8f3cac1659a8eb1157303cf082dfd2cbed1a36`
+- Git: 2026-09-21 저장소 통합과 서버 마이그레이션 후속 작업 완료, `main` 기준선 `cb5f20adfb408925859eb848a00d5d650116754d`
 - Xcode: 26.6 설치·라이선스·최초 구성 완료
 - Apple SDK: iOS/iPadOS 26.5 SDK 사용 가능
 - Simulator: iOS 26.5 런타임과 iPad Pro·Air·mini·기본 iPad 기기 사용 가능
@@ -16,16 +16,17 @@
 - Mac Catalyst: 설정 및 호환 빌드 확인 완료
 - Windows 소스: `공유/`에 읽기 전용 참조 소스 제공됨
 - Windows 테스트 작품: `집필모드/`에 1권·2권, 총 50화 제공됨
-- Supabase: 계약·마이그레이션·오프라인 검증은 저장소에 통합됨. 이번 저장소 통합에서는 실제 프로젝트·DB·Auth·서버를 변경하지 않음
+- Supabase: 계약·마이그레이션·오프라인 검증을 저장소에 통합했고, 후속 승인 단계에서 대상 프로젝트의 마이그레이션 적용과 검증을 완료함
 
 ## 2026-09-21 통합 검증
 
 - PR #24~#28로 생성물 제외, 앱 소스·테스트, 오프라인 검증 도구, Supabase 마이그레이션, 직접 참조되는 검증 문서를 순차 통합했다.
+- PR #30으로 마이그레이션 안전성 보완을 병합하고 대상 Supabase 프로젝트에 적용했다. 적용 뒤 보안 권고는 25건에서 21건으로 감소했고, 남은 권고는 별도 후속 범위로 유지한다.
 - iPad Pro 11-inch (M5), iOS 26.5 시뮬레이터에서 WriterPad Debug 빌드가 성공했다.
 - `WriterPadTests` 1,414개 중 1,410개가 통과했고 실패는 0개였다. 비공개 fixture·성능/스케일링 환경이 필요한 4개는 건너뛰었다.
 - 오프라인 Python 검사 177개와 Auth Swift 하네스 11개가 모두 통과했다.
 - sync-contract 검증, Supabase 서버 migration chain 정적 검사, Stage 7 재검증 하네스 검사가 통과했다.
-- 실제 Supabase 프로젝트 migration 적용, 인증, 서버 요청, 실기기 설치·실행은 이 최종 저장소 통합 검증에서 수행하지 않았다.
+- PR #24~#29 통합 검증에서는 실제 Supabase 적용, 인증, 서버 요청, 실기기 설치·실행을 수행하지 않았다. Supabase 적용은 이후 PR #30 승인 단계에서 별도로 수행했다.
 
 ## 요구사항 우선순위
 
@@ -69,6 +70,8 @@
 - `BinderCommands.md`: 일반 생성·이름 변경·이동·순서·휴지통·재실행 복구 계약
 - `NativeTextEditor.md`: UITextView·TextKit 연결, 외부 버전, 선택·포커스·초안 경계
 - `DualEditor.md`: 좌우 문서 라우팅, 동일 문서 잠금, 독립 상태, 분할 닫기 경계
+- `ipad-local-editable-copy-usability-2026-09-21.md`: 오프라인 편집 사본의 초안 보존·dirty 상태·저장 차단 문구와 실기기 확인 결과
+- `ipad-local-editable-copy-export-contract-2026-09-21.md`: 저장 완료 문서 한 개를 UTF-8 TXT로 수동 내보내는 계약과 fail-closed 검증 결과
 - `IMEInputSafety.md`: marked text, pending 문서 전환, foreground 포커스와 실기기 검증 절차
 - `TextRuleEngine.md`: 스마트 쌍 입력, UTF-16 경계, 최소 편집과 Undo 계약
 - `CompositionCompletionRules.md`: `ㄴㄴ`·`ㄱㄱ` 조합 완료와 별표 장면 전환선 계약
