@@ -4341,6 +4341,114 @@ final class AppEnvironmentTests: XCTestCase {
     }
 
     @MainActor
+    func testSceneDeactivationSavesRightAndStopsSyncWhileLeftSaveWaits() async throws {
+        let f = try await makeSceneTransitionFixture()
+        let rightSaved = expectation(description: "right TXT saved before left release")
+        let syncStopped = expectation(description: "sync stopped before left release")
+        let delayed = FirstSaveDelayingDocumentStore(underlying: f.environment.localDocumentStore)
+        let rightStore = SceneRecordingDocumentStore(underlying: f.environment.localDocumentStore) {
+            rightSaved.fulfill()
+        }
+        let left = f.editor(delayed), right = f.editor(rightStore)
+        await left.select(f.nodes[0]); await right.select(f.nodes[1])
+        left.updateText("왼쪽 저장 중\n")
+        right.updateText("오른쪽 최신 원고 e\u{301}🙂\n\n")
+        let lifecycle = WorkspaceLifecycleCoordinator()
+        await lifecycle.appear(initialActivity: true, prepare: {}, updateActivity: { _ in })?.value
+        var workspaceSaved = false
+        var resumed = false
+        let deactivation = try XCTUnwrap(lifecycle.observeSceneActivity(false) { active in
+            await WorkspaceSceneTransition.apply(active, left: left, right: right,
+                updateSync: { _ in syncStopped.fulfill() },
+                persistWorkspace: { workspaceSaved = true })
+        })
+        await delayed.waitUntilFirstSaveStarts()
+        // The transition must survive SwiftUI cancelling its scene task.
+        let sceneCaller = Task { await deactivation.value }
+        sceneCaller.cancel()
+        let activation = try XCTUnwrap(lifecycle.observeSceneActivity(true) { active in
+            await WorkspaceSceneTransition.apply(active, left: left, right: right,
+                updateSync: { _ in resumed = true }, persistWorkspace: {})
+        })
+        await fulfillment(of: [rightSaved, syncStopped], timeout: 2)
+        let savedRight = try await f.environment.localDocumentStore.loadText(for: f.documents[1])
+        XCTAssertEqual(Data(savedRight.utf8), Data("오른쪽 최신 원고 e\u{301}🙂\n\n".utf8))
+        XCTAssertFalse(workspaceSaved)
+        XCTAssertFalse(resumed)
+        left.updateText("왼쪽 지연 중 최신 입력🙂\n")
+        await delayed.releaseFirstSave()
+        await deactivation.value; await sceneCaller.value; await activation.value
+        let savedLeft = try await f.environment.localDocumentStore.loadText(for: f.documents[0])
+        XCTAssertEqual(savedLeft, "왼쪽 지연 중 최신 입력🙂\n")
+        XCTAssertTrue(workspaceSaved)
+        XCTAssertTrue(resumed)
+        XCTAssertNotEqual(left.focusPhase, .backgrounded)
+        XCTAssertNotEqual(right.focusPhase, .backgrounded)
+    }
+
+    @MainActor
+    func testSceneDeactivationKeepsFailedPaneDirtyAndSavesOtherPane() async throws {
+        let f = try await makeSceneTransitionFixture()
+        let failing = ControllableFailingDocumentStore(underlying: f.environment.localDocumentStore)
+        let left = f.editor(failing), right = f.editor(f.environment.localDocumentStore)
+        await left.select(f.nodes[0]); await right.select(f.nodes[1])
+        left.updateText("실패해도 남길 초안"); right.updateText("오른쪽 저장 성공")
+        await failing.setSaveFailureEnabled(true)
+        await WorkspaceSceneTransition.apply(false, left: left, right: right,
+            updateSync: { _ in }, persistWorkspace: {})
+        XCTAssertTrue(left.hasUnsavedChanges)
+        XCTAssertEqual(left.currentText, "실패해도 남길 초안")
+        XCTAssertFalse(right.hasUnsavedChanges)
+        let savedRight = try await f.environment.localDocumentStore.loadText(for: f.documents[1])
+        XCTAssertEqual(savedRight, "오른쪽 저장 성공")
+        await failing.setSaveFailureEnabled(false)
+        await WorkspaceSceneTransition.apply(true, left: left, right: right,
+            updateSync: { _ in }, persistWorkspace: {})
+        let saved = await left.saveNow()
+        XCTAssertTrue(saved)
+        let recovered = try await f.environment.localDocumentStore.loadText(for: f.documents[0])
+        XCTAssertEqual(recovered, "실패해도 남길 초안")
+    }
+
+    @MainActor
+    func testSceneDeactivationDefersComposingPaneWithoutBlockingOtherPane() async throws {
+        let f = try await makeSceneTransitionFixture()
+        let left = f.editor(f.environment.localDocumentStore), right = f.editor(f.environment.localDocumentStore)
+        await left.select(f.nodes[0]); await right.select(f.nodes[1])
+        _ = left.recordCompositionState(true)
+        left.updateText("조합 중 한글 e\u{301}🙂")
+        right.updateText("확정된 오른쪽 원고")
+        await WorkspaceSceneTransition.apply(false, left: left, right: right,
+            updateSync: { _ in }, persistWorkspace: {})
+        XCTAssertTrue(left.hasUnsavedChanges)
+        XCTAssertTrue(left.isComposing)
+        let uncommitted = try await f.environment.localDocumentStore.loadText(for: f.documents[0])
+        XCTAssertNotEqual(uncommitted, left.currentText)
+        let savedRight = try await f.environment.localDocumentStore.loadText(for: f.documents[1])
+        XCTAssertEqual(savedRight, "확정된 오른쪽 원고")
+        await WorkspaceSceneTransition.apply(true, left: left, right: right,
+            updateSync: { _ in }, persistWorkspace: {})
+        await left.updateCompositionState(false)
+        let saved = await left.saveNow()
+        XCTAssertTrue(saved)
+        let committed = try await f.environment.localDocumentStore.loadText(for: f.documents[0])
+        XCTAssertEqual(Data(committed.utf8), Data("조합 중 한글 e\u{301}🙂".utf8))
+    }
+
+    @MainActor
+    private func makeSceneTransitionFixture() async throws -> SceneTransitionFixture {
+        let environment = try AppEnvironment.testing()
+        let project = try await environment.projectManager.createProject(named: "합성 scene 전환")
+        _ = try await environment.binderRepository.rootNodes(in: project.id)
+        _ = try await environment.binderCommands.addNewVolume(projectID: project.id)
+        let documents = try await environment.documentRepository.documents(in: project.id)
+            .filter { $0.kind == .text && $0.relativePath.rawValue.contains("/원고/") }
+            .sorted { $0.userOrder < $1.userOrder }
+        XCTAssertGreaterThanOrEqual(documents.count, 2)
+        return SceneTransitionFixture(environment: environment, documents: Array(documents.prefix(2)))
+    }
+
+    @MainActor
     func testDualEditorSessionsShareUnsavedDraftWithoutSharingActiveState() async throws {
         let environment = try AppEnvironment.testing()
         let project = try await environment.projectManager.createProject(named: "듀얼 초안")
@@ -4935,6 +5043,40 @@ private actor AutosaveSleepProbe {
 
     func recordedDelays() -> [Duration] {
         delays
+    }
+}
+
+@MainActor
+private struct SceneTransitionFixture {
+    let environment: AppEnvironment
+    let documents: [DocumentNode]
+    var nodes: [BinderNode] {
+        documents.map { document in
+            BinderNode(id: document.id, projectID: document.projectID, kind: .text,
+                relativePath: document.relativePath, displayName: document.relativePath.rawValue,
+                fixedCategory: nil, userOrder: document.userOrder, contentState: .empty, isExpanded: false)
+        }
+    }
+    func editor(_ store: any LocalDocumentStoring) -> EditorSessionModel {
+        EditorSessionModel(documentRepository: environment.documentRepository,
+            documentStore: store, workspaceStateRepository: environment.workspaceStateRepository,
+            autosaveDelay: .seconds(60))
+    }
+}
+
+private actor SceneRecordingDocumentStore: LocalDocumentStoring {
+    let underlying: any LocalDocumentStoring
+    let saved: @Sendable () -> Void
+    init(underlying: any LocalDocumentStoring, saved: @escaping @Sendable () -> Void) {
+        self.underlying = underlying; self.saved = saved
+    }
+    func loadText(for document: DocumentNode) async throws -> String {
+        try await underlying.loadText(for: document)
+    }
+    func save(_ request: DocumentSaveRequest) async throws -> DocumentSaveReceipt {
+        let receipt = try await underlying.save(request)
+        saved()
+        return receipt
     }
 }
 

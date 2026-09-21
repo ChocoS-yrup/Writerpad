@@ -1,10 +1,10 @@
 # SYNC-004: iPadOS 백그라운드 저장·동기화 정책
 
 - 결정일: 2026-09-22
-- 상태: 정책 확정, 수명주기 통합 검증 대기
+- 상태: 정책 확정, 분할 저장 수명주기 보완, OS 중단 실기기 검증 대기
 - 조사 기준: `8370e1f53e9d0782f46351c2913f8407f0af1b8d`
 - 범위: iPad 클라이언트 실행 수명과 저장·재시도·완료 표시
-- 이번 변경: 문서만 변경. 서버 wire 계약, Windows 동작, 앱 실행 코드는 변경하지 않는다.
+- 정책 결정 단계는 문서만 변경했다. 후속 분할 저장 수명주기 보완과 검증은 아래 기록을 따른다.
 
 ## 결정
 
@@ -53,10 +53,11 @@ background `URLSession`은 파일 전송용 별도 수명 관리가 필요하다
 
 ## 현재 구현 증거와 남은 검증
 
-- `WriterPad/Features/Editor/EditorSessionModel.swift`의 `updateSceneActivity`는
+- 정책 조사 기준의 `WriterPad/Features/Editor/EditorSessionModel.swift`의 `updateSceneActivity`는
   `saveNow(.sceneInactive)`, 세션 저장, lease 정리를 순서대로 기다린다.
   `WritingWorkspaceView.updateSceneActivity`는 좌우 편집기를 차례로 처리한다.
-  첫 편집기의 지연이 둘째 저장과 workspace 정리에 미치는 영향은 통합 검증 대상이다.
+  이 순차 처리에서 첫 편집기의 지연이 둘째 저장과 workspace 동기화 중지를 막는
+  결함을 후속 회귀 테스트로 재현했고, 아래와 같이 보완했다.
 - `WriterPad/App/WriterPadApp.swift`는 비활성 전환에서 검증 권한을 무효화하고
   background pull coordinator를 중지한다. 일반 dispatcher는 여기서 중지하지 않는다.
   `ReceiveValidationPolicy.invalidate()`만으로 일반 dispatcher의 송신이 차단됐다고
@@ -101,3 +102,45 @@ SYNC-004는 정책 확정만으로 검증 완료로 올리지 않는다.
 - Apple 공식 문서와 위 코드·기존 테스트의 읽기 전용 대조
 - 공통 계약 검증기 및 문서 diff/참조 검사
 - Swift 재빌드, 기기 실행, 서버 요청·변경은 이 문서 단계의 검증에 포함하지 않는다.
+
+## 2026-09-22 분할 저장 수명주기 보완
+
+`WorkspaceSceneTransition.apply`를 실제 workspace 경로에 연결했다.
+비활성 전환에서는 두 편집기의 `updateSceneActivity(false)`를 독립적으로 시작하고,
+workspace pull/Realtime 중지도 저장 완료를 기다리지 않고 시작한다.
+두 편집기의 정리가 완료된 뒤 workspace 상태를 기록한다.
+활성 전환은 기존의 왼쪽→오른쪽→동기화 재개 순서를 유지한다.
+전체 scene 사건의 직렬화는 `WorkspaceLifecycleCoordinator`가 계속 담당한다.
+
+`AppEnvironmentTests`에 실제 편집기와 로컬 파일 저장소를 사용하는 회귀 테스트를 추가했다.
+
+- `testSceneDeactivationSavesRightAndStopsSyncWhileLeftSaveWaits`: 왼쪽 저장을
+  gate로 멈춘 동안 오른쪽 UTF-8 TXT 저장과 동기화 중지가 먼저 끝나는지 확인한다.
+  호출자의 취소와 빠른 활성 복귀, 기다리는 동안 추가된 왼쪽 입력도 확인한다.
+- `testSceneDeactivationKeepsFailedPaneDirtyAndSavesOtherPane`: 왼쪽 저장 실패에도
+  오른쪽은 저장되고 실패한 초안은 dirty로 남아 복귀 후 재시도로 저장되는지 확인한다.
+- `testSceneDeactivationDefersComposingPaneWithoutBlockingOtherPane`: 조합 중인
+  본문은 TXT로 확정하지 않으며, 다른 편집기는 저장되고 조합 종료 뒤 UTF-8 바이트가 보존되는지 확인한다.
+
+수정 전 세 테스트 중 첫 테스트가 실패했다. 왼쪽 저장이 해제되기 전 오른쪽 저장과
+동기화 중지가 시작되지 않았고, 나머지 두 테스트는 통과했다. 수정 후 세 테스트가
+모두 통과했다. 한글 조합 테스트는 모델 사건을 주입한 검증이며 실물 IME 검증을 대신하지 않는다.
+
+실제 `EditLeaseManager.releaseAndRemove`는 네트워크 해제를 별도 Task로 실행하므로
+서버 해제 응답을 기다리는 결함은 이번 조사에서 확인되지 않았다. lease 구현은 변경하지 않았다.
+
+최종 구현의 관련 회귀 검증은 350개 중 348개 통과, 실패 0개, 건너뜀 2개다.
+건너뛴 것은 비공개 실행 기록을 요구하는 `IntegratedEditorTests`의
+`testCapturedJournalExtensionOnPrivateCopyPreservesEveryOriginalRecord`와
+`testCapturedSeventyRecordsAcceptRecoveryOnCopyAndPreserveFirstDiagnostic`이다.
+빌드 로그의 경고/오류와 xcresult runtime warning은 없었다.
+
+검증 범위는 `AppEnvironmentTests`, `LocalDocumentStoreTests`,
+`SyncV2SnapshotPullTests`, `IntegratedEditorTests`, `NormalEditorTests` 전체와
+큐 순서/ID 재실행·Base/충돌 원본 보존·응답 유실 복구·기동 drain·foreground 권한
+취소 후 늦은 응답 거부의 선택 테스트다. 공통 계약 검증기도 통과했다.
+전체 테스트 타깃을 모두 실행한 결과로 확대 해석하지 않는다.
+
+이 결과는 iPad Pro 11-inch (M5), iOS 26.5 시뮬레이터의 자동 검증이다.
+실제 OS suspension·잠금·강제 종료 직전 미영구화 입력의 보존은 아직 검증하지 않았다.
+다음 단계는 생성 원고를 쓰는 격리된 실기기 수명주기 검증이다.
