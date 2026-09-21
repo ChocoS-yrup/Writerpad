@@ -3,7 +3,7 @@
 ## 현재 상태
 
 - 현재 단계: 1~7단계 로컬 기능과 성능 기준선, SyncV2 클라이언트·서버 계약, 오프라인 수신·편집·WriterPad 승격 경로 구현 및 저장소 통합·전체 회귀 검증 완료
-- 다음 단계: SYNC-004의 남은 범위인 iPadOS 제한 시간 내 서버 업로드 정책을 확정한다. 백그라운드 네트워크 완료를 보장하지 않는 현행 정책을 유지할지, 별도 background task를 도입할지 결정하기 전까지 로컬 저장·영구 큐·foreground 재개 기준선을 유지한다.
+- 다음 단계: [SYNC-004 정책](SyncV2BackgroundPolicy.md)에 따라 분할 편집·IME·빠른 scene 전환·전송 중단/재개의 수명주기 회귀 검증을 진행한다. 정책은 로컬 저장 우선·미전송 작업 보존·foreground 재개이며, background 서버 업로드 완료는 보장하지 않는다.
 - 제품 코드: SwiftUI 앱·SwiftData 메타데이터 저장소·SyncV2·오프라인 수신/승격 경계와 테스트 타깃 통합 완료
 - Git: 2026-09-22 저장소 통합·경고 정리·로컬 증거 제외 정책과 정본 상태 문서 최신화를 PR #35까지 `main`에 병합 완료
 - Xcode: 27.0 설치·라이선스·최초 구성 완료
@@ -51,12 +51,13 @@
 - 바인더 너비와 TXT 추출 내용 옵션은 전 작품이 공유하고, TXT 추출 화수 범위는 작품별로 기억한다.
 - 실행 취소·다시 실행은 `⌘Z`·`⇧⌘Z`, 화 이동은 `⌘[`·`⌘]`를 사용하며 `⌘⌥←`·`⌘⌥→`는 제공하지 않는다.
 - 원고 내보내기는 백업·복원과 무관한 소장용 UTF-8 TXT·PDF만 제공하며, 작품 manifest와 재가져오기는 구현하지 않는다.
-- Windows v2의 Supabase Baseline 2.0과 iPad SyncV2 계약은 대조·구현·검증을 완료했다. iPadOS background 서버 업로드 보장만 별도 정책 결정 전까지 확대하지 않는다.
+- Windows v2의 Supabase Baseline 2.0과 iPad SyncV2 계약은 대조·구현·검증을 완료했다. iPadOS background 저장·동기화는 `SyncV2BackgroundPolicy.md`를 따른다.
 
 ## 문서 목록
 
 - `CrossPlatformSyncGitWorkflow.md`: Windows–iPad 단계별 커밋·인계·검토·병합 규칙
 - `RequirementsTraceability.md`: 요구사항과 단계·검증 연결
+- `SyncV2BackgroundPolicy.md`: SYNC-004의 로컬 저장·미전송 작업 보존·foreground 재개 정책과 남은 검증
 - `Architecture.md`: 목표 아키텍처와 데이터 흐름
 - `ModuleDependencies.md`: 모듈 의존 규칙
 - `StageCompletionCriteria.md`: 1~7단계 완료 조건

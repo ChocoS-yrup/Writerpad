@@ -2,6 +2,10 @@
 
 ## 현재 계약
 
+이 문서의 background pull은 앱 실행 중 열지 않은 작품의 동기화도 뜻한다.
+앱이 suspend된 뒤 실행이 지속된다는 의미가 아니다. iPadOS 비활성 전환의
+저장·미전송 작업 보존·재개 기준은 [SYNC-004 정책](SyncV2BackgroundPolicy.md)을 따른다.
+
 Realtime payload는 원고 본문에 직접 적용하지 않는다. `documents` 변경은
 snapshot pull을 깨우는 신호일 뿐이며, 적용 여부는 서버 snapshot의 revision,
 영구 queue 상태, 로컬 dirty/IME guard를 함께 확인해 결정한다.
