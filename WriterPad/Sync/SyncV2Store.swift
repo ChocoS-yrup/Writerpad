@@ -11250,7 +11250,7 @@ actor SyncV2Store:
               !batch.mutations.isEmpty else { throw SyncV2ContractStructureError.unsupportedLocalBatch }
         let ids = try batch.mutations.map { mutation -> UUID in
             switch mutation {
-            case let .documentSnapshot(id, _, _, content, hash, _, deleted):
+            case let .documentSnapshot(id, _, _, content, hash, _, _):
                 guard Data(content.utf8).count <= Self.maximumContentByteCount,
                       SHA256.hash(data: Data(content.utf8)).map({ String(format: "%02x", $0) }).joined() == hash.rawValue
                 else { throw SyncV2ContractStructureError.unsupportedLocalBatch }

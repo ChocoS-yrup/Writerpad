@@ -1,10 +1,12 @@
 import XCTest
+import Foundation
 import Supabase
 @testable import WriterPad
 
 /// 핸드셰이크가 "서버가 뭐라 했는가"와 "우리가 계약 경로를 써도 되는가"를 끝까지
 /// 갈라 두는지 본다. 둘이 붙는 순간, 서버가 답 하나로 우리 쓰기 경로를 바꿀 수
 /// 있게 된다.
+@MainActor
 final class SyncV2HandshakeTests: XCTestCase {
 
     // MARK: - 도구
@@ -728,7 +730,7 @@ final class SyncV2HandshakeTests: XCTestCase {
         let name = "SyncV2HandshakeTests.\(function)"
         let defaults = UserDefaults(suiteName: name)!
         defaults.removePersistentDomain(forName: name)
-        addTeardownBlock { defaults.removePersistentDomain(forName: name) }
+        addTeardownBlock { UserDefaults(suiteName: name)?.removePersistentDomain(forName: name) }
         return defaults
     }
 
@@ -794,7 +796,7 @@ extension SyncV2HandshakeTests {
         func disconnect(localProjectID: ProjectID) -> ProjectBindingResult { .failed(.serverRejected) }
     }
 
-    private func eventually(_ condition: () async -> Bool, file: StaticString = #filePath, line: UInt = #line) async {
+    private func eventually(_ condition: @Sendable () async -> Bool, file: StaticString = #filePath, line: UInt = #line) async {
         for _ in 0..<600 {
             if await condition() { return }
             try? await Task.sleep(for: .milliseconds(5))
@@ -880,17 +882,17 @@ extension SyncV2HandshakeTests {
         ])
         let transport = StubTransport(results: [a, a, b, a].map { .success(supportedResponse(projectID: $0)) })
         let service = SyncV2HandshakeService(transport: transport)
-        func ctx(_ local: ProjectID, _ server: UUID, _ epoch: UInt64) -> SyncV2HandshakeContext {
-            .init(localProjectID: local, serverProjectID: server, accountID: account, authenticationEpoch: epoch)
-        }
+        let contextA0 = SyncV2HandshakeContext(localProjectID: localA, serverProjectID: a, accountID: account, authenticationEpoch: 0)
+        let contextA1 = SyncV2HandshakeContext(localProjectID: localA, serverProjectID: a, accountID: account, authenticationEpoch: 1)
+        let contextB1 = SyncV2HandshakeContext(localProjectID: localB, serverProjectID: b, accountID: account, authenticationEpoch: 1)
         await service.observeProject(localA, authentication: auth, bindings: bindings)
-        await eventually { await service.isFresh(for: ctx(localA, a, 0)) }
+        await eventually { await service.isFresh(for: contextA0) }
         await auth.relogin()
-        await eventually { await service.isFresh(for: ctx(localA, a, 1)) }
+        await eventually { await service.isFresh(for: contextA1) }
         await service.observeProject(localB, authentication: auth, bindings: bindings)
-        await eventually { await service.isFresh(for: ctx(localB, b, 1)) }
+        await eventually { await service.isFresh(for: contextB1) }
         await service.observeProject(localA, authentication: auth, bindings: bindings)
-        await eventually { await service.isFresh(for: ctx(localA, a, 1)) }
+        await eventually { await service.isFresh(for: contextA1) }
         let count = await transport.callCount
         XCTAssertEqual(count, 4)
         await service.stopObserving()
@@ -1139,7 +1141,7 @@ extension SyncV2HandshakeTests {
         authority.finishBaseline(context, token: token, allowed: true)
         let localEpoch = SyncV2ContractEpoch()
         let sender = SyncV2ContractStructureSender(store: queue, transport: transport,
-            handshakeService: handshake, authenticationService: auth, uploadPullCoordinator: coordinator, defaults: defaults,
+            handshakeService: handshake, authenticationService: auth, uploadPullCoordinator: coordinator, defaults: ContractDefaults(value: defaults),
             bindingEpoch: bindingEpoch, deviceIdentityProvider: DeviceIdentityService(
                 store: InMemoryDeviceIdentityStore(), generateUUID: { actualDevice }),
             structureAuthority: authority, localProjectEpoch: localEpoch, isLocalProjectActive: { _ in localIsActive })
@@ -1961,7 +1963,7 @@ extension SyncV2HandshakeTests {
     }
 
     private func installLostReceipt(_ f: SenderFixture) async throws -> SyncV2GeneralCommitReceipt {
-        let pending = await f.queue.pending
+        let pending = f.queue.pending
         let receipt = try makeGeneralCommitReceiptForTesting(pending, accountID: f.context.accountID,
             response: makeGeneralCommitResponseForTesting(pending))
         await f.queue.setRecoveryEligible()
@@ -2575,7 +2577,7 @@ extension SyncV2HandshakeTests {
             serverProjectID: f.context.serverProjectID,
             treeOrders: [.init(treeOrderID: UUID(), parentFolderID: nil, children: [], revision: 1, updatedAt: Date())])
         let recorder = SyncV2ContractPathRecorder(store: store, handshakeService: f.service,
-            authenticationService: f.auth, defaults: f.defaults, bindingEpoch: f.bindingEpoch,
+            authenticationService: f.auth, defaults: ContractDefaults(value: f.defaults), bindingEpoch: f.bindingEpoch,
             structureAuthority: f.authority, localProjectEpoch: f.localEpoch, isLocalProjectActive: { _ in true })
         let batch = LocalMutationBatch(batchID: UUID(), projectID: f.localID, localTransactionID: nil,
             kind: .structureChange, mutations: [
@@ -2587,7 +2589,7 @@ extension SyncV2HandshakeTests {
         await store.failContractStructure(pending, error: SyncV2ContractStructureError.transmissionNotStarted, response: nil)
         let sender = SyncV2ContractStructureSender(store: store, transport: f.transport,
             handshakeService: f.service, authenticationService: f.auth, uploadPullCoordinator: f.coordinator,
-            defaults: f.defaults, bindingEpoch: f.bindingEpoch, deviceIdentityProvider: device,
+            defaults: ContractDefaults(value: f.defaults), bindingEpoch: f.bindingEpoch, deviceIdentityProvider: device,
             structureAuthority: f.authority, localProjectEpoch: f.localEpoch, isLocalProjectActive: { _ in true })
         return .init(base: f, store: store, secondStore: secondStore, recorder: recorder,
                      sender: sender, request: pending.request, deviceID: deviceID)
@@ -2854,7 +2856,7 @@ extension SyncV2HandshakeTests {
             folders: folderInfo.map { .init(folderID: $0.0, parentFolderID: $0.1, name: $0.2, revision: 1, isDeleted: false, updatedAt: Date()) }, excluding: [])
         let sender = SyncV2ContractStructureSender(store: store, transport: f.transport,
             handshakeService: f.service, authenticationService: f.auth, uploadPullCoordinator: f.coordinator,
-            defaults: f.defaults, bindingEpoch: f.bindingEpoch, deviceIdentityProvider: device,
+            defaults: ContractDefaults(value: f.defaults), bindingEpoch: f.bindingEpoch, deviceIdentityProvider: device,
             structureAuthority: f.authority, localProjectEpoch: f.localEpoch, isLocalProjectActive: { _ in true },
             localDocuments: { _ in await local.read() })
         return .init(base: f, store: store, sender: sender, nodes: local, snapshot: snapshot, url: url)

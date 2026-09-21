@@ -91,7 +91,9 @@ final class NormalEditorAuthority: @unchecked Sendable {
     func context<T: Sendable>(_ operation: @Sendable () async throws -> T) async rethrows -> T {
         try await Self.$current.withValue(self) {
             try await ReceiveValidationPolicy.$override.withValue(policy) {
-                try await ReceiveValidationPolicy.$operation.withValue(ticket, operation: operation)
+                try await ReceiveValidationPolicy.$operation.withValue(ticket) {
+                    try await operation()
+                }
             }
         }
     }
@@ -100,7 +102,9 @@ final class NormalEditorAuthority: @unchecked Sendable {
             try await Self.$mutation.withValue(sending) {
                 try self.requireMutation(sending: sending)
                 return try await ReceiveValidationPolicy.$localProject.withValue(NormalEditorPlan.local.rawValue) {
-                    try await GeneralValidationMutation.$current.withValue({ try self.requireMutation(sending: sending) }, operation: operation)
+                    try await GeneralValidationMutation.$current.withValue({ try self.requireMutation(sending: sending) }) {
+                        try await operation()
+                    }
                 }
             }
         }

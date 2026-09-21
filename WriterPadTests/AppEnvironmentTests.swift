@@ -1771,7 +1771,7 @@ final class AppEnvironmentTests: XCTestCase {
         var query = "한글"
         var isFocused = true
         var submitCount = 0
-        let field = DocumentSearchTextField(
+        _ = DocumentSearchTextField(
             text: Binding(get: { query }, set: { query = $0 }),
             isFocused: Binding(get: { isFocused }, set: { isFocused = $0 }),
             onSubmit: { submitCount += 1 },

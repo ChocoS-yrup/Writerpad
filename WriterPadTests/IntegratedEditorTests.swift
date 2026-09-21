@@ -122,13 +122,14 @@ actor IntegratedWireStub {
                 default: throw IntegratedEditorError.scope
                 }
             }
-            func folderPath(_ id: UUID?, seen: Set<UUID> = []) throws -> String {
-                guard let id else { return "" }; guard !seen.contains(id), let folder = folders.first(where: { $0.folderID == id }) else { throw IntegratedEditorError.scope }
-                let prefix = try folderPath(folder.parentFolderID, seen: seen.union([id])); return prefix.isEmpty ? folder.name : prefix + "/" + folder.name
+            func folderPath(_ id: UUID?, in folderSnapshot: [SyncV2RemoteFolder], seen: Set<UUID> = []) throws -> String {
+                guard let id else { return "" }; guard !seen.contains(id), let folder = folderSnapshot.first(where: { $0.folderID == id }) else { throw IntegratedEditorError.scope }
+                let prefix = try folderPath(folder.parentFolderID, in: folderSnapshot, seen: seen.union([id])); return prefix.isEmpty ? folder.name : prefix + "/" + folder.name
             }
+            let folderSnapshot = folders
             docs = try docs.map { doc in
                 guard changedDocuments.contains(doc.documentID) else { return doc }
-                let prefix = try folderPath(doc.parentFolderID)
+                let prefix = try folderPath(doc.parentFolderID, in: folderSnapshot)
                 return .init(documentID: doc.documentID, relativePath: prefix + "/" + (doc.name ?? ""), content: doc.content,
                     revision: doc.revision, isDeleted: doc.isDeleted, deletedAt: doc.deletedAt, updatedAt: doc.updatedAt,
                     parentFolderID: doc.parentFolderID, name: doc.name, structureRevision: doc.structureRevision)

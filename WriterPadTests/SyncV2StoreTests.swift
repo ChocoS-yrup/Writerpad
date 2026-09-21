@@ -8689,7 +8689,7 @@ final class SyncV2StoreTests: XCTestCase {
             store: LazySyncV2ProjectBindingStore(databaseURL: database),
             handshakeService: nil,
             authenticationService: InitialSnapshotAuthenticationStub(),
-            defaults: defaults
+            defaults: ContractDefaults(value: defaults)
         )
 
         let hasRecorded = try await recorder.hasRecordedInitialSnapshot(

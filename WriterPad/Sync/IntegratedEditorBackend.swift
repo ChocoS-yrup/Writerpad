@@ -178,7 +178,9 @@ final class IntegratedEditorAuthority: @unchecked Sendable {
     func context<T: Sendable>(_ operation: @Sendable () async throws -> T) async rethrows -> T {
         try await Self.$current.withValue(self) {
             try await ReceiveValidationPolicy.$override.withValue(policy) {
-                try await ReceiveValidationPolicy.$operation.withValue(ticket, operation: operation)
+                try await ReceiveValidationPolicy.$operation.withValue(ticket) {
+                    try await operation()
+                }
             }
         }
     }
@@ -187,7 +189,9 @@ final class IntegratedEditorAuthority: @unchecked Sendable {
             try await Self.$sending.withValue(sending) {
                 try self.requireMutation(sending: sending)
                 return try await ReceiveValidationPolicy.$localProject.withValue(IntegratedEditorPlan.local.rawValue) {
-                    try await GeneralValidationMutation.$current.withValue({ try self.requireMutation(sending: sending) }, operation: operation)
+                    try await GeneralValidationMutation.$current.withValue({ try self.requireMutation(sending: sending) }) {
+                        try await operation()
+                    }
                 }
             }
         }
@@ -236,7 +240,7 @@ actor IntegratedEditorBackend {
     }
     func signIn(email: String, password: String) async throws {
         let authority = try begin(), auth = auth
-        let state = try await authority.context { await auth.signIn(email: email, password: password) }
+        let state = await authority.context { await auth.signIn(email: email, password: password) }
         guard case let .authenticated(account) = state, account.userID == journal.state().execution?.accountID else { throw IntegratedEditorError.locked }
         try authority.policy.verifyAccount(account.userID, ticket: authority.ticket)
     }
@@ -256,7 +260,7 @@ actor IntegratedEditorBackend {
                 || state.sources.contains { !$0.enqueued } || queue.pendingCount > 0)
         }
         var state = await auth.currentState()
-        if !state.isAuthenticated { state = try await authority.context { await auth.restoreSession() } }
+        if !state.isAuthenticated { state = await authority.context { await auth.restoreSession() } }
         guard case let .authenticated(user) = state, user.userID == journal.state().execution?.accountID,
               let binding = try await store.binding(for: IntegratedEditorPlan.local), binding.serverProjectID == IntegratedEditorPlan.server,
               binding.ownerSubject == user.userID, binding.kind == .existingServerProject else { throw IntegratedEditorError.locked }

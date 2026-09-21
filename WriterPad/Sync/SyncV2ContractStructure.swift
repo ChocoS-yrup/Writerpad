@@ -2,8 +2,10 @@ import Foundation
 import Supabase
 
 /// UserDefaults의 읽기/쓰기는 스레드 안전하다. 송신 예약에만 전달하는 불변 참조다.
-private struct ContractDefaults: @unchecked Sendable {
+struct ContractDefaults: @unchecked Sendable {
     let value: UserDefaults
+
+    static let standard = ContractDefaults(value: .standard)
 }
 
 enum SyncV2ContractStructureError: Error, Equatable, Sendable {
@@ -224,13 +226,13 @@ actor SyncV2ContractPathRecorder: DurableLocalChangeRecording {
     private let localProjectEpoch: SyncV2ContractEpoch?
     private let isLocalProjectActive: @Sendable (ProjectID) async throws -> Bool
     private let bindingEpoch: SyncV2ContractEpoch?
-    private let defaults: UserDefaults
+    private let defaults: ContractDefaults
 
     init(
         store: LazySyncV2ProjectBindingStore,
         handshakeService: SyncV2HandshakeService?,
         authenticationService: any AuthenticationServicing,
-        defaults: UserDefaults = .standard,
+        defaults: ContractDefaults = .standard,
         bindingEpoch: SyncV2ContractEpoch? = nil,
         structureAuthority: SyncV2ContractStructureAuthority? = nil,
         localProjectEpoch: SyncV2ContractEpoch? = nil,
@@ -265,7 +267,7 @@ actor SyncV2ContractPathRecorder: DurableLocalChangeRecording {
     func record(_ batch: LocalMutationBatch) async -> DurableRecordResult {
         do { try GeneralSyncValidationScope.current.require(local: batch.projectID) }
         catch { return .localSavedButNotQueued(reason: "이 작품은 현재 동기화 검증 범위에 포함되지 않습니다.") }
-        guard ContractPathGate.isOpen(for: batch.projectID, in: defaults) else {
+        guard ContractPathGate.isOpen(for: batch.projectID, in: defaults.value) else {
             return await store.record(batch)
         }
         guard let handshakeService else {
@@ -276,7 +278,7 @@ actor SyncV2ContractPathRecorder: DurableLocalChangeRecording {
         let authEpoch = authenticationService.contractEpoch
         let authRevision = authEpoch?.value ?? 0
         let bindingRevision = bindingEpoch?.value ?? 0
-        let gateRevision = ContractPathGate.revision(for: batch.projectID, in: defaults)
+        let gateRevision = ContractPathGate.revision(for: batch.projectID, in: defaults.value)
         let handshakeEpoch = handshakeService.authorizationEpoch
         let handshakeRevision = handshakeEpoch.value
         guard let binding = try? await store.binding(for: batch.projectID),
@@ -319,7 +321,7 @@ actor SyncV2ContractPathRecorder: DurableLocalChangeRecording {
               (try? await isLocalProjectActive(batch.projectID)) == true,
               localProjectEpoch?.isAvailable == true
         else { return .localSavedButNotQueued(reason: "작품 활성 상태와 구조 기준을 다시 확인해야 합니다.") }
-        let defaults = ContractDefaults(value: self.defaults)
+        let defaults = self.defaults
         let bindingEpoch = self.bindingEpoch
         let authorize: @Sendable () throws -> Void = {
             try Task.checkCancellation()
@@ -436,7 +438,7 @@ actor SyncV2ContractStructureSender: SyncV2GeneralContractSending, SyncV2General
     private let authenticationService: any AuthenticationServicing
     private let uploadPullCoordinator:
         SyncV2ProjectUploadPullCoordinator?
-    private let defaults: UserDefaults
+    private let defaults: ContractDefaults
     private let structureAuthority: SyncV2ContractStructureAuthority?
     private let localProjectEpoch: SyncV2ContractEpoch?
     private let isLocalProjectActive: @Sendable (ProjectID) async throws -> Bool
@@ -455,7 +457,7 @@ actor SyncV2ContractStructureSender: SyncV2GeneralContractSending, SyncV2General
         authenticationService: any AuthenticationServicing,
         uploadPullCoordinator:
             SyncV2ProjectUploadPullCoordinator? = nil,
-        defaults: UserDefaults = .standard,
+        defaults: ContractDefaults = .standard,
         bindingEpoch: SyncV2ContractEpoch? = nil,
         deviceIdentityProvider: (any DeviceIdentityProviding)? = nil,
         structureAuthority: SyncV2ContractStructureAuthority? = nil,
@@ -481,10 +483,10 @@ actor SyncV2ContractStructureSender: SyncV2GeneralContractSending, SyncV2General
     func prepareEmptyVolume(localProjectID: ProjectID) async throws -> SyncV2ContractPreparation {
         guard sendingProjects.insert(localProjectID).inserted else { throw SyncV2ContractStructureError.uploadPullGateBusy }
         defer { sendingProjects.remove(localProjectID) }
-        guard !ContractPathGate.isOpen(for: localProjectID, in: defaults) else {
+        guard !ContractPathGate.isOpen(for: localProjectID, in: defaults.value) else {
             throw SyncV2ContractStructureError.preparationRequiresClosedGate
         }
-        let gateRevision = ContractPathGate.revision(for: localProjectID, in: defaults)
+        let gateRevision = ContractPathGate.revision(for: localProjectID, in: defaults.value)
         let authRevision = authenticationService.contractEpoch?.value
         let bindingRevision = bindingEpoch?.value
         let localRevision = localProjectEpoch?.value
@@ -539,8 +541,8 @@ actor SyncV2ContractStructureSender: SyncV2GeneralContractSending, SyncV2General
         }
         try authorizeQueue()
         try authorizePreparation()
-        guard !Task.isCancelled, !ContractPathGate.isOpen(for: localProjectID, in: defaults),
-              gateRevision == ContractPathGate.revision(for: localProjectID, in: defaults),
+        guard !Task.isCancelled, !ContractPathGate.isOpen(for: localProjectID, in: defaults.value),
+              gateRevision == ContractPathGate.revision(for: localProjectID, in: defaults.value),
               authRevision == authenticationService.contractEpoch?.value, bindingRevision == bindingEpoch?.value,
               localRevision == localProjectEpoch?.value, localProjectEpoch?.isAvailable == true,
               handshakeRevision == handshakeService.authorizationEpoch.value,
@@ -550,8 +552,8 @@ actor SyncV2ContractStructureSender: SyncV2GeneralContractSending, SyncV2General
         try await store.saveContractPreparation(preparation)
         try authorizeQueue()
         try authorizePreparation()
-        guard !Task.isCancelled, !ContractPathGate.isOpen(for: localProjectID, in: defaults),
-              gateRevision == ContractPathGate.revision(for: localProjectID, in: defaults),
+        guard !Task.isCancelled, !ContractPathGate.isOpen(for: localProjectID, in: defaults.value),
+              gateRevision == ContractPathGate.revision(for: localProjectID, in: defaults.value),
               authRevision == authenticationService.contractEpoch?.value, bindingRevision == bindingEpoch?.value,
               localRevision == localProjectEpoch?.value, localProjectEpoch?.isAvailable == true,
               handshakeRevision == handshakeService.authorizationEpoch.value,
@@ -560,7 +562,7 @@ actor SyncV2ContractStructureSender: SyncV2GeneralContractSending, SyncV2General
     }
 
     func discardUnsentPreparation(localProjectID: ProjectID) async throws {
-        guard !sendingProjects.contains(localProjectID), !ContractPathGate.isOpen(for: localProjectID, in: defaults) else {
+        guard !sendingProjects.contains(localProjectID), !ContractPathGate.isOpen(for: localProjectID, in: defaults.value) else {
             throw SyncV2ContractStructureError.preparationRequiresClosedGate
         }
         try await store.discardUnsentPreparation(localProjectID: localProjectID)
@@ -812,9 +814,9 @@ actor SyncV2ContractStructureSender: SyncV2GeneralContractSending, SyncV2General
               let deviceIdentityProvider else { throw SyncV2GeneralConflictError.unavailable }
         let authRevision = authEpoch.value, bindingRevision = bindingEpoch.value, localRevision = localProjectEpoch.value
         let activityEpoch = handshakeService.activityEpoch, activityRevision = activityEpoch.value
-        let gateRevision = ContractPathGate.revision(for: localProjectID, in: defaults)
+        let gateRevision = ContractPathGate.revision(for: localProjectID, in: defaults.value)
         let globalEpoch = GlobalSyncPreference.contractEpoch, globalRevision = globalEpoch.value
-        guard ContractPathGate.isOpen(for: localProjectID, in: defaults), GlobalSyncPreference.isEnabled(in: defaults),
+        guard ContractPathGate.isOpen(for: localProjectID, in: defaults.value), GlobalSyncPreference.isEnabled(in: defaults.value),
               bindingEpoch.isAvailable, localProjectEpoch.isAvailable,
               await handshakeService.canStartContractWrite(), try await isLocalProjectActive(localProjectID),
               let binding = try await store.binding(for: localProjectID), let serverID = binding.serverProjectID,
@@ -826,7 +828,7 @@ actor SyncV2ContractStructureSender: SyncV2GeneralContractSending, SyncV2General
             throw SyncV2GeneralConflictError.unavailable
         }
         let handshakeEpoch = handshakeService.authorizationEpoch, handshakeRevision = handshakeEpoch.value
-        let sharedDefaults = ContractDefaults(value: defaults)
+        let sharedDefaults = defaults
         let authorize: @Sendable () throws -> Void = {
             try Task.checkCancellation()
             try ContractPathGate.reserveStart(for: localProjectID, in: sharedDefaults.value, revision: gateRevision) {
@@ -888,7 +890,7 @@ actor SyncV2ContractStructureSender: SyncV2GeneralContractSending, SyncV2General
     }
 
     func retryGeneralContract(localProjectID: ProjectID) async throws {
-        guard ContractPathGate.isOpen(for: localProjectID, in: defaults), GlobalSyncPreference.isEnabled(in: defaults)
+        guard ContractPathGate.isOpen(for: localProjectID, in: defaults.value), GlobalSyncPreference.isEnabled(in: defaults.value)
         else { throw SyncV2ContractStructureError.gateClosed }
         generalRetries.removeValue(forKey: localProjectID)
         generalResumeMessages.removeValue(forKey: localProjectID)
@@ -899,7 +901,7 @@ actor SyncV2ContractStructureSender: SyncV2GeneralContractSending, SyncV2General
         // 닫힌 관문이나 끊긴 인증도 이미 UUID 계약인 작품을 구형 송신으로
         // 되돌리지 않는다. 반대로 LEGACY 작품의 정상 본문 큐는 유지한다.
         if (try? await store.hasGeneralContractHistory(localProjectID: projectID)) ?? true { return true }
-        guard ContractPathGate.isOpen(for: projectID, in: defaults) else { return false }
+        guard ContractPathGate.isOpen(for: projectID, in: defaults.value) else { return false }
         guard let binding = try? await store.binding(for: projectID), let serverID = binding.serverProjectID,
               let context = SyncV2HandshakeContext.make(authenticationState: await authenticationService.currentState(),
                 localProjectID: projectID, serverProjectID: serverID,
@@ -1053,7 +1055,7 @@ actor SyncV2ContractStructureSender: SyncV2GeneralContractSending, SyncV2General
             throw SyncV2ContractStructureError.uploadPullGateBusy
         }
         defer { sendingProjects.remove(localProjectID) }
-        let gateRevision = ContractPathGate.revision(for: localProjectID, in: defaults)
+        let gateRevision = ContractPathGate.revision(for: localProjectID, in: defaults.value)
         let globalRevision = GlobalSyncPreference.contractEpoch.value
         let authEpoch = authenticationService.contractEpoch
         let authRevision = authEpoch?.value ?? 0
@@ -1061,9 +1063,9 @@ actor SyncV2ContractStructureSender: SyncV2GeneralContractSending, SyncV2General
         let handshakeEpoch = handshakeService.authorizationEpoch
         let activityEpoch = handshakeService.activityEpoch
         let activityRevision = activityEpoch.value
-        guard ContractPathGate.isOpen(for: localProjectID, in: defaults)
+        guard ContractPathGate.isOpen(for: localProjectID, in: defaults.value)
         else { throw SyncV2ContractStructureError.gateClosed }
-        if generalOnly, !GlobalSyncPreference.isEnabled(in: defaults) {
+        if generalOnly, !GlobalSyncPreference.isEnabled(in: defaults.value) {
             throw SyncV2ContractStructureError.gateClosed
         }
         guard let binding = try await store.binding(for: localProjectID),
@@ -1077,7 +1079,7 @@ actor SyncV2ContractStructureSender: SyncV2GeneralContractSending, SyncV2General
             authenticationEpoch: authRevision, bindingEpoch: bindingRevision
         ) else { throw SyncV2ContractStructureError.authenticationRequired }
         if generalOnly, binding.ownerSubject == context.accountID,
-           GlobalSyncPreference.isEnabled(in: defaults), await handshakeService.canStartContractWrite(),
+           GlobalSyncPreference.isEnabled(in: defaults.value), await handshakeService.canStartContractWrite(),
            await handshakeService.standingHandshake(for: context) == nil {
             _ = try await handshakeService.refresh(context: context)
         }
@@ -1114,7 +1116,7 @@ actor SyncV2ContractStructureSender: SyncV2GeneralContractSending, SyncV2General
         }
         if generalOnly {
             guard handshake.projectSyncMode == .idBased else { throw SyncV2ContractStructureError.handshakeMissing }
-            let recoveryDefaults = ContractDefaults(value: defaults)
+            let recoveryDefaults = defaults
             let recoveryBindingEpoch = bindingEpoch
             let authorizeRecovery: @Sendable () throws -> Void = {
                 try Task.checkCancellation()
@@ -1160,7 +1162,7 @@ actor SyncV2ContractStructureSender: SyncV2GeneralContractSending, SyncV2General
             authorizePreparation = nil
         }
         let writerDeviceID = try await deviceIdentityProvider.currentIdentifier().uuid
-        let defaults = ContractDefaults(value: self.defaults)
+        let defaults = self.defaults
         let bindingEpoch = self.bindingEpoch
         let authorize: @Sendable () throws -> Void = {
             try Task.checkCancellation()

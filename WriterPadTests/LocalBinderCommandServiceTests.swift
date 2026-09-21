@@ -107,6 +107,7 @@ final class LocalBinderCommandServiceTests: XCTestCase {
 
     /// 화면에는 사유별 문구 대신 한 문장으로 보여준다. 표시 후 2초 뒤 자동으로
     /// 사라지는 것은 BinderPanel의 기존 처리와 같다.
+    @MainActor
     func testUnsupportedNameUsesSingleUserFacingMessage() {
         XCTAssertEqual(
             BinderViewModel.unsupportedNameMessage,
