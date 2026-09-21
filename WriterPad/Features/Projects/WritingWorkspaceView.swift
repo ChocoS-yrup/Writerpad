@@ -114,6 +114,34 @@ final class WorkspaceLifecycleCoordinator {
     }
 }
 
+@MainActor
+enum WorkspaceSceneTransition {
+    static func apply(
+        _ active: Bool,
+        left: EditorSessionModel,
+        right: EditorSessionModel,
+        updateSync: @MainActor @Sendable (Bool) async -> Void,
+        persistWorkspace: @MainActor @Sendable () async -> Void
+    ) async {
+        if active {
+            // Preserve the existing focus/selection restoration order.
+            await left.updateSceneActivity(true)
+            await right.updateSceneActivity(true)
+            await updateSync(true)
+        } else {
+            // WorkspaceLifecycleCoordinator serializes scene transitions.
+            // Neither pane may delay the other pane's local save.
+            async let leftTransition: Void = left.updateSceneActivity(false)
+            async let rightTransition: Void = right.updateSceneActivity(false)
+            // Stop pull/Realtime while the editors flush; a slow write must
+            // not keep receiving work alive until both panes have finished.
+            await updateSync(false)
+            _ = await (leftTransition, rightTransition)
+            await persistWorkspace()
+        }
+    }
+}
+
 struct WritingWorkspaceShell: View {
     @Environment(\.colorScheme) private var colorScheme
     @Environment(\.scenePhase) private var scenePhase
@@ -2150,12 +2178,11 @@ struct WritingWorkspaceShell: View {
     }
 
     private func updateSceneActivity(_ active: Bool) async {
-        await leftEditorModel.updateSceneActivity(active)
-        await rightEditorModel.updateSceneActivity(active)
-        await workspaceSyncModel.updateSceneActivity(active)
-        if !active {
-            await persistWorkspaceState()
-        }
+        await WorkspaceSceneTransition.apply(
+            active, left: leftEditorModel, right: rightEditorModel,
+            updateSync: { await workspaceSyncModel.updateSceneActivity($0) },
+            persistWorkspace: { await persistWorkspaceState() }
+        )
     }
 
     private func currentSyncEditingGuards()

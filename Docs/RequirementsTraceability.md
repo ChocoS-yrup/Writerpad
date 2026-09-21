@@ -117,4 +117,4 @@
 | SYNC-001 | Supabase 인증·스키마·RLS·RPC | Baseline 2.0 계약 감사, Keychain 세션·RLS/권한·RPC 정적 검사, 대상 프로젝트 migration 적용·검증 | 검증 완료 |
 | SYNC-002 | 영구 동기화 큐·Realtime·lease | 재실행 후 동일 operation ID·1,000개 큐 복구, Realtime 재조정, lease 획득·갱신·해제 자동 테스트 | 검증 완료 |
 | SYNC-003 | Base·Local·Remote 3방향 병합 | Base 영구 보존, 비중첩 자동 병합, 중첩 충돌의 Base·Local·Remote 보존과 재실행 복구 자동 테스트 | 검증 완료 |
-| SYNC-004 | iPad background 서버 업로드 | [정책 확정](SyncV2BackgroundPolicy.md): 로컬 저장 우선·미전송 작업 보존·foreground 재개, background 업로드 완료 보장 없음. 기존 저장/복구 경로 구현됨. 지연 저장·IME·분할 편집·OS 중단의 통합 검증은 남음 | 부분 구현·정책 확정 |
+| SYNC-004 | iPad background 서버 업로드 | [정책·검증](SyncV2BackgroundPolicy.md): 로컬 저장 우선·미전송 작업 보존·foreground 재개, background 업로드 완료 보장 없음. 분할 편집기의 지연/실패/조합 저장과 빠른 복귀 자동 검증 및 순차 저장 결함 수정. OS 중단 실기기 검증은 남음 | 부분 구현·실기기 검증 대기 |
