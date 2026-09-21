@@ -1,5 +1,7 @@
 import Foundation
+#if canImport(Supabase)
 import Supabase
+#endif
 
 struct ValidatedAuthSession: Equatable, Sendable {
     let userID: UUID
@@ -87,6 +89,7 @@ actor SerializedSupabaseAuthTransport: SupabaseAuthTransporting {
     func signOut() async throws { try await run { try await self.base.signOut() } }
 }
 
+#if canImport(Supabase)
 actor LiveSupabaseAuthTransport: SupabaseAuthTransporting {
     private let client: SupabaseClient
     private let receiveClients: ReceiveValidationSDKClients?
@@ -220,6 +223,8 @@ actor LiveSupabaseAuthTransport: SupabaseAuthTransporting {
     }
 }
 
+#endif
+
 struct AuthenticatedAccount: Equatable, Sendable {
     let userID: UUID
     let maskedEmail: String?
@@ -312,6 +317,7 @@ actor SupabaseAuthService: AuthenticationServicing {
     }
 
     private let transport: (any SupabaseAuthTransporting)?
+    private let receiveObserver: (any ReceiveAuthObserving)?
     private let sessionStore: any SessionTokenStoring
     private let restoreTimeout: Duration
     private let refreshMargin: TimeInterval
@@ -323,6 +329,7 @@ actor SupabaseAuthService: AuthenticationServicing {
     ] = [:]
     private var state: AuthenticationState = .localOnly {
         didSet {
+            if !state.isAuthenticated && state != .restoring { receiveObserver?.invalidate() }
             guard oldValue != state else { return }
             SyncV2RecoveryDiagnostics.record(stage: .authentication, event: state.isAuthenticated ? .available : .unavailable, operationID: activeOperationID)
             stateObservers.values.forEach { $0.yield(state) }
@@ -342,16 +349,18 @@ actor SupabaseAuthService: AuthenticationServicing {
     init(
         transport: (any SupabaseAuthTransporting)?,
         sessionStore: any SessionTokenStoring,
+        receiveObserver: (any ReceiveAuthObserving)? = nil,
         restoreTimeout: Duration = SyncV2Timing.standard.authRestoreTimeout,
         refreshMargin: TimeInterval = SyncV2Timing.standard.refreshMargin,
         refreshRetryDelay: Duration =
             SyncV2Timing.standard.refreshRetryDelay,
-        now: @escaping AuthenticationNow = Date.init,
+        now: @escaping AuthenticationNow = { Date() },
         sleep: @escaping AuthenticationSleep = {
             try await ContinuousClock().sleep(for: $0)
         }
     ) {
         self.transport = transport.map { SerializedSupabaseAuthTransport($0) }
+        self.receiveObserver = receiveObserver
         self.sessionStore = sessionStore
         self.restoreTimeout = restoreTimeout
         self.refreshMargin = refreshMargin
@@ -755,6 +764,7 @@ actor SupabaseAuthService: AuthenticationServicing {
                     contractEpoch?.advance()
                     state = .authenticated(AuthenticatedAccount(userID: session.userID, maskedEmail: Self.masked(session.email)))
                     sessionExpiresAt = session.expiresAt
+                    receiveObserver?.accept(operationID, account: session.userID, accessToken: session.accessToken, expiresAt: session.expiresAt)
                     return state
                 }
             } catch { state = .unavailable(.configurationUnavailable); return state }
@@ -786,6 +796,7 @@ actor SupabaseAuthService: AuthenticationServicing {
             )
         )
         sessionExpiresAt = session.expiresAt
+        receiveObserver?.accept(operationID, account: session.userID, accessToken: session.accessToken, expiresAt: session.expiresAt)
         if wasAuthenticated {
             // 같은 계정의 토큰 갱신도 새 인증 수명이다.
             stateObservers.values.forEach { $0.yield(state) }
@@ -890,6 +901,7 @@ actor SupabaseAuthService: AuthenticationServicing {
         contractEpoch?.advance()
         let operationID = UUID()
         activeOperationID = operationID
+        receiveObserver?.begin(operationID)
         SyncV2RecoveryDiagnostics.record(stage: .authentication, event: .started, operationID: operationID)
         return operationID
     }

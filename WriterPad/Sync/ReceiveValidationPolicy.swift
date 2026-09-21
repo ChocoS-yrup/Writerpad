@@ -32,6 +32,7 @@ final class GeneralValidationCapability: @unchecked Sendable {
             documents: [GeneralValidationPlan.document], reviewedRPCs: [], requiresJournal: true))
     }
     func check() throws {
+        try Task.checkCancellation()
         let checked = try lock.withLock {
             guard !stopped else { throw GeneralValidationFailure.denied }
             return standing
@@ -157,7 +158,7 @@ final class ReceiveValidationPolicy: @unchecked Sendable {
     }
     static var current: ReceiveValidationPolicy { override ?? built }
     static let built: ReceiveValidationPolicy = {
-#if DEBUG && (WRITERPAD_RECEIVE_VALIDATION || WRITERPAD_BODY_VALIDATION)
+#if DEBUG && (WRITERPAD_RECEIVE_VALIDATION || WRITERPAD_BODY_VALIDATION || WRITERPAD_NORMAL_EDITOR || WRITERPAD_INTEGRATED_EDITOR)
         let url = URL.applicationSupportDirectory.appendingPathComponent("ReceiveValidation/policy.json")
         return ReceiveValidationPolicy(enabled: true, configuration: try? PolicyStore(url: url).load(),
             bodyValidationEnabled: {
@@ -206,6 +207,8 @@ final class ReceiveValidationPolicy: @unchecked Sendable {
     var denialCount: Int { lock.withLock { denials } }
     func requireSending() throws {
         try GeneralValidationMutation.check()
+        if let integrated = IntegratedEditorAuthority.current, integrated.policy === self { try integrated.requireMutation(sending: true); return }
+        if let normal = NormalEditorAuthority.current, normal.policy === self { try normal.requireMutation(sending: true); return }
         if let capability = GeneralValidationCapability.current, capability.policy === self {
             try capability.requireMutation(sending: true); return
         }
@@ -298,7 +301,8 @@ final class ReceiveValidationPolicy: @unchecked Sendable {
     /// File appliers have a local identity only. The general runner binds the
     /// different server identity; ordinary receive validation keeps its rule.
     func requireLocalApplication(local: ProjectID) throws {
-        let server = GeneralValidationCapability.current?.policy === self
+        if IntegratedEditorAuthority.current?.policy === self { try requireApplication(local: local, server: IntegratedEditorPlan.server); return }
+        let server = (NormalEditorAuthority.current?.policy === self || GeneralValidationCapability.current?.policy === self)
             ? GeneralValidationPlan.server : local.rawValue
         try requireApplication(local: local, server: server)
     }
@@ -306,6 +310,14 @@ final class ReceiveValidationPolicy: @unchecked Sendable {
         try GeneralValidationMutation.check()
         try GeneralSyncValidationScope.current.require(local: local, server: server)
         guard enabled else { return }
+        if let integrated = IntegratedEditorAuthority.current, integrated.policy === self {
+            guard local == IntegratedEditorPlan.local, server == IntegratedEditorPlan.server else { throw Denied.locked }
+            try requireRead(project: server); try integrated.requireMutation(sending: false); return
+        }
+        if let normal = NormalEditorAuthority.current, normal.policy === self {
+            guard local == NormalEditorPlan.local, server == NormalEditorPlan.server else { throw Denied.locked }
+            try requireRead(project: server); try normal.requireMutation(sending: false); return
+        }
         if let capability = GeneralValidationCapability.current, capability.policy === self {
             guard local == GeneralValidationPlan.local, server == GeneralValidationPlan.server else { throw Denied.locked }
             try requireRead(project: server); try capability.requireMutation(sending: false); return
@@ -323,6 +335,16 @@ final class ReceiveValidationPolicy: @unchecked Sendable {
         try GeneralValidationMutation.check()
         if let local { try GeneralSyncValidationScope.current.require(local: local) }
         guard enabled else { return try body() }
+        if let integrated = IntegratedEditorAuthority.current, integrated.policy === self {
+            guard local == nil || local == IntegratedEditorPlan.local else { throw Denied.locked }
+            try integrated.requireMutation(); return try body()
+        }
+        if let normal = NormalEditorAuthority.current, normal.policy === self {
+            guard local == nil || local == NormalEditorPlan.local else { throw Denied.locked }
+            return try lock.withLock {
+                try requireRead(project: NormalEditorPlan.server); try normal.requireMutation(); return try body()
+            }
+        }
         if let capability = GeneralValidationCapability.current, capability.policy === self {
             guard Self.localProject == GeneralValidationPlan.local.rawValue, local == nil || local == GeneralValidationPlan.local else { throw Denied.locked }
             return try lock.withLock {
@@ -358,10 +380,16 @@ final class ReceiveValidationPolicy: @unchecked Sendable {
             if bodyContext != nil { try checkBodyLocked(requireTask: false) }
             let method = request.httpMethod ?? "GET"
             let items = parts.queryItems ?? []
+            if let integrated = IntegratedEditorAuthority.current, integrated.policy === self {
+                try integrated.authorize(request); return value
+            }
             if url.path == "/auth/v1/token", method == "POST",
                items.count == 1, items[0].name == "grant_type",
                ["password", "refresh_token"].contains(items[0].value ?? "") { return value }
             if url.path == "/auth/v1/user", method == "GET", items.isEmpty { return value }
+            if let normal = NormalEditorAuthority.current, normal.policy === self {
+                try checkReadLocked(project: NormalEditorPlan.server); try normal.authorize(request); return value
+            }
             if method == "POST", url.path.hasPrefix("/rest/v1/rpc/") {
                 if let capability = GeneralValidationCapability.current, capability.policy === self {
                     guard verifiedAccount == configuration?.accountID, verifiedAccount != nil,
@@ -588,7 +616,7 @@ final class ReceiveValidationPolicy: @unchecked Sendable {
 final class ReceiveValidationURLProtocol: URLProtocol, @unchecked Sendable {
     private final class Registry: @unchecked Sendable {
         let lock = NSLock()
-        struct Context { let policy: ReceiveValidationPolicy; let ticket: ReceiveValidationPolicy.Ticket?; let scope: GeneralSyncValidationScope; let execution: GeneralValidationExecution?; let localMutation: Bool; let capability: GeneralValidationCapability? }
+        struct Context { let policy: ReceiveValidationPolicy; let ticket: ReceiveValidationPolicy.Ticket?; let scope: GeneralSyncValidationScope; let execution: GeneralValidationExecution?; let localMutation: Bool; let capability: GeneralValidationCapability?; let integrated: IntegratedEditorAuthority? }
         var contexts: [String: Context] = [:]
     }
     private static let registry = Registry()
@@ -624,18 +652,23 @@ final class ReceiveValidationURLProtocol: URLProtocol, @unchecked Sendable {
             do {
                 let request = outgoing
                 guard let context, !context.localMutation, !context.policy.enabled || context.ticket != nil else { throw ReceiveValidationPolicy.Denied.locked }
+                try await IntegratedEditorAuthority.$current.withValue(context.integrated) {
                 try await GeneralValidationCapability.$current.withValue(context.capability) {
                 let policy = context.policy, ticket = context.ticket
                 try context.scope.authorize(request)
                 _ = try policy.authorize(request, ticket: ticket)
                 try policy.reserveBodyRequest(request)
                 if context.scope.restricted, context.scope.selection?.requiresJournal == true,
-                   request.url?.path.hasPrefix("/rest/") == true, context.execution == nil,
+                   request.url?.path.hasPrefix("/rest/") == true, context.execution == nil, context.integrated == nil,
                    try context.capability?.isHandshake(request) != true {
                     throw GeneralValidationFailure.denied
                 }
                 try context.capability?.reserveHandshake(request)
                 try context.execution?.begin(request)
+                if let integrated = context.integrated {
+                    guard request.url?.path.hasPrefix("/auth/v1/") == true else { throw IntegratedEditorError.scope }
+                    try integrated.journal.reserve(kind: "auth")
+                }
                 let (data, response) = try await policy.network(request)
                 try Task.checkCancellation()
                 try context.scope.authorize(request)
@@ -647,6 +680,7 @@ final class ReceiveValidationURLProtocol: URLProtocol, @unchecked Sendable {
                 client?.urlProtocol(self, didLoad: data)
                 client?.urlProtocolDidFinishLoading(self)
                 }
+                }
             } catch { context?.capability?.stop(); context?.execution?.stop(); client?.urlProtocol(self, didFailWithError: error) }
         }
     }
@@ -657,7 +691,7 @@ final class ReceiveValidationURLProtocol: URLProtocol, @unchecked Sendable {
     static func session(policy: ReceiveValidationPolicy, ticket: ReceiveValidationPolicy.Ticket?) -> URLSession {
         // Each session is permanently bound to its originating grant, including SDK refresh.
         let key = UUID().uuidString
-        registry.lock.withLock { registry.contexts[key] = .init(policy: policy, ticket: ticket, scope: GeneralSyncValidationScope.current, execution: GeneralValidationExecution.current, localMutation: GeneralValidationMutation.current != nil, capability: GeneralValidationCapability.current) }
+        registry.lock.withLock { registry.contexts[key] = .init(policy: policy, ticket: ticket, scope: GeneralSyncValidationScope.current, execution: GeneralValidationExecution.current, localMutation: GeneralValidationMutation.current != nil, capability: GeneralValidationCapability.current, integrated: IntegratedEditorAuthority.current) }
         let configuration = URLSessionConfiguration.ephemeral
         configuration.protocolClasses = [ReceiveValidationURLProtocol.self]
         configuration.httpAdditionalHeaders = [policyHeader: key]

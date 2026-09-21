@@ -10,7 +10,7 @@ struct GeneralValidationIsolatedStorage: Sendable {
         try authorize()
         guard let contract = try GeneralValidationExecution.Frozen(request: request, stage: .sendUpdate).contract,
               try SyncV2Contract.validateDocumentCommitResponse(request: contract, response: response) == .committed,
-              response.objectValue?["results"]?.arrayValue?.first?.objectValue?["result_revision"] == .int(2) else { throw GeneralValidationFailure.denied }
+              response.objectValue?["results"]?.arrayValue?.first?.objectValue?["result_revision"] == .int(Int(GeneralValidationPlan.outgoingRevision)) else { throw GeneralValidationFailure.denied }
         try await GeneralValidationMutation.$current.withValue(authorize) {
             try await store.completeContractStructure(.init(localProjectID: GeneralValidationPlan.local,
                 serverProjectID: GeneralValidationPlan.server, request: contract), response: response)
@@ -106,7 +106,16 @@ actor GeneralValidationProductAdapter {
               state.serverRevision == revision, !state.hasActiveOperation, !state.hasUnresolvedConflict, !state.hasPathCollision,
               state.serverPath == node.relativePath.rawValue else { throw GeneralValidationFailure.denied }
     }
+    func makeEditor() async throws -> GeneralValidationEditor {
+        guard GeneralValidationPlan.editorEnabled else { throw GeneralValidationFailure.denied }
+        try await idle()
+        try await requireBody(revision: GeneralValidationPlan.incomingRevision, content: GeneralValidationPlan.incoming)
+        let editor = await GeneralValidationEditor(documents: documents, local: local)
+        try await editor.open(node())
+        return editor
+    }
     func saveAndCaptureRequest(bearer: String, publishableKey: String,
+                               editor: GeneralValidationEditor? = nil, draft: GeneralValidationEditor.Draft? = nil,
                                authorize: @escaping @Sendable () throws -> Void) async throws -> URLRequest {
         // A review build must fail before changing TXT, not only when claiming.
         try authorize(); try ReceiveValidationPolicy.current.requireSending()
@@ -116,15 +125,24 @@ actor GeneralValidationProductAdapter {
         standingAuthorization = standing
         let checked: @Sendable () throws -> Void = { try authorize(); try standing() }
         return try await GeneralValidationMutation.$current.withValue(checked) {
-            try await idle(); try await requireBody(revision: 1, content: GeneralValidationPlan.incoming)
+            try await idle(); try await requireBody(revision: GeneralValidationPlan.incomingRevision, content: GeneralValidationPlan.incoming)
             let node = try await node(), device = try await identity.currentIdentifier().uuid
             guard let binding = try await store.binding(for: GeneralValidationPlan.local),
                   binding.serverProjectID == GeneralValidationPlan.server, binding.kind == .existingServerProject else { throw GeneralValidationFailure.denied }
             try checked()
-            let generation = UInt64((GeneralValidationRuntimeValues.current?.date ?? Date()).timeIntervalSince1970 * 1_000_000)
-            let receipt = try await local.saveCompared(.init(projectID: node.projectID, documentID: node.id,
-                relativePath: node.relativePath, text: GeneralValidationPlan.outgoing, generation: generation,
-                expectedCurrentContentHash: SHA256ContentHasher().sha256(for: Data(GeneralValidationPlan.incoming.utf8))), authorize: checked)
+            let generation: UInt64
+            let receipt: DocumentSaveReceipt
+            if GeneralValidationPlan.editorEnabled {
+                guard let editor, let draft, let values = GeneralValidationRuntimeValues.current else { throw GeneralValidationFailure.denied }
+                generation = values.editorGeneration
+                GeneralValidationFailureDiagnostic.mark(.editorSave)
+                receipt = try await editor.save(draft, authorize: checked)
+            } else {
+                generation = UInt64((GeneralValidationRuntimeValues.current?.date ?? Date()).timeIntervalSince1970 * 1_000_000)
+                receipt = try await local.saveCompared(.init(projectID: node.projectID, documentID: node.id,
+                    relativePath: node.relativePath, text: GeneralValidationPlan.outgoing, generation: generation,
+                    expectedCurrentContentHash: SHA256ContentHasher().sha256(for: Data(GeneralValidationPlan.incoming.utf8))), authorize: checked)
+            }
             try checked()
             guard case let .queued(ids) = receipt.durableRecordResult, ids.count == 1,
                   receipt.projectID == node.projectID, receipt.documentID == node.id, receipt.relativePath == node.relativePath,
@@ -171,9 +189,9 @@ actor GeneralValidationProductAdapter {
         try await GeneralValidationMutation.$current.withValue(checked) {
             try checked()
             guard try SyncV2Contract.validateDocumentCommitResponse(request: pending.request, response: response) == .committed,
-                  response.objectValue?["results"]?.arrayValue?.first?.objectValue?["result_revision"] == .int(2) else { throw GeneralValidationFailure.denied }
+                  response.objectValue?["results"]?.arrayValue?.first?.objectValue?["result_revision"] == .int(Int(GeneralValidationPlan.outgoingRevision)) else { throw GeneralValidationFailure.denied }
             try await store.completeContractStructure(pending, response: response)
-            try checked(); try await requireBody(revision: 2, content: GeneralValidationPlan.outgoing)
+            try checked(); try await requireBody(revision: GeneralValidationPlan.outgoingRevision, content: GeneralValidationPlan.outgoing)
             try await idle(); try checked()
         }
     }
@@ -287,6 +305,7 @@ actor GeneralValidationRuntime {
             return .init(capability: capability, handshake: handshake, binding: binding, baseline: baseline)
         } catch { capability.stop(); throw error }
     }
+    func makeEditor() async throws -> GeneralValidationEditor { try await adapter().makeEditor() }
     private func readRequests(bearer: String) -> [URLRequest] {
         ["documents", "folders", "tree_orders"].map { name in
             var url = URLComponents(url: configuration.url.appendingPathComponent("rest/v1/" + name), resolvingAgainstBaseURL: false)!
@@ -305,92 +324,127 @@ actor GeneralValidationRuntime {
         }
     }
     func run(stage: GeneralValidationPlan.Stage, prepared: Prepared, probe: GeneralValidationLocalProbe,
-             before: GeneralValidationLocalProbe.Snapshot, journalRoot: URL) async throws -> GeneralValidationLocalProbe.Snapshot {
+             before: GeneralValidationLocalProbe.Snapshot, journalRoot: URL, editor: GeneralValidationEditor? = nil) async throws -> GeneralValidationLocalProbe.Snapshot {
         guard !busy, before.stage == stage else { throw GeneralValidationFailure.denied }; busy = true
         defer { busy = false }
+        let draft: GeneralValidationEditor.Draft?
+        if GeneralValidationPlan.editorEnabled && stage == .sendUpdate {
+            guard let editor else { throw GeneralValidationEditor.Failure.wrongDraft }
+            draft = try await editor.draft()
+        } else { draft = nil }
         let capability = prepared.capability
-        return try await capability.withContext {
-            try await GeneralValidationRuntimeValues.$current.withValue(GeneralValidationRuntimeValues()) {
-                try capability.begin(stage)
-                let cursor = GeneralValidationRuntimeCursor(check: {
-                    try capability.check()
-                    guard try probe.capture() == before else { throw GeneralValidationFailure.denied }
-                })
-                try cursor.check()
-                try FileManager.default.createDirectory(at: journalRoot, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
-                let reservation = try GeneralValidationJournal(root: journalRoot, stage: stage)
-                var execution: GeneralValidationExecution?
-                let actual = self.adapter()
-                do {
-                    let planningRoot = journalRoot.appendingPathComponent("planning")
-                    try FileManager.default.createDirectory(at: planningRoot, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
-                    if stage != .sendUpdate {
-                        let requests = await self.readRequests(bearer: capability.bearer)
-                        try GeneralValidationRemoteSnapshot.validateRequests(requests); try capability.register(requests)
-                        let run = try GeneralValidationExecution(root: journalRoot, stage: stage, requests: requests, bearer: capability.bearer,
-                            checkCurrent: { try capability.check() }, checkLocal: { try cursor.check() }, reservation: reservation)
-                        execution = run
-                        var data: [Data] = []
-                        for request in requests { data.append(try await self.exchange(request, execution: run).0) }
-                        try run.requireAcceptedPayloads(data)
-                        let snapshot = try GeneralValidationRemoteSnapshot(stage: stage, data: data, baseline: prepared.baseline)
-                        let copy = try GeneralValidationPlanningCopy.create(from: probe, in: planningRoot)
-                        let predicted = try GeneralValidationIsolatedStorage(copy: copy, identity: self.identity,
-                            binding: prepared.binding, handshake: prepared.handshake, preflight: { try capability.check() })
-                        _ = try await GeneralValidationMutation.$current.withValue({ try cursor.check() }) {
-                            try await predicted.adapter.apply(snapshot, authorize: { try cursor.check(); try copy.requireOriginalUnchanged() })
+        let diagnostic = GeneralValidationFailureDiagnostic()
+        return try await GeneralValidationFailureDiagnostic.$current.withValue(diagnostic) {
+            try await capability.withContext {
+                try await GeneralValidationRuntimeValues.$current.withValue(GeneralValidationRuntimeValues()) {
+                    try capability.begin(stage)
+                    let cursor = GeneralValidationRuntimeCursor(check: {
+                        try capability.check()
+                        guard try probe.capture() == before else { throw GeneralValidationFailure.denied }
+                    })
+                    try cursor.check()
+                    try FileManager.default.createDirectory(at: journalRoot, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
+                    let reservation = try GeneralValidationJournal(root: journalRoot, stage: stage)
+                    var execution: GeneralValidationExecution?
+                    let actual = self.adapter()
+                    do {
+                        let planningRoot = journalRoot.appendingPathComponent("planning")
+                        try FileManager.default.createDirectory(at: planningRoot, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
+                        if stage != .sendUpdate {
+                            let requests = await self.readRequests(bearer: capability.bearer)
+                            try GeneralValidationRemoteSnapshot.validateRequests(requests); try capability.register(requests)
+                            let run = try GeneralValidationExecution(root: journalRoot, stage: stage, requests: requests, bearer: capability.bearer,
+                                checkCurrent: { try capability.check() }, checkLocal: { try cursor.check() }, reservation: reservation)
+                            execution = run
+                            var data: [Data] = []
+                            for request in requests { data.append(try await self.exchange(request, execution: run).0) }
+                            try run.requireAcceptedPayloads(data)
+                            diagnostic.enter(.responses, .validateResponse)
+                            let snapshot = try GeneralValidationRemoteSnapshot(stage: stage, data: data, baseline: prepared.baseline)
+                            diagnostic.enter(.prediction, .copy)
+                            let copy = try GeneralValidationPlanningCopy.create(from: probe, in: planningRoot)
+                            let predicted = try GeneralValidationIsolatedStorage(copy: copy, identity: self.identity,
+                                binding: prepared.binding, handshake: prepared.handshake, preflight: { try capability.check() })
+                            // The cursor already compares the complete original probe
+                            // to the sealed starting snapshot on every authorization.
+                            diagnostic.enter(.prediction, .apply)
+                            _ = try await GeneralValidationMutation.$current.withValue({ try cursor.check() }) {
+                                try await predicted.adapter.apply(snapshot, authorize: { try cursor.check() })
+                            }
+                            diagnostic.enter(.prediction, .checkpoint)
+                            let transition = try copy.predictedCheckpoint().makeTransition(probe: probe, current: { try capability.check() })
+                            try cursor.check()
+                            diagnostic.enter(.original, .apply)
+                            _ = try await transition.advance { authorize in try await actual.apply(snapshot, authorize: authorize) }
+                            try cursor.finish(transition)
+                        } else {
+                            diagnostic.enter(.prediction, .copy)
+                            // The journal was reserved before planning or saving.
+                            let copy = try GeneralValidationPlanningCopy.create(from: probe, in: planningRoot)
+                            let predicted = try GeneralValidationIsolatedStorage(copy: copy, identity: self.identity,
+                                binding: prepared.binding, handshake: prepared.handshake, preflight: { try capability.check() })
+                            diagnostic.enter(.prediction, .apply)
+                            let predictedEditor: GeneralValidationEditor?
+                            if let draft {
+                                let value = try await predicted.adapter.makeEditor()
+                                await value.usePrediction(draft)
+                                predictedEditor = value
+                            } else { predictedEditor = nil }
+                            let request = try await GeneralValidationMutation.$current.withValue({ try cursor.check() }) {
+                                try await predicted.adapter.saveAndCaptureRequest(bearer: capability.bearer, publishableKey: self.configuration.publishableKey,
+                                    editor: predictedEditor, draft: draft, authorize: { try cursor.check() })
+                            }
+                            diagnostic.enter(.prediction, .checkpoint)
+                            let save = try copy.predictedCheckpoint(savedForUpdate: true).makeTransition(probe: probe, current: { try capability.check() })
+                            try cursor.check()
+                            diagnostic.enter(.original, .apply)
+                            let actualRequest = try await save.advance { authorize in
+                                try await actual.saveAndCaptureRequest(bearer: capability.bearer, publishableKey: self.configuration.publishableKey, editor: editor, draft: draft, authorize: authorize)
+                            }
+                            await predicted.adapter.end()
+                            try cursor.finish(save)
+                            guard GeneralSyncValidationScope.fingerprint(actualRequest) == GeneralSyncValidationScope.fingerprint(request) else { throw GeneralValidationFailure.denied }
+                            try capability.register([actualRequest])
+                            let run = try GeneralValidationExecution(root: journalRoot, stage: stage, requests: [actualRequest], bearer: capability.bearer,
+                                checkCurrent: { try capability.check() }, checkLocal: { try cursor.check() }, reservation: reservation)
+                            execution = run
+                            diagnostic.enter(.responses, .transport)
+                            let response = try await self.exchange(actualRequest, execution: run)
+                            try run.requireAcceptedPayloads([response.0])
+                            let json = try JSONDecoder().decode(SyncV2JSON.self, from: response.0)
+                            diagnostic.enter(.prediction, .copy)
+                            let completionCopy = try GeneralValidationPlanningCopy.create(from: probe, in: planningRoot, savedForUpdate: true)
+                            let completionPrediction = try GeneralValidationIsolatedStorage(copy: completionCopy, identity: self.identity,
+                                binding: prepared.binding, handshake: prepared.handshake, preflight: { try capability.check() })
+                            diagnostic.enter(.prediction, .apply)
+                            try await completionPrediction.completeAccepted(actualRequest, response: json,
+                                authorize: { try cursor.check() })
+                            diagnostic.enter(.prediction, .checkpoint)
+                            let completion = try completionCopy.predictedCheckpoint().makeTransition(probe: probe, current: { try capability.check() })
+                            try cursor.check()
+                            diagnostic.enter(.original, .finish)
+                            try await completion.advance { authorize in try await actual.finish(json, authorize: authorize) }
+                            try cursor.finish(completion)
                         }
-                        let transition = try copy.predictedCheckpoint().makeTransition(probe: probe, current: { try capability.check() })
-                        try cursor.check()
-                        _ = try await transition.advance { authorize in try await actual.apply(snapshot, authorize: authorize) }
-                        try cursor.finish(transition)
-                    } else {
-                        // The journal was reserved before planning or saving.
-                        let copy = try GeneralValidationPlanningCopy.create(from: probe, in: planningRoot)
-                        let predicted = try GeneralValidationIsolatedStorage(copy: copy, identity: self.identity,
-                            binding: prepared.binding, handshake: prepared.handshake, preflight: { try capability.check() })
-                        let request = try await GeneralValidationMutation.$current.withValue({ try cursor.check() }) {
-                            try await predicted.adapter.saveAndCaptureRequest(bearer: capability.bearer, publishableKey: self.configuration.publishableKey,
-                                authorize: { try cursor.check(); try copy.requireOriginalUnchanged() })
-                        }
-                        let save = try copy.predictedCheckpoint(savedForUpdate: true).makeTransition(probe: probe, current: { try capability.check() })
-                        try cursor.check()
-                        let actualRequest = try await save.advance { authorize in
-                            try await actual.saveAndCaptureRequest(bearer: capability.bearer, publishableKey: self.configuration.publishableKey, authorize: authorize)
-                        }
-                        await predicted.adapter.end()
-                        try cursor.finish(save)
-                        guard GeneralSyncValidationScope.fingerprint(actualRequest) == GeneralSyncValidationScope.fingerprint(request) else { throw GeneralValidationFailure.denied }
-                        try capability.register([actualRequest])
-                        let run = try GeneralValidationExecution(root: journalRoot, stage: stage, requests: [actualRequest], bearer: capability.bearer,
-                            checkCurrent: { try capability.check() }, checkLocal: { try cursor.check() }, reservation: reservation)
-                        execution = run
-                        let response = try await self.exchange(actualRequest, execution: run)
-                        try run.requireAcceptedPayloads([response.0])
-                        let json = try JSONDecoder().decode(SyncV2JSON.self, from: response.0)
-                        let completionCopy = try GeneralValidationPlanningCopy.create(from: probe, in: planningRoot, savedForUpdate: true)
-                        let completionPrediction = try GeneralValidationIsolatedStorage(copy: completionCopy, identity: self.identity,
-                            binding: prepared.binding, handshake: prepared.handshake, preflight: { try capability.check() })
-                        try await completionPrediction.completeAccepted(actualRequest, response: json,
-                            authorize: { try cursor.check(); try completionCopy.requireOriginalUnchanged() })
-                        let completion = try completionCopy.predictedCheckpoint().makeTransition(probe: probe, current: { try capability.check() })
-                        try cursor.check()
-                        try await completion.advance { authorize in try await actual.finish(json, authorize: authorize) }
-                        try cursor.finish(completion)
+                        diagnostic.enter(.completion, .finish)
+                        guard let execution else { throw GeneralValidationFailure.denied }
+                        try execution.completeAfterLocalValidation { try cursor.check() }
+                        try cursor.check(); let result = try probe.capture(); try cursor.check()
+                        await actual.end(); try capability.finishStage()
+                        return result
+                    } catch {
+                        capability.stop()
+                        execution?.stop(); try? reservation.append(.stopped, sequence: 0)
+                        diagnostic.observeOriginal(probe)
+                        try? diagnostic.preserve(error: error, journal: reservation, root: journalRoot)
+                        await actual.end(); throw error
                     }
-                    guard let execution else { throw GeneralValidationFailure.denied }
-                    try execution.completeAfterLocalValidation { try cursor.check() }
-                    try cursor.check(); let result = try probe.capture(); try cursor.check()
-                    await actual.end(); try capability.finishStage()
-                    return result
-                } catch {
-                    execution?.stop(); try? reservation.append(.stopped, sequence: 0)
-                    capability.stop(); await actual.end(); throw error
                 }
             }
         }
     }
 }
+
 private final class GeneralValidationRuntimeCursor: @unchecked Sendable {
     private let lock = NSRecursiveLock()
     private var checked: @Sendable () throws -> Void

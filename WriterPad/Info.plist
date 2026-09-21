@@ -2,9 +2,13 @@
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
-	<key>CFBundleDisplayName</key>
-	<string>$(WRITERPAD_DISPLAY_NAME)</string>
-	<key>LSSupportsOpeningDocumentsInPlace</key>
+	<key>UIAppFonts</key>
+	<array>
+		<string>malgun.ttf</string>
+		<string>malgunbd.ttf</string>
+		<string>malgunsl.ttf</string>
+	</array>
+	<key>UIFileSharingEnabled</key>
 	<true/>
 	<key>UTExportedTypeDeclarations</key>
 	<array>
@@ -39,14 +43,6 @@
 			</dict>
 		</dict>
 	</array>
-	<key>UIAppFonts</key>
-    <array>
-        <string>malgun.ttf</string>
-        <string>malgunbd.ttf</string>
-        <string>malgunsl.ttf</string>
-	</array>
-	<key>UIFileSharingEnabled</key>
-	<true/>
 	<key>WriterPadSupabasePublishableKey</key>
 	<string>$(WRITERPAD_SUPABASE_PUBLISHABLE_KEY)</string>
 	<key>WriterPadSupabaseURL</key>

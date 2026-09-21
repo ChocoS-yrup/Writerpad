@@ -29,6 +29,8 @@ final class AppEnvironment: ObservableObject {
     let deviceIdentityService: any DeviceIdentityProviding
     let projectBindingService: any ProjectBindingServicing
     var bodyValidationService: BodyValidationService?
+    var integratedEditorSession: IntegratedEditorSession?
+    var normalEditorSession: NormalEditorSession?
     var generalValidationModel: GeneralValidationScreenModel?
     var makeGeneralValidationAdapter: (@Sendable () -> GeneralValidationProductAdapter)?
     let serverProjectCatalog: ServerProjectCatalogService?
@@ -52,10 +54,10 @@ final class AppEnvironment: ObservableObject {
         workspaceStateRepository: any WorkspaceStateRepository,
         projectManager: any ProjectManaging,
         projectImporter: any ProjectImporting,
-        binderRepository: any BinderRepository,
-        binderCommands: any BinderCommanding,
         receivePromotionInspector: any ReceivePromotionPackageInspecting,
         receivePromotionTransaction: any ReceivePromotionTransacting,
+        binderRepository: any BinderRepository,
+        binderCommands: any BinderCommanding,
         localDocumentStore: any LocalDocumentStoring,
         searchService: any Searching,
         backupStore: any BackupStoring,
@@ -87,10 +89,10 @@ final class AppEnvironment: ObservableObject {
         self.workspaceStateRepository = workspaceStateRepository
         self.projectManager = projectManager
         self.projectImporter = projectImporter
-        self.binderRepository = binderRepository
-        self.binderCommands = binderCommands
         self.receivePromotionInspector = receivePromotionInspector
         self.receivePromotionTransaction = receivePromotionTransaction
+        self.binderRepository = binderRepository
+        self.binderCommands = binderCommands
         self.localDocumentStore = localDocumentStore
         self.searchService = searchService
         self.exporter = exporter ?? LocalManuscriptExporter(
@@ -132,7 +134,11 @@ final class AppEnvironment: ObservableObject {
     }
 
     static func live() throws -> AppEnvironment {
+#if WRITERPAD_AUTOSAVE_ISOLATED
+        throw AutoSaveIsolationError.incomplete
+#else
         try make(isStoredInMemoryOnly: false)
+#endif
     }
 
     static func testing() throws -> AppEnvironment {
@@ -538,10 +544,10 @@ final class AppEnvironment: ObservableObject {
             workspaceStateRepository: repository,
             projectManager: projectManager,
             projectImporter: projectImporter,
-            binderRepository: binderRepository,
-            binderCommands: binderCommands,
             receivePromotionInspector: receivePromotionReader,
             receivePromotionTransaction: receivePromotionTransaction,
+            binderRepository: binderRepository,
+            binderCommands: binderCommands,
             localDocumentStore: localDocumentStore,
             searchService: searchService,
             backupStore: backupStore,
@@ -566,7 +572,7 @@ final class AppEnvironment: ObservableObject {
             serverProjectCatalog: serverProjectCatalog,
             exporter: exporter
         )
-        if GeneralSyncValidationScope.current.restricted, !isStoredInMemoryOnly,
+        if GeneralSyncValidationScope.current.restricted, !NormalEditorPlan.enabled, !IntegratedEditorPlan.enabled, !isStoredInMemoryOnly,
            let syncV2Store, let metadataURL = container.configurations.first?.url, let syncURL = SyncV2Store.defaultDatabaseURL() {
             environment.generalValidationModel = GeneralValidationScreenModel(
                 auth: authenticationService, bindingEpoch: contractBindingEpoch,
@@ -581,7 +587,8 @@ final class AppEnvironment: ObservableObject {
                 probe: {
                     GeneralValidationLocalProbe(syncURL: syncURL, metadataURL: metadataURL,
                         workspace: try await workspaceLocator.workspaceRoot(for: GeneralValidationPlan.local))
-                })
+                }, reviewedRecoverySHA256: GeneralValidationJournal.reviewedRecoveryHash(arguments: ProcessInfo.processInfo.arguments),
+                reviewedRecoveryID: GeneralValidationJournal.reviewedRecoveryID(arguments: ProcessInfo.processInfo.arguments))
         }
         if GeneralSyncValidationScope.current.restricted, let syncV2Store, let snapshotStateStore {
             let generalPreflight: @Sendable (Bool) async throws -> (@Sendable () throws -> Void) = { requiresBaseline in
@@ -676,6 +683,52 @@ final class AppEnvironment: ObservableObject {
                 local: localDocumentStore, puller: snapshotPullService, snapshot: snapshot, commit: commit,
                 lease: lease, handshake: handshake, auth: authenticationService, identity: deviceIdentityService,
                 coordinator: uploadPullCoordinator, bindingEpoch: contractBindingEpoch)
+        }
+        if NormalEditorPlan.enabled, !isStoredInMemoryOnly, let syncV2Store,
+           case let .configured(configuration) = supabaseClientProvider.configurationState {
+            let journal = try NormalEditorJournal(root: URL.applicationSupportDirectory.appendingPathComponent("NormalEditor/" + NormalEditorPlan.id))
+            let normalLocal = LocalDocumentStore(workspaceLocator: workspaceLocator, metadataUpdater: repository,
+                durableChangeRecorder: NormalEditorRecorder(journal: journal), syncMutationGate: syncMutationGate)
+            let scopedLocal = NormalEditorDocumentStore(local: normalLocal, journal: journal)
+            let editor = EditorSessionModel(documentRepository: repository, documentStore: scopedLocal,
+                workspaceStateRepository: repository, preserveDraft: { id, text, cursor in
+                    guard id.rawValue == NormalEditorPlan.document else { throw NormalEditorError.target }
+                    try journal.saveDraft(text: text, cursor: cursor)
+                })
+            let backend = LiveNormalEditorBackend(store: syncV2Store, documents: repository, local: normalLocal,
+                applier: localSnapshotApplier, mutationGate: syncMutationGate, auth: authenticationService,
+                configuration: configuration, journal: journal, bindingEpoch: contractBindingEpoch,
+                projectEpoch: projectManager.contractLifecycleEpoch)
+            environment.normalEditorSession = NormalEditorSession(editor: editor, journal: journal, backend: backend,
+                documents: repository, auth: authenticationService)
+        }
+        if IntegratedEditorPlan.enabled, !isStoredInMemoryOnly, let syncV2Store, let snapshotStateStore,
+           case let .configured(configuration) = supabaseClientProvider.configurationState {
+            let journal = try IntegratedEditorJournal(root: URL.applicationSupportDirectory.appendingPathComponent("IntegratedEditor/" + IntegratedEditorPlan.id))
+            let wakeup = IntegratedEditorWakeup()
+            let recorder = IntegratedEditorRecorder(journal: journal, wakeup: wakeup)
+            let integratedLocal = LocalDocumentStore(workspaceLocator: workspaceLocator, metadataUpdater: repository,
+                durableChangeRecorder: recorder, syncMutationGate: syncMutationGate)
+            let scopedLocal = IntegratedEditorDocumentStore(local: integratedLocal, journal: journal)
+            let commands = LocalBinderCommandService(metadataStore: repository, workspaceStateRepository: repository,
+                workspaceLocator: workspaceLocator, durableChangeRecorder: recorder, syncMutationGate: syncMutationGate,
+                recoverProjectAliases: false, shouldRecover: { transaction in
+                    transaction.projectID == IntegratedEditorPlan.local &&
+                    (IntegratedEditorPlan.contains(transaction.destinationPath.rawValue) ||
+                     transaction.sourcePath.map { IntegratedEditorPlan.contains($0.rawValue) } == true) &&
+                    transaction.kind != .permanentDelete && transaction.kind != .emptyTrash
+                })
+            let backend = IntegratedEditorBackend(store: syncV2Store, journal: journal, auth: authenticationService,
+                configuration: configuration, bindingEpoch: contractBindingEpoch, projectEpoch: projectManager.contractLifecycleEpoch,
+                makePuller: { snapshot in
+                    SyncV2SnapshotPullService(client: snapshot, stateStore: snapshotStateStore,
+                        localApplier: localSnapshotApplier,
+                        mergeStore: LocalSyncV2SnapshotMergeStore(workspaceLocator: workspaceLocator),
+                        folderApplier: SyncV2RemoteFolderApplier(documentRepository: repository, workspaceLocator: workspaceLocator),
+                        folderDocuments: repository, mutationGate: syncMutationGate)
+                })
+            environment.integratedEditorSession = IntegratedEditorSession(journal: journal, backend: backend,
+                documents: repository, local: scopedLocal, workspace: repository, commands: commands, wakeup: wakeup)
         }
         return environment
     }
