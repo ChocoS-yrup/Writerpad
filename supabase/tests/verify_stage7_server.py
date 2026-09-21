@@ -32,6 +32,7 @@ HANDSHAKE_NAME = "20260820113209_authenticated_sync_handshake.sql"
 RESTORE_HANDSHAKE_NAME = "20260825000000_restore_deployed_sync_handshake.sql"
 TRASH_PURGE_NAME = "20260910053721_general_contract_trash_purge.sql"
 CONTROL_DOCUMENTS_NAME = "20260910072310_contract_migration_control_documents.sql"
+SECURITY_HARDENING_NAME = "20260921125202_harden_legacy_function_privileges.sql"
 SOURCE_CATALOG_DIGEST = (
     "6c71ff36a90993dc327557b4a1a64c0dfb27b347134ed89e7f126dae76c6ff9a"
 )
@@ -46,6 +47,9 @@ IMMUTABLE_MIGRATION_DIGESTS = {
     TRASH_PURGE_NAME: "d26bea7678028e50cbbafa1d871923918f84baa63ab061bc92db8cc3844592e4",
     CONTROL_DOCUMENTS_NAME: (
         "81ccd40b3d5dec672e4d287c1e278155500ef539f626a90d0b71336646cf69a3"
+    ),
+    SECURITY_HARDENING_NAME: (
+        "cc5a914d9fe0fe1c3f0067a8c41fb1bf9ec129a5e7cedb18fde7475450dc44c5"
     ),
 }
 
@@ -82,7 +86,7 @@ def main() -> None:
         [path.name for path in sql_paths]
         == [BASELINE_NAME, FOUNDATION_NAME, RPC_NAME, STORAGE_V2_NAME,
             CORRECTIVE_NAME, HANDSHAKE_NAME, RESTORE_HANDSHAKE_NAME,
-            TRASH_PURGE_NAME, CONTROL_DOCUMENTS_NAME],
+            TRASH_PURGE_NAME, CONTROL_DOCUMENTS_NAME, SECURITY_HARDENING_NAME],
         "the server chain must match the exact reviewed migration order",
     )
     for name, expected in IMMUTABLE_MIGRATION_DIGESTS.items():
@@ -99,6 +103,9 @@ def main() -> None:
     trash_purge = (MIGRATIONS / TRASH_PURGE_NAME).read_text(encoding="utf-8")
     control_documents = (
         MIGRATIONS / CONTROL_DOCUMENTS_NAME
+    ).read_text(encoding="utf-8")
+    security_hardening = (
+        MIGRATIONS / SECURITY_HARDENING_NAME
     ).read_text(encoding="utf-8")
     workflow = WORKFLOW.read_text(encoding="utf-8")
 
@@ -234,7 +241,26 @@ def main() -> None:
         require(marker in control_documents,
                 f"migration-control guard missing: {marker}")
 
-    for name in (TRASH_PURGE_NAME, CONTROL_DOCUMENTS_NAME):
+    for marker in (
+        "RLS_AUTO_ENABLE_EVENT_TRIGGER_MISMATCH",
+        "LEGACY_FUNCTION_HARDENING_PRIVILEGE_MISMATCH",
+        "LEGACY_FUNCTION_HARDENING_CONFIG_MISMATCH",
+        "PUBLIC_FUNCTION_DEFAULT_PRIVILEGE_MISMATCH",
+        "alter function public.touch_editor_locks_locked_at()",
+        "alter function public.touch_writing_contents_updated_at()",
+        "set search_path = ''",
+        "revoke all on function public.rls_auto_enable()",
+        "alter default privileges for role postgres in schema public",
+        "revoke execute on functions from public",
+    ):
+        require(marker in security_hardening,
+                f"legacy function hardening guard missing: {marker}")
+    require(
+        "grant execute" not in security_hardening.lower(),
+        "legacy function hardening must not widen execution privileges",
+    )
+
+    for name in (TRASH_PURGE_NAME, CONTROL_DOCUMENTS_NAME, SECURITY_HARDENING_NAME):
         require(
             workflow.count(f"supabase/migrations/{name}") == 4,
             f"CI must apply and safely re-run the reviewed migration: {name}",
