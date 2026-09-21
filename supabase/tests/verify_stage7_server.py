@@ -13,18 +13,23 @@ import sys
 ROOT = pathlib.Path(__file__).resolve().parents[2]
 CONTRACT_DIR = ROOT / "sync-contract"
 MIGRATIONS = ROOT / "supabase" / "migrations"
+WORKFLOW = ROOT / ".github" / "workflows" / "server-contract-run.yml"
 
-VERSION = "0.3.0"
-CONTRACT_GIT_COMMIT = "2705fcbda0be440a9d82a5e1919f2885c6166727"
-CONTRACT_CONTENT_COMMIT = "3843b05aa91461e1541f5ebaa14557dc3dc2b39c"
-DIGEST = "abbd234c7b65d422c2e43d468f4f724e069ede26a3d24be22eb8b35cce8ebf2c"
-CANONICAL_BYTES = 24777
+CLIENT_VERSION = "0.2.0"
+CLIENT_DIGEST = "416c1b99edb9bda694731dee4b25688d9d82d1f32610aa23ddfda571ec3c7670"
+CLIENT_CANONICAL_BYTES = 23256
+SERVER_VERSION = "0.3.0"
+SERVER_CONTRACT_GIT_COMMIT = "2705fcbda0be440a9d82a5e1919f2885c6166727"
+SERVER_CONTRACT_CONTENT_COMMIT = "3843b05aa91461e1541f5ebaa14557dc3dc2b39c"
+SERVER_DIGEST = "abbd234c7b65d422c2e43d468f4f724e069ede26a3d24be22eb8b35cce8ebf2c"
+SERVER_CANONICAL_BYTES = 24777
 BASELINE_NAME = "20260811000000_operational_v2_schema_baseline_snapshot.sql"
 FOUNDATION_NAME = "20260811010000_sync_contract_0_1_0_foundation.sql"
 RPC_NAME = "20260811020000_sync_contract_0_1_0_rpcs.sql"
 STORAGE_V2_NAME = "20260813063251_sync_contract_0_3_0_storage_name_v2.sql"
 CORRECTIVE_NAME = "20260814182850_rpc_auth_error_envelope_corrective.sql"
 HANDSHAKE_NAME = "20260820113209_authenticated_sync_handshake.sql"
+RESTORE_HANDSHAKE_NAME = "20260825000000_restore_deployed_sync_handshake.sql"
 SOURCE_CATALOG_DIGEST = (
     "6c71ff36a90993dc327557b4a1a64c0dfb27b347134ed89e7f126dae76c6ff9a"
 )
@@ -33,6 +38,9 @@ IMMUTABLE_MIGRATION_DIGESTS = {
     FOUNDATION_NAME: "5374b61f270541ae3f40717269c82e3f60949889254d1cdaaaee94ffa99aa70d",
     RPC_NAME: "60775ced603122aae2f4a53a7cfaf39299676c647b839feaf9527210ec514b46",
     STORAGE_V2_NAME: "77b3e4ca9537d42207cb16b407be4490adc1cda4dbf2054316cc8f775139c66a",
+    RESTORE_HANDSHAKE_NAME: (
+        "48c7b34749687851a233ffe2683b938347c311ff7c4c19ddefa2b74faf349fd4"
+    ),
 }
 
 
@@ -52,17 +60,23 @@ def sha256(path: pathlib.Path) -> str:
 def main() -> None:
     lock = load_json(CONTRACT_DIR / "contract-lock.json")
     protocol = load_json(CONTRACT_DIR / "protocol.json")
-    require(lock["contract_version"] == VERSION, "contract version pin mismatch")
-    require(protocol["contract_version"] == VERSION, "protocol version pin mismatch")
-    require(lock["canonical_byte_length"] == CANONICAL_BYTES, "canonical byte pin mismatch")
-    require(lock["canonical_contract_sha256"] == DIGEST, "contract digest pin mismatch")
+    require(lock["contract_version"] == CLIENT_VERSION, "client contract version pin mismatch")
+    require(protocol["contract_version"] == CLIENT_VERSION, "client protocol version pin mismatch")
+    require(
+        lock["canonical_byte_length"] == CLIENT_CANONICAL_BYTES,
+        "client canonical byte pin mismatch",
+    )
+    require(
+        lock["canonical_contract_sha256"] == CLIENT_DIGEST,
+        "client contract digest pin mismatch",
+    )
 
     sql_paths = sorted(MIGRATIONS.glob("*.sql"))
     require(
         [path.name for path in sql_paths]
         == [BASELINE_NAME, FOUNDATION_NAME, RPC_NAME, STORAGE_V2_NAME,
-            CORRECTIVE_NAME, HANDSHAKE_NAME],
-        "the server chain must end with the additive authenticated handshake migration",
+            CORRECTIVE_NAME, HANDSHAKE_NAME, RESTORE_HANDSHAKE_NAME],
+        "the server chain must end with the deployed handshake restoration migration",
     )
     for name, expected in IMMUTABLE_MIGRATION_DIGESTS.items():
         require(sha256(MIGRATIONS / name) == expected, f"historical migration changed: {name}")
@@ -72,6 +86,10 @@ def main() -> None:
     storage_v2 = (MIGRATIONS / STORAGE_V2_NAME).read_text(encoding="utf-8")
     corrective = (MIGRATIONS / CORRECTIVE_NAME).read_text(encoding="utf-8")
     handshake = (MIGRATIONS / HANDSHAKE_NAME).read_text(encoding="utf-8")
+    restored_handshake = (
+        MIGRATIONS / RESTORE_HANDSHAKE_NAME
+    ).read_text(encoding="utf-8")
+    workflow = WORKFLOW.read_text(encoding="utf-8")
 
     for marker in (
         "purpose: bootstrap blank staging/new environment",
@@ -98,8 +116,13 @@ def main() -> None:
         require(required_baseline_object in baseline,
                 f"operational snapshot object missing: {required_baseline_object}")
 
-    for value in (VERSION, CONTRACT_GIT_COMMIT, CONTRACT_CONTENT_COMMIT, DIGEST,
-                  str(CANONICAL_BYTES)):
+    for value in (
+        SERVER_VERSION,
+        SERVER_CONTRACT_GIT_COMMIT,
+        SERVER_CONTRACT_CONTENT_COMMIT,
+        SERVER_DIGEST,
+        str(SERVER_CANONICAL_BYTES),
+    ):
         require(value in storage_v2, f"missing 0.3.0 pin in storage-name-v2 migration: {value}")
 
     for name in (
@@ -150,6 +173,36 @@ def main() -> None:
         "anonymous callers must not receive private allowlist metadata",
     )
 
+    normalized_restore = " ".join(
+        restored_handshake.replace('"', "").lower().split()
+    )
+    for marker in (
+        "create or replace function public.get_sync_handshake",
+        "language plpgsql stable security definer",
+        "set search_path to ''",
+        "private.has_project_role(p_project_id, v_user_id, 'viewer')",
+        "allowlist.enabled",
+        "allowlist.revoked_at is null",
+        "server_protocol_version",
+        "server_contract_sha256",
+        "supported_protocol_versions",
+        "server_capabilities",
+        "revoke all on function public.get_sync_handshake"
+        "(p_project_id uuid, p_contract_sha256 text) from public",
+        "grant all on function public.get_sync_handshake"
+        "(p_project_id uuid, p_contract_sha256 text) to authenticated",
+    ):
+        require(marker in normalized_restore,
+                f"deployed handshake restoration guard missing: {marker}")
+    require(
+        "to anon" not in normalized_restore,
+        "deployed handshake restoration must not grant anonymous execution",
+    )
+    require(
+        workflow.count(f"supabase/migrations/{RESTORE_HANDSHAKE_NAME}") == 4,
+        "CI must apply and safely re-run the deployed handshake restoration",
+    )
+
     for guard in (
         "LEGACY_EPOCH_0", "CONTRACT_BATCH", "CONTRACT_NOT_ALLOWED",
         "CONTRACT_DIGEST_MISMATCH", "PROTOCOL_TOO_OLD", "CAPABILITY_MISMATCH",
@@ -195,7 +248,8 @@ def main() -> None:
     )
 
     print(f"Server static checks passed ({len(sql_paths)} migrations)")
-    print(f"contract: {VERSION} {DIGEST}")
+    print(f"client contract: {CLIENT_VERSION} {CLIENT_DIGEST}")
+    print(f"server storage contract: {SERVER_VERSION} {SERVER_DIGEST}")
     print(f"operational catalog: {SOURCE_CATALOG_DIGEST}")
     for name, expected in IMMUTABLE_MIGRATION_DIGESTS.items():
         print(f"immutable migration: {name} {expected}")
