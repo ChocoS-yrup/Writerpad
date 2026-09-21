@@ -259,5 +259,12 @@ jobs:
           -v existing_fixture_project_id=02000000-0000-4000-8000-000000000703
           -v expected_existing_fixture_fingerprint=capture
           -f supabase/tests/stage7_staging_revalidation_harness.sql
-      - name: Check patch whitespace
-        run: git diff --check "${EXPECTED_CHECKOUT_SHA}^1" "${EXPECTED_CHECKOUT_SHA}"
+      - name: Check server patch whitespace
+        run: >-
+          git diff --check
+          "${EXPECTED_CHECKOUT_SHA}^1"
+          "${EXPECTED_CHECKOUT_SHA}"
+          --
+          .github/workflows/server-contract-run.yml
+          supabase
+          sync-contract
