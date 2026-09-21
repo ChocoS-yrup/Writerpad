@@ -28,6 +28,15 @@ extension SwiftDataMetadataRepository: ProjectImportMetadataRegistering {
         var pathKeys: Set<String> = []
         let pathPolicy = PathPolicy()
         for document in documents {
+            // SwiftData uniqueness can upsert an existing row on save. Imports
+            // must never move another project's document into this project.
+            guard try uniqueDocumentRecord(id: document.id) == nil else {
+                throw MetadataRepositoryError.corruptedRecord(
+                    entity: "DocumentRecord",
+                    identifier: document.id.rawValue.uuidString,
+                    reason: "import document_id already exists"
+                )
+            }
             guard document.projectID == project.id else {
                 throw MetadataRepositoryError.documentProjectCannotChange(document.id)
             }
@@ -100,5 +109,11 @@ extension SwiftDataMetadataRepository: ProjectImportMetadataRegistering {
         }
         try modelContext.save()
         didSave = true
+    }
+}
+
+extension SwiftDataMetadataRepository: ReceivePromotionMetadataStoring {
+    func hasDocumentsForPromotionRecovery(in projectID: ProjectID) async throws -> Bool {
+        try !documentRecords(in: projectID).isEmpty
     }
 }

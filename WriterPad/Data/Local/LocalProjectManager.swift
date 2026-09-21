@@ -441,6 +441,9 @@ actor LocalProjectManager: ProjectManaging, ServerProjectReceiving {
         }
         try validateFilesystemNameIsAvailable(newName, excluding: oldProject.name)
 
+        guard try !ReceivePromotionTransaction.pendingProjectIDs(
+            at: pathResolver.projectsRootURL, fileManager: fileManager
+        ).contains(id) else { throw ProjectManagerError.missingProject(id) }
         let oldURL = try pathResolver.standardPaths(
             forProjectNamed: oldProject.name
         ).projectContainerURL
@@ -501,7 +504,6 @@ actor LocalProjectManager: ProjectManaging, ServerProjectReceiving {
     }
 
     func reorderProjects(_ orderedIDs: [ProjectID]) async throws -> [ManagedProject] {
-        var catalog = try loadCatalog()
         let managed = try await managedProjectsWithoutRecovery()
         let visibleIDs = Set(managed.filter { !$0.isInDeletedList }.map(\.id))
         guard orderedIDs.count == visibleIDs.count,
@@ -509,6 +511,8 @@ actor LocalProjectManager: ProjectManaging, ServerProjectReceiving {
         else {
             throw ProjectManagerError.invalidOrder
         }
+        // Keep entries reserved by publication while the metadata read awaited.
+        var catalog = try loadCatalog()
         for (index, id) in orderedIDs.enumerated() {
             guard let entryIndex = catalog.entries.firstIndex(
                 where: { $0.projectID == id }
@@ -1058,12 +1062,22 @@ actor LocalProjectManager: ProjectManaging, ServerProjectReceiving {
     }
 
     private func managedProjectsWithoutRecovery() async throws -> [ManagedProject] {
+        let promotingBeforeRead = try ReceivePromotionTransaction.pendingProjectIDs(
+            at: pathResolver.projectsRootURL, fileManager: fileManager
+        )
         let storedProjects = try await projectRepository.projects()
         // 메타데이터 조회 대기 중 새 수신 journal이 생겨도 공개하지 않는다.
         let receiving = Set(try receivingJournals().map { $0.project.id })
-        let projects = storedProjects.filter { !receiving.contains($0.id) }
+        let promoting = try ReceivePromotionTransaction.pendingProjectIDs(
+            at: pathResolver.projectsRootURL, fileManager: fileManager
+        ).union(promotingBeforeRead)
+        // A rollback may remove metadata and its marker while this snapshot awaits.
+        // Hide projects pending at either end of the read until the next refresh.
+        let projects = storedProjects.filter { !receiving.contains($0.id) && !promoting.contains($0.id) }
         var catalog = try loadCatalog()
-        let validIDs = Set(projects.map(\.id))
+        // Publication can have reserved a catalog slot while its marker remains.
+        // A concurrent list refresh must not remove or expose that slot.
+        let validIDs = Set(projects.map(\.id)).union(promoting)
         catalog.entries.removeAll { !validIDs.contains($0.projectID) }
         for project in projects {
             appendCatalogEntryIfNeeded(for: project.id, to: &catalog)
@@ -1712,6 +1726,28 @@ extension LocalProjectManager {
         try fileManager.removeItem(at: receivingURL(journal.project.id))
         let entry = catalog.entries.first { $0.projectID == journal.project.id }!
         return ManagedProject(project: journal.project, userOrder: entry.userOrder, lifecycleState: .active)
+    }
+}
+
+extension LocalProjectManager: ReceivePromotionProjectPublishing {
+    func publishPromotedProject(_ project: Project) async throws -> ManagedProject {
+        try await recoverPendingTransactions()
+        guard try await projectRepository.project(id: project.id) == project else {
+            throw ProjectManagerError.missingProject(project.id)
+        }
+        let projectURL = try pathResolver.standardPaths(
+            forProjectNamed: project.name
+        ).projectContainerURL
+        guard fileManager.fileExists(atPath: projectURL.path) else {
+            throw ProjectManagerError.projectFolderMissing(project.name)
+        }
+        var catalog = try loadCatalog()
+        appendCatalogEntryIfNeeded(for: project.id, to: &catalog)
+        try saveCatalog(catalog)
+        // Return the reserved entry to the transaction without making it
+        // visible to general list/select callers before marker removal.
+        let entry = catalog.entries.first { $0.projectID == project.id }!
+        return ManagedProject(project: project, userOrder: entry.userOrder, lifecycleState: lifecycleState(for: entry))
     }
 }
 

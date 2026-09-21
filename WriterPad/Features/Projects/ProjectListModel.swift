@@ -1,6 +1,39 @@
 import Foundation
 import SwiftUI
 
+/// Keeps the document picker's security-scoped grant alive from the initial
+/// read-only inspection through the user's final confirmation. The package is
+/// re-read before the first transaction write, so releasing this grant after
+/// inspection would make that safety check unable to open provider-backed URLs.
+@MainActor
+final class ReceivePromotionSelectionAccess {
+    typealias Begin = (URL) -> Bool
+    typealias End = (URL) -> Void
+
+    private let begin: Begin
+    private let end: End
+    private(set) var retainedURL: URL?
+
+    init(
+        begin: @escaping Begin = { $0.startAccessingSecurityScopedResource() },
+        end: @escaping End = { $0.stopAccessingSecurityScopedResource() }
+    ) {
+        self.begin = begin
+        self.end = end
+    }
+
+    func retain(_ url: URL) {
+        release()
+        if begin(url) { retainedURL = url }
+    }
+
+    func release() {
+        guard let retainedURL else { return }
+        self.retainedURL = nil
+        end(retainedURL)
+    }
+}
+
 @MainActor
 final class ProjectBackupExportModel: ObservableObject {
     @Published private(set) var isWorking = false
@@ -48,22 +81,32 @@ final class ProjectListModel: ObservableObject {
     @Published var selectedProjectID: ProjectID?
     @Published private(set) var errorMessage: String?
     @Published var importReport: ImportReport?
+    @Published var receivePromotionReport: ReceivePromotionReport?
     @Published private(set) var importSuccessMessage: String?
     @Published private(set) var isWorking = false
 
     private let projectManager: any ProjectManaging
     private let projectImporter: any ProjectImporting
+    private let receivePromotionInspector: (any ReceivePromotionPackageInspecting)?
+    private let receivePromotionTransaction: (any ReceivePromotionTransacting)?
+    private let receivePromotionSelectionAccess: ReceivePromotionSelectionAccess
     private let authenticationService: (any AuthenticationServicing)?
     private let projectBindingService: (any ProjectBindingServicing)?
 
     init(
         projectManager: any ProjectManaging,
         projectImporter: any ProjectImporting,
+        receivePromotionInspector: (any ReceivePromotionPackageInspecting)? = nil,
+        receivePromotionTransaction: (any ReceivePromotionTransacting)? = nil,
+        receivePromotionSelectionAccess: ReceivePromotionSelectionAccess = .init(),
         authenticationService: (any AuthenticationServicing)? = nil,
         projectBindingService: (any ProjectBindingServicing)? = nil
     ) {
         self.projectManager = projectManager
         self.projectImporter = projectImporter
+        self.receivePromotionInspector = receivePromotionInspector
+        self.receivePromotionTransaction = receivePromotionTransaction
+        self.receivePromotionSelectionAccess = receivePromotionSelectionAccess
         self.authenticationService = authenticationService
         self.projectBindingService = projectBindingService
     }
@@ -83,6 +126,7 @@ final class ProjectListModel: ObservableObject {
     func load(opensLastProject: Bool = true) async {
         await perform {
             try await projectImporter.recoverPendingImports()
+            try await receivePromotionTransaction?.recoverPendingPromotions()
             projects = try await projectManager.projects()
             let lastProjectID = try await projectManager.restoreLastProject()?.id
             selectedProjectID = opensLastProject ? lastProjectID : nil
@@ -128,6 +172,48 @@ final class ProjectListModel: ObservableObject {
 
     func dismissImportReport() {
         importReport = nil
+    }
+
+    func inspectReceivePromotion(at packageURL: URL) async {
+        receivePromotionReport = nil
+        receivePromotionSelectionAccess.release()
+        await perform {
+            guard let receivePromotionInspector else {
+                throw ReceivePromotionUIError.unavailable
+            }
+            receivePromotionSelectionAccess.retain(packageURL)
+            do {
+                receivePromotionReport = try await receivePromotionInspector.inspect(packageURL)
+            } catch {
+                receivePromotionSelectionAccess.release()
+                throw error
+            }
+        }
+    }
+
+    func confirmReceivePromotion(projectName: String) async {
+        guard let report = receivePromotionReport else { return }
+        await perform {
+            guard let receivePromotionTransaction else {
+                throw ReceivePromotionUIError.unavailable
+            }
+            let result = try await receivePromotionTransaction.promote(
+                from: report,
+                projectName: projectName
+            )
+            receivePromotionSelectionAccess.release()
+            receivePromotionReport = nil
+            projects = try await projectManager.projects()
+            selectedProjectID = result.project.id
+            importSuccessMessage = result.wasAlreadyCompleted
+                ? "이미 완료된 ‘\(result.project.name)’ 로컬 작품을 확인했습니다."
+                : "‘\(result.project.name)’ 로컬 작품과 문서 \(result.documentMappings.count)개를 만들었습니다. 서버에는 연결하거나 전송하지 않았습니다."
+        }
+    }
+
+    func dismissReceivePromotionReport() {
+        receivePromotionSelectionAccess.release()
+        receivePromotionReport = nil
     }
 
     func create(named name: String) async {
@@ -251,5 +337,13 @@ final class ProjectListModel: ObservableObject {
             return
         }
         _ = await projectBindingService.createServerProject(for: project.id)
+    }
+}
+
+private enum ReceivePromotionUIError: LocalizedError {
+    case unavailable
+
+    var errorDescription: String? {
+        "수신 편집본을 로컬 작품으로 만드는 기능을 준비하지 못했습니다."
     }
 }

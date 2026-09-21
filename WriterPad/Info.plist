@@ -19,6 +19,26 @@
 			<string>com.chocos.writerpad.binder-move</string>
 		</dict>
 	</array>
+	<key>UTImportedTypeDeclarations</key>
+	<array>
+		<dict>
+			<key>UTTypeConformsTo</key>
+			<array>
+				<string>com.apple.package</string>
+			</array>
+			<key>UTTypeDescription</key>
+			<string>WriterPad Receive Promotion Package</string>
+			<key>UTTypeIdentifier</key>
+			<string>com.chocos.writerpad.receive-promotion</string>
+			<key>UTTypeTagSpecification</key>
+			<dict>
+				<key>public.filename-extension</key>
+				<array>
+					<string>writerpadpromotion</string>
+				</array>
+			</dict>
+		</dict>
+	</array>
 	<key>UIAppFonts</key>
     <array>
         <string>malgun.ttf</string>

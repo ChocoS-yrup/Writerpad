@@ -10,6 +10,8 @@ final class AppEnvironment: ObservableObject {
     let workspaceStateRepository: any WorkspaceStateRepository
     let projectManager: any ProjectManaging
     let projectImporter: any ProjectImporting
+    let receivePromotionInspector: any ReceivePromotionPackageInspecting
+    let receivePromotionTransaction: any ReceivePromotionTransacting
     let binderRepository: any BinderRepository
     let binderCommands: any BinderCommanding
     let localDocumentStore: any LocalDocumentStoring
@@ -52,6 +54,8 @@ final class AppEnvironment: ObservableObject {
         projectImporter: any ProjectImporting,
         binderRepository: any BinderRepository,
         binderCommands: any BinderCommanding,
+        receivePromotionInspector: any ReceivePromotionPackageInspecting,
+        receivePromotionTransaction: any ReceivePromotionTransacting,
         localDocumentStore: any LocalDocumentStoring,
         searchService: any Searching,
         backupStore: any BackupStoring,
@@ -85,6 +89,8 @@ final class AppEnvironment: ObservableObject {
         self.projectImporter = projectImporter
         self.binderRepository = binderRepository
         self.binderCommands = binderCommands
+        self.receivePromotionInspector = receivePromotionInspector
+        self.receivePromotionTransaction = receivePromotionTransaction
         self.localDocumentStore = localDocumentStore
         self.searchService = searchService
         self.exporter = exporter ?? LocalManuscriptExporter(
@@ -162,6 +168,14 @@ final class AppEnvironment: ObservableObject {
             metadataRegistrar: repository,
             workspaceStateRepository: repository,
             projectManager: projectManager,
+            pathResolver: pathResolver,
+            clock: clock
+        )
+        let receivePromotionReader = ReceivePromotionPackageReader()
+        let receivePromotionTransaction = ReceivePromotionTransaction(
+            packageReader: receivePromotionReader,
+            metadataStore: repository,
+            projectPublisher: projectManager,
             pathResolver: pathResolver,
             clock: clock
         )
@@ -526,6 +540,8 @@ final class AppEnvironment: ObservableObject {
             projectImporter: projectImporter,
             binderRepository: binderRepository,
             binderCommands: binderCommands,
+            receivePromotionInspector: receivePromotionReader,
+            receivePromotionTransaction: receivePromotionTransaction,
             localDocumentStore: localDocumentStore,
             searchService: searchService,
             backupStore: backupStore,

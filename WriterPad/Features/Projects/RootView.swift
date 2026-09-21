@@ -9,6 +9,8 @@ struct RootView: View {
         ProjectWorkspaceView(
             projectManager: environment.projectManager,
             projectImporter: environment.projectImporter,
+            receivePromotionInspector: environment.receivePromotionInspector,
+            receivePromotionTransaction: environment.receivePromotionTransaction,
             binderRepository: environment.binderRepository,
             binderCommands: environment.binderCommands,
             documentRepository: environment.documentRepository,
