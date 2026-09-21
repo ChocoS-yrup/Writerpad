@@ -110,11 +110,11 @@
 | EXPORT-004 | 내보내기는 백업·복원과 분리된 소장용 TXT·PDF이며, 시작 전에 편집 원고를 저장하고 실패·취소 시 원본과 기존 출력본을 보존한다. | 7 | 저장 전처리·취소·출력 교체 실패·PDF 구조 자동 테스트, iPad M5 PDF 열람·원고 불변 검증 | 검증 완료 |
 | PERF-001 | 1,000화·보조 문서 500개·백업 5,000개 기준선을 측정한다. | 7 | 통합 실제 파일 fixture·Release 시뮬레이터 교정, iPad Pro 11-inch (M4) Release median/p95·메모리·메인 액터 heartbeat·메인 스레드 I/O JSON과 XCTest 결과 번들, Time Profiler CPU 샘플 4,354개·250ms 이상 멈춤 0건, Allocations·VM Tracker 확인 | 검증 완료 |
 
-## 명시적 보류
+## 동기화 상태
 
-| ID | 요구사항 | 재개 조건 | 상태 |
+| ID | 요구사항 | 검증 또는 남은 조건 | 상태 |
 |---|---|---|---|
-| SYNC-001 | Supabase 인증·스키마·RLS·RPC | Windows v2 규약 확정 | 보류 |
-| SYNC-002 | 영구 동기화 큐·Realtime·lease | Windows v2 규약 확정 | 보류 |
-| SYNC-003 | Base·Local·Remote 3방향 병합 | Base 보존 정책 확정 | 보류 |
-| SYNC-004 | iPad background 서버 업로드 | 공통 동기화 규약 확정 | 보류 |
+| SYNC-001 | Supabase 인증·스키마·RLS·RPC | Baseline 2.0 계약 감사, Keychain 세션·RLS/권한·RPC 정적 검사, 대상 프로젝트 migration 적용·검증 | 검증 완료 |
+| SYNC-002 | 영구 동기화 큐·Realtime·lease | 재실행 후 동일 operation ID·1,000개 큐 복구, Realtime 재조정, lease 획득·갱신·해제 자동 테스트 | 검증 완료 |
+| SYNC-003 | Base·Local·Remote 3방향 병합 | Base 영구 보존, 비중첩 자동 병합, 중첩 충돌의 Base·Local·Remote 보존과 재실행 복구 자동 테스트 | 검증 완료 |
+| SYNC-004 | iPad background 서버 업로드 | background 진입 전 로컬 저장·영구 큐 보존·다음 foreground 재개는 완료. iPadOS 제한 시간의 서버 업로드 완료를 보장할지와 background task 도입 여부 결정 필요 | 부분 구현 |

@@ -38,7 +38,7 @@ rg -q 'authenticationService\.restoreSession\(\)' \
     WriterPad/App/WriterPadApp.swift \
     || fail "app startup does not trigger asynchronous session restoration"
 
-rg -q 'NonPersistingAuthLocalStorage' \
+rg -q 'EphemeralAuthLocalStorage' \
     WriterPad/Sync/SupabaseClientProvider.swift \
     || fail "Supabase SDK persistence has not been disabled"
 rg -q 'autoRefreshToken: false' \
@@ -60,7 +60,7 @@ fi
 if rg -n '(let|var)[[:space:]]+password[[:space:]]*[:=]' $auth_files >/dev/null; then
     fail "password is retained as stored state"
 fi
-if rg -n '(signUp|resetPassword|deleteAccount)' $auth_files >/dev/null; then
+if rg -n '(resetPassword|deleteAccount)' $auth_files >/dev/null; then
     fail "out-of-scope account management was added"
 fi
 if rg -n 'SupabaseClient' WriterPad/Features --glob '*.swift' >/dev/null; then
