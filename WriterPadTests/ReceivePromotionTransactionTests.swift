@@ -1,3 +1,4 @@
+import Darwin
 import Foundation
 import XCTest
 @testable import WriterPad
@@ -117,6 +118,57 @@ final class ReceivePromotionTransactionTests: XCTestCase {
                 projectName: "새 작품을 만들면 안 됨"
             )
         }
+    }
+
+    func testDanglingReceiptEntriesBlockReplayWithoutWriting() async throws {
+        for replaceFolder in [false, true] {
+            let harness = makeHarness()
+            _ = try await harness.transaction.promote(
+                from: harness.package.report, projectName: "완료된 작품"
+            )
+            let before = try snapshot(harness.root)
+            let uuidCount = harness.uuids.count
+            let folder = harness.root.appendingPathComponent(".writerpad-promotion-receipts")
+            let receipt = folder.appendingPathComponent(harness.package.report.sourceKey.rawValue + ".json")
+            let entry = replaceFolder ? folder : receipt
+            let retained = harness.root.deletingLastPathComponent().appendingPathComponent("retained")
+            let missing = harness.root.deletingLastPathComponent().appendingPathComponent("missing")
+            try fileManager.moveItem(at: entry, to: retained)
+            try fileManager.createSymbolicLink(at: entry, withDestinationURL: missing)
+
+            await assertError(.recoveryRequired(receipt.path)) {
+                _ = try await harness.transaction.promote(
+                    from: harness.package.report, projectName: "중복 작품 금지"
+                )
+            }
+            XCTAssertEqual(harness.uuids.count, uuidCount)
+            XCTAssertEqual(try? fileManager.destinationOfSymbolicLink(atPath: entry.path), missing.path)
+            let projects = try await harness.metadata.projects()
+            XCTAssertEqual(projects.count, 1)
+            // Restore the test fixture only after checking the link was preserved.
+            try fileManager.removeItem(at: entry)
+            try fileManager.moveItem(at: retained, to: entry)
+            XCTAssertEqual(try snapshot(harness.root), before)
+        }
+    }
+
+    func testFIFOReceiptIsRejectedWithoutWaitingForAWriter() async throws {
+        let harness = makeHarness()
+        _ = try await harness.transaction.promote(
+            from: harness.package.report, projectName: "특수 파일 차단"
+        )
+        let receipt = harness.root.appendingPathComponent(
+            ".writerpad-promotion-receipts/" + harness.package.report.sourceKey.rawValue + ".json"
+        )
+        try fileManager.removeItem(at: receipt)
+        XCTAssertEqual(mkfifo(receipt.path, 0o600), 0)
+        let uuidCount = harness.uuids.count
+        await assertError(.recoveryRequired(receipt.path)) {
+            _ = try await harness.transaction.promote(
+                from: harness.package.report, projectName: "중복 작품 금지"
+            )
+        }
+        XCTAssertEqual(harness.uuids.count, uuidCount)
     }
 
     func testChangedPackageFailsBeforeFirstWrite() async throws {

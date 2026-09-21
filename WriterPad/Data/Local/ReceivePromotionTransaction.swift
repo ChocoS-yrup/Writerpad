@@ -636,9 +636,13 @@ private extension ReceivePromotionTransaction {
         sourceKey: ContentHash
     ) throws -> ReceivePromotionReceipt? {
         let url = receiptURL(sourceKey)
-        guard fileManager.fileExists(atPath: url.path) else { return nil }
         do {
-            try requireDirectory(url.deletingLastPathComponent())
+            let folder = url.deletingLastPathComponent()
+            // fileExists follows links: a dangling receipt must not be treated
+            // as a new source and overwritten by a second promotion.
+            guard try entryExistsWithoutFollowingLinks(folder) else { return nil }
+            try requireDirectory(folder)
+            guard try entryExistsWithoutFollowingLinks(url) else { return nil }
             let receipt = try decodeCanonical(ReceivePromotionReceipt.self, from: url)
             guard receipt.format == Self.receiptFormat,
                   receipt.sourceKey == sourceKey else {
@@ -648,6 +652,13 @@ private extension ReceivePromotionTransaction {
         } catch {
             throw ReceivePromotionTransactionError.recoveryRequired(url.path)
         }
+    }
+
+    func entryExistsWithoutFollowingLinks(_ url: URL) throws -> Bool {
+        var status = stat()
+        if lstat(url.path, &status) == 0 { return true }
+        guard errno == ENOENT else { throw CocoaError(.fileReadUnknown) }
+        return false
     }
 
     func completedResult(
@@ -877,7 +888,7 @@ private extension ReceivePromotionTransaction {
     }
 
     func readRegularFile(_ url: URL) throws -> Data {
-        let descriptor = Darwin.open(url.path, O_RDONLY | O_NOFOLLOW | O_CLOEXEC)
+        let descriptor = Darwin.open(url.path, O_RDONLY | O_NOFOLLOW | O_CLOEXEC | O_NONBLOCK)
         guard descriptor >= 0 else { throw CocoaError(.fileReadNoSuchFile) }
         defer { Darwin.close(descriptor) }
         var before = stat()
@@ -896,6 +907,9 @@ private extension ReceivePromotionTransaction {
             }
             guard count >= 0 else { throw CocoaError(.fileReadUnknown) }
             if count == 0 { break }
+            guard data.count + count <= 20 * 1_024 * 1_024 else {
+                throw CocoaError(.fileReadCorruptFile)
+            }
             data.append(contentsOf: buffer[0..<count])
         }
         var after = stat()

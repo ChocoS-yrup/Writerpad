@@ -305,7 +305,7 @@ actor ReceivePromotionPackageReader: ReceivePromotionPackageMaterializing {
         relativePath: String,
         limit: Int
     ) throws -> Data {
-        let descriptor = Darwin.open(url.path, O_RDONLY | O_NOFOLLOW | O_CLOEXEC)
+        let descriptor = Darwin.open(url.path, O_RDONLY | O_NOFOLLOW | O_CLOEXEC | O_NONBLOCK)
         guard descriptor >= 0 else {
             throw ReceivePromotionPackageError.unsafeEntry(relativePath)
         }

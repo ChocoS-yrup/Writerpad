@@ -1,3 +1,4 @@
+import Darwin
 import Foundation
 import XCTest
 @testable import WriterPad
@@ -160,6 +161,59 @@ final class ReceivePromotionPackageReaderTests: XCTestCase {
         }
     }
 
+    func testFIFOEntriesAreRejectedWithoutWaitingForAWriter() async throws {
+        for path in ["manifest.json", "seal.json", "payload/0002.txt"] {
+            let fixture = try makePackage()
+            let url = fixture.packageURL.appendingPathComponent(path)
+            try FileManager.default.removeItem(at: url)
+            XCTAssertEqual(mkfifo(url.path, 0o600), 0)
+            await assertError(.unsafeEntry(path)) {
+                _ = try await self.reader.inspect(fixture.packageURL)
+            }
+        }
+    }
+
+    func testMatchingHashesDoNotMakeInvalidUTF8Valid() async throws {
+        let fixture = try makePackage(editableBodies: [Data(), Data([0xFF, 0xFE])])
+        await assertError(.invalidPayload("payload/0002.txt")) {
+            _ = try await self.reader.inspect(fixture.packageURL)
+        }
+    }
+
+    func testSealInventoryMismatchIsRejected() async throws {
+        let fixture = try makePackage()
+        let url = fixture.packageURL.appendingPathComponent("seal.json")
+        var json = try JSONSerialization.jsonObject(with: Data(contentsOf: url)) as! [String: Any]
+        json["inventory_sha256"] = String(repeating: "0", count: 64)
+        var data = try JSONSerialization.data(withJSONObject: json, options: [.sortedKeys, .withoutEscapingSlashes])
+        data.append(0x0A)
+        try data.write(to: url)
+        await assertError(.invalidSeal) {
+            _ = try await self.reader.inspect(fixture.packageURL)
+        }
+    }
+
+    func testUnknownManifestFieldAndEscapingPayloadPathAreRejected() async throws {
+        for escapingPath in [false, true] {
+            let fixture = try makePackage()
+            let url = fixture.packageURL.appendingPathComponent("manifest.json")
+            var json = try JSONSerialization.jsonObject(with: Data(contentsOf: url)) as! [String: Any]
+            if escapingPath {
+                var documents = json["documents"] as! [[String: Any]]
+                documents[0]["payload"] = "payload/../outside.txt"
+                json["documents"] = documents
+            } else {
+                json["unexpected"] = true
+            }
+            var data = try JSONSerialization.data(withJSONObject: json, options: [.sortedKeys, .withoutEscapingSlashes])
+            data.append(0x0A)
+            try data.write(to: url)
+            await assertError(.invalidManifest) {
+                _ = try await self.reader.inspect(fixture.packageURL)
+            }
+        }
+    }
+
     func testUnicodeAndCaseFoldedNameCollisionsAreRejected() async throws {
         let unicode = try makePackage(names: ["É.txt", "E\u{301}.txt"])
         await assertError(.invalidName("E\u{301}.txt")) {
@@ -222,7 +276,8 @@ final class ReceivePromotionPackageReaderTests: XCTestCase {
         localID: UUID = UUID(),
         runID: UUID = UUID(),
         names: [String] = ["빈문서.txt", "저장경계.txt"],
-        extensionName: String = "writerpadpromotion"
+        extensionName: String = "writerpadpromotion",
+        editableBodies: [Data] = [Data(), Data("한글\n마지막 LF\n".utf8)]
     ) throws -> Fixture {
         let root = FileManager.default.temporaryDirectory.appendingPathComponent(
             "writerpad-promotion-test-" + UUID().uuidString.lowercased(),
@@ -245,7 +300,6 @@ final class ReceivePromotionPackageReaderTests: XCTestCase {
             UUID(uuidString: "22222222-2222-2222-2222-222222222222")!
         ]
         let sourceBodies = [Data(), Data("격리 저장 경계 기준".utf8)]
-        let editableBodies = [Data(), Data("한글\n마지막 LF\n".utf8)]
         let documents = zip(ids.indices, ids).map { index, id in
             Manifest.Document(
                 sourceDocumentID: id.uuidString.lowercased(),
