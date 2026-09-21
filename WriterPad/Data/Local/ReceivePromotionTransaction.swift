@@ -2,6 +2,7 @@ import Darwin
 import Foundation
 
 enum ReceivePromotionTransactionError: Error, Equatable, LocalizedError, Sendable {
+    case operationInProgress
     case sourceChangedAfterInspection
     case duplicateProject(String)
     case sourceAlreadyPromoted
@@ -11,6 +12,8 @@ enum ReceivePromotionTransactionError: Error, Equatable, LocalizedError, Sendabl
 
     var errorDescription: String? {
         switch self {
+        case .operationInProgress:
+            "다른 승격 또는 복구 작업이 진행 중입니다. 완료 후 다시 시도하세요."
         case .sourceChangedAfterInspection:
             "검사 뒤 package가 변경되었습니다. 다시 검사하세요."
         case let .duplicateProject(name):
@@ -180,6 +183,8 @@ actor ReceivePromotionTransaction: ReceivePromotionTransacting {
     private let fileManager: FileManager
     private let atomicWriter: POSIXAtomicFileWriter
     private let faultPlan: ReceivePromotionFaultPlan?
+    // Actor isolation does not prevent re-entry while metadata calls await.
+    private var operationInProgress = false
 
     init(
         packageReader: any ReceivePromotionPackageMaterializing,
@@ -209,7 +214,9 @@ actor ReceivePromotionTransaction: ReceivePromotionTransacting {
         from report: ReceivePromotionReport,
         projectName: String
     ) async throws -> ReceivePromotionResult {
-        try await recoverPendingPromotions()
+        try beginOperation()
+        defer { operationInProgress = false }
+        try await recoverPendingPromotionsWhileLocked()
         try pathResolver.policy.validateName(projectName)
 
         let current = try await packageReader.materialize(report.sourceSelectionURL)
@@ -227,7 +234,9 @@ actor ReceivePromotionTransaction: ReceivePromotionTransacting {
 
         let transactionID = uuidGenerator.makeUUID()
         let projectID = ProjectID(rawValue: uuidGenerator.makeUUID())
-        let now = clock.now()
+        // The durable marker uses ISO-8601 seconds. Metadata must use the same
+        // precision so a decoded marker still matches after process restart.
+        let now = Date(timeIntervalSince1970: floor(clock.now().timeIntervalSince1970))
         let project = Project(
             id: projectID,
             name: projectName,
@@ -358,6 +367,19 @@ actor ReceivePromotionTransaction: ReceivePromotionTransacting {
     }
 
     func recoverPendingPromotions() async throws {
+        try beginOperation()
+        defer { operationInProgress = false }
+        try await recoverPendingPromotionsWhileLocked()
+    }
+
+    private func beginOperation() throws {
+        guard !operationInProgress else {
+            throw ReceivePromotionTransactionError.operationInProgress
+        }
+        operationInProgress = true
+    }
+
+    private func recoverPendingPromotionsWhileLocked() async throws {
         guard fileManager.fileExists(atPath: pathResolver.projectsRootURL.path) else {
             return
         }
@@ -907,19 +929,23 @@ private extension ReceivePromotionTransaction {
         if fileManager.fileExists(atPath: finalURL.path) {
             throw ReceivePromotionTransactionError.recoveryRequired(markerURL.path)
         }
-        try remove(stagingURL)
-        if let existing = try await metadataStore.project(id: marker.project.id) {
+        let existing = try await metadataStore.project(id: marker.project.id)
+        if let existing {
             let documents = try await metadataStore.documents(in: marker.project.id)
             guard existing == marker.project,
                   sorted(documents) == sorted(marker.nodes) else {
                 throw ReceivePromotionTransactionError.recoveryRequired(markerURL.path)
             }
-            try await metadataStore.remove(id: marker.project.id)
         } else {
             let documents = try await metadataStore.documents(in: marker.project.id)
             if !documents.isEmpty {
                 throw ReceivePromotionTransactionError.recoveryRequired(markerURL.path)
             }
+        }
+        // Keep all evidence when ownership/metadata validation fails.
+        try remove(stagingURL)
+        if existing != nil {
+            try await metadataStore.remove(id: marker.project.id)
         }
         try remove(markerURL)
     }

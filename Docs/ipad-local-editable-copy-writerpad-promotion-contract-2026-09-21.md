@@ -362,3 +362,21 @@ WriterPad 작품 목록에 별도 `수신 편집본 가져오기`를 둔다. 기
 - 기존 작품명 충돌은 첫 staging write 전에 차단하는 정식 회귀 검사로 고정했다. 취소는 검토 sheet를 닫을 뿐 transaction을 호출하지 않는 UI 경계로 유지한다.
 - 전체 `WriterPadTests` bundle은 기존 `AutoSaveIsolationStore.checkpoint`와 `NormalEditorRecoveryInjection.$testConfiguration` 테스트 소스 불일치 때문에 생성 전에 중단된다. 새 promotion 소스와 전용 하네스에는 컴파일·실행 오류가 없다.
 - 실기기 후보 절차는 [Receive Boundary → WriterPad 1회 승격 설치 후보 절차](ipad-local-editable-copy-writerpad-promotion-install-candidate-2026-09-21.md)에 고정했다. 이 단계에서는 기기 설치·앱 실행·인증·서버 요청을 수행하지 않았다.
+
+## PR #20 거래·복구 검토 후속 수정 (2026-09-21)
+
+PR 기준 `53dd499..232283e`의 저장·복구·재확인 경로를 검토하면서 아래 세 결함을 합성 회귀 검사로 재현했다.
+
+1. **중단 후 시각 불일치**: marker의 ISO-8601 직렬화는 소수점 초를 버리지만 최초 metadata는 `clock.now()` 원값을 저장했다. 소수점 시계를 주입하면 재실행한 복구의 exact equality가 실패했다. 새 거래의 project/node 시각을 marker와 같은 초 정밀도로 생성한다.
+2. **검증 전 staging 삭제**: rollback이 metadata 일치 검사보다 먼저 staging을 지웠다. metadata가 달라 복구를 거부하는 상황에서도 임시 본문·provenance가 사라졌다. 프로젝트·노드 검증이 완료된 뒤 staging과 metadata를 제거하도록 순서를 변경했다.
+3. **actor 재진입으로 진행 중 거래 삭제**: metadata 등록을 기다리는 동안 동일 서비스에 `recoverPendingPromotions()`가 들어오면 진행 중인 staging을 미완료 거래로 보고 삭제했다. 승격과 복구의 전체 async 구간에 공유 실행 플래그를 두어 동시 호출을 `operationInProgress`로 거부한다. 성공·실패 시 `defer`로 해제하며, 중복 호출은 활성 거래의 플래그를 해제하지 않는다.
+
+정식 `ReceivePromotionTransactionTests`에 소수점 시계의 metadata 등록 후·작품 이동 후·영수증 기록 후 복구, metadata 불일치 시 디스크 바이트 보존, continuation으로 등록을 정지시킨 동시 호출 검사를 추가했다. 수정 전에는 각각 복구 실패, staging 삭제, 활성 거래 삭제가 재현됐다. 수정 후 독립 macOS XCTest 구성에서 reader 10개와 transaction 13개가 통과했다.
+
+독립 XCTest는 실제 reader·transaction·POSIX writer·경로/도메인 소스와 정식 테스트 파일을 임시 Swift package로 묶어 실행했다. 전체 앱 의존성을 피하기 위해 외곽 저장소 protocol 및 POSIX 오류 타입의 최소 선언을 사용했고, metadata/catalog는 테스트 내 메모리 구현이다. 실제 SwiftData 영속화, iPad 다중 창 UI, 전체 앱 테스트 통과를 뜻하지 않는다. 전체 `WriterPadTests`의 기존 컴파일 제한은 유지한다.
+
+이 수정은 앞으로 생성하는 거래의 시각 정밀도를 맞춘다. 이전 빌드에서 이미 중단된 거래 기록을 무조건 재봉인하거나 초기화하지 않는다. 같은 서비스 인스턴스의 동시 호출을 차단하며 여러 프로세스의 파일 접근을 조정하는 잠금은 아니다.
+
+PR 커밋만 별도 디렉터리에 추출한 앱 빌드에서 `AppEnvironment`의 승격 서비스 생성 코드가 다른 생성자 인자 사이에 삽입된 오류와 `AppEnvironment`·`RootView`의 인자 순서 오류를 확인했다. 작업 폴더의 미커밋 연결부에는 이 오류가 없었지만 PR 커밋에는 남아 있었다. 생성자 경계와 인자 순서를 PR 기준으로 바로잡았다. 이전의 격리 앱 빌드 성공 보고는 `232283e` 자체의 빌드 성공 근거로 사용하지 않는다.
+
+후속 수정 후보를 `232283e` 추출본에 적용한 뒤 WriterPad Debug / generic iOS Simulator / `CODE_SIGNING_ALLOWED=NO` 앱 빌드가 종료 코드 0으로 완료됐다. 기존 deprecated/concurrency 경고는 남아 있다. 이 검증에서 실기기 설치·앱 실행·인증·서버 요청은 하지 않았다.

@@ -9,6 +9,8 @@ struct RootView: View {
         ProjectWorkspaceView(
             projectManager: environment.projectManager,
             projectImporter: environment.projectImporter,
+            receivePromotionInspector: environment.receivePromotionInspector,
+            receivePromotionTransaction: environment.receivePromotionTransaction,
             binderRepository: environment.binderRepository,
             binderCommands: environment.binderCommands,
             documentRepository: environment.documentRepository,
@@ -18,8 +20,6 @@ struct RootView: View {
             backupStore: environment.backupStore,
             backupPolicyStore: environment.backupPolicyStore,
             projectBackupCoordinator: environment.projectBackupCoordinator,
-            receivePromotionInspector: environment.receivePromotionInspector,
-            receivePromotionTransaction: environment.receivePromotionTransaction,
             restoreCoordinator: environment.restoreCoordinator,
             workspaceStateRepository: environment.workspaceStateRepository,
             futureChangeNotifier: environment.futureChangeNotifier,

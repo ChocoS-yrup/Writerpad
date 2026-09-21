@@ -200,6 +200,96 @@ final class ReceivePromotionTransactionTests: XCTestCase {
         XCTAssertTrue(try markerNames(harness.root).isEmpty)
     }
 
+    func testFractionalClockRecoversEveryDurablePhase() async throws {
+        for point in [ReceivePromotionFaultPoint.afterMetadataRegistration,
+                      .afterPromotion, .afterReceiptWrite] {
+            let harness = makeHarness(
+                fault: .init(point: point, leavesTransactionForRecovery: true),
+                timestamp: 1_800_000_000.253024
+            )
+            await assertError(.injectedFailure(recoveryPending: true)) {
+                _ = try await harness.transaction.promote(
+                    from: harness.package.report, projectName: "소수점 시각 복구"
+                )
+            }
+            let recovery = makeRecovery(harness)
+            try await recovery.recoverPendingPromotions()
+            XCTAssertTrue(try markerNames(harness.root).isEmpty)
+            let result = try await recovery.promote(
+                from: harness.package.report, projectName: "소수점 시각 복구"
+            )
+            XCTAssertEqual(result.wasAlreadyCompleted, point != .afterMetadataRegistration)
+            let before = try snapshot(harness.root)
+            _ = try await recovery.promote(
+                from: harness.package.report, projectName: "소수점 시각 복구"
+            )
+            XCTAssertEqual(try snapshot(harness.root), before)
+        }
+    }
+
+    func testRollbackMetadataMismatchPreservesStagingAndMarker() async throws {
+        let harness = makeHarness(fault: .init(
+            point: .afterMetadataRegistration, leavesTransactionForRecovery: true
+        ))
+        await assertError(.injectedFailure(recoveryPending: true)) {
+            _ = try await harness.transaction.promote(
+                from: harness.package.report, projectName: "복구 자료 보존"
+            )
+        }
+        let project = try await harness.metadata.projects().first!
+        let changed = project.renamed(to: "다른 메타데이터", at: harness.clock.now())
+        try await harness.metadata.save(changed)
+        let before = try snapshot(harness.root)
+        XCTAssertTrue(before.keys.contains { $0.hasSuffix("저장경계.txt") })
+        do {
+            try await makeRecovery(harness).recoverPendingPromotions()
+            XCTFail("Metadata mismatch must block rollback")
+        } catch let error as ReceivePromotionTransactionError {
+            guard case .recoveryRequired = error else { throw error }
+        }
+        XCTAssertEqual(try snapshot(harness.root), before)
+        let retained = try await harness.metadata.project(id: project.id)
+        XCTAssertEqual(retained, changed)
+    }
+
+    func testConcurrentRecoveryCannotDeleteActiveStaging() async throws {
+        let harness = makeHarness()
+        await harness.metadata.pauseNextRegistration()
+        let promotion = Task {
+            try await harness.transaction.promote(
+                from: harness.package.report, projectName: "진행 중 거래"
+            )
+        }
+        await harness.metadata.waitForRegistrationPause()
+        let before = try snapshot(harness.root)
+        do {
+            try await harness.transaction.recoverPendingPromotions()
+            XCTFail("Recovery must reject an active transaction")
+        } catch {
+            XCTAssertEqual(error as? ReceivePromotionTransactionError, .operationInProgress)
+        }
+        XCTAssertEqual(try snapshot(harness.root), before)
+        do {
+            _ = try await harness.transaction.promote(
+                from: harness.package.report, projectName: "동시 요청"
+            )
+            XCTFail("Concurrent promotion must be rejected")
+        } catch {
+            XCTAssertEqual(error as? ReceivePromotionTransactionError, .operationInProgress)
+        }
+        XCTAssertEqual(try snapshot(harness.root), before)
+        await harness.metadata.resumeRegistration()
+        let result = try await promotion.value
+        XCTAssertFalse(result.wasAlreadyCompleted)
+        let projects = try await harness.metadata.projects()
+        XCTAssertEqual(projects.count, 1)
+        try await harness.transaction.recoverPendingPromotions()
+        let replay = try await harness.transaction.promote(
+            from: harness.package.report, projectName: "진행 중 거래"
+        )
+        XCTAssertTrue(replay.wasAlreadyCompleted)
+    }
+
     func testCorruptPostMoveStateFailsClosedAndPreservesEvidence() async throws {
         let harness = makeHarness(fault: .init(
             point: .afterPromotion,
@@ -304,7 +394,10 @@ private extension ReceivePromotionTransactionTests {
         let transaction: ReceivePromotionTransaction
     }
 
-    func makeHarness(fault: ReceivePromotionFaultPlan? = nil) -> Harness {
+    func makeHarness(
+        fault: ReceivePromotionFaultPlan? = nil,
+        timestamp: TimeInterval = 1_800_000_000
+    ) -> Harness {
         let parent = fileManager.temporaryDirectory.appendingPathComponent(
             "promotion-transaction-test-" + UUID().uuidString
         )
@@ -317,7 +410,7 @@ private extension ReceivePromotionTransactionTests {
         let publisher = ReceivePromotionMemoryPublisher(metadata)
         let uuids = ReceivePromotionSequenceUUIDGenerator()
         let clock = ReceivePromotionFixedClock(
-            value: Date(timeIntervalSince1970: 1_800_000_000)
+            value: Date(timeIntervalSince1970: timestamp)
         )
         return Harness(
             root: root,
@@ -478,6 +571,19 @@ private actor ReceivePromotionMutableMaterializer: ReceivePromotionPackageMateri
 private actor ReceivePromotionMemoryMetadata: ReceivePromotionMetadataStoring {
     private var projectValues: [ProjectID: Project] = [:]
     private var documentValues: [ProjectID: [DocumentNode]] = [:]
+    private var shouldPauseRegistration = false
+    private var registrationContinuation: CheckedContinuation<Void, Never>?
+    private var pauseWaiter: CheckedContinuation<Void, Never>?
+
+    func pauseNextRegistration() { shouldPauseRegistration = true }
+    func waitForRegistrationPause() async {
+        if registrationContinuation != nil { return }
+        await withCheckedContinuation { pauseWaiter = $0 }
+    }
+    func resumeRegistration() {
+        registrationContinuation?.resume()
+        registrationContinuation = nil
+    }
 
     func projects() async throws -> [Project] { Array(projectValues.values) }
     func project(id: ProjectID) async throws -> Project? { projectValues[id] }
@@ -507,6 +613,14 @@ private actor ReceivePromotionMemoryMetadata: ReceivePromotionMetadataStoring {
         _ project: Project,
         documents: [DocumentNode]
     ) async throws {
+        if shouldPauseRegistration {
+            shouldPauseRegistration = false
+            await withCheckedContinuation {
+                registrationContinuation = $0
+                pauseWaiter?.resume()
+                pauseWaiter = nil
+            }
+        }
         projectValues[project.id] = project
         documentValues[project.id] = documents
     }

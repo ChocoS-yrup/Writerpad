@@ -171,12 +171,6 @@ final class AppEnvironment: ObservableObject {
             pathResolver: pathResolver,
             clock: clock
         )
-        let workspaceLocator = RepositoryProjectWorkspaceLocator(
-            projectRepository: repository,
-            pathResolver: pathResolver
-        )
-        let syncMutationGate = SyncV2DocumentMutationGate()
-        let backupStore = LocalBackupStore(
         let receivePromotionReader = ReceivePromotionPackageReader()
         let receivePromotionTransaction = ReceivePromotionTransaction(
             packageReader: receivePromotionReader,
@@ -185,6 +179,12 @@ final class AppEnvironment: ObservableObject {
             pathResolver: pathResolver,
             clock: clock
         )
+        let workspaceLocator = RepositoryProjectWorkspaceLocator(
+            projectRepository: repository,
+            pathResolver: pathResolver
+        )
+        let syncMutationGate = SyncV2DocumentMutationGate()
+        let backupStore = LocalBackupStore(
             workspaceLocator: workspaceLocator,
             clock: clock
         )
@@ -540,12 +540,12 @@ final class AppEnvironment: ObservableObject {
             projectImporter: projectImporter,
             binderRepository: binderRepository,
             binderCommands: binderCommands,
+            receivePromotionInspector: receivePromotionReader,
+            receivePromotionTransaction: receivePromotionTransaction,
             localDocumentStore: localDocumentStore,
             searchService: searchService,
             backupStore: backupStore,
             backupPolicyStore: backupPolicyStore,
-            receivePromotionInspector: receivePromotionReader,
-            receivePromotionTransaction: receivePromotionTransaction,
             projectBackupCoordinator: projectBackupCoordinator,
             conflictRecoveryStore: conflictRecoveryStore,
             restoreCoordinator: restoreCoordinator,
