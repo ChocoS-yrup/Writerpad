@@ -36,7 +36,7 @@ for key in WriterPadSupabaseURL WriterPadSupabasePublishableKey; do
 done
 
 if rg -n -i \
-    '(service[_ -]?role|sb_secret_|access[_ -]?token|refresh[_ -]?token|password|email)[^=]*=[[:space:]]*"[^"]+"' \
+    '(service[_ -]?role|sb_secret_|access[_ -]?token|refresh[_ -]?token|password|email)[[:space:]]*[:=][[:space:]]*"[^"]+"' \
     WriterPad Configuration --glob '!Supabase.local.xcconfig.example' >/dev/null; then
     fail "a forbidden credential-like value exists in app/configuration sources"
 fi
