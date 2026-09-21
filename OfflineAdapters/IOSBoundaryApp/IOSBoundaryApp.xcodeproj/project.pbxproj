@@ -1,0 +1,423 @@
+// !$*UTF8*$!
+{
+	archiveVersion = 1;
+	classes = {
+	};
+	objectVersion = 60;
+	objects = {
+
+/* Begin PBXBuildFile section */
+		A10000000000000000000016 /* ReceiveBoundaryApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = A10000000000000000000008 /* ReceiveBoundaryApp.swift */; };
+		A10000000000000000000040 /* ../SyntheticInitialReceive/Sources/SyntheticInitialReceive/Adapter.swift in Sources */ = {isa = PBXBuildFile; fileRef = A10000000000000000000030 /* ../SyntheticInitialReceive/Sources/SyntheticInitialReceive/Adapter.swift */; };
+		A10000000000000000000041 /* ../SyntheticInitialReceive/Sources/SyntheticInitialReceive/Fixture.swift in Sources */ = {isa = PBXBuildFile; fileRef = A10000000000000000000031 /* ../SyntheticInitialReceive/Sources/SyntheticInitialReceive/Fixture.swift */; };
+		A10000000000000000000042 /* ../SyntheticInitialReceive/Sources/SyntheticInitialReceive/SafeFiles.swift in Sources */ = {isa = PBXBuildFile; fileRef = A10000000000000000000032 /* ../SyntheticInitialReceive/Sources/SyntheticInitialReceive/SafeFiles.swift */; };
+		A10000000000000000000043 /* ../SyntheticInitialReceive/Sources/SyntheticInitialReceive/LocalBoundary.swift in Sources */ = {isa = PBXBuildFile; fileRef = A10000000000000000000033 /* ../SyntheticInitialReceive/Sources/SyntheticInitialReceive/LocalBoundary.swift */; };
+		A10000000000000000000044 /* ../SyntheticInitialReceive/Sources/SyntheticInitialReceive/PhysicalBoundaryStorage.swift in Sources */ = {isa = PBXBuildFile; fileRef = A10000000000000000000034 /* ../SyntheticInitialReceive/Sources/SyntheticInitialReceive/PhysicalBoundaryStorage.swift */; };
+		A10000000000000000000045 /* ../SyntheticInitialReceive/Sources/SyntheticInitialReceive/ProtectedBoundaryContainer.swift in Sources */ = {isa = PBXBuildFile; fileRef = A10000000000000000000035 /* ../SyntheticInitialReceive/Sources/SyntheticInitialReceive/ProtectedBoundaryContainer.swift */; };
+		A10000000000000000000046 /* ../SyntheticInitialReceive/Sources/SyntheticInitialReceive/IOSBoundaryController.swift in Sources */ = {isa = PBXBuildFile; fileRef = A10000000000000000000036 /* ../SyntheticInitialReceive/Sources/SyntheticInitialReceive/IOSBoundaryController.swift */; };
+		A10000000000000000000047 /* ../SyntheticInitialReceive/Sources/SyntheticInitialReceive/WindowsWireJSON.swift in Sources */ = {isa = PBXBuildFile; fileRef = A10000000000000000000037 /* ../SyntheticInitialReceive/Sources/SyntheticInitialReceive/WindowsWireJSON.swift */; };
+		A10000000000000000000048 /* ../SyntheticInitialReceive/Sources/SyntheticInitialReceive/WindowsHandoffReader.swift in Sources */ = {isa = PBXBuildFile; fileRef = A10000000000000000000038 /* ../SyntheticInitialReceive/Sources/SyntheticInitialReceive/WindowsHandoffReader.swift */; };
+		A10000000000000000000049 /* ../SyntheticInitialReceive/Sources/SyntheticInitialReceive/WindowsReaderWork.swift in Sources */ = {isa = PBXBuildFile; fileRef = A10000000000000000000039 /* ../SyntheticInitialReceive/Sources/SyntheticInitialReceive/WindowsReaderWork.swift */; };
+		A10000000000000000000070 /* ../SyntheticInitialReceive/Sources/SyntheticInitialReceive/SyntheticABContract.swift in Sources */ = {isa = PBXBuildFile; fileRef = A10000000000000000000060 /* ../SyntheticInitialReceive/Sources/SyntheticInitialReceive/SyntheticABContract.swift */; };
+		A10000000000000000000071 /* ../SyntheticInitialReceive/Sources/SyntheticInitialReceive/SyntheticABPolicy.swift in Sources */ = {isa = PBXBuildFile; fileRef = A10000000000000000000061 /* ../SyntheticInitialReceive/Sources/SyntheticInitialReceive/SyntheticABPolicy.swift */; };
+		A10000000000000000000072 /* ../SyntheticInitialReceive/Sources/SyntheticInitialReceive/SyntheticABDiskJournal.swift in Sources */ = {isa = PBXBuildFile; fileRef = A10000000000000000000062 /* ../SyntheticInitialReceive/Sources/SyntheticInitialReceive/SyntheticABDiskJournal.swift */; };
+		A10000000000000000000073 /* ../SyntheticInitialReceive/Sources/SyntheticInitialReceive/ProtectedABJournalWork.swift in Sources */ = {isa = PBXBuildFile; fileRef = A10000000000000000000063 /* ../SyntheticInitialReceive/Sources/SyntheticInitialReceive/ProtectedABJournalWork.swift */; };
+		A10000000000000000000074 /* ../SyntheticInitialReceive/Sources/SyntheticInitialReceive/ABRuntimeClock.swift in Sources */ = {isa = PBXBuildFile; fileRef = A10000000000000000000064 /* ../SyntheticInitialReceive/Sources/SyntheticInitialReceive/ABRuntimeClock.swift */; };
+		A10000000000000000000075 /* ../SyntheticInitialReceive/Sources/SyntheticInitialReceive/ReceiveSessionBoundary.swift in Sources */ = {isa = PBXBuildFile; fileRef = A10000000000000000000065 /* ../SyntheticInitialReceive/Sources/SyntheticInitialReceive/ReceiveSessionBoundary.swift */; };
+		A10000000000000000000076 /* ../SyntheticInitialReceive/Sources/SyntheticInitialReceive/ReceiveHTTPConnection.swift in Sources */ = {isa = PBXBuildFile; fileRef = A10000000000000000000066 /* ../SyntheticInitialReceive/Sources/SyntheticInitialReceive/ReceiveHTTPConnection.swift */; };
+		A10000000000000000000077 /* ../SyntheticInitialReceive/Sources/SyntheticInitialReceive/ReceiveAuthOwner.swift in Sources */ = {isa = PBXBuildFile; fileRef = A10000000000000000000067 /* ../SyntheticInitialReceive/Sources/SyntheticInitialReceive/ReceiveAuthOwner.swift */; };
+		A10000000000000000000078 /* ../SyntheticInitialReceive/Sources/SyntheticInitialReceive/ReceiveABCoordinator.swift in Sources */ = {isa = PBXBuildFile; fileRef = A10000000000000000000068 /* ../SyntheticInitialReceive/Sources/SyntheticInitialReceive/ReceiveABCoordinator.swift */; };
+		A10000000000000000000079 /* ../SyntheticInitialReceive/Sources/SyntheticInitialReceive/ReceiveOfflineAppSession.swift in Sources */ = {isa = PBXBuildFile; fileRef = A10000000000000000000069 /* ../SyntheticInitialReceive/Sources/SyntheticInitialReceive/ReceiveOfflineAppSession.swift */; };
+		A10000000000000000000090 /* ../SyntheticInitialReceive/Sources/SyntheticInitialReceive/ReceiveAuthObservation.swift in Sources */ = {isa = PBXBuildFile; fileRef = A10000000000000000000080 /* ../SyntheticInitialReceive/Sources/SyntheticInitialReceive/ReceiveAuthObservation.swift */; };
+		A10000000000000000000091 /* ../SyntheticInitialReceive/Sources/SyntheticInitialReceive/ReviewedReceiveTarget.swift in Sources */ = {isa = PBXBuildFile; fileRef = A10000000000000000000081 /* ../SyntheticInitialReceive/Sources/SyntheticInitialReceive/ReviewedReceiveTarget.swift */; };
+		A10000000000000000000092 /* ../SyntheticInitialReceive/Sources/SyntheticInitialReceive/ReceiveExecutionCandidate.swift in Sources */ = {isa = PBXBuildFile; fileRef = A10000000000000000000082 /* ../SyntheticInitialReceive/Sources/SyntheticInitialReceive/ReceiveExecutionCandidate.swift */; };
+		A10000000000000000000093 /* ../SyntheticInitialReceive/Sources/SyntheticInitialReceive/ReceiveReviewedExecution.swift in Sources */ = {isa = PBXBuildFile; fileRef = A10000000000000000000083 /* ../SyntheticInitialReceive/Sources/SyntheticInitialReceive/ReceiveReviewedExecution.swift */; };
+		A10000000000000000000094 /* ../SyntheticInitialReceive/Sources/SyntheticInitialReceive/ReceiveInputAdmission.swift in Sources */ = {isa = PBXBuildFile; fileRef = A10000000000000000000084 /* ../SyntheticInitialReceive/Sources/SyntheticInitialReceive/ReceiveInputAdmission.swift */; };
+		A200000000000000000000C8 /* ../SyntheticInitialReceive/Sources/SyntheticInitialReceive/ReceiveActivationAuthority.swift in Sources */ = {isa = PBXBuildFile; fileRef = A100000000000000000000C8 /* ../SyntheticInitialReceive/Sources/SyntheticInitialReceive/ReceiveActivationAuthority.swift */; };
+		A200000000000000000000C9 /* ../SyntheticInitialReceive/Sources/SyntheticInitialReceive/ReceiveProductProjection.swift in Sources */ = {isa = PBXBuildFile; fileRef = A100000000000000000000C9 /* ../SyntheticInitialReceive/Sources/SyntheticInitialReceive/ReceiveProductProjection.swift */; };
+		A200000000000000000000CA /* ../SyntheticInitialReceive/Sources/SyntheticInitialReceive/ReceiveProductDatabases.swift in Sources */ = {isa = PBXBuildFile; fileRef = A100000000000000000000CA /* ../SyntheticInitialReceive/Sources/SyntheticInitialReceive/ReceiveProductDatabases.swift */; };
+		A200000000000000000000CB /* ../SyntheticInitialReceive/Sources/SyntheticInitialReceive/ReceiveProductModelSupport.swift in Sources */ = {isa = PBXBuildFile; fileRef = A100000000000000000000CB /* ../SyntheticInitialReceive/Sources/SyntheticInitialReceive/ReceiveProductModelSupport.swift */; };
+		A200000000000000000000CC /* ../SyntheticInitialReceive/Sources/SyntheticInitialReceive/ReceiveDedicatedEnvironment.swift in Sources */ = {isa = PBXBuildFile; fileRef = A100000000000000000000CC /* ../SyntheticInitialReceive/Sources/SyntheticInitialReceive/ReceiveDedicatedEnvironment.swift */; };
+		A200000000000000000000CD /* ../SyntheticInitialReceive/Sources/SyntheticInitialReceive/ProductModels/BootstrapRecord.swift in Sources */ = {isa = PBXBuildFile; fileRef = A100000000000000000000CD /* ../SyntheticInitialReceive/Sources/SyntheticInitialReceive/ProductModels/BootstrapRecord.swift */; };
+		A200000000000000000000CE /* ../SyntheticInitialReceive/Sources/SyntheticInitialReceive/ProductModels/WriterPadMetadataSchema.swift in Sources */ = {isa = PBXBuildFile; fileRef = A100000000000000000000CE /* ../SyntheticInitialReceive/Sources/SyntheticInitialReceive/ProductModels/WriterPadMetadataSchema.swift */; };
+		A200000000000000000000CF /* ../SyntheticInitialReceive/Sources/SyntheticInitialReceive/MigrationResources/SyncV2StoreSchemaV1.sql in Resources */ = {isa = PBXBuildFile; fileRef = A100000000000000000000CF /* ../SyntheticInitialReceive/Sources/SyntheticInitialReceive/MigrationResources/SyncV2StoreSchemaV1.sql */; };
+		A200000000000000000000D0 /* ../SyntheticInitialReceive/Sources/SyntheticInitialReceive/MigrationResources/SyncV2StoreSchemaV2.sql in Resources */ = {isa = PBXBuildFile; fileRef = A100000000000000000000D0 /* ../SyntheticInitialReceive/Sources/SyntheticInitialReceive/MigrationResources/SyncV2StoreSchemaV2.sql */; };
+		A200000000000000000000D1 /* ../SyntheticInitialReceive/Sources/SyntheticInitialReceive/MigrationResources/SyncV2StoreSchemaV3.sql in Resources */ = {isa = PBXBuildFile; fileRef = A100000000000000000000D1 /* ../SyntheticInitialReceive/Sources/SyntheticInitialReceive/MigrationResources/SyncV2StoreSchemaV3.sql */; };
+		A200000000000000000000D2 /* ../SyntheticInitialReceive/Sources/SyntheticInitialReceive/MigrationResources/SyncV2StoreSchemaV4.sql in Resources */ = {isa = PBXBuildFile; fileRef = A100000000000000000000D2 /* ../SyntheticInitialReceive/Sources/SyntheticInitialReceive/MigrationResources/SyncV2StoreSchemaV4.sql */; };
+		A200000000000000000000D3 /* ../SyntheticInitialReceive/Sources/SyntheticInitialReceive/MigrationResources/SyncV2StoreSchemaV5.sql in Resources */ = {isa = PBXBuildFile; fileRef = A100000000000000000000D3 /* ../SyntheticInitialReceive/Sources/SyntheticInitialReceive/MigrationResources/SyncV2StoreSchemaV5.sql */; };
+		A200000000000000000000D4 /* ../SyntheticInitialReceive/Sources/SyntheticInitialReceive/MigrationResources/SyncV2StoreSchemaV6.sql in Resources */ = {isa = PBXBuildFile; fileRef = A100000000000000000000D4 /* ../SyntheticInitialReceive/Sources/SyntheticInitialReceive/MigrationResources/SyncV2StoreSchemaV6.sql */; };
+		A200000000000000000000D5 /* ../SyntheticInitialReceive/Sources/SyntheticInitialReceive/MigrationResources/SyncV2StoreSchemaV7.sql in Resources */ = {isa = PBXBuildFile; fileRef = A100000000000000000000D5 /* ../SyntheticInitialReceive/Sources/SyntheticInitialReceive/MigrationResources/SyncV2StoreSchemaV7.sql */; };
+		A200000000000000000000D6 /* ../SyntheticInitialReceive/Sources/SyntheticInitialReceive/MigrationResources/SyncV2StoreSchemaV8.sql in Resources */ = {isa = PBXBuildFile; fileRef = A100000000000000000000D6 /* ../SyntheticInitialReceive/Sources/SyntheticInitialReceive/MigrationResources/SyncV2StoreSchemaV8.sql */; };
+		A200000000000000000000D7 /* ../SyntheticInitialReceive/Sources/SyntheticInitialReceive/MigrationResources/SyncV2StoreSchemaV9.sql in Resources */ = {isa = PBXBuildFile; fileRef = A100000000000000000000D7 /* ../SyntheticInitialReceive/Sources/SyntheticInitialReceive/MigrationResources/SyncV2StoreSchemaV9.sql */; };
+		A200000000000000000000D8 /* ../SyntheticInitialReceive/Sources/SyntheticInitialReceive/MigrationResources/SyncV2StoreSchemaV10.sql in Resources */ = {isa = PBXBuildFile; fileRef = A100000000000000000000D8 /* ../SyntheticInitialReceive/Sources/SyntheticInitialReceive/MigrationResources/SyncV2StoreSchemaV10.sql */; };
+		A200000000000000000000D9 /* ../SyntheticInitialReceive/Sources/SyntheticInitialReceive/MigrationResources/SyncV2StoreSchemaV11.sql in Resources */ = {isa = PBXBuildFile; fileRef = A100000000000000000000D9 /* ../SyntheticInitialReceive/Sources/SyntheticInitialReceive/MigrationResources/SyncV2StoreSchemaV11.sql */; };
+		A200000000000000000000DA /* ../SyntheticInitialReceive/Sources/SyntheticInitialReceive/MigrationResources/SyncV2StoreSchemaV12.sql in Resources */ = {isa = PBXBuildFile; fileRef = A100000000000000000000DA /* ../SyntheticInitialReceive/Sources/SyntheticInitialReceive/MigrationResources/SyncV2StoreSchemaV12.sql */; };
+		A200000000000000000000DB /* ../SyntheticInitialReceive/Sources/SyntheticInitialReceive/MigrationResources/SyncV2StoreSchemaV13.sql in Resources */ = {isa = PBXBuildFile; fileRef = A100000000000000000000DB /* ../SyntheticInitialReceive/Sources/SyntheticInitialReceive/MigrationResources/SyncV2StoreSchemaV13.sql */; };
+		A200000000000000000000DC /* ../SyntheticInitialReceive/Sources/SyntheticInitialReceive/MigrationResources/SyncV2StoreSchemaV14.sql in Resources */ = {isa = PBXBuildFile; fileRef = A100000000000000000000DC /* ../SyntheticInitialReceive/Sources/SyntheticInitialReceive/MigrationResources/SyncV2StoreSchemaV14.sql */; };
+		A200000000000000000000DD /* ../SyntheticInitialReceive/Sources/SyntheticInitialReceive/MigrationResources/SyncV2StoreSchemaV15.sql in Resources */ = {isa = PBXBuildFile; fileRef = A100000000000000000000DD /* ../SyntheticInitialReceive/Sources/SyntheticInitialReceive/MigrationResources/SyncV2StoreSchemaV15.sql */; };
+		A200000000000000000000DE /* ../SyntheticInitialReceive/Sources/SyntheticInitialReceive/MigrationResources/SyncV2StoreSchemaV16.sql in Resources */ = {isa = PBXBuildFile; fileRef = A100000000000000000000DE /* ../SyntheticInitialReceive/Sources/SyntheticInitialReceive/MigrationResources/SyncV2StoreSchemaV16.sql */; };
+		A20000000000000000000F00 /* ../SyntheticInitialReceive/Sources/SyntheticInitialReceive/ReceiveAuthorizedRun.swift in Sources */ = {isa = PBXBuildFile; fileRef = A10000000000000000000F00 /* ../SyntheticInitialReceive/Sources/SyntheticInitialReceive/ReceiveAuthorizedRun.swift */; };
+		A20000000000000000000F01 /* ../SyntheticInitialReceive/Sources/SyntheticInitialReceive/ReceiveApprovalCallSite.swift in Sources */ = {isa = PBXBuildFile; fileRef = A10000000000000000000F01 /* ../SyntheticInitialReceive/Sources/SyntheticInitialReceive/ReceiveApprovalCallSite.swift */; };
+		A20000000000000000000F02 /* ../SyntheticInitialReceive/Sources/SyntheticInitialReceive/StorageFailureDiagnostic.swift in Sources */ = {isa = PBXBuildFile; fileRef = A10000000000000000000F02 /* ../SyntheticInitialReceive/Sources/SyntheticInitialReceive/StorageFailureDiagnostic.swift */; };
+		A20000000000000000000F03 /* ../SyntheticInitialReceive/Sources/SyntheticInitialReceive/ReceiveEditableCopy.swift in Sources */ = {isa = PBXBuildFile; fileRef = A10000000000000000000F03 /* ../SyntheticInitialReceive/Sources/SyntheticInitialReceive/ReceiveEditableCopy.swift */; };
+		A20000000000000000000F04 /* ../SyntheticInitialReceive/Sources/SyntheticInitialReceive/ReceiveEditableExport.swift in Sources */ = {isa = PBXBuildFile; fileRef = A10000000000000000000F04 /* ../SyntheticInitialReceive/Sources/SyntheticInitialReceive/ReceiveEditableExport.swift */; };
+		A20000000000000000000F05 /* ../SyntheticInitialReceive/Sources/SyntheticInitialReceive/ReceiveEditablePromotionPackage.swift in Sources */ = {isa = PBXBuildFile; fileRef = A10000000000000000000F05 /* ../SyntheticInitialReceive/Sources/SyntheticInitialReceive/ReceiveEditablePromotionPackage.swift */; };
+/* End PBXBuildFile section */
+
+/* Begin PBXFileReference section */
+		A10000000000000000000008 /* ReceiveBoundaryApp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ReceiveBoundaryApp.swift; sourceTree = "<group>"; };
+		A10000000000000000000009 /* ReceiveBoundary.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = ReceiveBoundary.app; sourceTree = BUILT_PRODUCTS_DIR; };
+		A10000000000000000000030 /* ../SyntheticInitialReceive/Sources/SyntheticInitialReceive/Adapter.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ../SyntheticInitialReceive/Sources/SyntheticInitialReceive/Adapter.swift; sourceTree = "<group>"; };
+		A10000000000000000000031 /* ../SyntheticInitialReceive/Sources/SyntheticInitialReceive/Fixture.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ../SyntheticInitialReceive/Sources/SyntheticInitialReceive/Fixture.swift; sourceTree = "<group>"; };
+		A10000000000000000000032 /* ../SyntheticInitialReceive/Sources/SyntheticInitialReceive/SafeFiles.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ../SyntheticInitialReceive/Sources/SyntheticInitialReceive/SafeFiles.swift; sourceTree = "<group>"; };
+		A10000000000000000000033 /* ../SyntheticInitialReceive/Sources/SyntheticInitialReceive/LocalBoundary.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ../SyntheticInitialReceive/Sources/SyntheticInitialReceive/LocalBoundary.swift; sourceTree = "<group>"; };
+		A10000000000000000000034 /* ../SyntheticInitialReceive/Sources/SyntheticInitialReceive/PhysicalBoundaryStorage.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ../SyntheticInitialReceive/Sources/SyntheticInitialReceive/PhysicalBoundaryStorage.swift; sourceTree = "<group>"; };
+		A10000000000000000000035 /* ../SyntheticInitialReceive/Sources/SyntheticInitialReceive/ProtectedBoundaryContainer.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ../SyntheticInitialReceive/Sources/SyntheticInitialReceive/ProtectedBoundaryContainer.swift; sourceTree = "<group>"; };
+		A10000000000000000000036 /* ../SyntheticInitialReceive/Sources/SyntheticInitialReceive/IOSBoundaryController.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ../SyntheticInitialReceive/Sources/SyntheticInitialReceive/IOSBoundaryController.swift; sourceTree = "<group>"; };
+		A10000000000000000000037 /* ../SyntheticInitialReceive/Sources/SyntheticInitialReceive/WindowsWireJSON.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ../SyntheticInitialReceive/Sources/SyntheticInitialReceive/WindowsWireJSON.swift; sourceTree = "<group>"; };
+		A10000000000000000000038 /* ../SyntheticInitialReceive/Sources/SyntheticInitialReceive/WindowsHandoffReader.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ../SyntheticInitialReceive/Sources/SyntheticInitialReceive/WindowsHandoffReader.swift; sourceTree = "<group>"; };
+		A10000000000000000000039 /* ../SyntheticInitialReceive/Sources/SyntheticInitialReceive/WindowsReaderWork.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ../SyntheticInitialReceive/Sources/SyntheticInitialReceive/WindowsReaderWork.swift; sourceTree = "<group>"; };
+		A10000000000000000000050 /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = Info.plist; sourceTree = "<group>"; };
+		A10000000000000000000060 /* ../SyntheticInitialReceive/Sources/SyntheticInitialReceive/SyntheticABContract.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ../SyntheticInitialReceive/Sources/SyntheticInitialReceive/SyntheticABContract.swift; sourceTree = "<group>"; };
+		A10000000000000000000061 /* ../SyntheticInitialReceive/Sources/SyntheticInitialReceive/SyntheticABPolicy.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ../SyntheticInitialReceive/Sources/SyntheticInitialReceive/SyntheticABPolicy.swift; sourceTree = "<group>"; };
+		A10000000000000000000062 /* ../SyntheticInitialReceive/Sources/SyntheticInitialReceive/SyntheticABDiskJournal.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ../SyntheticInitialReceive/Sources/SyntheticInitialReceive/SyntheticABDiskJournal.swift; sourceTree = "<group>"; };
+		A10000000000000000000063 /* ../SyntheticInitialReceive/Sources/SyntheticInitialReceive/ProtectedABJournalWork.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ../SyntheticInitialReceive/Sources/SyntheticInitialReceive/ProtectedABJournalWork.swift; sourceTree = "<group>"; };
+		A10000000000000000000064 /* ../SyntheticInitialReceive/Sources/SyntheticInitialReceive/ABRuntimeClock.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ../SyntheticInitialReceive/Sources/SyntheticInitialReceive/ABRuntimeClock.swift; sourceTree = "<group>"; };
+		A10000000000000000000065 /* ../SyntheticInitialReceive/Sources/SyntheticInitialReceive/ReceiveSessionBoundary.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ../SyntheticInitialReceive/Sources/SyntheticInitialReceive/ReceiveSessionBoundary.swift; sourceTree = "<group>"; };
+		A10000000000000000000066 /* ../SyntheticInitialReceive/Sources/SyntheticInitialReceive/ReceiveHTTPConnection.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ../SyntheticInitialReceive/Sources/SyntheticInitialReceive/ReceiveHTTPConnection.swift; sourceTree = "<group>"; };
+		A10000000000000000000067 /* ../SyntheticInitialReceive/Sources/SyntheticInitialReceive/ReceiveAuthOwner.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ../SyntheticInitialReceive/Sources/SyntheticInitialReceive/ReceiveAuthOwner.swift; sourceTree = "<group>"; };
+		A10000000000000000000068 /* ../SyntheticInitialReceive/Sources/SyntheticInitialReceive/ReceiveABCoordinator.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ../SyntheticInitialReceive/Sources/SyntheticInitialReceive/ReceiveABCoordinator.swift; sourceTree = "<group>"; };
+		A10000000000000000000069 /* ../SyntheticInitialReceive/Sources/SyntheticInitialReceive/ReceiveOfflineAppSession.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ../SyntheticInitialReceive/Sources/SyntheticInitialReceive/ReceiveOfflineAppSession.swift; sourceTree = "<group>"; };
+		A10000000000000000000080 /* ../SyntheticInitialReceive/Sources/SyntheticInitialReceive/ReceiveAuthObservation.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ../SyntheticInitialReceive/Sources/SyntheticInitialReceive/ReceiveAuthObservation.swift; sourceTree = "<group>"; };
+		A10000000000000000000081 /* ../SyntheticInitialReceive/Sources/SyntheticInitialReceive/ReviewedReceiveTarget.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ../SyntheticInitialReceive/Sources/SyntheticInitialReceive/ReviewedReceiveTarget.swift; sourceTree = "<group>"; };
+		A10000000000000000000082 /* ../SyntheticInitialReceive/Sources/SyntheticInitialReceive/ReceiveExecutionCandidate.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ../SyntheticInitialReceive/Sources/SyntheticInitialReceive/ReceiveExecutionCandidate.swift; sourceTree = "<group>"; };
+		A10000000000000000000083 /* ../SyntheticInitialReceive/Sources/SyntheticInitialReceive/ReceiveReviewedExecution.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ../SyntheticInitialReceive/Sources/SyntheticInitialReceive/ReceiveReviewedExecution.swift; sourceTree = "<group>"; };
+		A10000000000000000000084 /* ../SyntheticInitialReceive/Sources/SyntheticInitialReceive/ReceiveInputAdmission.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ../SyntheticInitialReceive/Sources/SyntheticInitialReceive/ReceiveInputAdmission.swift; sourceTree = "<group>"; };
+		A100000000000000000000C8 /* ../SyntheticInitialReceive/Sources/SyntheticInitialReceive/ReceiveActivationAuthority.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ../SyntheticInitialReceive/Sources/SyntheticInitialReceive/ReceiveActivationAuthority.swift; sourceTree = "<group>"; };
+		A100000000000000000000C9 /* ../SyntheticInitialReceive/Sources/SyntheticInitialReceive/ReceiveProductProjection.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ../SyntheticInitialReceive/Sources/SyntheticInitialReceive/ReceiveProductProjection.swift; sourceTree = "<group>"; };
+		A100000000000000000000CA /* ../SyntheticInitialReceive/Sources/SyntheticInitialReceive/ReceiveProductDatabases.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ../SyntheticInitialReceive/Sources/SyntheticInitialReceive/ReceiveProductDatabases.swift; sourceTree = "<group>"; };
+		A100000000000000000000CB /* ../SyntheticInitialReceive/Sources/SyntheticInitialReceive/ReceiveProductModelSupport.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ../SyntheticInitialReceive/Sources/SyntheticInitialReceive/ReceiveProductModelSupport.swift; sourceTree = "<group>"; };
+		A100000000000000000000CC /* ../SyntheticInitialReceive/Sources/SyntheticInitialReceive/ReceiveDedicatedEnvironment.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ../SyntheticInitialReceive/Sources/SyntheticInitialReceive/ReceiveDedicatedEnvironment.swift; sourceTree = "<group>"; };
+		A100000000000000000000CD /* ../SyntheticInitialReceive/Sources/SyntheticInitialReceive/ProductModels/BootstrapRecord.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ../SyntheticInitialReceive/Sources/SyntheticInitialReceive/ProductModels/BootstrapRecord.swift; sourceTree = "<group>"; };
+		A100000000000000000000CE /* ../SyntheticInitialReceive/Sources/SyntheticInitialReceive/ProductModels/WriterPadMetadataSchema.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ../SyntheticInitialReceive/Sources/SyntheticInitialReceive/ProductModels/WriterPadMetadataSchema.swift; sourceTree = "<group>"; };
+		A100000000000000000000CF /* ../SyntheticInitialReceive/Sources/SyntheticInitialReceive/MigrationResources/SyncV2StoreSchemaV1.sql */ = {isa = PBXFileReference; lastKnownFileType = text; path = ../SyntheticInitialReceive/Sources/SyntheticInitialReceive/MigrationResources/SyncV2StoreSchemaV1.sql; sourceTree = "<group>"; };
+		A100000000000000000000D0 /* ../SyntheticInitialReceive/Sources/SyntheticInitialReceive/MigrationResources/SyncV2StoreSchemaV2.sql */ = {isa = PBXFileReference; lastKnownFileType = text; path = ../SyntheticInitialReceive/Sources/SyntheticInitialReceive/MigrationResources/SyncV2StoreSchemaV2.sql; sourceTree = "<group>"; };
+		A100000000000000000000D1 /* ../SyntheticInitialReceive/Sources/SyntheticInitialReceive/MigrationResources/SyncV2StoreSchemaV3.sql */ = {isa = PBXFileReference; lastKnownFileType = text; path = ../SyntheticInitialReceive/Sources/SyntheticInitialReceive/MigrationResources/SyncV2StoreSchemaV3.sql; sourceTree = "<group>"; };
+		A100000000000000000000D2 /* ../SyntheticInitialReceive/Sources/SyntheticInitialReceive/MigrationResources/SyncV2StoreSchemaV4.sql */ = {isa = PBXFileReference; lastKnownFileType = text; path = ../SyntheticInitialReceive/Sources/SyntheticInitialReceive/MigrationResources/SyncV2StoreSchemaV4.sql; sourceTree = "<group>"; };
+		A100000000000000000000D3 /* ../SyntheticInitialReceive/Sources/SyntheticInitialReceive/MigrationResources/SyncV2StoreSchemaV5.sql */ = {isa = PBXFileReference; lastKnownFileType = text; path = ../SyntheticInitialReceive/Sources/SyntheticInitialReceive/MigrationResources/SyncV2StoreSchemaV5.sql; sourceTree = "<group>"; };
+		A100000000000000000000D4 /* ../SyntheticInitialReceive/Sources/SyntheticInitialReceive/MigrationResources/SyncV2StoreSchemaV6.sql */ = {isa = PBXFileReference; lastKnownFileType = text; path = ../SyntheticInitialReceive/Sources/SyntheticInitialReceive/MigrationResources/SyncV2StoreSchemaV6.sql; sourceTree = "<group>"; };
+		A100000000000000000000D5 /* ../SyntheticInitialReceive/Sources/SyntheticInitialReceive/MigrationResources/SyncV2StoreSchemaV7.sql */ = {isa = PBXFileReference; lastKnownFileType = text; path = ../SyntheticInitialReceive/Sources/SyntheticInitialReceive/MigrationResources/SyncV2StoreSchemaV7.sql; sourceTree = "<group>"; };
+		A100000000000000000000D6 /* ../SyntheticInitialReceive/Sources/SyntheticInitialReceive/MigrationResources/SyncV2StoreSchemaV8.sql */ = {isa = PBXFileReference; lastKnownFileType = text; path = ../SyntheticInitialReceive/Sources/SyntheticInitialReceive/MigrationResources/SyncV2StoreSchemaV8.sql; sourceTree = "<group>"; };
+		A100000000000000000000D7 /* ../SyntheticInitialReceive/Sources/SyntheticInitialReceive/MigrationResources/SyncV2StoreSchemaV9.sql */ = {isa = PBXFileReference; lastKnownFileType = text; path = ../SyntheticInitialReceive/Sources/SyntheticInitialReceive/MigrationResources/SyncV2StoreSchemaV9.sql; sourceTree = "<group>"; };
+		A100000000000000000000D8 /* ../SyntheticInitialReceive/Sources/SyntheticInitialReceive/MigrationResources/SyncV2StoreSchemaV10.sql */ = {isa = PBXFileReference; lastKnownFileType = text; path = ../SyntheticInitialReceive/Sources/SyntheticInitialReceive/MigrationResources/SyncV2StoreSchemaV10.sql; sourceTree = "<group>"; };
+		A100000000000000000000D9 /* ../SyntheticInitialReceive/Sources/SyntheticInitialReceive/MigrationResources/SyncV2StoreSchemaV11.sql */ = {isa = PBXFileReference; lastKnownFileType = text; path = ../SyntheticInitialReceive/Sources/SyntheticInitialReceive/MigrationResources/SyncV2StoreSchemaV11.sql; sourceTree = "<group>"; };
+		A100000000000000000000DA /* ../SyntheticInitialReceive/Sources/SyntheticInitialReceive/MigrationResources/SyncV2StoreSchemaV12.sql */ = {isa = PBXFileReference; lastKnownFileType = text; path = ../SyntheticInitialReceive/Sources/SyntheticInitialReceive/MigrationResources/SyncV2StoreSchemaV12.sql; sourceTree = "<group>"; };
+		A100000000000000000000DB /* ../SyntheticInitialReceive/Sources/SyntheticInitialReceive/MigrationResources/SyncV2StoreSchemaV13.sql */ = {isa = PBXFileReference; lastKnownFileType = text; path = ../SyntheticInitialReceive/Sources/SyntheticInitialReceive/MigrationResources/SyncV2StoreSchemaV13.sql; sourceTree = "<group>"; };
+		A100000000000000000000DC /* ../SyntheticInitialReceive/Sources/SyntheticInitialReceive/MigrationResources/SyncV2StoreSchemaV14.sql */ = {isa = PBXFileReference; lastKnownFileType = text; path = ../SyntheticInitialReceive/Sources/SyntheticInitialReceive/MigrationResources/SyncV2StoreSchemaV14.sql; sourceTree = "<group>"; };
+		A100000000000000000000DD /* ../SyntheticInitialReceive/Sources/SyntheticInitialReceive/MigrationResources/SyncV2StoreSchemaV15.sql */ = {isa = PBXFileReference; lastKnownFileType = text; path = ../SyntheticInitialReceive/Sources/SyntheticInitialReceive/MigrationResources/SyncV2StoreSchemaV15.sql; sourceTree = "<group>"; };
+		A100000000000000000000DE /* ../SyntheticInitialReceive/Sources/SyntheticInitialReceive/MigrationResources/SyncV2StoreSchemaV16.sql */ = {isa = PBXFileReference; lastKnownFileType = text; path = ../SyntheticInitialReceive/Sources/SyntheticInitialReceive/MigrationResources/SyncV2StoreSchemaV16.sql; sourceTree = "<group>"; };
+		A10000000000000000000F00 /* ../SyntheticInitialReceive/Sources/SyntheticInitialReceive/ReceiveAuthorizedRun.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ../SyntheticInitialReceive/Sources/SyntheticInitialReceive/ReceiveAuthorizedRun.swift; sourceTree = "<group>"; };
+		A10000000000000000000F01 /* ../SyntheticInitialReceive/Sources/SyntheticInitialReceive/ReceiveApprovalCallSite.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ../SyntheticInitialReceive/Sources/SyntheticInitialReceive/ReceiveApprovalCallSite.swift; sourceTree = "<group>"; };
+		A10000000000000000000F02 /* ../SyntheticInitialReceive/Sources/SyntheticInitialReceive/StorageFailureDiagnostic.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ../SyntheticInitialReceive/Sources/SyntheticInitialReceive/StorageFailureDiagnostic.swift; sourceTree = "<group>"; };
+		A10000000000000000000F03 /* ../SyntheticInitialReceive/Sources/SyntheticInitialReceive/ReceiveEditableCopy.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ../SyntheticInitialReceive/Sources/SyntheticInitialReceive/ReceiveEditableCopy.swift; sourceTree = "<group>"; };
+		A10000000000000000000F04 /* ../SyntheticInitialReceive/Sources/SyntheticInitialReceive/ReceiveEditableExport.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ../SyntheticInitialReceive/Sources/SyntheticInitialReceive/ReceiveEditableExport.swift; sourceTree = "<group>"; };
+		A10000000000000000000F05 /* ../SyntheticInitialReceive/Sources/SyntheticInitialReceive/ReceiveEditablePromotionPackage.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ../SyntheticInitialReceive/Sources/SyntheticInitialReceive/ReceiveEditablePromotionPackage.swift; sourceTree = "<group>"; };
+/* End PBXFileReference section */
+
+/* Begin PBXFrameworksBuildPhase section */
+		A10000000000000000000012 /* Frameworks */ = {
+			isa = PBXFrameworksBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXFrameworksBuildPhase section */
+
+/* Begin PBXGroup section */
+		A10000000000000000000003 = {
+			isa = PBXGroup;
+			children = (
+				A10000000000000000000F05 /* ../SyntheticInitialReceive/Sources/SyntheticInitialReceive/ReceiveEditablePromotionPackage.swift */,
+				A10000000000000000000F04 /* ../SyntheticInitialReceive/Sources/SyntheticInitialReceive/ReceiveEditableExport.swift */,
+				A10000000000000000000F03 /* ../SyntheticInitialReceive/Sources/SyntheticInitialReceive/ReceiveEditableCopy.swift */,
+				A10000000000000000000F02 /* ../SyntheticInitialReceive/Sources/SyntheticInitialReceive/StorageFailureDiagnostic.swift */,
+				A10000000000000000000F01 /* ../SyntheticInitialReceive/Sources/SyntheticInitialReceive/ReceiveApprovalCallSite.swift */,
+				A10000000000000000000F00 /* ../SyntheticInitialReceive/Sources/SyntheticInitialReceive/ReceiveAuthorizedRun.swift */,
+				A100000000000000000000C8 /* ../SyntheticInitialReceive/Sources/SyntheticInitialReceive/ReceiveActivationAuthority.swift */,
+				A100000000000000000000C9 /* ../SyntheticInitialReceive/Sources/SyntheticInitialReceive/ReceiveProductProjection.swift */,
+				A100000000000000000000CA /* ../SyntheticInitialReceive/Sources/SyntheticInitialReceive/ReceiveProductDatabases.swift */,
+				A100000000000000000000CB /* ../SyntheticInitialReceive/Sources/SyntheticInitialReceive/ReceiveProductModelSupport.swift */,
+				A100000000000000000000CC /* ../SyntheticInitialReceive/Sources/SyntheticInitialReceive/ReceiveDedicatedEnvironment.swift */,
+				A100000000000000000000CD /* ../SyntheticInitialReceive/Sources/SyntheticInitialReceive/ProductModels/BootstrapRecord.swift */,
+				A100000000000000000000CE /* ../SyntheticInitialReceive/Sources/SyntheticInitialReceive/ProductModels/WriterPadMetadataSchema.swift */,
+				A100000000000000000000CF /* ../SyntheticInitialReceive/Sources/SyntheticInitialReceive/MigrationResources/SyncV2StoreSchemaV1.sql */,
+				A100000000000000000000D0 /* ../SyntheticInitialReceive/Sources/SyntheticInitialReceive/MigrationResources/SyncV2StoreSchemaV2.sql */,
+				A100000000000000000000D1 /* ../SyntheticInitialReceive/Sources/SyntheticInitialReceive/MigrationResources/SyncV2StoreSchemaV3.sql */,
+				A100000000000000000000D2 /* ../SyntheticInitialReceive/Sources/SyntheticInitialReceive/MigrationResources/SyncV2StoreSchemaV4.sql */,
+				A100000000000000000000D3 /* ../SyntheticInitialReceive/Sources/SyntheticInitialReceive/MigrationResources/SyncV2StoreSchemaV5.sql */,
+				A100000000000000000000D4 /* ../SyntheticInitialReceive/Sources/SyntheticInitialReceive/MigrationResources/SyncV2StoreSchemaV6.sql */,
+				A100000000000000000000D5 /* ../SyntheticInitialReceive/Sources/SyntheticInitialReceive/MigrationResources/SyncV2StoreSchemaV7.sql */,
+				A100000000000000000000D6 /* ../SyntheticInitialReceive/Sources/SyntheticInitialReceive/MigrationResources/SyncV2StoreSchemaV8.sql */,
+				A100000000000000000000D7 /* ../SyntheticInitialReceive/Sources/SyntheticInitialReceive/MigrationResources/SyncV2StoreSchemaV9.sql */,
+				A100000000000000000000D8 /* ../SyntheticInitialReceive/Sources/SyntheticInitialReceive/MigrationResources/SyncV2StoreSchemaV10.sql */,
+				A100000000000000000000D9 /* ../SyntheticInitialReceive/Sources/SyntheticInitialReceive/MigrationResources/SyncV2StoreSchemaV11.sql */,
+				A100000000000000000000DA /* ../SyntheticInitialReceive/Sources/SyntheticInitialReceive/MigrationResources/SyncV2StoreSchemaV12.sql */,
+				A100000000000000000000DB /* ../SyntheticInitialReceive/Sources/SyntheticInitialReceive/MigrationResources/SyncV2StoreSchemaV13.sql */,
+				A100000000000000000000DC /* ../SyntheticInitialReceive/Sources/SyntheticInitialReceive/MigrationResources/SyncV2StoreSchemaV14.sql */,
+				A100000000000000000000DD /* ../SyntheticInitialReceive/Sources/SyntheticInitialReceive/MigrationResources/SyncV2StoreSchemaV15.sql */,
+				A100000000000000000000DE /* ../SyntheticInitialReceive/Sources/SyntheticInitialReceive/MigrationResources/SyncV2StoreSchemaV16.sql */,
+				A10000000000000000000008 /* ReceiveBoundaryApp.swift */,
+				A10000000000000000000050 /* Info.plist */,
+				A10000000000000000000030 /* ../SyntheticInitialReceive/Sources/SyntheticInitialReceive/Adapter.swift */,
+				A10000000000000000000031 /* ../SyntheticInitialReceive/Sources/SyntheticInitialReceive/Fixture.swift */,
+				A10000000000000000000032 /* ../SyntheticInitialReceive/Sources/SyntheticInitialReceive/SafeFiles.swift */,
+				A10000000000000000000033 /* ../SyntheticInitialReceive/Sources/SyntheticInitialReceive/LocalBoundary.swift */,
+				A10000000000000000000034 /* ../SyntheticInitialReceive/Sources/SyntheticInitialReceive/PhysicalBoundaryStorage.swift */,
+				A10000000000000000000035 /* ../SyntheticInitialReceive/Sources/SyntheticInitialReceive/ProtectedBoundaryContainer.swift */,
+				A10000000000000000000036 /* ../SyntheticInitialReceive/Sources/SyntheticInitialReceive/IOSBoundaryController.swift */,
+				A10000000000000000000037 /* ../SyntheticInitialReceive/Sources/SyntheticInitialReceive/WindowsWireJSON.swift */,
+				A10000000000000000000038 /* ../SyntheticInitialReceive/Sources/SyntheticInitialReceive/WindowsHandoffReader.swift */,
+				A10000000000000000000039 /* ../SyntheticInitialReceive/Sources/SyntheticInitialReceive/WindowsReaderWork.swift */,
+				A10000000000000000000060 /* ../SyntheticInitialReceive/Sources/SyntheticInitialReceive/SyntheticABContract.swift */,
+				A10000000000000000000061 /* ../SyntheticInitialReceive/Sources/SyntheticInitialReceive/SyntheticABPolicy.swift */,
+				A10000000000000000000062 /* ../SyntheticInitialReceive/Sources/SyntheticInitialReceive/SyntheticABDiskJournal.swift */,
+				A10000000000000000000063 /* ../SyntheticInitialReceive/Sources/SyntheticInitialReceive/ProtectedABJournalWork.swift */,
+				A10000000000000000000064 /* ../SyntheticInitialReceive/Sources/SyntheticInitialReceive/ABRuntimeClock.swift */,
+				A10000000000000000000065 /* ../SyntheticInitialReceive/Sources/SyntheticInitialReceive/ReceiveSessionBoundary.swift */,
+				A10000000000000000000066 /* ../SyntheticInitialReceive/Sources/SyntheticInitialReceive/ReceiveHTTPConnection.swift */,
+				A10000000000000000000067 /* ../SyntheticInitialReceive/Sources/SyntheticInitialReceive/ReceiveAuthOwner.swift */,
+				A10000000000000000000068 /* ../SyntheticInitialReceive/Sources/SyntheticInitialReceive/ReceiveABCoordinator.swift */,
+				A10000000000000000000069 /* ../SyntheticInitialReceive/Sources/SyntheticInitialReceive/ReceiveOfflineAppSession.swift */,
+				A10000000000000000000080 /* ../SyntheticInitialReceive/Sources/SyntheticInitialReceive/ReceiveAuthObservation.swift */,
+				A10000000000000000000081 /* ../SyntheticInitialReceive/Sources/SyntheticInitialReceive/ReviewedReceiveTarget.swift */,
+				A10000000000000000000082 /* ../SyntheticInitialReceive/Sources/SyntheticInitialReceive/ReceiveExecutionCandidate.swift */,
+				A10000000000000000000083 /* ../SyntheticInitialReceive/Sources/SyntheticInitialReceive/ReceiveReviewedExecution.swift */,
+				A10000000000000000000084 /* ../SyntheticInitialReceive/Sources/SyntheticInitialReceive/ReceiveInputAdmission.swift */,
+				A10000000000000000000004 /* Products */,
+			);
+			sourceTree = "<group>";
+		};
+		A10000000000000000000004 /* Products */ = {
+			isa = PBXGroup;
+			children = (
+				A10000000000000000000009 /* ReceiveBoundary.app */,
+			);
+			name = Products;
+			sourceTree = "<group>";
+		};
+/* End PBXGroup section */
+
+/* Begin PBXNativeTarget section */
+		A10000000000000000000005 /* ReceiveBoundary */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = A10000000000000000000010 /* Build configuration list for PBXNativeTarget "ReceiveBoundary" */;
+			buildPhases = (
+				A10000000000000000000011 /* Sources */,
+				A10000000000000000000012 /* Frameworks */,
+				A10000000000000000000013 /* Resources */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+			);
+			name = ReceiveBoundary;
+			productName = ReceiveBoundary;
+			productReference = A10000000000000000000009 /* ReceiveBoundary.app */;
+			productType = "com.apple.product-type.application";
+		};
+/* End PBXNativeTarget section */
+
+/* Begin PBXProject section */
+		A10000000000000000000001 /* Project object */ = {
+			isa = PBXProject;
+			attributes = {
+				LastUpgradeCheck = 1600;
+			};
+			buildConfigurationList = A10000000000000000000002 /* Build configuration list for PBXProject "IOSBoundaryApp" */;
+			compatibilityVersion = "Xcode 15.0";
+			developmentRegion = en;
+			hasScannedForEncodings = 0;
+			knownRegions = (
+				en,
+				Base,
+			);
+			mainGroup = A10000000000000000000003;
+			productRefGroup = A10000000000000000000004 /* Products */;
+			projectDirPath = "";
+			projectRoot = "";
+			targets = (
+				A10000000000000000000005 /* ReceiveBoundary */,
+			);
+		};
+/* End PBXProject section */
+
+/* Begin PBXResourcesBuildPhase section */
+		A10000000000000000000013 /* Resources */ = {
+			isa = PBXResourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				A200000000000000000000CF /* ../SyntheticInitialReceive/Sources/SyntheticInitialReceive/MigrationResources/SyncV2StoreSchemaV1.sql in Resources */,
+				A200000000000000000000D0 /* ../SyntheticInitialReceive/Sources/SyntheticInitialReceive/MigrationResources/SyncV2StoreSchemaV2.sql in Resources */,
+				A200000000000000000000D1 /* ../SyntheticInitialReceive/Sources/SyntheticInitialReceive/MigrationResources/SyncV2StoreSchemaV3.sql in Resources */,
+				A200000000000000000000D2 /* ../SyntheticInitialReceive/Sources/SyntheticInitialReceive/MigrationResources/SyncV2StoreSchemaV4.sql in Resources */,
+				A200000000000000000000D3 /* ../SyntheticInitialReceive/Sources/SyntheticInitialReceive/MigrationResources/SyncV2StoreSchemaV5.sql in Resources */,
+				A200000000000000000000D4 /* ../SyntheticInitialReceive/Sources/SyntheticInitialReceive/MigrationResources/SyncV2StoreSchemaV6.sql in Resources */,
+				A200000000000000000000D5 /* ../SyntheticInitialReceive/Sources/SyntheticInitialReceive/MigrationResources/SyncV2StoreSchemaV7.sql in Resources */,
+				A200000000000000000000D6 /* ../SyntheticInitialReceive/Sources/SyntheticInitialReceive/MigrationResources/SyncV2StoreSchemaV8.sql in Resources */,
+				A200000000000000000000D7 /* ../SyntheticInitialReceive/Sources/SyntheticInitialReceive/MigrationResources/SyncV2StoreSchemaV9.sql in Resources */,
+				A200000000000000000000D8 /* ../SyntheticInitialReceive/Sources/SyntheticInitialReceive/MigrationResources/SyncV2StoreSchemaV10.sql in Resources */,
+				A200000000000000000000D9 /* ../SyntheticInitialReceive/Sources/SyntheticInitialReceive/MigrationResources/SyncV2StoreSchemaV11.sql in Resources */,
+				A200000000000000000000DA /* ../SyntheticInitialReceive/Sources/SyntheticInitialReceive/MigrationResources/SyncV2StoreSchemaV12.sql in Resources */,
+				A200000000000000000000DB /* ../SyntheticInitialReceive/Sources/SyntheticInitialReceive/MigrationResources/SyncV2StoreSchemaV13.sql in Resources */,
+				A200000000000000000000DC /* ../SyntheticInitialReceive/Sources/SyntheticInitialReceive/MigrationResources/SyncV2StoreSchemaV14.sql in Resources */,
+				A200000000000000000000DD /* ../SyntheticInitialReceive/Sources/SyntheticInitialReceive/MigrationResources/SyncV2StoreSchemaV15.sql in Resources */,
+				A200000000000000000000DE /* ../SyntheticInitialReceive/Sources/SyntheticInitialReceive/MigrationResources/SyncV2StoreSchemaV16.sql in Resources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXResourcesBuildPhase section */
+
+/* Begin PBXSourcesBuildPhase section */
+		A10000000000000000000011 /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				A20000000000000000000F05 /* ../SyntheticInitialReceive/Sources/SyntheticInitialReceive/ReceiveEditablePromotionPackage.swift in Sources */,
+				A20000000000000000000F04 /* ../SyntheticInitialReceive/Sources/SyntheticInitialReceive/ReceiveEditableExport.swift in Sources */,
+				A20000000000000000000F03 /* ../SyntheticInitialReceive/Sources/SyntheticInitialReceive/ReceiveEditableCopy.swift in Sources */,
+				A20000000000000000000F02 /* ../SyntheticInitialReceive/Sources/SyntheticInitialReceive/StorageFailureDiagnostic.swift in Sources */,
+				A20000000000000000000F01 /* ../SyntheticInitialReceive/Sources/SyntheticInitialReceive/ReceiveApprovalCallSite.swift in Sources */,
+				A20000000000000000000F00 /* ../SyntheticInitialReceive/Sources/SyntheticInitialReceive/ReceiveAuthorizedRun.swift in Sources */,
+				A200000000000000000000C8 /* ../SyntheticInitialReceive/Sources/SyntheticInitialReceive/ReceiveActivationAuthority.swift in Sources */,
+				A200000000000000000000C9 /* ../SyntheticInitialReceive/Sources/SyntheticInitialReceive/ReceiveProductProjection.swift in Sources */,
+				A200000000000000000000CA /* ../SyntheticInitialReceive/Sources/SyntheticInitialReceive/ReceiveProductDatabases.swift in Sources */,
+				A200000000000000000000CB /* ../SyntheticInitialReceive/Sources/SyntheticInitialReceive/ReceiveProductModelSupport.swift in Sources */,
+				A200000000000000000000CC /* ../SyntheticInitialReceive/Sources/SyntheticInitialReceive/ReceiveDedicatedEnvironment.swift in Sources */,
+				A200000000000000000000CD /* ../SyntheticInitialReceive/Sources/SyntheticInitialReceive/ProductModels/BootstrapRecord.swift in Sources */,
+				A200000000000000000000CE /* ../SyntheticInitialReceive/Sources/SyntheticInitialReceive/ProductModels/WriterPadMetadataSchema.swift in Sources */,
+				A10000000000000000000016 /* ReceiveBoundaryApp.swift in Sources */,
+				A10000000000000000000040 /* ../SyntheticInitialReceive/Sources/SyntheticInitialReceive/Adapter.swift in Sources */,
+				A10000000000000000000041 /* ../SyntheticInitialReceive/Sources/SyntheticInitialReceive/Fixture.swift in Sources */,
+				A10000000000000000000042 /* ../SyntheticInitialReceive/Sources/SyntheticInitialReceive/SafeFiles.swift in Sources */,
+				A10000000000000000000043 /* ../SyntheticInitialReceive/Sources/SyntheticInitialReceive/LocalBoundary.swift in Sources */,
+				A10000000000000000000044 /* ../SyntheticInitialReceive/Sources/SyntheticInitialReceive/PhysicalBoundaryStorage.swift in Sources */,
+				A10000000000000000000045 /* ../SyntheticInitialReceive/Sources/SyntheticInitialReceive/ProtectedBoundaryContainer.swift in Sources */,
+				A10000000000000000000046 /* ../SyntheticInitialReceive/Sources/SyntheticInitialReceive/IOSBoundaryController.swift in Sources */,
+				A10000000000000000000047 /* ../SyntheticInitialReceive/Sources/SyntheticInitialReceive/WindowsWireJSON.swift in Sources */,
+				A10000000000000000000048 /* ../SyntheticInitialReceive/Sources/SyntheticInitialReceive/WindowsHandoffReader.swift in Sources */,
+				A10000000000000000000049 /* ../SyntheticInitialReceive/Sources/SyntheticInitialReceive/WindowsReaderWork.swift in Sources */,
+				A10000000000000000000070 /* ../SyntheticInitialReceive/Sources/SyntheticInitialReceive/SyntheticABContract.swift in Sources */,
+				A10000000000000000000071 /* ../SyntheticInitialReceive/Sources/SyntheticInitialReceive/SyntheticABPolicy.swift in Sources */,
+				A10000000000000000000072 /* ../SyntheticInitialReceive/Sources/SyntheticInitialReceive/SyntheticABDiskJournal.swift in Sources */,
+				A10000000000000000000073 /* ../SyntheticInitialReceive/Sources/SyntheticInitialReceive/ProtectedABJournalWork.swift in Sources */,
+				A10000000000000000000074 /* ../SyntheticInitialReceive/Sources/SyntheticInitialReceive/ABRuntimeClock.swift in Sources */,
+				A10000000000000000000075 /* ../SyntheticInitialReceive/Sources/SyntheticInitialReceive/ReceiveSessionBoundary.swift in Sources */,
+				A10000000000000000000076 /* ../SyntheticInitialReceive/Sources/SyntheticInitialReceive/ReceiveHTTPConnection.swift in Sources */,
+				A10000000000000000000077 /* ../SyntheticInitialReceive/Sources/SyntheticInitialReceive/ReceiveAuthOwner.swift in Sources */,
+				A10000000000000000000078 /* ../SyntheticInitialReceive/Sources/SyntheticInitialReceive/ReceiveABCoordinator.swift in Sources */,
+				A10000000000000000000079 /* ../SyntheticInitialReceive/Sources/SyntheticInitialReceive/ReceiveOfflineAppSession.swift in Sources */,
+				A10000000000000000000090 /* ../SyntheticInitialReceive/Sources/SyntheticInitialReceive/ReceiveAuthObservation.swift in Sources */,
+				A10000000000000000000091 /* ../SyntheticInitialReceive/Sources/SyntheticInitialReceive/ReviewedReceiveTarget.swift in Sources */,
+				A10000000000000000000092 /* ../SyntheticInitialReceive/Sources/SyntheticInitialReceive/ReceiveExecutionCandidate.swift in Sources */,
+				A10000000000000000000093 /* ../SyntheticInitialReceive/Sources/SyntheticInitialReceive/ReceiveReviewedExecution.swift in Sources */,
+				A10000000000000000000094 /* ../SyntheticInitialReceive/Sources/SyntheticInitialReceive/ReceiveInputAdmission.swift in Sources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXSourcesBuildPhase section */
+
+/* Begin XCBuildConfiguration section */
+		A10000000000000000000006 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				CLANG_ENABLE_MODULES = YES;
+				CODE_SIGNING_ALLOWED = NO;
+				CODE_SIGNING_REQUIRED = NO;
+				IPHONEOS_DEPLOYMENT_TARGET = 17.0;
+				SDKROOT = iphoneos;
+				SWIFT_VERSION = 5.0;
+			};
+			name = Debug;
+		};
+		A10000000000000000000007 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				CLANG_ENABLE_MODULES = YES;
+				CODE_SIGNING_ALLOWED = NO;
+				CODE_SIGNING_REQUIRED = NO;
+				IPHONEOS_DEPLOYMENT_TARGET = 17.0;
+				SDKROOT = iphoneos;
+				SWIFT_VERSION = 5.0;
+			};
+			name = Release;
+		};
+		A10000000000000000000014 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				CODE_SIGNING_ALLOWED = YES;
+				CODE_SIGNING_REQUIRED = YES;
+				CODE_SIGN_IDENTITY = "Apple Development";
+				CODE_SIGN_STYLE = Automatic;
+				CURRENT_PROJECT_VERSION = 1;
+				DEVELOPMENT_TEAM = LZZLHYSSC2;
+				GENERATE_INFOPLIST_FILE = NO;
+				INFOPLIST_FILE = Info.plist;
+				MARKETING_VERSION = 0.1;
+				OTHER_LDFLAGS = "-lsqlite3";
+				PRODUCT_BUNDLE_IDENTIFIER = com.chocos.writerpad.receiveboundary;
+				PRODUCT_NAME = ReceiveBoundary;
+				PROVISIONING_PROFILE_SPECIFIER = "";
+				SUPPORTED_PLATFORMS = "iphoneos iphonesimulator";
+				SUPPORTS_MACCATALYST = NO;
+				SWIFT_OPTIMIZATION_LEVEL = "-Onone";
+				TARGETED_DEVICE_FAMILY = 2;
+			};
+			name = Debug;
+		};
+		A10000000000000000000015 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				CODE_SIGNING_ALLOWED = NO;
+				CODE_SIGNING_REQUIRED = NO;
+				CODE_SIGN_IDENTITY = "";
+				CURRENT_PROJECT_VERSION = 1;
+				"DEVELOPMENT_TEAM[sdk=iphoneos*]" = LZZLHYSSC2;
+				GENERATE_INFOPLIST_FILE = NO;
+				INFOPLIST_FILE = Info.plist;
+				MARKETING_VERSION = 0.1;
+				OTHER_LDFLAGS = "-lsqlite3";
+				PRODUCT_BUNDLE_IDENTIFIER = com.chocos.writerpad.receiveboundary;
+				PRODUCT_NAME = ReceiveBoundary;
+				"PROVISIONING_PROFILE_SPECIFIER[sdk=iphoneos*]" = "iOS Team Provisioning Profile: com.chocos.writerpad.receiveboundary";
+				SUPPORTED_PLATFORMS = "iphoneos iphonesimulator";
+				SUPPORTS_MACCATALYST = NO;
+				TARGETED_DEVICE_FAMILY = 2;
+			};
+			name = Release;
+		};
+/* End XCBuildConfiguration section */
+
+/* Begin XCConfigurationList section */
+		A10000000000000000000002 /* Build configuration list for PBXProject "IOSBoundaryApp" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				A10000000000000000000006 /* Debug */,
+				A10000000000000000000007 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Debug;
+		};
+		A10000000000000000000010 /* Build configuration list for PBXNativeTarget "ReceiveBoundary" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				A10000000000000000000014 /* Debug */,
+				A10000000000000000000015 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Debug;
+		};
+/* End XCConfigurationList section */
+	};
+	rootObject = A10000000000000000000001 /* Project object */;
+}
