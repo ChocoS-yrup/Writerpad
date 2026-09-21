@@ -102,3 +102,5 @@ extension SwiftDataMetadataRepository: ProjectImportMetadataRegistering {
         didSave = true
     }
 }
+
+extension SwiftDataMetadataRepository: ReceivePromotionMetadataStoring {}

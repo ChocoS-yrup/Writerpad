@@ -77,6 +77,18 @@ struct POSIXAtomicFileWriter: Sendable {
         }
     }
 
+    /// Makes directory-entry changes durable for transaction journals and moves.
+    func synchronizeDirectory(at url: URL) throws {
+        let descriptor = open(url.path, O_RDONLY | O_DIRECTORY)
+        guard descriptor >= 0 else {
+            throw mappedError(operation: .flush, url: url, code: errno)
+        }
+        defer { close(descriptor) }
+        guard fsync(descriptor) == 0 else {
+            throw mappedError(operation: .flush, url: url, code: errno)
+        }
+    }
+
     func injectedJournalFailure(at url: URL) throws {
         try inject(.beforeReconciliationJournal, operation: .reconciliation, url: url)
     }

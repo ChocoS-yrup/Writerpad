@@ -18,6 +18,8 @@ struct RootView: View {
             backupStore: environment.backupStore,
             backupPolicyStore: environment.backupPolicyStore,
             projectBackupCoordinator: environment.projectBackupCoordinator,
+            receivePromotionInspector: environment.receivePromotionInspector,
+            receivePromotionTransaction: environment.receivePromotionTransaction,
             restoreCoordinator: environment.restoreCoordinator,
             workspaceStateRepository: environment.workspaceStateRepository,
             futureChangeNotifier: environment.futureChangeNotifier,

@@ -1715,6 +1715,25 @@ extension LocalProjectManager {
     }
 }
 
+extension LocalProjectManager: ReceivePromotionProjectPublishing {
+    func publishPromotedProject(_ project: Project) async throws -> ManagedProject {
+        try await recoverPendingTransactions()
+        guard try await projectRepository.project(id: project.id) == project else {
+            throw ProjectManagerError.missingProject(project.id)
+        }
+        let projectURL = try pathResolver.standardPaths(
+            forProjectNamed: project.name
+        ).projectContainerURL
+        guard fileManager.fileExists(atPath: projectURL.path) else {
+            throw ProjectManagerError.projectFolderMissing(project.name)
+        }
+        var catalog = try loadCatalog()
+        appendCatalogEntryIfNeeded(for: project.id, to: &catalog)
+        try saveCatalog(catalog)
+        return try await requireManagedProject(id: project.id)
+    }
+}
+
 private extension JSONEncoder {
     static var writerPad: JSONEncoder {
         let encoder = JSONEncoder()

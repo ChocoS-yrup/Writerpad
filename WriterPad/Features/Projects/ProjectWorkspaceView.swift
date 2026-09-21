@@ -2,6 +2,13 @@ import SwiftUI
 import UIKit
 import UniformTypeIdentifiers
 
+private extension UTType {
+    static let writerPadReceivePromotion = UTType(
+        importedAs: "com.chocos.writerpad.receive-promotion",
+        conformingTo: .package
+    )
+}
+
 struct ProjectWorkspaceView: View {
     @Environment(\.scenePhase) private var scenePhase
     @Environment(\.colorScheme) private var colorScheme
@@ -19,6 +26,7 @@ struct ProjectWorkspaceView: View {
     @State private var deletedListTarget: ManagedProject?
     @State private var isSelectingImportFolder = false
     @State private var isSelectingBackupPackage = false
+    @State private var isSelectingReceivePromotion = false
     @State private var backupTarget: ManagedProject?
     @State private var isShowingSettings = false
     @State private var isShowingDeletedProjects = false
@@ -57,6 +65,8 @@ struct ProjectWorkspaceView: View {
     init(
         projectManager: any ProjectManaging,
         projectImporter: any ProjectImporting,
+        receivePromotionInspector: any ReceivePromotionPackageInspecting,
+        receivePromotionTransaction: any ReceivePromotionTransacting,
         binderRepository: any BinderRepository,
         binderCommands: any BinderCommanding,
         documentRepository: any DocumentRepository,
@@ -119,6 +129,8 @@ struct ProjectWorkspaceView: View {
             wrappedValue: ProjectListModel(
                 projectManager: projectManager,
                 projectImporter: projectImporter,
+                receivePromotionInspector: receivePromotionInspector,
+                receivePromotionTransaction: receivePromotionTransaction,
                 authenticationService: authenticationService,
                 projectBindingService: projectBindingService
             )
@@ -228,6 +240,19 @@ struct ProjectWorkspaceView: View {
             await model.load(opensLastProject: restoresLastProjectOnLaunch)
         }
         .fileImporter(
+            isPresented: $isSelectingReceivePromotion,
+            allowedContentTypes: [.writerPadReceivePromotion],
+            allowsMultipleSelection: false
+        ) { result in
+            switch result {
+            case let .success(urls):
+                guard let packageURL = urls.first else { return }
+                Task { await model.inspectReceivePromotion(at: packageURL) }
+            case let .failure(error):
+                model.present(error: error)
+            }
+        }
+        .fileImporter(
             isPresented: $isSelectingImportFolder,
             allowedContentTypes: [.folder],
             allowsMultipleSelection: false
@@ -252,6 +277,19 @@ struct ProjectWorkspaceView: View {
             case let .failure(error):
                 model.present(error: error)
             }
+        }
+        .sheet(
+            item: $model.receivePromotionReport,
+            onDismiss: { model.dismissReceivePromotionReport() }
+        ) { report in
+            ReceivePromotionReviewView(
+                report: report,
+                isWorking: model.isWorking,
+                onCancel: { model.dismissReceivePromotionReport() },
+                onPromote: { name in
+                    Task { await model.confirmReceivePromotion(projectName: name) }
+                }
+            )
         }
         .sheet(
             item: $model.importReport,
@@ -423,6 +461,12 @@ struct ProjectWorkspaceView: View {
                         isSelectingImportFolder = true
                     }
                     .disabled(model.isWorking)
+
+                    Button("수신 편집본을 로컬 작품으로 만들기", systemImage: "doc.badge.plus") {
+                        isSelectingReceivePromotion = true
+                    }
+                    .disabled(model.isWorking)
+                    .accessibilityIdentifier("writerpad.receive-promotion")
 
                     Button("WriterPad 백업 복원", systemImage: "arrow.counterclockwise.icloud") {
                         isSelectingBackupPackage = true
@@ -612,6 +656,71 @@ struct ProjectWorkspaceView: View {
         renameTarget = nil
         Task {
             await model.rename(target, to: submittedName)
+        }
+    }
+}
+
+private struct ReceivePromotionReviewView: View {
+    let report: ReceivePromotionReport
+    let isWorking: Bool
+    let onCancel: () -> Void
+    let onPromote: (String) -> Void
+    @State private var projectName: String
+
+    init(
+        report: ReceivePromotionReport,
+        isWorking: Bool,
+        onCancel: @escaping () -> Void,
+        onPromote: @escaping (String) -> Void
+    ) {
+        self.report = report
+        self.isWorking = isWorking
+        self.onCancel = onCancel
+        self.onPromote = onPromote
+        _projectName = State(initialValue: report.suggestedProjectName)
+    }
+
+    var body: some View {
+        NavigationStack {
+            List {
+                Section("읽기 전용 검사 결과") {
+                    LabeledContent("원본 폴더", value: report.sourceFolderName)
+                    LabeledContent("문서", value: "\(report.documents.count)개")
+                    LabeledContent("본문 크기", value: "\(report.totalBytes) bytes")
+                    LabeledContent("package ID", value: report.packageID.uuidString.lowercased())
+                    LabeledContent("package SHA-256", value: report.packageFingerprint.rawValue)
+                }
+                Section("포함 문서") {
+                    ForEach(report.documents, id: \.sourceDocumentID) { document in
+                        VStack(alignment: .leading, spacing: 4) {
+                            Text(document.sourceName)
+                            Text("local revision \(document.editableRevision) · \(document.byteCount) bytes")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        }
+                    }
+                }
+                Section("새 로컬 작품") {
+                    TextField("작품 이름", text: $projectName)
+                    Text("확정할 때 package를 다시 읽고 SHA-256을 대조한 뒤 새 로컬 작품을 원자적으로 만듭니다. 인증·서버 조회·서버 연결·전송은 하지 않습니다.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+            }
+            .navigationTitle("수신 편집본 검토")
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) {
+                    Button("취소", action: onCancel)
+                        .disabled(isWorking)
+                }
+                ToolbarItem(placement: .confirmationAction) {
+                    Button("로컬 작품 만들기") {
+                        onPromote(projectName)
+                    }
+                    .disabled(isWorking || projectName.isEmpty)
+                }
+            }
+            .interactiveDismissDisabled(isWorking)
         }
     }
 }

@@ -190,6 +190,12 @@
 		A92000000000000000000001 /* ThreeWayMerge.swift in Sources */ = {isa = PBXBuildFile; fileRef = B92000000000000000000001 /* ThreeWayMerge.swift */; };
 		A92000000000000000000002 /* ThreeWayMergeTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = B92000000000000000000002 /* ThreeWayMergeTests.swift */; };
 		A92000000000000000000003 /* three_way_merge_cases.json in Resources */ = {isa = PBXBuildFile; fileRef = B92000000000000000000003 /* three_way_merge_cases.json */; };
+		C92100000000000000000001 /* ReceivePromotionModels.swift in Sources */ = {isa = PBXBuildFile; fileRef = D92100000000000000000001 /* ReceivePromotionModels.swift */; };
+		C92100000000000000000002 /* ReceivePromotionImporting.swift in Sources */ = {isa = PBXBuildFile; fileRef = D92100000000000000000002 /* ReceivePromotionImporting.swift */; };
+		C92100000000000000000003 /* ReceivePromotionPackageReader.swift in Sources */ = {isa = PBXBuildFile; fileRef = D92100000000000000000003 /* ReceivePromotionPackageReader.swift */; };
+		C92100000000000000000004 /* ReceivePromotionPackageReaderTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = D92100000000000000000004 /* ReceivePromotionPackageReaderTests.swift */; };
+		C92100000000000000000005 /* ReceivePromotionTransaction.swift in Sources */ = {isa = PBXBuildFile; fileRef = D92100000000000000000005 /* ReceivePromotionTransaction.swift */; };
+		C92100000000000000000006 /* ReceivePromotionTransactionTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = D92100000000000000000006 /* ReceivePromotionTransactionTests.swift */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXContainerItemProxy section */
@@ -402,6 +408,12 @@
 		B92000000000000000000001 /* ThreeWayMerge.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ThreeWayMerge.swift; sourceTree = "<group>"; };
 		B92000000000000000000002 /* ThreeWayMergeTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ThreeWayMergeTests.swift; sourceTree = "<group>"; };
 		B92000000000000000000003 /* three_way_merge_cases.json */ = {isa = PBXFileReference; lastKnownFileType = text.json; path = three_way_merge_cases.json; sourceTree = "<group>"; };
+		D92100000000000000000001 /* ReceivePromotionModels.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ReceivePromotionModels.swift; sourceTree = "<group>"; };
+		D92100000000000000000002 /* ReceivePromotionImporting.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ReceivePromotionImporting.swift; sourceTree = "<group>"; };
+		D92100000000000000000003 /* ReceivePromotionPackageReader.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ReceivePromotionPackageReader.swift; sourceTree = "<group>"; };
+		D92100000000000000000004 /* ReceivePromotionPackageReaderTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ReceivePromotionPackageReaderTests.swift; sourceTree = "<group>"; };
+		D92100000000000000000005 /* ReceivePromotionTransaction.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ReceivePromotionTransaction.swift; sourceTree = "<group>"; };
+		D92100000000000000000006 /* ReceivePromotionTransactionTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ReceivePromotionTransactionTests.swift; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -497,6 +509,7 @@
 				B10000000000000000000010 /* Project.swift */,
 				B1000000000000000000002E /* ManagedProject.swift */,
 				B10000000000000000000033 /* ImportModels.swift */,
+				D92100000000000000000001 /* ReceivePromotionModels.swift */,
 				B10000000000000000000038 /* BinderModels.swift */,
 				B10000000000000000000042 /* BinderCommandModels.swift */,
 				B10000000000000000000011 /* DocumentNode.swift */,
@@ -647,6 +660,8 @@
 				B10000000000000000000024 /* ProjectPathResolverTests.swift */,
 				B10000000000000000000032 /* LocalProjectManagerTests.swift */,
 				B10000000000000000000037 /* WindowsProjectImporterTests.swift */,
+				D92100000000000000000004 /* ReceivePromotionPackageReaderTests.swift */,
+				D92100000000000000000006 /* ReceivePromotionTransactionTests.swift */,
 				B1000000000000000000003F /* LocalBinderRepositoryTests.swift */,
 				B10000000000000000000041 /* BinderRuleServiceTests.swift */,
 				B10000000000000000000045 /* LocalBinderCommandServiceTests.swift */,
@@ -711,6 +726,7 @@
 				B10000000000000000000015 /* StorageProtocols.swift */,
 				B1000000000000000000002F /* ProjectManaging.swift */,
 				B10000000000000000000034 /* ProjectImporting.swift */,
+				D92100000000000000000002 /* ReceivePromotionImporting.swift */,
 				B10000000000000000000039 /* BinderRepository.swift */,
 				B10000000000000000000016 /* UtilityProtocols.swift */,
 			);
@@ -732,6 +748,8 @@
 				B10000000000000000000022 /* ProjectPathResolver.swift */,
 				B10000000000000000000030 /* LocalProjectManager.swift */,
 				B10000000000000000000036 /* WindowsProjectImporter.swift */,
+				D92100000000000000000003 /* ReceivePromotionPackageReader.swift */,
+				D92100000000000000000005 /* ReceivePromotionTransaction.swift */,
 				B1000000000000000000003A /* LocalBinderDirectoryScanner.swift */,
 				B1000000000000000000003C /* LocalBinderRepository.swift */,
 				B10000000000000000000043 /* LocalBinderCommandService.swift */,
@@ -1024,6 +1042,7 @@
 				A1000000000000000000000C /* Project.swift in Sources */,
 				A1000000000000000000002A /* ManagedProject.swift in Sources */,
 				A1000000000000000000002F /* ImportModels.swift in Sources */,
+				C92100000000000000000001 /* ReceivePromotionModels.swift in Sources */,
 				A10000000000000000000034 /* BinderModels.swift in Sources */,
 				A1000000000000000000003E /* BinderCommandModels.swift in Sources */,
 				A1000000000000000000000D /* DocumentNode.swift in Sources */,
@@ -1033,6 +1052,7 @@
 				A10000000000000000000011 /* StorageProtocols.swift in Sources */,
 				A1000000000000000000002B /* ProjectManaging.swift in Sources */,
 				A10000000000000000000030 /* ProjectImporting.swift in Sources */,
+				C92100000000000000000002 /* ReceivePromotionImporting.swift in Sources */,
 				A10000000000000000000035 /* BinderRepository.swift in Sources */,
 				A10000000000000000000012 /* UtilityProtocols.swift in Sources */,
 				A10000000000000000000013 /* SaveStateMachine.swift in Sources */,
@@ -1058,6 +1078,8 @@
 				A1000000000000000000001E /* ProjectPathResolver.swift in Sources */,
 				A1000000000000000000002C /* LocalProjectManager.swift in Sources */,
 				A10000000000000000000032 /* WindowsProjectImporter.swift in Sources */,
+				C92100000000000000000003 /* ReceivePromotionPackageReader.swift in Sources */,
+				C92100000000000000000005 /* ReceivePromotionTransaction.swift in Sources */,
 				A10000000000000000000036 /* LocalBinderDirectoryScanner.swift in Sources */,
 				A10000000000000000000038 /* LocalBinderRepository.swift in Sources */,
 				A1000000000000000000003F /* LocalBinderCommandService.swift in Sources */,
@@ -1125,6 +1147,8 @@
 				A10000000000000000000020 /* ProjectPathResolverTests.swift in Sources */,
 				A1000000000000000000002E /* LocalProjectManagerTests.swift in Sources */,
 				A10000000000000000000033 /* WindowsProjectImporterTests.swift in Sources */,
+				C92100000000000000000004 /* ReceivePromotionPackageReaderTests.swift in Sources */,
+				C92100000000000000000006 /* ReceivePromotionTransactionTests.swift in Sources */,
 				A1000000000000000000003B /* LocalBinderRepositoryTests.swift in Sources */,
 				A1000000000000000000003D /* BinderRuleServiceTests.swift in Sources */,
 				A10000000000000000000041 /* LocalBinderCommandServiceTests.swift in Sources */,
