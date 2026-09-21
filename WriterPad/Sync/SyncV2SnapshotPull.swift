@@ -529,7 +529,8 @@ actor SyncV2BackgroundSyncCoordinator {
         ) { [weak self] finish in
             guard let self else { return }
             let race = SyncV2RealtimeStartRace()
-            let operation = Task {
+            let operation = Task { [weak self] in
+                guard let self else { return }
                 do {
                     try await self.realtime.startAll(
                         onChange: { [weak self] in
@@ -1906,7 +1907,8 @@ final class SyncV2WorkspaceSyncModel: ObservableObject {
         realtimeStartTask.schedule { [weak self] _ in
             guard let self else { return }
             let race = SyncV2RealtimeStartRace()
-            let operation = Task {
+            let operation = Task { [weak self, realtime, serverProjectID] in
+                guard let self else { return }
                 do {
                     try await realtime.start(
                         projectID: serverProjectID,

@@ -626,7 +626,7 @@ final class LocalProjectManagerTests: XCTestCase {
 
     func testRestoreProjectBackupRegistersExactIdentityTreeAndRawBytes() async throws {
         let harness = try makeHarness()
-        let fixture = try await makeBackupFixture(in: harness)
+        let fixture = try await Self.makeBackupFixture(in: harness)
         let packageBefore = try directoryFingerprint(fixture.packageURL)
 
         let restored = try await harness.manager.restoreProjectBackup(
@@ -689,8 +689,9 @@ final class LocalProjectManagerTests: XCTestCase {
 
     @MainActor
     func testBackupScreenSavesExternalPackageAndRestoresIntoSeparateLibrary() async throws {
-        let source = try makeHarness()
-        let fixture = try await makeBackupFixture(in: source)
+        let source = try Self.makeUntrackedHarness()
+        addTeardownBlock { [root = source.root] in try? FileManager.default.removeItem(at: root) }
+        let fixture = try await Self.makeBackupFixture(in: source)
         let original = try await source.manager.restoreProjectBackup(at: fixture.packageURL)
         let paths = try source.resolver.standardPaths(forProjectNamed: original.name)
         // 설정과 과거 백업은 원고·구조 v1의 범위 밖이며 몰래 섞지 않는다.
@@ -715,7 +716,8 @@ final class LocalProjectManagerTests: XCTestCase {
                        Set(["manifest.json", "workspace"]))
         let manifest = try await ProjectBackupStore().validatedManifest(at: package)
         XCTAssertEqual(Set(manifest.nodes.map(\.uuid)), Set(fixture.nodes.map { $0.id.rawValue.uuidString.lowercased() }))
-        let target = try makeHarness()
+        let target = try Self.makeUntrackedHarness()
+        addTeardownBlock { [root = target.root] in try? FileManager.default.removeItem(at: root) }
         let restored = try await target.manager.restoreProjectBackup(at: package)
         XCTAssertEqual(restored.id, original.id)
         let restoredNodes = try await target.repository.documents(in: restored.id)
@@ -741,7 +743,7 @@ final class LocalProjectManagerTests: XCTestCase {
 
     func testRestoreProjectBackupRejectsDuplicateProjectUUIDWithoutMutation() async throws {
         let harness = try makeHarness()
-        let fixture = try await makeBackupFixture(in: harness)
+        let fixture = try await Self.makeBackupFixture(in: harness)
         _ = try await harness.manager.restoreProjectBackup(at: fixture.packageURL)
         let workspace = try harness.resolver.standardPaths(
             forProjectNamed: fixture.project.name
@@ -762,7 +764,7 @@ final class LocalProjectManagerTests: XCTestCase {
 
     func testRestoreProjectBackupRejectsExistingDestinationEvenWhenEmpty() async throws {
         let harness = try makeHarness()
-        let fixture = try await makeBackupFixture(in: harness)
+        let fixture = try await Self.makeBackupFixture(in: harness)
         let destination = try harness.resolver.standardPaths(
             forProjectNamed: fixture.project.name
         ).projectContainerURL
@@ -787,7 +789,7 @@ final class LocalProjectManagerTests: XCTestCase {
 
     func testRestoreProjectBackupUsesUUIDParentTreeNotReferencePath() async throws {
         let harness = try makeHarness()
-        let fixture = try await makeBackupFixture(in: harness)
+        let fixture = try await Self.makeBackupFixture(in: harness)
         let manifestURL = fixture.packageURL.appendingPathComponent("manifest.json")
         var object = try XCTUnwrap(
             JSONSerialization.jsonObject(with: Data(contentsOf: manifestURL))
@@ -824,7 +826,7 @@ final class LocalProjectManagerTests: XCTestCase {
                 leavesTransactionForRecovery: true
             )
         )
-        let fixture = try await makeBackupFixture(in: harness)
+        let fixture = try await Self.makeBackupFixture(in: harness)
         do {
             _ = try await harness.manager.restoreProjectBackup(at: fixture.packageURL)
             XCTFail("복원 메타데이터 저장 뒤 중단돼야 합니다.")
@@ -853,7 +855,7 @@ final class LocalProjectManagerTests: XCTestCase {
                 leavesTransactionForRecovery: true
             )
         )
-        let fixture = try await makeBackupFixture(in: harness)
+        let fixture = try await Self.makeBackupFixture(in: harness)
         do {
             _ = try await harness.manager.restoreProjectBackup(at: fixture.packageURL)
             XCTFail("복원 journal 기록 뒤 중단돼야 합니다.")
@@ -878,7 +880,7 @@ final class LocalProjectManagerTests: XCTestCase {
                 leavesTransactionForRecovery: true
             )
         )
-        let fixture = try await makeBackupFixture(in: harness)
+        let fixture = try await Self.makeBackupFixture(in: harness)
         do {
             _ = try await harness.manager.restoreProjectBackup(at: fixture.packageURL)
             XCTFail("패키지 내부 복사 뒤 중단돼야 합니다.")
@@ -924,9 +926,16 @@ final class LocalProjectManagerTests: XCTestCase {
     private func makeHarness(
         faultPlan: ProjectManagerFaultPlan? = nil
     ) throws -> Harness {
+        let harness = try Self.makeUntrackedHarness(faultPlan: faultPlan)
+        roots.append(harness.root)
+        return harness
+    }
+
+    private static func makeUntrackedHarness(
+        faultPlan: ProjectManagerFaultPlan? = nil
+    ) throws -> Harness {
         let root = FileManager.default.temporaryDirectory
             .appendingPathComponent("WriterPad-ProjectManagerTests-\(UUID().uuidString)")
-        roots.append(root)
         let container = try WriterPadMetadataStore.makeContainer(
             isStoredInMemoryOnly: true
         )
@@ -967,7 +976,7 @@ final class LocalProjectManagerTests: XCTestCase {
         )
     }
 
-    private func makeBackupFixture(in harness: Harness) async throws -> BackupFixture {
+    private static func makeBackupFixture(in harness: Harness) async throws -> BackupFixture {
         let fileManager = FileManager.default
         let source = harness.root.appendingPathComponent("BackupSource", isDirectory: true)
         let workspace = source.appendingPathComponent("집필모드", isDirectory: true)

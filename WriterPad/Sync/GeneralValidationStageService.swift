@@ -352,7 +352,7 @@ struct GeneralValidationPlanningCopy: Sendable {
     /// Derive a proposal by applying reviewed local steps only to the copy. The
     /// callback must use the supplied copy paths. This is not a live execution
     /// grant or proof of deterministic replay of UUIDs, timestamps and metadata.
-    func derive(apply: (GeneralValidationLocalProbe, Int) async throws -> Void) async throws -> GeneralValidationCheckpointPlan {
+    func derive(apply: @Sendable (GeneralValidationLocalProbe, Int) async throws -> Void) async throws -> GeneralValidationCheckpointPlan {
         try requireOriginalUnchanged()
         guard try probe.capture() == baseline, let stage = baseline.stage else { throw GeneralValidationFailure.denied }
         let savedFlags = stage == .sendUpdate ? [true, false] : [false]

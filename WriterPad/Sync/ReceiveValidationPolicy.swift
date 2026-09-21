@@ -116,7 +116,9 @@ final class GeneralValidationCapability: @unchecked Sendable {
             try await ReceiveValidationPolicy.$override.withValue(policy) {
                 try await ReceiveValidationPolicy.$operation.withValue(ticket) {
                     try await ReceiveValidationPolicy.$localProject.withValue(GeneralValidationPlan.local.rawValue) {
-                        try await GeneralSyncValidationScope.$override.withValue(scope, operation: work)
+                        try await GeneralSyncValidationScope.$override.withValue(scope) {
+                            try await work()
+                        }
                     }
                 }
             }

@@ -75,7 +75,7 @@ final class BodyValidationServiceTests: XCTestCase {
             let f = try await BodyFixture.make(mode: mode, remoteRevision: mode == .legacy ? 4 : 2)
             addTeardownBlock { [root = f.root] in try? FileManager.default.removeItem(at: root) }
             let before = try f.otherRows()
-            try await ReceiveValidationPolicy.$override.withValue(f.policy) {
+            await ReceiveValidationPolicy.$override.withValue(f.policy) {
                 do { try await f.service.run(send: false, foreground: true); XCTFail() } catch {}
             }
             let calls = await f.network.calls
@@ -189,7 +189,7 @@ final class BodyValidationServiceTests: XCTestCase {
             let rows = try f.allSyncRows(), files = try f.workspaceBytes()
             let metadata = try await f.repository.documents(in: BodyValidationPlan.local)
             let otherMetadata = try await f.repository.documents(in: f.otherProject)
-            try await ReceiveValidationPolicy.$override.withValue(f.policy) {
+            await ReceiveValidationPolicy.$override.withValue(f.policy) {
                 do { try await f.service.run(send: false, foreground: true); XCTFail("accepted \(fault)") } catch {}
             }
             let calls = await f.network.calls

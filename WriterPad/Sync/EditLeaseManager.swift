@@ -204,7 +204,7 @@ actor LiveEditLeaseTransport: EditLeaseTransporting {
         try await rpc("get_edit_lease", parameters: parameters)
     }
 
-    private func rpc<Parameters: Encodable, Result: Decodable>(
+    private func rpc<Parameters: Encodable, Result: Decodable & Sendable>(
         _ name: String,
         parameters: Parameters
     ) async throws -> Result {

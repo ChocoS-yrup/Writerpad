@@ -53,7 +53,7 @@ final class SyncV2FolderMigrationTests: XCTestCase {
         XCTAssertNil(parentFolderID)
         XCTAssertEqual(name, "메모장")
         XCTAssertFalse(isDeleted)
-        let completed = try await marker.isFolderMigrationCompleted(
+        let completed = await marker.isFolderMigrationCompleted(
             localProjectID: projectID
         )
         XCTAssertTrue(completed)
@@ -210,7 +210,7 @@ final class SyncV2FolderMigrationTests: XCTestCase {
         guard case .postponed = result else {
             return XCTFail("Expected the migration to be postponed.")
         }
-        let completed = try await marker.isFolderMigrationCompleted(
+        let completed = await marker.isFolderMigrationCompleted(
             localProjectID: projectID
         )
         XCTAssertFalse(completed)

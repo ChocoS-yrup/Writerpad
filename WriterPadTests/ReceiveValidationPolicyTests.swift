@@ -4,7 +4,19 @@ import SwiftUI
 import UIKit
 import XCTest
 import Supabase
+@preconcurrency import PostgREST
 @testable import WriterPad
+
+private func generalValidationExecuteSQL(_ url: URL, _ sql: String) throws {
+    var database: OpaquePointer?
+    guard sqlite3_open(url.path, &database) == SQLITE_OK, let database else {
+        throw GeneralValidationFailure.denied
+    }
+    defer { sqlite3_close_v2(database) }
+    guard sqlite3_exec(database, sql, nil, nil, nil) == SQLITE_OK else {
+        throw GeneralValidationFailure.denied
+    }
+}
 
 final class ReceiveValidationPolicyTests: XCTestCase {
     private let endpoint = ReceiveValidationPolicy.Configuration.staging
@@ -397,7 +409,7 @@ extension ReceiveValidationPolicyTests {
     }
 }
 
-final class BodyValidationPolicyTests: XCTestCase {
+final class BodyValidationPolicyTests: XCTestCase, @unchecked Sendable {
     let account = UUID(uuidString: "00000000-0000-4000-8000-000000000001")!
     let device = UUID(uuidString: "00000000-0000-4000-8000-000000000002")!
     var binding: ProjectSyncBinding { .connected(localProjectID: BodyValidationPlan.local,
@@ -699,7 +711,7 @@ extension GeneralSyncValidationScopeTests {
     }
 }
 
-final class GeneralValidationJournalTests: XCTestCase {
+final class GeneralValidationJournalTests: XCTestCase, @unchecked Sendable {
     private let bearer = "Bearer synthetic-journal-token"
     private func root() throws -> URL {
         let url = FileManager.default.temporaryDirectory.appendingPathComponent("general-journal-\(UUID())")
@@ -980,10 +992,7 @@ final class GeneralValidationScreenTests: XCTestCase {
         let model: GeneralValidationScreenModel
     }
     private func sql(_ url: URL, _ sql: String) throws {
-        var db: OpaquePointer?
-        guard sqlite3_open(url.path, &db) == SQLITE_OK, let db else { throw GeneralValidationFailure.denied }
-        defer { sqlite3_close_v2(db) }
-        guard sqlite3_exec(db, sql, nil, nil, nil) == SQLITE_OK else { throw GeneralValidationFailure.denied }
+        try generalValidationExecuteSQL(url, sql)
     }
     private func fixture(queueEmpty: Bool = true, bindingMatches: Bool = true, directory: URL? = nil,
                          clock: @escaping @Sendable () -> TimeInterval = { ProcessInfo.processInfo.systemUptime }) throws -> Fixture {
@@ -1061,7 +1070,7 @@ final class GeneralValidationScreenTests: XCTestCase {
             await f.model.prepare(); XCTAssertFalse(f.model.ready)
             XCTAssertFalse(FileManager.default.fileExists(atPath: f.journal.path))
         }
-        let signedOut = try fixture(); await signedOut.auth.signOut(); await signedOut.model.prepare()
+        let signedOut = try fixture(); _ = await signedOut.auth.signOut(); await signedOut.model.prepare()
         XCTAssertFalse(signedOut.model.ready)
     }
     func testScreenExitAuthenticationBindingProjectAndExpiryInvalidatePreparedContext() async throws {
@@ -1237,7 +1246,7 @@ extension GeneralValidationScreenTests {
         let transition = try GeneralValidationLocalTransition(expected: [before, expected], capture: { _ in try f.probe.capture() },
             current: {}, metadataReplays: [1: replay], metadataImage: { try f.probe.metadataImage() })
         try await transition.advance { _ in
-            try await self.sql(f.probe.metadataURL, "INSERT INTO ATRANSACTION VALUES(3,\(Date().timeIntervalSinceReferenceDate),'new')")
+            try generalValidationExecuteSQL(f.probe.metadataURL, "INSERT INTO ATRANSACTION VALUES(3,\(Date().timeIntervalSinceReferenceDate),'new')")
         }
         try transition.requireFinished()
         try sql(f.probe.metadataURL, "UPDATE ATRANSACTION SET ZTIMESTAMP=ZTIMESTAMP+0.01 WHERE Z_PK=3")
@@ -1513,12 +1522,12 @@ private let generalStageControlFixture = "{\"folder_paths\":[\"메인/메모장\
 
 extension GeneralValidationScreenTests {
     private func installStageBody(_ f: Fixture, revision: Int, content: String) throws {
-        try installStageBody(f.probe, revision: revision, content: content)
+        try Self.installStageBody(f.probe, revision: revision, content: content)
     }
-    private func installStageBody(_ probe: GeneralValidationLocalProbe, revision: Int, content: String) throws {
+    nonisolated private static func installStageBody(_ probe: GeneralValidationLocalProbe, revision: Int, content: String) throws {
         let local = GeneralValidationPlan.local.rawValue.uuidString.lowercased(), server = GeneralValidationPlan.server.uuidString.lowercased(), doc = GeneralValidationPlan.document.uuidString.lowercased()
         let hash = SHA256ContentHasher().sha256(for: Data((revision == 1 ? GeneralValidationPlan.incoming : content).utf8)).rawValue
-        try sql(probe.syncURL, "DELETE FROM sync_documents WHERE document_id='\(doc)'; INSERT INTO sync_documents VALUES('\(doc)','\(local)','\(server)',\(revision),'\(hash)','\(GeneralValidationPlan.parent.uuidString.lowercased())','\(GeneralValidationPlan.name)',1,0,'메인/원고/\(GeneralValidationPlan.name)'); UPDATE sync_tree_orders SET server_revision=2,children_json='[\"\(doc)\"]' WHERE tree_order_id='31eb06be-9cc9-55db-9a05-5882172474ce';")
+        try generalValidationExecuteSQL(probe.syncURL, "DELETE FROM sync_documents WHERE document_id='\(doc)'; INSERT INTO sync_documents VALUES('\(doc)','\(local)','\(server)',\(revision),'\(hash)','\(GeneralValidationPlan.parent.uuidString.lowercased())','\(GeneralValidationPlan.name)',1,0,'메인/원고/\(GeneralValidationPlan.name)'); UPDATE sync_tree_orders SET server_revision=2,children_json='[\"\(doc)\"]' WHERE tree_order_id='31eb06be-9cc9-55db-9a05-5882172474ce';")
         let parent = probe.workspace.appendingPathComponent("메인/원고")
         try FileManager.default.createDirectory(at: parent, withIntermediateDirectories: true)
         try Data(content.utf8).write(to: parent.appendingPathComponent(GeneralValidationPlan.name))
@@ -1577,7 +1586,7 @@ extension GeneralValidationScreenTests {
         XCTAssertEqual(try copy.probe.capture(), original)
         XCTAssertNotEqual(copy.probe.workspace, f.probe.workspace)
         let proposal = try await copy.derive { probe, step in
-            try self.installStageBody(probe, revision: step == 0 ? 1 : 2, content: GeneralValidationPlan.outgoing)
+            try Self.installStageBody(probe, revision: step == 0 ? 1 : 2, content: GeneralValidationPlan.outgoing)
         }
         XCTAssertEqual(proposal.checkpoints.map(\.stage), [.sendUpdate, .sendUpdate, .receiveFinal])
         XCTAssertEqual(proposal.checkpoints.map(\.savedForUpdate), [false, true, false])
@@ -1842,9 +1851,9 @@ extension GeneralValidationJournalTests {
                 let plannedRequest = try await sendPrediction.adapter.saveAndCaptureRequest(bearer: bearer, publishableKey: "synthetic", authorize: { try sendCopy.requireOriginalUnchanged() })
                 let savePlan = try sendCopy.predictedCheckpoint(savedForUpdate: true)
                 let save = try savePlan.makeTransition(probe: probe, current: {})
-                let actual = f.adapter()
+                let actual = f.adapter(), bearer = bearer
                 let actualRequest = try await save.advance { authorize in
-                    try await actual.saveAndCaptureRequest(bearer: self.bearer, publishableKey: "synthetic", authorize: authorize)
+                    try await actual.saveAndCaptureRequest(bearer: bearer, publishableKey: "synthetic", authorize: authorize)
                 }
                 try save.requireFinished()
                 XCTAssertEqual(GeneralSyncValidationScope.fingerprint(actualRequest), GeneralSyncValidationScope.fingerprint(plannedRequest))
@@ -2096,7 +2105,7 @@ extension GeneralValidationJournalTests {
                 serverProjectID: GeneralValidationPlan.server, authenticationEpoch: auth.contractEpoch!.value, bindingEpoch: bindingEpoch.value)!
         }
         let recorder = SyncV2ContractPathRecorder(store: f.store, handshakeService: handshake, authenticationService: auth,
-            defaults: defaults, bindingEpoch: bindingEpoch, structureAuthority: authority, localProjectEpoch: projectEpoch,
+            defaults: ContractDefaults(value: defaults), bindingEpoch: bindingEpoch, structureAuthority: authority, localProjectEpoch: projectEpoch,
             isLocalProjectActive: { $0 == GeneralValidationPlan.local })
         let local = LocalDocumentStore(workspaceLocator: FixedWorkspaceLocator(root: f.workspace), metadataUpdater: f.repository,
             durableChangeRecorder: recorder)

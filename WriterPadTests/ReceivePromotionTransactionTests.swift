@@ -113,7 +113,7 @@ final class ReceivePromotionTransactionTests: XCTestCase {
         let mappedDocument = promotedDocuments.first { $0.kind == .text }!
         try await harness.metadata.removeMetadata(id: mappedDocument.id)
 
-        await assertError(.completedPromotionUnavailable) {
+        await Self.assertError(.completedPromotionUnavailable) {
             _ = try await harness.transaction.promote(
                 from: harness.package.report,
                 projectName: "새 작품을 만들면 안 됨"
@@ -137,7 +137,7 @@ final class ReceivePromotionTransactionTests: XCTestCase {
             try fileManager.moveItem(at: entry, to: retained)
             try fileManager.createSymbolicLink(at: entry, withDestinationURL: missing)
 
-            await assertError(.recoveryRequired(receipt.path)) {
+            await Self.assertError(.recoveryRequired(receipt.path)) {
                 _ = try await harness.transaction.promote(
                     from: harness.package.report, projectName: "중복 작품 금지"
                 )
@@ -164,7 +164,7 @@ final class ReceivePromotionTransactionTests: XCTestCase {
         try fileManager.removeItem(at: receipt)
         XCTAssertEqual(mkfifo(receipt.path, 0o600), 0)
         let uuidCount = harness.uuids.count
-        await assertError(.recoveryRequired(receipt.path)) {
+        await Self.assertError(.recoveryRequired(receipt.path)) {
             _ = try await harness.transaction.promote(
                 from: harness.package.report, projectName: "중복 작품 금지"
             )
@@ -187,7 +187,7 @@ final class ReceivePromotionTransactionTests: XCTestCase {
                 pathResolver: harness.resolver, clock: harness.clock,
                 faultPlan: .init(point: point, leavesTransactionForRecovery: true)
             )
-            await assertError(.injectedFailure(recoveryPending: true)) {
+            await Self.assertError(.injectedFailure(recoveryPending: true)) {
                 _ = try await transaction.promote(from: harness.package.report, projectName: "미완료 승격")
             }
             let stored = try await repository.projects()
@@ -236,7 +236,7 @@ final class ReceivePromotionTransactionTests: XCTestCase {
             pathResolver: harness.resolver, clock: harness.clock,
             faultPlan: .init(point: .afterMetadataRegistration, leavesTransactionForRecovery: true)
         )
-        await assertError(.injectedFailure(recoveryPending: true)) {
+        await Self.assertError(.injectedFailure(recoveryPending: true)) {
             _ = try await transaction.promote(from: harness.package.report, projectName: "롤백할 작품")
         }
         await gate.pauseNextProjects()
@@ -338,7 +338,7 @@ final class ReceivePromotionTransactionTests: XCTestCase {
             pathResolver: harness.resolver, clock: harness.clock,
             faultPlan: .init(point: .afterStaging, leavesTransactionForRecovery: true)
         )
-        await assertError(.injectedFailure(recoveryPending: true)) {
+        await Self.assertError(.injectedFailure(recoveryPending: true)) {
             _ = try await transaction.promote(from: harness.package.report, projectName: "고아 기록 보존")
         }
         let marker = harness.root.appendingPathComponent(try XCTUnwrap(markerNames(harness.root).first))
@@ -408,7 +408,7 @@ final class ReceivePromotionTransactionTests: XCTestCase {
                     pathResolver: harness.resolver, clock: harness.clock,
                     faultPlan: .init(point: point, leavesTransactionForRecovery: true)
                 )
-                await assertError(.injectedFailure(recoveryPending: true)) {
+                await Self.assertError(.injectedFailure(recoveryPending: true)) {
                     _ = try await transaction.promote(from: harness.package.report, projectName: "등록 전 복구")
                 }
             }
@@ -442,7 +442,7 @@ final class ReceivePromotionTransactionTests: XCTestCase {
                     pathResolver: harness.resolver, clock: harness.clock,
                     faultPlan: .init(point: point, leavesTransactionForRecovery: true)
                 )
-                await assertError(.injectedFailure(recoveryPending: true)) {
+                await Self.assertError(.injectedFailure(recoveryPending: true)) {
                     _ = try await transaction.promote(from: harness.package.report, projectName: "영속화 복구")
                 }
             }
@@ -472,7 +472,7 @@ final class ReceivePromotionTransactionTests: XCTestCase {
         let inspected = harness.package.report
         await harness.materializer.set(makePackage(fingerprint: "c"))
 
-        await assertError(.sourceChangedAfterInspection) {
+        await Self.assertError(.sourceChangedAfterInspection) {
             _ = try await harness.transaction.promote(
                 from: inspected,
                 projectName: "변경 차단"
@@ -491,7 +491,7 @@ final class ReceivePromotionTransactionTests: XCTestCase {
         )
         try await harness.metadata.save(existing)
 
-        await assertError(.duplicateProject(existing.name)) {
+        await Self.assertError(.duplicateProject(existing.name)) {
             _ = try await harness.transaction.promote(
                 from: harness.package.report,
                 projectName: existing.name
@@ -509,7 +509,7 @@ final class ReceivePromotionTransactionTests: XCTestCase {
                 point: point,
                 leavesTransactionForRecovery: false
             ))
-            await assertError(.injectedFailure(recoveryPending: false)) {
+            await Self.assertError(.injectedFailure(recoveryPending: false)) {
                 _ = try await harness.transaction.promote(
                     from: harness.package.report,
                     projectName: "롤백 작품"
@@ -530,7 +530,7 @@ final class ReceivePromotionTransactionTests: XCTestCase {
             point: .afterPromotion,
             leavesTransactionForRecovery: true
         ))
-        await assertError(.injectedFailure(recoveryPending: true)) {
+        await Self.assertError(.injectedFailure(recoveryPending: true)) {
             _ = try await harness.transaction.promote(
                 from: harness.package.report,
                 projectName: "복구 작품"
@@ -555,7 +555,7 @@ final class ReceivePromotionTransactionTests: XCTestCase {
                 fault: .init(point: point, leavesTransactionForRecovery: true),
                 timestamp: 1_800_000_000.253024
             )
-            await assertError(.injectedFailure(recoveryPending: true)) {
+            await Self.assertError(.injectedFailure(recoveryPending: true)) {
                 _ = try await harness.transaction.promote(
                     from: harness.package.report, projectName: "소수점 시각 복구"
                 )
@@ -579,7 +579,7 @@ final class ReceivePromotionTransactionTests: XCTestCase {
         let harness = makeHarness(fault: .init(
             point: .afterMetadataRegistration, leavesTransactionForRecovery: true
         ))
-        await assertError(.injectedFailure(recoveryPending: true)) {
+        await Self.assertError(.injectedFailure(recoveryPending: true)) {
             _ = try await harness.transaction.promote(
                 from: harness.package.report, projectName: "복구 자료 보존"
             )
@@ -643,7 +643,7 @@ final class ReceivePromotionTransactionTests: XCTestCase {
             point: .afterPromotion,
             leavesTransactionForRecovery: true
         ))
-        await assertError(.injectedFailure(recoveryPending: true)) {
+        await Self.assertError(.injectedFailure(recoveryPending: true)) {
             _ = try await harness.transaction.promote(
                 from: harness.package.report,
                 projectName: "손상 작품"
@@ -682,7 +682,7 @@ final class ReceivePromotionTransactionTests: XCTestCase {
         )
         await harness.materializer.set(changed)
 
-        await assertError(.sourceAlreadyPromoted) {
+        await Self.assertError(.sourceAlreadyPromoted) {
             _ = try await harness.transaction.promote(
                 from: changed.report,
                 projectName: "다른 이름"
@@ -841,9 +841,9 @@ private extension ReceivePromotionTransactionTests {
         )
     }
 
-    func assertError(
+    static func assertError(
         _ expected: ReceivePromotionTransactionError,
-        operation: () async throws -> Void
+        operation: @Sendable () async throws -> Void
     ) async {
         do {
             try await operation()

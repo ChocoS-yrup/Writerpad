@@ -55,7 +55,7 @@ final class ServerProjectCatalogTests: XCTestCase {
         let catalog = try await h.service().catalog()
         XCTAssertEqual(catalog.entries.first?.state, .imported)
         await expect(.bindingConflict) { _ = try await h.service().receive(catalog.entries[0], from: catalog, localName: "새 이름") }
-        let after = try await h.bindings.binding(for: old.id)
+        let after = await h.bindings.binding(for: old.id)
         XCTAssertEqual(after, binding)
     }
 
@@ -95,7 +95,7 @@ final class ServerProjectCatalogTests: XCTestCase {
         XCTAssertEqual(imported.name, "별도 로컬 이름")
         let after = try await h.repo.documents(in: old.id)
         XCTAssertEqual(after, oldNodes)
-        let remote = try await h.transport.project(id: row(1).id)
+        let remote = await h.transport.project(id: row(1).id)
         XCTAssertEqual(remote?.name, row(1).name)
     }
 
@@ -159,7 +159,7 @@ final class ServerProjectCatalogTests: XCTestCase {
         XCTAssertTrue(remaining.isEmpty)
         let now = try await service.catalog()
         XCTAssertEqual(now.entries[0].state, .imported)
-        let bindings = try await h.bindings.allBindings()
+        let bindings = await h.bindings.allBindings()
         XCTAssertEqual(bindings.count, 1)
     }
 
@@ -180,7 +180,7 @@ final class ServerProjectCatalogTests: XCTestCase {
         let service = h.service(), source = try await h.service().catalog()
         await expect(.staleContext) { _ = try await service.receive(source.entries[0], from: source, localName: self.row(1).name) }
         let visible = try await h.manager.projects()
-        let binding = try await h.bindings.binding(for: ProjectID(rawValue: row(1).id))
+        let binding = await h.bindings.binding(for: ProjectID(rawValue: row(1).id))
         XCTAssertTrue(visible.isEmpty)
         XCTAssertEqual(binding?.kind, .existingServerProject)
     }
@@ -219,7 +219,8 @@ final class ServerProjectCatalogTests: XCTestCase {
         let gate = CatalogTestGate()
         await h.puller.setHook { await gate.wait() }
         let service = h.service(), source = try await h.service().catalog()
-        let task = Task { try await service.receive(source.entries[0], from: source, localName: self.row(1).name) }
+        let localName = row(1).name
+        let task = Task { try await service.receive(source.entries[0], from: source, localName: localName) }
         await gate.started()
         await expect(.alreadyRunning) { _ = try await service.receive(source.entries[0], from: source, localName: self.row(1).name) }
         task.cancel()
@@ -383,7 +384,7 @@ final class ServerProjectCatalogTests: XCTestCase {
         await h.puller.setHook { try? await h.bindings.save(replacement) }
         let service = h.service(), source = try await h.service().catalog()
         await expect(.bindingConflict) { _ = try await service.receive(source.entries[0], from: source, localName: self.row(1).name) }
-        let after = try await h.bindings.binding(for: replacement.localProjectID)
+        let after = await h.bindings.binding(for: replacement.localProjectID)
         XCTAssertEqual(after, replacement)
         let visible = try await h.manager.projects()
         XCTAssertTrue(visible.isEmpty)

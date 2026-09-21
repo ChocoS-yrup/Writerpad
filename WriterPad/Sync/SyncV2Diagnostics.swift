@@ -237,10 +237,9 @@ enum SyncV2PullDiagnostics {
         guard let context else {
             return try await operation()
         }
-        return try await $current.withValue(
-            context,
-            operation: operation
-        )
+        return try await $current.withValue(context) {
+            try await operation()
+        }
     }
 
     static func record(
