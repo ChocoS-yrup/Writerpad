@@ -22,3 +22,10 @@ supabase/.temp/
 집필모드.zip
 build/
 .build/
+
+# 로컬 기기·DB 검증 증거는 저장소 이력에 포함하지 않는다.
+/com.chocos.writerpad.receiveboundary/
+/검증07_iPad_DB_20260822_s0H4cA/
+/교차검증/
+/진단_설치후_백업_20260916/
+/최신 참조파일/incidents/
