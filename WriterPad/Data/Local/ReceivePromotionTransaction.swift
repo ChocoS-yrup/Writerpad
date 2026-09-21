@@ -951,8 +951,7 @@ private extension ReceivePromotionTransaction {
                 throw ReceivePromotionTransactionError.recoveryRequired(markerURL.path)
             }
         } else {
-            let documents = try await metadataStore.documents(in: marker.project.id)
-            if !documents.isEmpty {
+            if try await metadataStore.hasDocumentsForPromotionRecovery(in: marker.project.id) {
                 throw ReceivePromotionTransactionError.recoveryRequired(markerURL.path)
             }
         }

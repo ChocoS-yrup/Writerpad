@@ -17,7 +17,11 @@ protocol ReceivePromotionPackageMaterializing: ReceivePromotionPackageInspecting
 protocol ReceivePromotionMetadataStoring:
     ProjectRepository,
     DocumentRepository,
-    ProjectImportMetadataRegistering {}
+    ProjectImportMetadataRegistering {
+    /// Recovery must detect orphan rows even when the project was never saved.
+    /// Unlike documents(in:), this query must not require a project record.
+    func hasDocumentsForPromotionRecovery(in projectID: ProjectID) async throws -> Bool
+}
 
 /// Publishes an already durable local project into WriterPad's local catalog.
 protocol ReceivePromotionProjectPublishing: Sendable {

@@ -392,3 +392,16 @@ PR 커밋만 별도 디렉터리에 추출한 앱 빌드에서 `AppEnvironment`�
 독립 macOS XCTest에서 reader 14개와 transaction 15개, 총 29개가 통과했다. 새 검사는 해시가 일치하는 잘못된 UTF-8, seal inventory 불일치, 알려지지 않은 manifest 필드, payload 경로 탈출을 포함한다. 기존 정상 편집·작품명 변경 후 영수증 재확인, source가 같고 fingerprint가 다른 패키지 차단, 중단 복구 검사도 유지했다. 이 결과는 전체 앱 테스트나 실제 기기 검증을 뜻하지 않으며 앞 절의 독립 테스트 제한이 그대로 적용된다.
 
 `35f2d80` 추출본에 이번 수정만 적용한 WriterPad Debug / generic iOS Simulator / 서명 비활성 앱 빌드도 종료 코드 0으로 완료했다. 기존 컴파일 경고는 남아 있으며 실기기 설치·앱 실행·인증·서버 요청은 수행하지 않았다.
+
+## PR #20 실제 SwiftData 등록·복구 연결 검토 (2026-09-21)
+
+`469f550` 기준으로 AppEnvironment가 동일 SwiftData repository를 승격 거래와 LocalProjectManager에 전달하고, 승격 UI가 거래 완료 후 목록을 읽는 연결을 확인했다. 실제 저장소로 두 결함을 재현했다.
+
+1. **등록 전 중단 복구 실패**: SwiftData의 `documents(in:)`는 작품 레코드가 없으면 `missingProject`를 던지지만 메모리 테스트 저장소는 빈 배열을 반환했다. 승격 marker 작성 후 또는 staging 완성 후 중단하면, 작품이 없는 정상 상태를 복구 실패로 판단했다. 작품 존재를 전제하지 않는 `hasDocumentsForPromotionRecovery(in:)` 조회를 별도 계약으로 추가했다. 남은 문서 레코드가 없을 때만 rollback을 계속하고 고아 레코드가 있으면 marker/staging을 보존한다. 메모리 구현도 일반 문서 조회의 missingProject 동작을 실제 저장소와 맞췄다.
+2. **기존 문서 UUID 덮어쓰기**: 공유 `registerImportedProject`는 입력 내부 UUID 중복만 검사했다. 기존 저장소 문서와 충돌한 입력을 넣으면 SwiftData의 unique upsert가 기존 문서의 소속·경로를 새 작품 값으로 바꿨다. 신규 레코드 삽입 전 전체 입력의 기존 document ID 충돌을 거부한다. 이 보호는 같은 등록 경계를 사용하는 Windows 가져오기에도 적용된다.
+
+독립 macOS XCTest 총 33개(reader 14 + transaction 19)가 통과했다. 신규 4개 검사는 실제 SwiftData schema/repository를 사용한다: SQLite 파일에 중단 상태를 남기고 새 ModelContainer로 등록 전 2지점 및 등록 후 3지점의 복구·재확인을 수행하고, 인메모리 SwiftData로 UUID 충돌 시 기존 레코드 보존과 고아 문서 존재 시 rollback 자료 보존을 확인했다. 두 결함은 수정 전 테스트 실패로 재현했다. 파일 저장소 재연결 검사이며 운영체제 강제 종료 실험은 아니다.
+
+테스트 하네스는 실제 schema·metadata/import 구현 및 project/document repository의 해당 conformance extension을 사용한다. unrelated conformance는 제외하고 외곽 protocol·EditorPane·ReceiveValidationPolicy에는 최소 선언을 사용했다. 해당 policy는 이 검사의 등록/복구 경로에서 호출되지 않는다. 목록 publisher는 여전히 테스트 대역이다. LocalProjectManager의 실제 catalog 동시 접근·다중 창 UI·전체 앱 테스트·실기기 동작까지 검증했다는 뜻은 아니다.
+
+`469f550` 추출본에 이번 수정만 적용한 WriterPad Debug / generic iOS Simulator / 서명 비활성 앱 빌드는 종료 코드 0으로 완료했다. 기존 경고는 남아 있다. 실기기 설치·앱 실행·인증·서버 요청은 수행하지 않았다.

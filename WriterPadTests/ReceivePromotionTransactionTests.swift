@@ -1,6 +1,7 @@
 import Darwin
 import Foundation
 import XCTest
+import SwiftData
 @testable import WriterPad
 
 final class ReceivePromotionTransactionTests: XCTestCase {
@@ -169,6 +170,146 @@ final class ReceivePromotionTransactionTests: XCTestCase {
             )
         }
         XCTAssertEqual(harness.uuids.count, uuidCount)
+    }
+
+    @MainActor
+    func testSwiftDataOrphansPreserveRollbackEvidence() async throws {
+        let harness = makeHarness()
+        let container = try WriterPadMetadataStore.makeContainer(isStoredInMemoryOnly: true)
+        let repository = SwiftDataMetadataRepository(modelContainer: container)
+        let transaction = ReceivePromotionTransaction(
+            packageReader: harness.materializer, metadataStore: repository,
+            projectPublisher: ReceivePromotionRepositoryPublisher(repository),
+            pathResolver: harness.resolver, clock: harness.clock,
+            faultPlan: .init(point: .afterStaging, leavesTransactionForRecovery: true)
+        )
+        await assertError(.injectedFailure(recoveryPending: true)) {
+            _ = try await transaction.promote(from: harness.package.report, projectName: "고아 기록 보존")
+        }
+        let marker = harness.root.appendingPathComponent(try XCTUnwrap(markerNames(harness.root).first))
+        struct MarkerProject: Decodable { let project: Project }
+        let decoder = JSONDecoder()
+        decoder.dateDecodingStrategy = .iso8601
+        let project = try decoder.decode(MarkerProject.self, from: Data(contentsOf: marker)).project
+        let context = ModelContext(container)
+        context.insert(DocumentRecord(
+            id: UUID(), projectID: project.id.rawValue, kindRawValue: DocumentKind.text.rawValue,
+            parentID: nil, relativePath: "고아.txt", userOrder: 0, modifiedAt: harness.clock.now(),
+            contentHash: nil, isDeleted: false, originalPath: nil, deletedAt: nil,
+            cursorLocation: 0, selectionLength: 0, isExpanded: false
+        ))
+        try context.save()
+        let before = try snapshot(harness.root)
+        do {
+            try await transaction.recoverPendingPromotions()
+            XCTFail("Orphan documents must block rollback")
+        } catch let error as ReceivePromotionTransactionError {
+            guard case let .recoveryRequired(path) = error else { throw error }
+            XCTAssertEqual(URL(fileURLWithPath: path).resolvingSymlinksInPath(), marker.resolvingSymlinksInPath())
+        }
+        XCTAssertEqual(try snapshot(harness.root), before)
+        let retained = try await repository.hasDocumentsForPromotionRecovery(in: project.id)
+        XCTAssertTrue(retained)
+    }
+
+    func testSwiftDataImportRejectsExistingDocumentIdentity() async throws {
+        let container = try WriterPadMetadataStore.makeContainer(isStoredInMemoryOnly: true)
+        let repository = SwiftDataMetadataRepository(modelContainer: container)
+        let date = Date(timeIntervalSince1970: 1_800_000_000)
+        let original = Project(id: .init(rawValue: UUID()), name: "기존 작품", createdAt: date, modifiedAt: date)
+        let incoming = Project(id: .init(rawValue: UUID()), name: "새 작품", createdAt: date, modifiedAt: date)
+        let id = DocumentID(rawValue: UUID())
+        func document(in project: Project, name: String) -> DocumentNode {
+            DocumentNode(id: id, projectID: project.id, kind: .text, parentID: nil,
+                         relativePath: .init(rawValue: name), userOrder: 0,
+                         modifiedAt: date, contentHash: nil)
+        }
+        let originalDocument = document(in: original, name: "보존.txt")
+        try await repository.registerImportedProject(original, documents: [originalDocument])
+        do {
+            try await repository.registerImportedProject(incoming, documents: [document(in: incoming, name: "덮어쓰기.txt")])
+            XCTFail("Existing document identity must not be upserted into another project")
+        } catch let error as MetadataRepositoryError {
+            guard case .corruptedRecord(entity: "DocumentRecord", identifier: _, reason: _) = error else { throw error }
+        }
+        let preserved = try await repository.document(id: id)
+        let projects = try await repository.projects()
+        XCTAssertEqual(preserved, originalDocument)
+        XCTAssertEqual(projects, [original])
+    }
+
+    func testSwiftDataRollbackBeforeRegistrationCanRetry() async throws {
+        for point in [ReceivePromotionFaultPoint.afterMarkerWrite, .afterStaging] {
+            let harness = makeHarness()
+            let store = harness.root.deletingLastPathComponent().appendingPathComponent("metadata.sqlite")
+            try fileManager.createDirectory(at: store.deletingLastPathComponent(), withIntermediateDirectories: true)
+            // Each phase uses a fresh ModelContainer against the same on-disk store.
+            do {
+                let container = try WriterPadMetadataStore.makeContainer(isStoredInMemoryOnly: false, storeURL: store)
+                let repository = SwiftDataMetadataRepository(modelContainer: container)
+                let transaction = ReceivePromotionTransaction(
+                    packageReader: harness.materializer, metadataStore: repository,
+                    projectPublisher: ReceivePromotionRepositoryPublisher(repository),
+                    pathResolver: harness.resolver, clock: harness.clock,
+                    faultPlan: .init(point: point, leavesTransactionForRecovery: true)
+                )
+                await assertError(.injectedFailure(recoveryPending: true)) {
+                    _ = try await transaction.promote(from: harness.package.report, projectName: "등록 전 복구")
+                }
+            }
+            let container = try WriterPadMetadataStore.makeContainer(isStoredInMemoryOnly: false, storeURL: store)
+            let repository = SwiftDataMetadataRepository(modelContainer: container)
+            let recovery = ReceivePromotionTransaction(
+                packageReader: harness.materializer, metadataStore: repository,
+                projectPublisher: ReceivePromotionRepositoryPublisher(repository),
+                pathResolver: harness.resolver, clock: harness.clock
+            )
+            try await recovery.recoverPendingPromotions()
+            XCTAssertEqual(try fileManager.contentsOfDirectory(atPath: harness.root.path), [])
+            let projects = try await repository.projects()
+            XCTAssertTrue(projects.isEmpty)
+            let result = try await recovery.promote(from: harness.package.report, projectName: "등록 전 복구")
+            XCTAssertFalse(result.wasAlreadyCompleted)
+        }
+    }
+
+    func testSwiftDataRecoveryAfterRegistrationAndPublication() async throws {
+        for point in [ReceivePromotionFaultPoint.afterMetadataRegistration, .afterPromotion, .afterReceiptWrite] {
+            let harness = makeHarness(timestamp: 1_800_000_000.253024)
+            let store = harness.root.deletingLastPathComponent().appendingPathComponent("metadata.sqlite")
+            try fileManager.createDirectory(at: store.deletingLastPathComponent(), withIntermediateDirectories: true)
+            do {
+                let container = try WriterPadMetadataStore.makeContainer(isStoredInMemoryOnly: false, storeURL: store)
+                let repository = SwiftDataMetadataRepository(modelContainer: container)
+                let transaction = ReceivePromotionTransaction(
+                    packageReader: harness.materializer, metadataStore: repository,
+                    projectPublisher: ReceivePromotionRepositoryPublisher(repository),
+                    pathResolver: harness.resolver, clock: harness.clock,
+                    faultPlan: .init(point: point, leavesTransactionForRecovery: true)
+                )
+                await assertError(.injectedFailure(recoveryPending: true)) {
+                    _ = try await transaction.promote(from: harness.package.report, projectName: "영속화 복구")
+                }
+            }
+            let container = try WriterPadMetadataStore.makeContainer(isStoredInMemoryOnly: false, storeURL: store)
+            let repository = SwiftDataMetadataRepository(modelContainer: container)
+            let recovery = ReceivePromotionTransaction(
+                packageReader: harness.materializer, metadataStore: repository,
+                projectPublisher: ReceivePromotionRepositoryPublisher(repository),
+                pathResolver: harness.resolver, clock: harness.clock
+            )
+            try await recovery.recoverPendingPromotions()
+            let result = try await recovery.promote(from: harness.package.report, projectName: "영속화 복구")
+            XCTAssertEqual(result.wasAlreadyCompleted, point != .afterMetadataRegistration)
+            let projects = try await repository.projects()
+            XCTAssertEqual(projects.count, 1)
+            let nodes = try await repository.documents(in: result.project.id)
+            XCTAssertEqual(nodes.filter { $0.kind == .text }.count, 2)
+            let before = try snapshot(harness.root)
+            let replay = try await recovery.promote(from: harness.package.report, projectName: "영속화 복구")
+            XCTAssertTrue(replay.wasAlreadyCompleted)
+            XCTAssertEqual(try snapshot(harness.root), before)
+        }
     }
 
     func testChangedPackageFailsBeforeFirstWrite() async throws {
@@ -645,7 +786,13 @@ private actor ReceivePromotionMemoryMetadata: ReceivePromotionMetadataStoring {
         documentValues.removeValue(forKey: id)
     }
     func documents(in projectID: ProjectID) async throws -> [DocumentNode] {
-        documentValues[projectID] ?? []
+        guard projectValues[projectID] != nil else {
+            throw MetadataRepositoryError.missingProject(projectID)
+        }
+        return documentValues[projectID] ?? []
+    }
+    func hasDocumentsForPromotionRecovery(in projectID: ProjectID) async throws -> Bool {
+        !(documentValues[projectID] ?? []).isEmpty
     }
     func document(id: DocumentID) async throws -> DocumentNode? {
         documentValues.values.flatMap { $0 }.first { $0.id == id }
@@ -685,6 +832,17 @@ private actor ReceivePromotionMemoryPublisher: ReceivePromotionProjectPublishing
 
     func publishPromotedProject(_ project: Project) async throws -> ManagedProject {
         guard try await metadata.project(id: project.id) == project else {
+            throw ReceivePromotionTransactionError.completedPromotionUnavailable
+        }
+        return ManagedProject(project: project, userOrder: 0, lifecycleState: .active)
+    }
+}
+
+private struct ReceivePromotionRepositoryPublisher: ReceivePromotionProjectPublishing {
+    let repository: any ReceivePromotionMetadataStoring
+    init(_ repository: any ReceivePromotionMetadataStoring) { self.repository = repository }
+    func publishPromotedProject(_ project: Project) async throws -> ManagedProject {
+        guard try await repository.project(id: project.id) == project else {
             throw ReceivePromotionTransactionError.completedPromotionUnavailable
         }
         return ManagedProject(project: project, userOrder: 0, lifecycleState: .active)
