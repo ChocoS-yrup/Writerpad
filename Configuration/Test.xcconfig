@@ -1,2 +1,5 @@
 #include "Shared.xcconfig"
 #include? "Supabase.Test.local.xcconfig"
+
+// Opt-in device validation can isolate the runner as well as the app sandbox.
+WRITERPAD_TEST_BUNDLE_SUFFIX =

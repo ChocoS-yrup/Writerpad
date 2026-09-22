@@ -783,6 +783,7 @@ struct WritingWorkspaceShell: View {
                     externalVersion: model.externalVersion,
                     externalTextMutation: model.externalTextMutation,
                     externalUTF16Length: model.currentUTF16Length,
+                    externalTextSnapshot: { model.currentText },
                     selection: Binding(
                         get: { model.cursor },
                         set: { model.updateCursor($0) }
