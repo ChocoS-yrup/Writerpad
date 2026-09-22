@@ -11172,6 +11172,143 @@ final class SyncV2GeneralSyncTests: XCTestCase {
         await f.store.close()
     }
 
+    func testRestartBeforeFirstClaimPreservesQueuedBytesIDsAndFIFO() async throws {
+        let fixture = try await fixture()
+        addTeardownBlock { await fixture.store.close() }
+        let contents = ["전송 전 첫 원고 e\u{301}\r\n🙂", "전송 전 다음 원고\n끝\r\n"]
+        let operationIDs = [UUID(), UUID()]
+        let batches = contents.enumerated().map { index, content in
+            save(fixture, content: content, operationID: operationIDs[index])
+        }
+        for batch in batches { try await enqueue(batch, fixture) }
+        let originalRows: [String]
+        do {
+            let database = try RawSQLite(url: fixture.url)
+            originalRows = try database.rowFingerprints("SELECT * FROM sync_contract_local_batches;")
+            XCTAssertEqual(try database.scalarInt("SELECT COUNT(*) FROM sync_contract_batches;"), 0)
+        }
+        await fixture.store.close()
+
+        guard case .available(let reopened) = await SyncV2Store.open(at: fixture.url) else {
+            return XCTFail("전송 전 큐를 다시 열지 못했습니다.")
+        }
+        addTeardownBlock { await reopened.close() }
+        try await reopened.recoverInterruptedWork()
+        let database = try RawSQLite(url: fixture.url)
+        XCTAssertEqual(try database.rowFingerprints("SELECT * FROM sync_contract_local_batches;"), originalRows)
+        XCTAssertEqual(try database.scalarInt("SELECT COUNT(*) FROM sync_contract_batches;"), 0)
+        XCTAssertEqual(try database.scalarInt("SELECT server_revision FROM sync_documents;"), 1)
+        XCTAssertEqual(try database.scalarText("SELECT base_content FROM sync_documents;"), "처음")
+        let page = try await reopened.generalRecoveryPage(localProjectID: fixture.local, after: nil)
+        XCTAssertEqual(page.rows.map(\.batchID), batches.map(\.batchID))
+
+        for (index, batch) in batches.enumerated() {
+            let detail = try await reopened.generalRecoveryDetail(localProjectID: fixture.local, batchID: batch.batchID)
+            let manuscript = try XCTUnwrap(detail.manuscripts().first)
+            XCTAssertEqual(manuscript.operationID, operationIDs[index])
+            XCTAssertEqual(Data(manuscript.content.utf8), Data(contents[index].utf8))
+            let pending = try await reopened.claimNextGeneralContract(localProjectID: fixture.local)
+            XCTAssertEqual(pending.request.batchID, batch.batchID)
+            let intent = try XCTUnwrap(pending.request.orderedIntents.first?.objectValue)
+            XCTAssertEqual(intent["operation_id"], .string(operationIDs[index].uuidString.lowercased()))
+            XCTAssertEqual(intent["base_revision"], .int(index + 1))
+            let payload = try XCTUnwrap(intent["payload"]?.objectValue)
+            let content = try XCTUnwrap(payload["content"]?.stringValue)
+            XCTAssertEqual(Data(content.utf8), Data(contents[index].utf8))
+            try await reopened.completeContractStructure(pending, response: response(pending))
+            let queue = try await reopened.uploadQueueSnapshot(localProjectID: fixture.local)
+            XCTAssertEqual(queue.pendingCount, batches.count - index - 1)
+        }
+        XCTAssertEqual(try database.scalarInt("SELECT server_revision FROM sync_documents;"), 3)
+        XCTAssertEqual(Data(try database.scalarText("SELECT base_content FROM sync_documents;").utf8), Data(contents[1].utf8))
+        XCTAssertEqual(try database.scalarInt("SELECT COUNT(*) FROM sync_contract_batches;"), 2)
+        XCTAssertEqual(try database.scalarInt("SELECT COUNT(*) FROM sync_contract_operations;"), 2)
+    }
+
+    func testReceiptWriteFailureRollsBackAndReopensWithoutReclaimingRequest() async throws {
+        let fixture = try await fixture()
+        addTeardownBlock { await fixture.store.close() }
+        let firstContent = "응답 반영 전 원고 e\u{301}\r\n🙂"
+        let nextContent = "뒤에서 기다리는 원고\n"
+        let firstBatch = save(fixture, content: firstContent)
+        let nextBatch = save(fixture, content: nextContent)
+        try await enqueue(firstBatch, fixture)
+        try await enqueue(nextBatch, fixture)
+        let pending = try await fixture.store.claimNextGeneralContract(localProjectID: fixture.local)
+        try await fixture.store.recoverInterruptedWork()
+        let receipt = try makeGeneralCommitReceiptForTesting(
+            pending, accountID: fixture.binding.ownerSubject!, response: response(pending)
+        )
+        let requestJSON: String
+        do {
+            let database = try RawSQLite(url: fixture.url)
+            let tables = ["sync_documents", "sync_contract_operations", "sync_contract_batches", "sync_contract_local_batches"]
+            let originalRows = try tables.map { try database.rowFingerprints("SELECT * FROM \($0);") }
+            requestJSON = try database.scalarText("SELECT request_json FROM sync_contract_batches;")
+            try database.execute("""
+                CREATE TRIGGER inject_receipt_completion_failure
+                BEFORE UPDATE OF status ON sync_contract_batches
+                WHEN NEW.status = 'completed'
+                  AND (SELECT server_revision FROM sync_documents) = 2
+                  AND (SELECT COUNT(*) FROM sync_contract_operations WHERE status = 'completed') = 1
+                  AND (SELECT COUNT(*) FROM sync_contract_local_batches WHERE status = 'completed') = 1
+                BEGIN
+                    SELECT RAISE(ABORT, 'injected receipt completion failure');
+                END;
+                """)
+            do {
+                try await fixture.store.recoverGeneralContract(
+                    pending, receipt: receipt, accountID: fixture.binding.ownerSubject!, authorize: {}
+                )
+                XCTFail("완료 행 쓰기 실패가 응답 반영 전체를 롤백해야 합니다.")
+            } catch {
+                guard case let SyncV2StoreError.sqlite(code) = error else {
+                    return XCTFail("예상한 SQLite 쓰기 실패가 아닙니다: \(error)")
+                }
+                XCTAssertEqual(code & 0xff, SQLITE_CONSTRAINT)
+            }
+            XCTAssertEqual(try tables.map { try database.rowFingerprints("SELECT * FROM \($0);") }, originalRows)
+            try database.execute("DROP TRIGGER inject_receipt_completion_failure;")
+        }
+        await fixture.store.close()
+
+        guard case .available(let reopened) = await SyncV2Store.open(at: fixture.url) else {
+            return XCTFail("응답 반영 실패 뒤 큐를 다시 열지 못했습니다.")
+        }
+        addTeardownBlock { await reopened.close() }
+        try await reopened.recoverInterruptedWork()
+        let restored = try await reopened.recoverableGeneralContract(localProjectID: fixture.local)
+        XCTAssertEqual(restored, pending)
+        let database = try RawSQLite(url: fixture.url)
+        XCTAssertEqual(Data(try database.scalarText("SELECT request_json FROM sync_contract_batches;").utf8), Data(requestJSON.utf8))
+        XCTAssertEqual(try database.scalarInt("SELECT server_revision FROM sync_documents;"), 1)
+        XCTAssertEqual(try database.scalarText("SELECT base_content FROM sync_documents;"), "처음")
+        XCTAssertEqual(try database.scalarInt("SELECT COUNT(*) FROM sync_contract_batches WHERE response_json IS NOT NULL;"), 0)
+        let queueBeforeRecovery = try await reopened.uploadQueueSnapshot(localProjectID: fixture.local)
+        XCTAssertEqual(queueBeforeRecovery.pendingCount, 2)
+
+        try await reopened.recoverGeneralContract(
+            pending, receipt: receipt, accountID: fixture.binding.ownerSubject!, authorize: {}
+        )
+        XCTAssertEqual(try database.scalarInt("SELECT attempts FROM sync_contract_batches;"), 1)
+        XCTAssertEqual(try database.scalarInt("SELECT server_revision FROM sync_documents;"), 2)
+        XCTAssertEqual(Data(try database.scalarText("SELECT base_content FROM sync_documents;").utf8), Data(firstContent.utf8))
+        let next = try await reopened.claimNextGeneralContract(localProjectID: fixture.local)
+        XCTAssertEqual(next.request.batchID, nextBatch.batchID)
+        XCTAssertEqual(next.request.orderedIntents[0].objectValue?["base_revision"], .int(2))
+        XCTAssertEqual(next.request.orderedIntents[0].objectValue?["payload"]?.objectValue?["content"], .string(nextContent))
+        try await reopened.completeContractStructure(next, response: response(next))
+        try await reopened.recoverGeneralContract(
+            pending, receipt: receipt, accountID: fixture.binding.ownerSubject!, authorize: {}
+        )
+        XCTAssertEqual(try database.scalarInt("SELECT server_revision FROM sync_documents;"), 3)
+        XCTAssertEqual(try database.scalarText("SELECT base_content FROM sync_documents;"), nextContent)
+        XCTAssertEqual(try database.scalarInt("SELECT COUNT(*) FROM sync_contract_operations WHERE status = 'completed';"), 2)
+        XCTAssertEqual(try database.scalarInt("SELECT SUM(attempts) FROM sync_contract_batches;"), 2)
+        let queueAfterRecovery = try await reopened.uploadQueueSnapshot(localProjectID: fixture.local)
+        XCTAssertEqual(queueAfterRecovery.pendingCount, 0)
+    }
+
     func testRestartAndResponseLossReuseExactlyTheStoredRequest() async throws {
         let f = try await fixture()
         try await enqueue(save(f, content: "유실 응답"), f)
