@@ -95,6 +95,17 @@ final class NormalEditorSession: ObservableObject {
         // Saving is deliberately independent of network busy/authentication.
         _ = await editor.saveNow()
     }
+    func cancelPreparedRecoveryRun() async {
+        guard opened, foreground, !busy else { return }
+        await perform {
+            self.prepared = false
+            let version = self.epoch
+            await self.backend.invalidate()
+            guard self.foreground, self.epoch == version else { throw NormalEditorError.locked }
+            try NormalEditorRecoveryInjection.cancelPreparedRun(self.journal)
+            self.message = self.journal.state().message
+        }
+    }
     func send() async {
         guard opened, prepared, !busy else { return }
         await perform {

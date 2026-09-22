@@ -57,7 +57,7 @@ enum NormalEditorRecoveryInjection {
         guard let configuration = try effectiveConfiguration(journal), configuration.point == point else { return }
         let key = checkpointKey(configuration)
         if configuration.run != nil {
-            guard let active = journal.state().recoveryRuns?.last, !active.completed,
+            guard let active = journal.state().recoveryRuns?.last, active.isActive,
                   active.configuration == configuration else { throw NormalEditorError.recoveryConfiguration }
             try checkAction(journal, receiving: point == .afterOriginalApply)
         }
@@ -94,9 +94,13 @@ enum NormalEditorRecoveryInjection {
     // never a fresh journal/queue namespace that could hide an uncertain request.
     static func effectiveConfiguration(_ journal: NormalEditorJournal) throws -> Configuration? {
         let supplied = try configuration()
-        if let active = journal.state().recoveryRuns?.last, !active.completed {
+        if let active = journal.state().recoveryRuns?.last, active.isActive {
             guard supplied == nil || supplied == active.configuration else { throw NormalEditorError.recoveryConfiguration }
             return active.configuration
+        }
+        // Cancellation must not silently downgrade the next action to a runless send.
+        if journal.state().recoveryRuns?.last?.cancelled == true {
+            guard supplied?.run != nil else { throw NormalEditorError.recoveryConfiguration }
         }
         return supplied
     }
@@ -110,7 +114,7 @@ enum NormalEditorRecoveryInjection {
         guard state.conflicts.isEmpty, state.error == nil, let recordedBase = state.baseline,
               recordedBase.revision == run.baselineRevision,
               NormalEditorPlan.hash(recordedBase.content) == run.baselineHash else { throw NormalEditorError.baseline }
-        let existing = runs.last.flatMap { $0.configuration == configuration && !$0.completed ? $0 : nil }
+        let existing = runs.last.flatMap { $0.configuration == configuration && $0.isActive ? $0 : nil }
         if existing == nil {
             guard !runs.contains(where: { $0.configuration.run?.id == run.id }),
                   state.receive == nil else { throw NormalEditorError.recoveryConfiguration }
@@ -157,7 +161,7 @@ enum NormalEditorRecoveryInjection {
     }
     static func checkAction(_ journal: NormalEditorJournal, receiving: Bool) throws {
         guard let configuration = try effectiveConfiguration(journal), configuration.run != nil else { return }
-        guard let active = journal.state().recoveryRuns?.last, !active.completed,
+        guard let active = journal.state().recoveryRuns?.last, active.isActive,
               active.configuration == configuration,
               receiving == (configuration.point == .afterOriginalApply) else { throw NormalEditorError.recoveryConfiguration }
         if !receiving {
@@ -171,8 +175,32 @@ enum NormalEditorRecoveryInjection {
               NormalEditorPlan.hash(remote.content) == configuration.contentHash else { throw NormalEditorError.recoveryConfiguration }
     }
     static func completeRun(_ state: inout NormalEditorJournal.State) {
-        guard let index = state.recoveryRuns?.indices.last, state.recoveryRuns?[index].completed == false else { return }
+        guard let index = state.recoveryRuns?.indices.last, state.recoveryRuns?[index].isActive == true else { return }
         state.recoveryRuns?[index].completed = true
+    }
+    static func canCancelPreparedRun(_ state: NormalEditorJournal.State) -> Bool {
+        guard let active = state.recoveryRuns?.last, active.isActive, active.configuration.run != nil,
+              state.receive == nil, state.conflicts.isEmpty, state.error == nil,
+              state.recoveryCheckpoints?.contains(checkpointKey(active.configuration)) != true else { return false }
+        // Even freezing (before a request has been journaled) cannot be abandoned.
+        func unmaterialized(_ save: NormalEditorJournal.Save) -> Bool {
+            [.queued, .superseded].contains(save.phase) && save.request == nil && save.requestHash == nil
+                && save.response == nil && save.attempts.isEmpty
+        }
+        guard state.saves.filter({ $0.phase != .completed }).allSatisfy(unmaterialized) else { return false }
+        if active.configuration.point == .afterOriginalApply { return active.batchID == nil }
+        guard let bound = state.saves.first(where: { $0.source.batchID == active.batchID }) else { return false }
+        return unmaterialized(bound)
+    }
+    static func cancelPreparedRun(_ journal: NormalEditorJournal) throws {
+        // Recheck under the journal lock, then publish a new record. Never rewrite source/history.
+        try journal.update("recoveryRunCancelledBeforeRequest") { state in
+            guard canCancelPreparedRun(state), let index = state.recoveryRuns?.indices.last else {
+                throw NormalEditorError.recoveryConfiguration
+            }
+            state.recoveryRuns?[index].cancelled = true
+            state.message = "진단 준비를 취소했습니다. 본문·기록은 보존했습니다. 새 실행 UUID와 명세로 다시 준비하세요."
+        }
     }
 }
 
@@ -246,6 +274,9 @@ final class NormalEditorJournal: @unchecked Sendable {
         let configuration: NormalEditorRecoveryInjection.Configuration
         let batchID: UUID?
         var completed = false
+        // Optional so pre-cancellation journals decode without a migration/rewrite.
+        var cancelled: Bool?
+        var isActive: Bool { !completed && cancelled != true }
     }
     struct Draft: Codable, Sendable {
         let text: String

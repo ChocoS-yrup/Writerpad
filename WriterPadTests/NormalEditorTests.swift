@@ -396,6 +396,203 @@ private actor NormalWireStub {
 }
 
 extension NormalEditorTests {
+    private func stableJSON<T: Encodable>(_ value: T) throws -> Data {
+        let encoder = JSONEncoder(); encoder.outputFormatting = [.sortedKeys]
+        return try encoder.encode(value)
+    }
+    func testPreparedRunCancellationRecoversAfterDurableResaveWithoutRewritingHistory() async throws {
+        let f = try await fixture(), first = "준비된 본문", second = "다시 저장한 본문"
+        let config = runConfiguration(first)
+        f.model.editor.updateText(first); await f.model.save()
+        await NormalEditorRecoveryInjection.$testConfiguration.withValue(config) { await f.model.prepare() }
+        XCTAssertTrue(f.model.prepared)
+        let bound = try XCTUnwrap(f.journal.state().recoveryRuns?.last?.batchID)
+        f.model.editor.updateText(second); await f.model.save()
+        await f.model.prepare()
+        XCTAssertFalse(f.model.prepared)
+        XCTAssertEqual(f.journal.state().saves.first?.phase, .superseded)
+        // Restoring the same bytes is also a distinct durable save; never silently rebind it.
+        f.model.editor.updateText(first); await f.model.save()
+        await f.model.prepare()
+        XCTAssertFalse(f.model.prepared)
+        let saves = try stableJSON(f.journal.state().saves)
+        let files = try FileManager.default.contentsOfDirectory(at: f.journal.root, includingPropertiesForKeys: nil)
+            .filter { $0.pathExtension == "record" }
+        let bytes = try files.map { try Data(contentsOf: $0) }
+        let draft = try Data(contentsOf: f.journal.root.appendingPathComponent("draft.json"))
+        await f.model.cancelPreparedRecoveryRun()
+        XCTAssertFalse(f.model.prepared)
+        XCTAssertEqual(f.journal.state().recoveryRuns?.last?.cancelled, true)
+        XCTAssertEqual(f.journal.state().recoveryRuns?.last?.completed, false)
+        XCTAssertEqual(f.journal.state().recoveryRuns?.last?.batchID, bound)
+        XCTAssertEqual(try stableJSON(f.journal.state().saves), saves)
+        XCTAssertEqual(try files.map { try Data(contentsOf: $0) }, bytes)
+        XCTAssertEqual(try Data(contentsOf: f.journal.root.appendingPathComponent("draft.json")), draft)
+        XCTAssertEqual(try Data(contentsOf: f.file), Data(first.utf8))
+        let reopened = try NormalEditorJournal(root: f.journal.root)
+        XCTAssertEqual(reopened.state().recoveryRuns?.last?.cancelled, true)
+        XCTAssertThrowsError(try NormalEditorRecoveryInjection.effectiveConfiguration(reopened))
+        // No launch environment, a runless config, or a reused UUID must not bypass diagnostics.
+        await f.model.prepare(); XCTAssertFalse(f.model.prepared)
+        for invalid in [config, .init(point: .afterStoredResponse, contentHash: NormalEditorPlan.hash(first))] {
+            await NormalEditorRecoveryInjection.$testConfiguration.withValue(invalid) { await f.model.prepare() }
+            XCTAssertFalse(f.model.prepared)
+        }
+        let next = runConfiguration(first)
+        await NormalEditorRecoveryInjection.$testConfiguration.withValue(next) { await f.model.prepare() }
+        XCTAssertTrue(f.model.prepared, f.model.message)
+        XCTAssertEqual(f.journal.state().recoveryRuns?.count, 2)
+        XCTAssertNotEqual(f.journal.state().recoveryRuns?.last?.batchID, bound)
+        // New run is durable too: no launch environment is needed to resume it.
+        await f.model.send(); await f.model.prepare(); await f.model.recoverResult()
+        XCTAssertEqual(f.journal.state().recoveryRuns?.last?.completed, true, f.model.message)
+        XCTAssertEqual(f.journal.state().recoveryRuns?.first?.cancelled, true)
+        let requests = await f.backend.requests
+        XCTAssertEqual(requests.count, 1)
+        XCTAssertEqual(requests.first?.batchID, f.journal.state().saves.last?.source.batchID)
+    }
+    func testPreparedRunCancellationAfterAutosaveDoesNotSendOrAcquireAuthority() async throws {
+        let f = try await fixture(autosave: .milliseconds(20))
+        f.model.editor.updateText("첫 저장"); await f.model.save()
+        await NormalEditorRecoveryInjection.$testConfiguration.withValue(runConfiguration("첫 저장")) { await f.model.prepare() }
+        f.model.editor.updateText("자동 저장")
+        for _ in 0..<100 where f.journal.state().saves.count < 2 { try await Task.sleep(for: .milliseconds(10)) }
+        XCTAssertEqual(f.journal.state().saves.count, 2)
+        await f.model.cancelPreparedRecoveryRun()
+        XCTAssertEqual(f.journal.state().recoveryRuns?.last?.cancelled, true)
+        XCTAssertFalse(f.model.prepared)
+        let prepares = await f.backend.prepares, requests = await f.backend.requests, reads = await f.backend.reads
+        let backendPrepared = await f.backend.prepared
+        XCTAssertEqual(prepares, 1); XCTAssertTrue(requests.isEmpty); XCTAssertEqual(reads, 0); XCTAssertFalse(backendPrepared)
+        await NormalEditorRecoveryInjection.$testConfiguration.withValue(runConfiguration("자동 저장")) { await f.model.prepare() }
+        XCTAssertTrue(f.model.prepared, f.model.message)
+    }
+    func testCancellationRejectsAllMaterializedSendPhasesWithoutChangingJournal() async throws {
+        for phase: NormalEditorJournal.Phase in [.freezing, .frozen, .httpStarted, .responseStored] {
+            let f = try await fixture(), text = "취소 금지"
+            f.model.editor.updateText(text); await f.model.save()
+            await NormalEditorRecoveryInjection.$testConfiguration.withValue(runConfiguration(text)) { await f.model.prepare() }
+            let request = try await f.backend.freeze(f.journal.state().saves[0].source)
+            try f.journal.update("testMaterializedPhase") { state in
+                state.saves[0].phase = phase
+                if phase != .freezing {
+                    state.saves[0].request = request.json; state.saves[0].requestHash = try request.json.sha256Hex()
+                }
+                if phase == .httpStarted || phase == .responseStored { state.saves[0].attempts = [UUID()] }
+                if phase == .responseStored { state.saves[0].response = .object([:]) }
+            }
+            let before = try stableJSON(f.journal.state())
+            let files = try FileManager.default.contentsOfDirectory(atPath: f.journal.root.path).sorted()
+            XCTAssertFalse(NormalEditorRecoveryInjection.canCancelPreparedRun(f.journal.state()))
+            XCTAssertThrowsError(try NormalEditorRecoveryInjection.cancelPreparedRun(f.journal))
+            XCTAssertEqual(try stableJSON(f.journal.state()), before)
+            XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath: f.journal.root.path).sorted(), files)
+            await f.model.cancelPreparedRecoveryRun()
+            XCTAssertFalse(f.model.prepared)
+            XCTAssertTrue(f.journal.state().recoveryRuns?.last?.isActive == true)
+            XCTAssertEqual(f.journal.state().saves[0].phase, phase)
+        }
+    }
+    func testCancellationRechecksRequestMarkersAndCheckpointEvenOnQueuedSource() async throws {
+        let f = try await fixture(), text = "요청 표식"
+        f.model.editor.updateText(text); await f.model.save()
+        let config = runConfiguration(text)
+        await NormalEditorRecoveryInjection.$testConfiguration.withValue(config) { await f.model.prepare() }
+        let state = f.journal.state()
+        for marker in 0..<5 {
+            var unsafe = state
+            switch marker {
+            case 0: unsafe.saves[0].request = .object([:])
+            case 1: unsafe.saves[0].requestHash = "recorded"
+            case 2: unsafe.saves[0].response = .object([:])
+            case 3: unsafe.saves[0].attempts = [UUID()]
+            default: unsafe.recoveryCheckpoints = [NormalEditorRecoveryInjection.checkpointKey(config)]
+            }
+            XCTAssertFalse(NormalEditorRecoveryInjection.canCancelPreparedRun(unsafe))
+        }
+    }
+    func testReceivePreparationCanCancelButStoredOrPartialReceiveCannot() async throws {
+        for phase in [nil, "responseStored", "originalApplyStarted"] as [String?] {
+            let f = try await fixture()
+            await NormalEditorRecoveryInjection.$testConfiguration.withValue(runConfiguration("수신 본문", point: .afterOriginalApply)) {
+                await f.model.prepare()
+            }
+            if let phase {
+                try f.journal.update("testReceiveStarted") {
+                    $0.receive = .init(id: UUID(), baseline: normalSnapshot(), remote: normalSnapshot("수신 본문", revision: 7), phase: phase)
+                }
+                let before = try stableJSON(f.journal.state())
+                XCTAssertThrowsError(try NormalEditorRecoveryInjection.cancelPreparedRun(f.journal))
+                XCTAssertEqual(try stableJSON(f.journal.state()), before)
+            } else {
+                await f.model.cancelPreparedRecoveryRun()
+                XCTAssertEqual(f.journal.state().recoveryRuns?.last?.cancelled, true)
+            }
+            let reads = await f.backend.reads, requests = await f.backend.requests
+            XCTAssertEqual(reads, 0); XCTAssertTrue(requests.isEmpty)
+        }
+    }
+    func testCancellationIsExplicitAndCannotRunInBackgroundOrCompleteCancelledRun() async throws {
+        let f = try await fixture(), text = "명시 취소"
+        f.model.editor.updateText(text); await f.model.save()
+        await NormalEditorRecoveryInjection.$testConfiguration.withValue(runConfiguration(text)) { await f.model.prepare() }
+        let model = f.model
+        await f.backend.onNextBaseline { await model.cancelPreparedRecoveryRun() }
+        await model.prepare()
+        XCTAssertTrue(model.prepared); XCTAssertNil(f.journal.state().recoveryRuns?.last?.cancelled)
+        await f.model.setForeground(false)
+        let before = try stableJSON(f.journal.state())
+        await f.model.cancelPreparedRecoveryRun()
+        XCTAssertEqual(try stableJSON(f.journal.state()), before)
+        await f.model.setForeground(true); await f.model.cancelPreparedRecoveryRun()
+        var cancelled = f.journal.state()
+        NormalEditorRecoveryInjection.completeRun(&cancelled)
+        XCTAssertEqual(cancelled.recoveryRuns?.last?.completed, false)
+        XCTAssertThrowsError(try NormalEditorRecoveryInjection.cancelPreparedRun(f.journal))
+    }
+    func testPreparedRunCanBeCancelledAfterSessionReconstruction() async throws {
+        let f = try await fixture()
+        f.model.editor.updateText("이전 저장"); await f.model.save()
+        await NormalEditorRecoveryInjection.$testConfiguration.withValue(runConfiguration("이전 저장")) { await f.model.prepare() }
+        f.model.editor.updateText("새 저장"); await f.model.save()
+        await f.model.setForeground(false)
+        let journal = try NormalEditorJournal(root: f.journal.root), repository = NormalTestRepository()
+        let product = LocalDocumentStore(workspaceLocator: FixedWorkspaceLocator(root: f.root.appendingPathComponent("workspace")),
+            metadataUpdater: RecordingMetadataUpdater(), durableChangeRecorder: NormalEditorRecorder(journal: journal))
+        let local = NormalEditorDocumentStore(local: product, journal: journal)
+        let editor = EditorSessionModel(documentRepository: repository, documentStore: local,
+            workspaceStateRepository: NormalTestWorkspace(), preserveDraft: { _, text, cursor in try journal.saveDraft(text: text, cursor: cursor) },
+            autosaveDelay: .seconds(3600))
+        let model = NormalEditorSession(editor: editor, journal: journal, backend: f.backend, documents: repository)
+        await model.open(); await model.prepare()
+        XCTAssertTrue(model.opened); XCTAssertFalse(model.prepared)
+        await model.cancelPreparedRecoveryRun()
+        XCTAssertEqual(journal.state().recoveryRuns?.last?.cancelled, true)
+        await NormalEditorRecoveryInjection.$testConfiguration.withValue(runConfiguration("새 저장")) { await model.prepare() }
+        XCTAssertTrue(model.prepared, model.message)
+        XCTAssertEqual(journal.state().recoveryRuns?.count, 2)
+    }
+    func testCancellationPreservesUnsavedDraftAndRequiresCleanNewRun() async throws {
+        let f = try await fixture()
+        f.model.editor.updateText("저장 본문"); await f.model.save()
+        await NormalEditorRecoveryInjection.$testConfiguration.withValue(runConfiguration("저장 본문")) { await f.model.prepare() }
+        f.model.editor.updateText("미저장 초안 e\u{301}🙂\n")
+        let draft = try Data(contentsOf: f.journal.root.appendingPathComponent("draft.json"))
+        await f.model.cancelPreparedRecoveryRun()
+        XCTAssertTrue(f.model.editor.hasUnsavedChanges)
+        XCTAssertEqual(try Data(contentsOf: f.journal.root.appendingPathComponent("draft.json")), draft)
+        XCTAssertEqual(try Data(contentsOf: f.file), Data("저장 본문".utf8))
+        await NormalEditorRecoveryInjection.$testConfiguration.withValue(runConfiguration("저장 본문")) { await f.model.prepare() }
+        XCTAssertFalse(f.model.prepared)
+        XCTAssertEqual(f.journal.state().recoveryRuns?.count, 1)
+    }
+    func testRecoveryRunWithoutCancellationFieldStillDecodesAsActive() throws {
+        let legacy = NormalEditorJournal.RecoveryRun(configuration: runConfiguration("이전 실행"), batchID: UUID())
+        let bytes = try JSONEncoder().encode(legacy)
+        XCTAssertFalse(String(decoding: bytes, as: UTF8.self).contains("cancelled"))
+        let decoded = try JSONDecoder().decode(NormalEditorJournal.RecoveryRun.self, from: bytes)
+        XCTAssertTrue(decoded.isActive); XCTAssertNil(decoded.cancelled)
+    }
     private func runConfiguration(_ text: String, point: NormalEditorRecoveryInjection.Point = .afterStoredResponse,
                                   id: UUID = UUID(), revision: Int64 = 6, baseline: String = normalInitial) -> NormalEditorRecoveryInjection.Configuration {
         .init(point: point, contentHash: NormalEditorPlan.hash(text),

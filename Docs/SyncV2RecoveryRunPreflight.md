@@ -26,6 +26,7 @@ batch ID를 영구 기록한다. 이전 저널의 hash chain·파일·draft·요
 
 실행 환경 값 없이 홈 아이콘으로 다시 실행하면 미완료 실행 명세를 저널에서 이어받는다.
 다른 실행 ID/본문/point/기준선 또는 run 없는 설정으로 미완료 실행을 교체할 수 없다.
+단, 아래의 명시적 준비 취소 조건을 만족하면 취소 기록을 남긴 뒤 새 UUID로 준비할 수 있다.
 완료 뒤에도 이전 실행 기록과 소비 키를 보존하며 같은 UUID를 재사용할 수 없다.
 새 실행에 기존 frozen/httpStarted 요청을 편입하지 않는다.
 
@@ -52,13 +53,36 @@ batch ID를 영구 기록한다. 이전 저널의 hash chain·파일·draft·요
 - 송신/수신 완료와 같은 append-only 기록에서 실행 완료도 남긴다. 실패 상태를 초기화하거나
   source를 재발급하지 않는다. 기존 미완료 건은 보존한 채 원인을 확인한다.
 
+## 요청 생성 전 준비 취소
+
+PR #42 최초 head `58f1056` 검토에서, 준비 후 재저장하면 이전 source가 superseded가 되어
+실행에 묶인 batch로 재개할 수도 새 실행으로 전환할 수도 없는 P2를 재현했다.
+명시적 **진단 준비 취소 · 본문과 기록 보존** 버튼으로 다음 조건에서만 종료할 수 있다.
+
+- 현재 미완료 run이 있고 충돌·저널 오류·수신 기록·해당 run의 소비된 checkpoint가 없어야 한다.
+- 완료되지 않은 저장은 queued 또는 superseded이며 request/requestHash/response/attempt가 없어야 한다.
+  송신 run에 묶인 source도 같은 조건을 만족해야 한다. freezing부터는 요청 기록이 없어도 거부한다.
+- 수신 D도 원격 수신 기록이 생기기 전 준비만 취소할 수 있다. responseStored/부분 원본 적용은
+  기존 수신 ID로 복구해야 하며 취소할 수 없다.
+- 전경·열린 세션에서 사용자가 직접 누른 경우에만 실행한다. busy 중에는 거부하고 준비 권한을
+  먼저 해제한다. 저널 잠금 안에서 조건을 다시 확인하고 새 `recoveryRunCancelledBeforeRequest`
+  레코드에 선택적 `cancelled: true`를 기록한다. `completed`는 false로 남는다.
+- 저장 source/본문/draft/기준선/오류/과거 record/UUID/소비 키는 지우거나 다시 쓰지 않는다.
+  이전 버전의 cancelled 필드 없는 run도 그대로 읽는다.
+- 취소 뒤 기존 UUID 재사용, run 없는 설정, 환경 없는 일반 송신 전환은 거부한다.
+  새 UUID·현재 저장 본문 해시·같은 기준선 명세로 진단 앱을 실행해 다시 준비해야 한다.
+  새 실행이 준비되면 이후 홈 아이콘 재실행은 그 새 실행을 이어받는다.
+
+따라서 준비 후 저장 변화는 자동으로 다른 실행에 편입되지 않는다. 사용자가 명시적으로 취소하고
+새 명세를 확인해야 한다. 이미 만들어진 요청/미확정 HTTP를 교체하는 기능은 아니다.
+
 ## 검증과 한계
 
 오프라인 테스트는 구성 파싱, 준비 전 권한 호출 차단, 잘못된 대상/조합/초안 오류,
 미완료 실행 교체 금지, 실행별 1회 소비, 과거 record 바이트 보존, 환경 없는 재개,
 수신 전 queued 차단, remote 검증 및 부분 수신 복구를 포함한다.
 기존 일반 편집·실제 SQLite queue/receipt 테스트도 함께 확인한다.
-2026-09-22, iPad Pro 11-inch (M5) / iOS 26.5 simulator 결과:
+최초 구현 head `58f1056`의 2026-09-22, iPad Pro 11-inch (M5) / iOS 26.5 simulator 결과:
 
 - 최초 NormalEditor 37개 통과 후, 비활성 전환과 재개 범위를 보강해 최종 재실행했다.
 - 최종 `NormalEditorTests` 40개(신규 12개 및 기존 경계 검사 확장)와
@@ -86,6 +110,27 @@ batch ID를 영구 기록한다. 이전 저널의 hash chain·파일·draft·요
 `OTHER_SWIFT_FLAGS='$(inherited) -DWRITERPAD_ISOLATED_TESTS'`, 빈 Supabase URL/key,
 서명 비활성, 고정 package 버전으로 실행했다. `xcodebuild test`의 선택 class는 위 두 개다.
 환경 파싱/진단 설정은 TaskLocal로 주입했으며, 실기기 launch 환경 전달이나 서명 설치는 검증하지 않았다.
+
+### P2 수정 후 최종 검증
+
+같은 simulator에서 `NormalEditorTests` **49개**와 `SyncV2GeneralSyncTests` **70개**,
+총 **119개 통과 / 실패 0 / 건너뜀 0**. 최초 head의 110개와 중간 수정의 117개는 합산하지 않는다.
+수정 회귀 9개는 재저장/원래 본문 복원/자동저장 후 명시 취소와 새 실행 송신 완료,
+세션 재구성 뒤 취소·준비, 취소 후 재열기·UUID 재사용/진단 우회 금지, 미저장 초안 보존,
+busy/비활성 취소 금지, freezing/frozen/httpStarted/responseStored 및 부분 수신 취소 금지,
+request 표식·소비 키 검사, 이전 run 디코딩 호환성을 포함한다.
+취소 전의 record 바이트와 저장 source·draft·본문 보존도 확인했다.
+
+- 로그: `/private/tmp/writerpad-recovery-run-fix-regression.log` (최종 명령과 119개 결과).
+- 중간 117개 검사: `/private/tmp/writerpad-recovery-run-fix-tests.log`.
+- xcresult: `/private/tmp/WriterPad-RecoveryRun-Fix-DD/Logs/Test/Test-WriterPad-2026.09.22_13-12-40-+0900.xcresult`.
+- debug dylib SHA-256: `1d584f9dc207040cd6c381d7c838a63a08e37d1ad72f9c22f8be923d15bcc017`.
+- bundle suffix `.recoveryrunfix`, 별도 DerivedData, 나머지 격리·빈 URL/key·서명 비활성 조건은 동일.
+- 최종 빌드/검사 로그 `warning:`·`error:` 0건, xcresult `runtimeWarnings` 비어 있음.
+- 계약 검증·`git diff --check` 통과. 계약·wire·Windows·Config·xcodeproj 변경 없음.
+
+최초 P2 재현 작업 트리와 실패 로그는 별도 보존하며 실패 증거를 성공 결과로 덮어쓰지 않았다.
+이 검증은 오프라인 세션/저널 복원이며 실제 OS 강제 종료·UI 조작·서버 송수신 검증은 아니다.
 
 이번 변경은 설치·인증·실제 서버 요청·OS suspension을 수행하지 않는다.
 SYNC-004는 부분 검증이다. Windows 의존성이나 교차 플랫폼 입력 변경이 없어

@@ -66,14 +66,20 @@ private struct NormalEditorControls: View {
         let state = session.journal.state()
         let phase = state.head.map { state.saves[$0].phase }
         let locked = session.busy || !session.prepared
-        HStack {
-            Button("송수신 준비·권한 갱신") { Task { await session.prepare() } }.disabled(session.busy || !session.opened)
-            Button("저장된 변경 송신 1회") { Task { await session.send() } }
-                .disabled(locked || !(phase == .queued || phase == .freezing || phase == .frozen) || !state.conflicts.isEmpty)
-            Button("서버 변경 수신·반영 재개") { Task { await session.receive() } }
-                .disabled(locked || state.head != nil || editor.hasUnsavedChanges || editor.isComposing || !state.conflicts.isEmpty || state.error != nil)
-            Button("미완료 송신 결과 확인") { Task { await session.recoverResult() } }
-                .disabled(locked || !(phase == .httpStarted || phase == .responseStored))
+        VStack(alignment: .leading) {
+            HStack {
+                Button("송수신 준비·권한 갱신") { Task { await session.prepare() } }.disabled(session.busy || !session.opened)
+                Button("저장된 변경 송신 1회") { Task { await session.send() } }
+                    .disabled(locked || !(phase == .queued || phase == .freezing || phase == .frozen) || !state.conflicts.isEmpty)
+                Button("서버 변경 수신·반영 재개") { Task { await session.receive() } }
+                    .disabled(locked || state.head != nil || editor.hasUnsavedChanges || editor.isComposing || !state.conflicts.isEmpty || state.error != nil)
+                Button("미완료 송신 결과 확인") { Task { await session.recoverResult() } }
+                    .disabled(locked || !(phase == .httpStarted || phase == .responseStored))
+            }
+            if state.recoveryRuns?.last?.isActive == true {
+                Button("진단 준비 취소 · 본문과 기록 보존") { Task { await session.cancelPreparedRecoveryRun() } }
+                    .disabled(session.busy || !session.opened || !NormalEditorRecoveryInjection.canCancelPreparedRun(state))
+            }
         }
     }
 }
