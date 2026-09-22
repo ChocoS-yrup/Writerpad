@@ -3,7 +3,7 @@
 ## 현재 상태
 
 - 현재 단계: 1~7단계 로컬 기능과 성능 기준선, SyncV2 클라이언트·서버 계약, 오프라인 수신·편집·WriterPad 승격 경로 구현 및 저장소 통합·전체 회귀 검증 완료
-- 다음 단계: [실기기·서버 중단 시험 준비](SyncV2DeviceInterruptionPlan.md)의 격리 조건·절차 검토 후 진단 준비 검사 구현. 분할 편집기 수정은 [PR #39](https://github.com/ChocoS-yrup/Writerpad/pull/39), [중단 경계 회귀 검증](SyncV2InterruptionBoundaries.md)은 [PR #40](https://github.com/ChocoS-yrup/Writerpad/pull/40)으로 병합했다. [실기기 본문 보존 기록](SyncV2DeviceLifecycleValidation.md)과 이전 임시 DB 관련 107개 통과를 유지한다. 실제 미영구화 입력·서버 요청 중단·OS suspension은 미검증이므로 SYNC-004는 부분 검증이며 background 서버 업로드 완료를 보장하지 않는다.
+- 다음 단계: [진단 실행 격리·사전 검사](SyncV2RecoveryRunPreflight.md)의 최종 검토·통합 후 시험 대상·계정·설치 구성을 확인한다. [실기기·서버 중단 시험 계획](SyncV2DeviceInterruptionPlan.md)은 PR #41로 병합했고, 후속 iPad 내부 진단 변경의 오프라인 회귀 110개가 통과했다. [실기기 본문 보존 기록](SyncV2DeviceLifecycleValidation.md)과 PR #39/#40 결과는 유지한다. 실제 미영구화 입력·서버 요청 중단·OS suspension은 미검증이므로 SYNC-004는 부분 검증이며 background 서버 업로드 완료를 보장하지 않는다. 교차 플랫폼 차이·Windows 의존성 없는 iPad 전용 변경은 Windows 회신 없이 진행한다.
 - 제품 코드: SwiftUI 앱·SwiftData 메타데이터 저장소·SyncV2·오프라인 수신/승격 경계와 테스트 타깃 통합 완료
 - Git: 2026-09-22 저장소 통합·경고 정리·로컬 증거 제외 정책과 정본 상태 문서 최신화를 PR #35까지 `main`에 병합 완료
 - Xcode: 27.0 설치·라이선스·최초 구성 완료
@@ -60,6 +60,7 @@
 - `SyncV2BackgroundPolicy.md`: SYNC-004의 로컬 저장·미전송 작업 보존·foreground 재개 정책과 남은 검증
 - `SyncV2InterruptionBoundaries.md`: 전송 전 영구 큐와 응답 로컬 반영 실패의 중단 경계 회귀 검증
 - `SyncV2DeviceInterruptionPlan.md`: 실기기·서버 중단 시험의 격리 선행 조건, 경계별 절차와 증거 판정
+- `SyncV2RecoveryRunPreflight.md`: iPad 진단 실행 ID·기준선 사전 검사와 미완료 요청/수신 보존, 오프라인 검증
 - `Architecture.md`: 목표 아키텍처와 데이터 흐름
 - `ModuleDependencies.md`: 모듈 의존 규칙
 - `StageCompletionCriteria.md`: 1~7단계 완료 조건
