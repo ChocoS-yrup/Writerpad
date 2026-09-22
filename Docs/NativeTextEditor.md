@@ -10,6 +10,10 @@
 
 - 외부 본문은 `document_id + externalVersion`이 바뀐 경우에만 UITextView에 적용한다.
 - 같은 문서와 버전의 SwiftUI 업데이트는 전체 `text`를 다시 설정하지 않는다.
+- 로컬 mutation은 `EditorSessionModel.textBuffer`에 반영되고 `text`에는 매번 게시되지 않는다.
+  분할·레이아웃 변경으로 새 native view를 만들거나 delta 적용 실패/버전 건너뛰기로
+  전체 본문을 복구할 때는 지연 `externalTextSnapshot`을 통해 `currentText`를 읽는다.
+  Binding 생성, 동일 버전 갱신, 연속 delta 적용은 최신 전체 문자열을 만들지 않는다.
 - 문서가 바뀔 때만 Undo 이력을 비우며 같은 문서의 외부 버전 갱신은 불필요한 초기화를 하지 않는다.
 - 커서와 선택은 영구 모델의 `TextCursorState`처럼 UTF-16 위치를 사용하고 실제 본문 범위로 제한한다.
 - 문서별 스크롤 위치는 동일한 UITextView coordinator 안에서 세션 동안 유지한다.

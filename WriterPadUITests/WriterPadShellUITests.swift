@@ -2,6 +2,100 @@ import XCTest
 
 @MainActor
 final class WriterPadShellUITests: XCTestCase {
+    /// Opt-in persistent-sandbox check, never run against the user's normal app.
+    /// XCTest termination is not evidence of manual force-quit or OS suspension.
+    func testIsolatedLifecyclePreservesBothPanesAfterHomeAndRelaunch() throws {
+        let testBundle = Bundle(for: WriterPadShellUITests.self).bundleIdentifier ?? ""
+        try XCTSkipUnless(
+            testBundle == "com.chocos.writerpad.uitests.lifecyclevalidation",
+            "Requires the dedicated lifecyclevalidation app and test bundle suffixes."
+        )
+        continueAfterFailure = false
+        XCUIDevice.shared.orientation = .landscapeLeft
+        defer { XCUIDevice.shared.orientation = .portrait }
+        let app = XCUIApplication(bundleIdentifier: "com.chocos.writerpad.lifecyclevalidation")
+        app.launchArguments += ["-writerpad.restore-last-project-on-launch", "YES"]
+        app.launch()
+
+        let switcher = app.buttons["writerpad.project-switcher"]
+        if switcher.waitForExistence(timeout: 3) { switcher.tap() }
+        let createProject = app.buttons["새 작품"]
+        XCTAssertTrue(createProject.waitForExistence(timeout: 10))
+        createProject.tap()
+        let alert = app.alerts["새 작품"]
+        XCTAssertTrue(alert.waitForExistence(timeout: 3))
+        let run = String(UUID().uuidString.prefix(8))
+        alert.textFields.firstMatch.typeText("Lifecycle Synthetic \(run)")
+        alert.buttons["만들기"].tap()
+
+        let manuscript = element("writerpad.binder-row-manuscript", in: app)
+        if !manuscript.waitForExistence(timeout: 3) {
+            app.buttons["writerpad.binder-toggle"].tap()
+        }
+        XCTAssertTrue(manuscript.waitForExistence(timeout: 5))
+        manuscript.press(forDuration: 1)
+        let addVolume = app.buttons["새 권 추가"]
+        XCTAssertTrue(addVolume.waitForExistence(timeout: 3))
+        addVolume.tap()
+        func episode(_ title: String) -> XCUIElement {
+            app.descendants(matching: .any).matching(
+                NSPredicate(
+                    format: "identifier == 'writerpad.binder-row-user' AND label BEGINSWITH %@",
+                    title
+                )
+            ).firstMatch
+        }
+        XCTAssertTrue(episode("001화").waitForExistence(timeout: 8))
+        episode("001화").tap()
+        let editors = app.textViews.matching(identifier: "writerpad.native-editor-text-view")
+        let left = editors.element(boundBy: 0)
+        XCTAssertTrue(left.waitForExistence(timeout: 5))
+        let leftText = "LEFT-\(run)-saved-before-home"
+        left.tap()
+        left.typeText(leftText)
+
+        app.buttons["writerpad.split-button"].tap()
+        let rightPane = element("writerpad.editor-pane-right", in: app)
+        XCTAssertTrue(rightPane.waitForExistence(timeout: 5))
+        rightPane.tap()
+        episode("002화").tap()
+        let right = editors.element(boundBy: 1)
+        XCTAssertTrue(right.waitForExistence(timeout: 5))
+        let rightText = "RIGHT-\(run)-saved-before-home"
+        right.tap()
+        right.typeText(rightText)
+
+        func assertBothContents(stage: String) {
+            let restoredScreen = XCTAttachment(screenshot: app.screenshot())
+            restoredScreen.name = "Split contents: \(stage)"
+            restoredScreen.lifetime = .keepAlways
+            add(restoredScreen)
+            XCTAssertEqual(element("writerpad.editor-pane-right", in: app).value as? String, "활성")
+            for (editor, expected) in [(left, leftText), (right, rightText)] {
+                XCTAssertTrue(editor.waitForExistence(timeout: 10))
+                let restored = XCTNSPredicateExpectation(
+                    predicate: NSPredicate(format: "value == %@", expected), object: editor
+                )
+                XCTAssertEqual(
+                    XCTWaiter.wait(for: [restored], timeout: 10), .completed,
+                    "\(stage): expected \(expected); actual \(String(describing: editor.value))"
+                )
+            }
+        }
+        assertBothContents(stage: "before home")
+        XCUIDevice.shared.press(.home)
+        XCTAssertTrue(app.wait(for: .runningBackground, timeout: 10))
+        app.activate()
+        assertBothContents(stage: "after home")
+        app.terminate()
+        app.launch()
+        assertBothContents(stage: "after relaunch")
+        let evidence = XCTAttachment(string: "project=Lifecycle Synthetic \(run)\nleft=\(leftText)\nright=\(rightText)")
+        evidence.name = "Synthetic lifecycle contents"
+        evidence.lifetime = .keepAlways
+        add(evidence)
+    }
+
     private func makeApp(restoresLastProjectOnLaunch: Bool = false) -> XCUIApplication {
         let app = XCUIApplication()
         app.launchArguments += [

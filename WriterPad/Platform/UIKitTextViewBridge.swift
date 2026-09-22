@@ -887,6 +887,9 @@ struct iPadTextEditor: UIViewRepresentable {
     let externalVersion: UInt64
     var externalTextMutation: SharedEditorTextChange.VersionedMutation? = nil
     var externalUTF16Length: Int? = nil
+    /// Mutation-backed sessions materialize the latest body only for native-view
+    /// initialization or full-text recovery, never while constructing a Binding.
+    var externalTextSnapshot: (() -> String)? = nil
     @Binding var selection: TextCursorState
     let focusRequest: UInt64
     var compositionCommitRequest: UInt64 = 0
@@ -913,6 +916,10 @@ struct iPadTextEditor: UIViewRepresentable {
     var onCompositionStateChange: (DocumentID, Bool) -> Void = { _, _ in }
     var onFocusChange: (Bool) -> Void = { _ in }
     var onInputSource: ((DocumentID, EditorInputSource) -> Void)? = nil
+
+    private var currentExternalText: String {
+        externalTextSnapshot?() ?? text
+    }
 
     func makeCoordinator() -> Coordinator {
         Coordinator(parent: self)
@@ -1016,7 +1023,7 @@ struct iPadTextEditor: UIViewRepresentable {
                     appliedIncrementally = textView.applyExternalTextMutation(
                         externalMutation.mutation,
                         expectedUTF16Length: parent.externalUTF16Length
-                            ?? parent.text.utf16.count,
+                            ?? parent.currentExternalText.utf16.count,
                         selection: parent.selection
                     )
                 } else {
@@ -1024,7 +1031,7 @@ struct iPadTextEditor: UIViewRepresentable {
                 }
                 if !appliedIncrementally {
                     textView.applyExternalText(
-                        parent.text,
+                        parent.currentExternalText,
                         selection: parent.selection,
                         clearsUndoHistory: decision == .applyDocument
                     )

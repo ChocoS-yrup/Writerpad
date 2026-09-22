@@ -676,6 +676,113 @@ final class AppEnvironmentTests: XCTestCase {
     }
 
     @MainActor
+    func testRecreatedEditorReadsLatestMutationBufferInsteadOfPublishedText() throws {
+        let environment = try AppEnvironment.testing()
+        let model = EditorSessionModel(
+            documentRepository: environment.documentRepository,
+            documentStore: environment.localDocumentStore,
+            workspaceStateRepository: environment.workspaceStateRepository
+        )
+        let documentID = DocumentID(rawValue: UUID())
+        func editor() -> iPadTextEditor {
+            iPadTextEditor(
+                text: Binding(get: { model.text }, set: { model.updateText($0) }),
+                documentID: documentID,
+                externalVersion: model.externalVersion,
+                externalUTF16Length: model.currentUTF16Length,
+                externalTextSnapshot: { model.currentText },
+                selection: .constant(.start),
+                focusRequest: 0,
+                isActive: false
+            )
+        }
+        let originalEditor = editor()
+        let originalView = SmartTextView()
+        let originalCoordinator = originalEditor.makeCoordinator()
+        originalCoordinator.applyExternalState(to: originalView)
+        let versionBeforeTyping = model.externalVersion
+        let latest = "분할 전 입력🙂\n두 번째 줄"
+        XCTAssertTrue(model.applyTextMutation(.init(
+            range: .start, replacementText: latest
+        )))
+        XCTAssertEqual(model.text, "", "Local mutations intentionally do not publish full strings.")
+        XCTAssertEqual(model.externalVersion, versionBeforeTyping)
+        let snapshotsBeforeRebuild = model.textSnapshotCreationCount
+
+        let rebuiltEditor = editor()
+        XCTAssertEqual(model.textSnapshotCreationCount, snapshotsBeforeRebuild)
+        let rebuiltView = SmartTextView()
+        let rebuiltCoordinator = rebuiltEditor.makeCoordinator()
+        rebuiltCoordinator.applyExternalState(to: rebuiltView)
+
+        XCTAssertEqual(rebuiltView.text, latest)
+        XCTAssertEqual(model.textSnapshotCreationCount, snapshotsBeforeRebuild + 1)
+        let assignments = rebuiltView.fullTextAssignmentCount
+        rebuiltCoordinator.applyExternalState(to: rebuiltView)
+        XCTAssertEqual(model.textSnapshotCreationCount, snapshotsBeforeRebuild + 1)
+        XCTAssertEqual(rebuiltView.fullTextAssignmentCount, assignments)
+    }
+
+    @MainActor
+    func testEditorSnapshotProviderIsLazyForContinuousMutationsAndUsedForRecovery() {
+        let documentID = DocumentID(rawValue: UUID())
+        var latest = "가"
+        var snapshotReads = 0
+        func editor(version: UInt64, mutation: SharedEditorTextChange.VersionedMutation? = nil) -> iPadTextEditor {
+            iPadTextEditor(
+                text: .constant("stale published body"),
+                documentID: documentID,
+                externalVersion: version,
+                externalTextMutation: mutation,
+                externalUTF16Length: latest.utf16.count,
+                externalTextSnapshot: { snapshotReads += 1; return latest },
+                selection: .constant(.start),
+                focusRequest: 0,
+                isActive: false
+            )
+        }
+        let coordinator = editor(version: 0).makeCoordinator()
+        let textView = SmartTextView()
+        XCTAssertEqual(snapshotReads, 0)
+        coordinator.applyExternalState(to: textView)
+        XCTAssertEqual(textView.text, "가")
+        XCTAssertEqual(snapshotReads, 1)
+        let assignments = textView.fullTextAssignmentCount
+
+        latest = "가🙂"
+        coordinator.parent = editor(version: 1, mutation: .init(
+            baseVersion: 0, version: 1,
+            mutation: .init(range: .init(location: 1, selectionLength: 0), replacementText: "🙂")
+        ))
+        coordinator.applyExternalState(to: textView)
+        XCTAssertEqual(textView.text, latest)
+        XCTAssertEqual(snapshotReads, 1)
+        XCTAssertEqual(textView.fullTextAssignmentCount, assignments)
+        coordinator.applyExternalState(to: textView)
+        XCTAssertEqual(snapshotReads, 1)
+
+        // A missed version must recover from the live buffer, not the last
+        // published string or an incremental edit based on a different version.
+        latest = "건너뛴 버전의 최신 본문🙂"
+        coordinator.parent = editor(version: 3, mutation: .init(
+            baseVersion: 2, version: 3,
+            mutation: .init(range: .start, replacementText: "무시할 delta")
+        ))
+        coordinator.applyExternalState(to: textView)
+        XCTAssertEqual(textView.text, latest)
+        XCTAssertEqual(snapshotReads, 2)
+
+        latest = "잘못된 delta에서도 최신 본문"
+        coordinator.parent = editor(version: 4, mutation: .init(
+            baseVersion: 3, version: 4,
+            mutation: .init(range: .init(location: 999, selectionLength: 0), replacementText: "범위 밖")
+        ))
+        coordinator.applyExternalState(to: textView)
+        XCTAssertEqual(textView.text, latest)
+        XCTAssertEqual(snapshotReads, 3)
+    }
+
+    @MainActor
     func testSharedEditorAppliesContinuousMutationWithoutFullTextAssignment() {
         let documentID = DocumentID(rawValue: UUID())
         let original = String(repeating: "긴 원고 문장🙂\n", count: 2_000)

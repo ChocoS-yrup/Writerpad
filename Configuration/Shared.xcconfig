@@ -10,3 +10,8 @@ WRITERPAD_SUPABASE_PUBLISHABLE_KEY =
 // 높은 쪽을 한 번 설치하면 낮은 쪽 빌드가 전부 막힌다.
 WRITERPAD_BUNDLE_SUFFIX =
 WRITERPAD_DISPLAY_NAME = ChocoS
+
+// No app/test target declares App Intents or App Shortcuts. Do not schedule an
+// inapplicable metadata export (Xcode 27 otherwise emits a missing-dependency
+// warning). Remove this opt-out when introducing App Intents/Shortcuts.
+LM_SKIP_METADATA_EXTRACTION = YES
