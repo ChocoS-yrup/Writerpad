@@ -82,6 +82,8 @@ final class NormalEditorSession: ObservableObject {
         await perform {
             self.prepared = false
             let version = self.epoch
+            try await self.validateRecoveryRun()
+            guard self.foreground, self.epoch == version else { throw NormalEditorError.locked }
             try await self.backend.prepare()
             guard self.foreground, self.epoch == version else { throw NormalEditorError.locked }
             self.prepared = true
@@ -96,6 +98,9 @@ final class NormalEditorSession: ObservableObject {
     func send() async {
         guard opened, prepared, !busy else { return }
         await perform {
+            try await self.validateRecoveryRun()
+            guard self.foreground, self.prepared else { throw NormalEditorError.locked }
+            try NormalEditorRecoveryInjection.checkAction(self.journal, receiving: false)
             let state = self.journal.state()
             guard state.receive == nil, state.conflicts.isEmpty else { throw NormalEditorError.conflict }
             guard self.editor.draftPersistenceError == nil else { throw NormalEditorError.storage }
@@ -134,6 +139,9 @@ final class NormalEditorSession: ObservableObject {
     func recoverResult() async {
         guard opened, prepared, !busy else { return }
         await perform {
+            try await self.validateRecoveryRun()
+            guard self.foreground, self.prepared else { throw NormalEditorError.locked }
+            try NormalEditorRecoveryInjection.checkAction(self.journal, receiving: false)
             let state = self.journal.state()
             guard let index = state.head, let json = state.saves[index].request else { throw NormalEditorError.noChange }
             let item = state.saves[index], request = try SyncV2ContractRequest(storedJSON: json)
@@ -160,18 +168,27 @@ final class NormalEditorSession: ObservableObject {
         let base = try await backend.localBaseline(), content = try NormalEditorPlan.content(journal.state().saves[index].source)
         guard Data(base.content.utf8) == Data(content.utf8) else { throw NormalEditorError.baseline }
         let result = "송신 완료. revision \(base.revision) · \(content.utf8.count)바이트 · SHA-256 \(NormalEditorPlan.hash(content))"
-        try journal.update("sendCompleted") { $0.saves[index].phase = .completed; $0.baseline = base; $0.message = result }
+        try journal.update("sendCompleted") {
+            $0.saves[index].phase = .completed; $0.baseline = base; $0.message = result
+            NormalEditorRecoveryInjection.completeRun(&$0)
+        }
         message = result
     }
     func receive() async {
         guard opened, prepared, !busy else { return }
         await perform {
+            try await self.validateRecoveryRun()
+            guard self.foreground, self.prepared else { throw NormalEditorError.locked }
+            try NormalEditorRecoveryInjection.checkAction(self.journal, receiving: true)
             try self.requireCleanReceive()
             let state = self.journal.state()
             guard let base = state.baseline else { throw NormalEditorError.baseline }
             if state.receive == nil {
                 let remote = try await self.backend.remote()
                 try NormalEditorPlan.validate(remote)
+                if let configuration = try NormalEditorRecoveryInjection.effectiveConfiguration(self.journal) {
+                    try NormalEditorRecoveryInjection.validateIncoming(remote, configuration: configuration)
+                }
                 try self.requireCleanReceive()
                 guard remote.revision >= base.revision else { throw NormalEditorError.baseline }
                 let current = try await self.backend.localText()
@@ -195,7 +212,10 @@ final class NormalEditorSession: ObservableObject {
             let result = "수신 완료. revision \(latest.revision) · \(text.utf8.count)바이트 · SHA-256 \(NormalEditorPlan.hash(text))"
             // Old draft must not be restored over an accepted receive after a crash.
             try self.journal.saveDraft(text: text, cursor: .start)
-            try self.journal.update("receiveCompleted") { $0.baseline = latest; $0.receive = nil; $0.message = result }
+            try self.journal.update("receiveCompleted") {
+                $0.baseline = latest; $0.receive = nil; $0.message = result
+                NormalEditorRecoveryInjection.completeRun(&$0)
+            }
             await self.editor.restore(documentID: .init(rawValue: NormalEditorPlan.document), cursor: .start)
             self.message = result
         }
@@ -204,6 +224,12 @@ final class NormalEditorSession: ObservableObject {
         let state = journal.state()
         guard !editor.hasUnsavedChanges, !editor.isComposing, editor.draftPersistenceError == nil,
               state.head == nil, state.conflicts.isEmpty, state.error == nil else { throw NormalEditorError.dirty }
+    }
+    private func validateRecoveryRun() async throws {
+        guard try NormalEditorRecoveryInjection.effectiveConfiguration(journal)?.run != nil else { return }
+        let baseline = try await backend.localBaseline(), text = try await backend.localText()
+        try NormalEditorRecoveryInjection.preflight(journal: journal, baseline: baseline, localText: text,
+            dirty: editor.hasUnsavedChanges, composing: editor.isComposing, draftFailed: editor.draftPersistenceError != nil)
     }
     private func preserveConflict(_ remote: SyncV2RemoteDocumentSnapshot) async throws {
         guard let base = journal.state().baseline else { throw NormalEditorError.baseline }

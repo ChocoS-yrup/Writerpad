@@ -5,23 +5,43 @@ import Foundation
 /// No transport, timers, settings writes, process termination or automatic recovery here.
 enum NormalEditorRecoveryInjection {
     static let plan = "normal-editor-recovery-20260913-v1"
-    enum Point: String, Sendable { case beforeHTTP, afterCommitResponse, afterStoredResponse, afterOriginalApply }
-    struct Configuration: Sendable {
+    enum Point: String, Codable, Sendable { case beforeHTTP, afterCommitResponse, afterStoredResponse, afterOriginalApply }
+    struct Run: Codable, Equatable, Sendable {
+        let id: UUID
+        let baselineRevision: Int64
+        let baselineHash: String
+    }
+    struct Configuration: Codable, Equatable, Sendable {
         let point: Point
         let contentHash: String
+        var run: Run? = nil
     }
 #if DEBUG
     @TaskLocal static var testConfiguration: Configuration?
 #endif
     static func parse(_ environment: [String: String]) throws -> Configuration? {
-        let keys = ["WRITERPAD_RECOVERY_PLAN", "WRITERPAD_RECOVERY_POINT", "WRITERPAD_RECOVERY_CONTENT_SHA256"]
+        let keys = ["WRITERPAD_RECOVERY_PLAN", "WRITERPAD_RECOVERY_POINT", "WRITERPAD_RECOVERY_CONTENT_SHA256",
+                    "WRITERPAD_RECOVERY_RUN_ID", "WRITERPAD_RECOVERY_BASE_REVISION", "WRITERPAD_RECOVERY_BASE_SHA256"]
         guard keys.contains(where: { environment[$0] != nil }) else { return nil }
         guard environment[keys[0]] == plan, let raw = environment[keys[1]], let point = Point(rawValue: raw),
               let hash = environment[keys[2]], hash.utf8.count == 64,
               hash.utf8.allSatisfy({ (48...57).contains($0) || (97...102).contains($0) }) else {
             throw NormalEditorError.recoveryConfiguration
         }
-        return Configuration(point: point, contentHash: hash)
+        var configuration = Configuration(point: point, contentHash: hash)
+        if keys.dropFirst(3).contains(where: { environment[$0] != nil }) {
+            guard let rawID = environment[keys[3]], let id = UUID(uuidString: rawID),
+                  rawID == id.uuidString.lowercased(), let rawRevision = environment[keys[4]],
+                  let revision = Int64(rawRevision), revision >= 6, revision < Int64.max, String(revision) == rawRevision,
+                  let baseHash = environment[keys[5]], validHash(baseHash) else {
+                throw NormalEditorError.recoveryConfiguration
+            }
+            configuration.run = .init(id: id, baselineRevision: revision, baselineHash: baseHash)
+        }
+        return configuration
+    }
+    static func validHash(_ hash: String) -> Bool {
+        hash.utf8.count == 64 && hash.utf8.allSatisfy { (48...57).contains($0) || (97...102).contains($0) }
     }
     static func configuration() throws -> Configuration? {
 #if DEBUG
@@ -34,8 +54,13 @@ enum NormalEditorRecoveryInjection {
 #endif
     }
     static func hit(_ point: Point, journal: NormalEditorJournal) throws {
-        guard let configuration = try configuration(), configuration.point == point else { return }
-        let key = plan + ":" + point.rawValue
+        guard let configuration = try effectiveConfiguration(journal), configuration.point == point else { return }
+        let key = checkpointKey(configuration)
+        if configuration.run != nil {
+            guard let active = journal.state().recoveryRuns?.last, !active.completed,
+                  active.configuration == configuration else { throw NormalEditorError.recoveryConfiguration }
+            try checkAction(journal, receiving: point == .afterOriginalApply)
+        }
         // Keep reopens and already-consumed boundaries completely read-only.
         guard journal.state().recoveryCheckpoints?.contains(key) != true else { return }
         try journal.update("recoveryCheckpoint:" + point.rawValue) { state in
@@ -60,6 +85,94 @@ enum NormalEditorRecoveryInjection {
             state.recoveryCheckpoints = (state.recoveryCheckpoints ?? []) + [key]
         }
         throw NormalEditorError.recoveryCheckpoint
+    }
+
+    static func checkpointKey(_ configuration: Configuration) -> String {
+        plan + ":" + (configuration.run.map { $0.id.uuidString.lowercased() + ":" } ?? "") + configuration.point.rawValue
+    }
+    // Home-screen relaunch does not inherit launch environment. Resume the same durable run,
+    // never a fresh journal/queue namespace that could hide an uncertain request.
+    static func effectiveConfiguration(_ journal: NormalEditorJournal) throws -> Configuration? {
+        let supplied = try configuration()
+        if let active = journal.state().recoveryRuns?.last, !active.completed {
+            guard supplied == nil || supplied == active.configuration else { throw NormalEditorError.recoveryConfiguration }
+            return active.configuration
+        }
+        return supplied
+    }
+    static func preflight(journal: NormalEditorJournal, baseline: SyncV2RemoteDocumentSnapshot,
+                          localText: String, dirty: Bool, composing: Bool, draftFailed: Bool) throws {
+        guard let configuration = try effectiveConfiguration(journal), let run = configuration.run else { return }
+        try NormalEditorPlan.validate(baseline)
+        guard run.baselineRevision >= 6, run.baselineRevision < Int64.max, validHash(run.baselineHash), validHash(configuration.contentHash),
+              !dirty, !composing, !draftFailed else { throw NormalEditorError.recoveryConfiguration }
+        let state = journal.state(), runs = state.recoveryRuns ?? []
+        guard state.conflicts.isEmpty, state.error == nil, let recordedBase = state.baseline,
+              recordedBase.revision == run.baselineRevision,
+              NormalEditorPlan.hash(recordedBase.content) == run.baselineHash else { throw NormalEditorError.baseline }
+        let existing = runs.last.flatMap { $0.configuration == configuration && !$0.completed ? $0 : nil }
+        if existing == nil {
+            guard !runs.contains(where: { $0.configuration.run?.id == run.id }),
+                  state.receive == nil else { throw NormalEditorError.recoveryConfiguration }
+        }
+        let baselineMatches = baseline.revision == run.baselineRevision && NormalEditorPlan.hash(baseline.content) == run.baselineHash
+        let batchID: UUID?
+        if configuration.point == .afterOriginalApply {
+            guard state.head == nil else { throw NormalEditorError.dirty }
+            batchID = nil
+            if let receive = state.receive {
+                guard existing != nil else { throw NormalEditorError.recoveryConfiguration }
+                try validateIncoming(receive.remote, configuration: configuration)
+                guard receive.baseline.revision == run.baselineRevision,
+                      NormalEditorPlan.hash(receive.baseline.content) == run.baselineHash,
+                      baselineMatches || (baseline.revision == receive.remote.revision && Data(baseline.content.utf8) == Data(receive.remote.content.utf8)),
+                      Data(localText.utf8) == Data(receive.baseline.content.utf8) || Data(localText.utf8) == Data(receive.remote.content.utf8) else { throw NormalEditorError.baseline }
+            } else {
+                guard baselineMatches, Data(localText.utf8) == Data(baseline.content.utf8) else { throw NormalEditorError.baseline }
+            }
+        } else {
+            guard state.receive == nil, let head = state.head,
+                  state.saves.filter({ $0.phase != .completed && $0.phase != .superseded }).count == 1 else { throw NormalEditorError.queue }
+            let save = state.saves[head], text = try NormalEditorPlan.content(save.source)
+            guard !text.isEmpty, !text.contains("\r"), NormalEditorPlan.hash(text) == configuration.contentHash,
+                  Data(localText.utf8) == Data(text.utf8) else { throw NormalEditorError.recoveryConfiguration }
+            batchID = save.source.batchID
+            if let existing {
+                guard existing.batchID == batchID else { throw NormalEditorError.recoveryConfiguration }
+            } else {
+                // Never attach a new run ID to an already materialized/uncertain request.
+                guard save.phase == .queued, save.request == nil, save.attempts.isEmpty else { throw NormalEditorError.recoveryConfiguration }
+            }
+            guard baselineMatches || (existing != nil && save.phase == .responseStored && baseline.revision == run.baselineRevision + 1 && Data(baseline.content.utf8) == Data(text.utf8)) else { throw NormalEditorError.baseline }
+        }
+        if let draft = try journal.draft() {
+            let allowed = configuration.point == .afterOriginalApply
+                ? [run.baselineHash, state.receive.map { NormalEditorPlan.hash($0.remote.content) }].compactMap { $0 }
+                : [configuration.contentHash]
+            guard allowed.contains(draft.hash) else { throw NormalEditorError.dirty }
+        }
+        if existing == nil {
+            try journal.update("recoveryRunPrepared") { $0.recoveryRuns = runs + [.init(configuration: configuration, batchID: batchID)] }
+        }
+    }
+    static func checkAction(_ journal: NormalEditorJournal, receiving: Bool) throws {
+        guard let configuration = try effectiveConfiguration(journal), configuration.run != nil else { return }
+        guard let active = journal.state().recoveryRuns?.last, !active.completed,
+              active.configuration == configuration,
+              receiving == (configuration.point == .afterOriginalApply) else { throw NormalEditorError.recoveryConfiguration }
+        if !receiving {
+            guard let head = journal.state().head, journal.state().saves[head].source.batchID == active.batchID else { throw NormalEditorError.recoveryConfiguration }
+        }
+    }
+    static func validateIncoming(_ remote: SyncV2RemoteDocumentSnapshot, configuration: Configuration) throws {
+        guard let run = configuration.run else { return }
+        try NormalEditorPlan.validate(remote)
+        guard configuration.point == .afterOriginalApply, remote.revision > run.baselineRevision,
+              NormalEditorPlan.hash(remote.content) == configuration.contentHash else { throw NormalEditorError.recoveryConfiguration }
+    }
+    static func completeRun(_ state: inout NormalEditorJournal.State) {
+        guard let index = state.recoveryRuns?.indices.last, state.recoveryRuns?[index].completed == false else { return }
+        state.recoveryRuns?[index].completed = true
     }
 }
 
@@ -129,6 +242,11 @@ enum NormalEditorError: String, Error, LocalizedError {
 /// Draft replaces only its private file; accepted operations and transitions are append-only.
 /// A new instance verifies the complete hash chain before using the latest state.
 final class NormalEditorJournal: @unchecked Sendable {
+    struct RecoveryRun: Codable, Sendable {
+        let configuration: NormalEditorRecoveryInjection.Configuration
+        let batchID: UUID?
+        var completed = false
+    }
     struct Draft: Codable, Sendable {
         let text: String
         let cursor: TextCursorState
@@ -167,6 +285,7 @@ final class NormalEditorJournal: @unchecked Sendable {
         var lastRequestHash: String?
         // Optional for compatibility with the installed candidate's existing journal.
         var recoveryCheckpoints: [String]?
+        var recoveryRuns: [RecoveryRun]?
         var message = "통신 잠김. 로컬 편집·저장은 로그인 없이 가능합니다."
         var head: Int? { saves.firstIndex { $0.phase != .completed && $0.phase != .superseded } }
     }
