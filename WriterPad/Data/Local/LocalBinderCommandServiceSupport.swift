@@ -572,7 +572,8 @@ extension LocalBinderCommandService {
 
     /// Validate saved intent without rebuilding requests or consulting current files.
     /// An allowlisted journal envelope alone does not make its payload safe to replay.
-    func isReplayableStructureBatch(_ batch: LocalMutationBatch, for journal: BinderCommandJournal) -> Bool {
+    func isReplayableStructureBatch(_ batch: LocalMutationBatch, for journal: BinderCommandJournal,
+        committedNodes: [DocumentNode]) -> Bool {
         let expectedKind: DurableLocalBatchKind
         switch journal.kind {
         case .create, .relocate, .reorder: expectedKind = .structureChange
@@ -581,6 +582,8 @@ extension LocalBinderCommandService {
         }
         guard batch.kind == expectedKind, batch.contractStep == nil, batch.originBatchID == nil,
               journal.trashRecord == nil, let snapshot = batch.structureSnapshot,
+              snapshot.sorted(by: { $0.id.rawValue.uuidString < $1.id.rawValue.uuidString })
+                == committedNodes.map(LocalStructureSnapshotNode.init).sorted(by: { $0.id.rawValue.uuidString < $1.id.rawValue.uuidString }),
               snapshot.allSatisfy({ $0.projectID == journal.projectID }),
               Set(snapshot.map(\.id)).count == snapshot.count,
               Set(journal.newNodes.map(\.id)).count == journal.newNodes.count,

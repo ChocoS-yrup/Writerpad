@@ -232,10 +232,15 @@ actor LocalBinderCommandService: BinderCommanding {
               [.create, .createVolume, .relocate, .reorder].contains(journal.kind),
               let batch = journal.durableBatch, batch.projectID == projectID,
               batch.localTransactionID == journal.transactionID,
-              isReplayableStructureBatch(batch, for: journal),
               let origin = journal.handoffOrigin, batch.handoffOrigin == origin,
               origin == (await durableChangeRecorder.handoffOrigin(for: projectID))
         else { return 1 }
+        // The batch includes a project-wide tree snapshot, not only affected nodes.
+        // Read committed structure under the same gate; body/cursor/date changes
+        // are intentionally absent from LocalStructureSnapshotNode comparison.
+        let committed = try await metadataStore.binderDocuments(in: projectID)
+        try authorize()
+        guard isReplayableStructureBatch(batch, for: journal, committedNodes: committed) else { return 1 }
         try authorize()
         let result = await durableChangeRecorder.record(batch, authorize: authorize)
         try authorize()

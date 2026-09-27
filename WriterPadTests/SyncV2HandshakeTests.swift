@@ -3575,6 +3575,47 @@ extension SyncV2HandshakeTests {
         }
     }
 
+    func testStructureRetryRejectsCorruptionOutsideAffectedJournalNodes() async throws {
+        for mode in 0..<4 {
+            let f = try await productDocumentsFixture(withVolume: true)
+            let commands = structureCommands(f)
+            ContractPathGate.close(for: f.base.localID, in: f.base.defaults)
+            _ = try await commands.renameChapter(documentID: f.documents[0].id,
+                titleSuffix: " 형제 구조 검증", projectID: f.base.localID)
+            let (url, _, original) = try structureJournal(f)
+            let source = try XCTUnwrap(original.durableBatch)
+            let committed = try await f.repository.documents(in: f.base.localID)
+            var alteredNodes = committed
+            let index = try XCTUnwrap(alteredNodes.firstIndex { $0.id == f.documents[1].id })
+            let node = alteredNodes[index]
+            if mode == 3 { alteredNodes.remove(at: index) }
+            else {
+                alteredNodes[index] = DocumentNode(id: node.id, projectID: node.projectID, kind: node.kind,
+                    parentID: mode == 1 ? DocumentID(rawValue: f.folders[1].folderID) : node.parentID,
+                    relativePath: mode == 2 ? .init(rawValue: "메인/원고/1권/002화 손상.txt") : node.relativePath,
+                    userOrder: mode == 0 ? node.userOrder + 100 : node.userOrder, modifiedAt: node.modifiedAt,
+                    contentHash: node.contentHash)
+            }
+            var batch = LocalMutationBatch(batchID: source.batchID, projectID: source.projectID,
+                localTransactionID: source.localTransactionID, kind: source.kind, mutations: source.mutations,
+                structureSnapshot: alteredNodes)
+            batch.handoffOrigin = source.handoffOrigin
+            var journal = original; journal.durableBatch = batch
+            let encoder = JSONEncoder(); encoder.dateEncodingStrategy = .iso8601
+            let bytes = try encoder.encode(journal); try bytes.write(to: url)
+            ContractPathGate.setOpen(true, for: f.base.localID, in: f.base.defaults)
+            let deferred = try await commands.retryPendingStructureSyncHandoffs(in: f.base.localID, authorize: {})
+            XCTAssertEqual(deferred, 1, "mode \(mode)")
+            XCTAssertEqual(try? Data(contentsOf: url), bytes, "mode \(mode)")
+            let queue = try await f.store.generalQueueStatus(localProjectID: f.base.localID)
+            XCTAssertEqual(queue.pendingCount + queue.retryCount + queue.attentionCount, 0, "mode \(mode)")
+            let after = try await f.repository.documents(in: f.base.localID)
+            XCTAssertEqual(after.sorted { $0.id.rawValue.uuidString < $1.id.rawValue.uuidString },
+                committed.sorted { $0.id.rawValue.uuidString < $1.id.rawValue.uuidString })
+            XCTAssertEqual(try Data(contentsOf: f.root.appendingPathComponent(node.relativePath.rawValue)), Data("기준 1".utf8))
+        }
+    }
+
     private actor MissingStructureOriginRecorder: DurableLocalChangeRecording {
         let recorder: SyncV2ContractPathRecorder
         private(set) var calls = 0

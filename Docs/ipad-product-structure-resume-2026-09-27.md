@@ -161,3 +161,32 @@ Windows 의존성이나 계약·교차 플랫폼 입력 변경이 없으므로 W
 - 로그: `/private/tmp/writerpad-pr46-review-green-v2.log`.
 - xcresult: `/private/tmp/WriterPad-RecoveryRun-Fix-DD/Logs/Test/Test-WriterPad-2026.09.28_00-15-05-+0900.xcresult`.
 - 계약 0.2.0 재검증 통과, canonical digest 불변.
+
+### 전체 구조 snapshot 보강
+
+`6469b17` 재검토에서 [변경 대상 밖 snapshot 검증](https://github.com/ChocoS-yrup/Writerpad/pull/46#discussion_r4115885541)
+지적이 추가됐다. journal의 변경 대상은 일치해도 무관한 형제의 순서·부모·경로 또는 누락을
+바꾼 전체 snapshot이 재생될 수 있었다. 4종을 실제 queue 경계에서 재현했으며 수정 전
+`/private/tmp/writerpad-pr46-snapshot-red.log`에서 12 assertion failures, unexpected 0을 확인했다.
+
+자동 인계가 작품 구조 mutation gate 안에서 확정 binder metadata 전체를 읽고, 저장된 전체
+`LocalStructureSnapshotNode` 집합과 ID 정렬 후 비교하도록 보강했다. 읽기 후 호출자 권한을
+다시 확인한다. 일치하지 않으면 기록을 큐에 넣거나 journal을 지우지 않는다. 비교에는 ID·작품·
+종류·부모·경로·순서·tree 포함 여부만 포함되며 본문·hash·커서·수정 시각은 포함하지 않는다.
+따라서 본문 저장에 따른 비구조 metadata 갱신만으로 구조를 다시 쓰거나 현재 파일로 요청을 재생성하지 않는다.
+
+최종 회귀 결과는 아래에, Release·CI·재검토의 정확한 head와 결과는 PR 본문에 기록한다.
+
+첫 확장 회귀에서 새 snapshot 검사는 통과했지만 기존
+`testWorkspaceSyncModelDebouncesRealtimeAndStopsInBackground`가 기대 수신 2회 대신 1회로 실패했다.
+로그에는 두 번째 pull 예약 후 실제 시작이 105ms 뒤로 늦어졌으며, 100ms 고정 대기의 assertion이
+그 사이 실행됐다. 해당 테스트의 두 긍정 대기를 최대 200회×10ms의 실제 횟수 조건 대기로 바꿨다.
+기대 횟수 2/3, 비활성 상태의 추가 수신 금지 검사는 유지하며 제품 debounce 코드는 바꾸지 않았다.
+실패 로그 `/private/tmp/writerpad-pr46-snapshot-green.log`도 검증 이력으로 남긴다.
+
+- 최종 선택 회귀 **565개 통과**, 실패·건너뜀 0, 컴파일 경고·오류 0, xcresult `runtimeWarnings: []`.
+  이전 564개 구성에서 Handshake만 155→156개이며 나머지 class 수는 같다.
+- 로그: `/private/tmp/writerpad-pr46-snapshot-green-v2.log`.
+- xcresult: `/private/tmp/WriterPad-RecoveryRun-Fix-DD/Logs/Test/Test-WriterPad-2026.09.28_00-27-45-+0900.xcresult`.
+- 계약 0.2.0 검증 재통과, canonical digest 불변. Release 로그는
+  `/private/tmp/writerpad-pr46-snapshot-release.log`이며 완료 결과는 PR 본문에서 추적한다.
