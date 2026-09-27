@@ -32,7 +32,7 @@ $$;
 
 do $cases$
 declare u uuid:='97000000-0000-4000-8000-000000000001'; other_user uuid:='97000000-0000-4000-8000-000000000002';
-  p uuid; f uuid; doc uuid; device uuid; request jsonb; plan jsonb; r jsonb; before_rows jsonb;
+  p uuid; f uuid; doc uuid; device uuid; request jsonb; changed jsonb; plan jsonb; r jsonb; before_rows jsonb;
   c text; expected text; saved_error text; hash bytea; control uuid; before_metadata jsonb;
 begin
   foreach c in array array['ordinary','empty','tombstone','legacy_order','stale_baseline','collision','missing_parent','partial_metadata','wrong_device','editor','wrong_profile','response_loss'] loop
@@ -111,6 +111,33 @@ begin
     if c<>'empty' and not exists(select 1 from public.documents where document_id=doc and name='chapter.txt' and parent_folder_id=f and structure_revision=1) then raise exception 'NOT_INITIALIZED'; end if;
     if c<>'empty' and not exists(select 1 from public.documents where document_id=doc and updated_at=transaction_timestamp() and updated_by=u) then raise exception 'STRUCTURE_CHANGE_NOT_MARKED'; end if;
     if c='legacy_order' and not exists(select 1 from public.tree_orders where project_id=p and parent_folder_id=f and children=array[doc]) then raise exception 'ORDER_LOST'; end if;
+    if c='ordinary' then
+      changed:=jsonb_set(request,'{batch,client_build_id}','"different-build"');
+      begin
+        set local role authenticated;
+        perform public.prepare_project_sync_transition(changed);
+        reset role;
+        raise exception using errcode='XX001',message='BATCH_REUSE_ACCEPTED';
+      exception when sqlstate 'P0001' then
+        get stacked diagnostics saved_error=pg_exception_detail;
+        reset role;
+        if saved_error is null or position('BATCH_ID_REUSED' in saved_error)=0 then raise exception 'WRONG_BATCH_REUSE_ERROR'; end if;
+      end;
+      changed:=pg_temp.transition_request(p,device,private.project_transition_payload(p));
+      changed:=jsonb_set(changed,'{ordered_intents,0,operation_id}',request#>'{ordered_intents,0,operation_id}');
+      changed:=jsonb_set(changed,'{batch,batch_payload_sha256}',to_jsonb(private.jsonb_rfc8785_sha256(changed->'ordered_intents')));
+      begin
+        set local role authenticated;
+        perform public.prepare_project_sync_transition(changed);
+        reset role;
+        raise exception using errcode='XX001',message='OPERATION_REUSE_ACCEPTED';
+      exception when sqlstate 'P0001' then
+        get stacked diagnostics saved_error=pg_exception_detail;
+        reset role;
+        if saved_error is null or position('OPERATION_ID_REUSED' in saved_error)=0 then raise exception 'WRONG_OPERATION_REUSE_ERROR'; end if;
+      end;
+      if (select count(*) from public.sync_batches where project_id=p)<>1 then raise exception 'REUSE_LEFT_LEDGER'; end if;
+    end if;
     set local role authenticated;
     r:=public.prepare_project_sync_transition(request);
     if r->>'status'<>'replayed' then raise exception 'REPLAY_FAILED'; end if;
