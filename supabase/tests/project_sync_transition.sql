@@ -25,8 +25,9 @@ begin
 end $$;
 
 create function pg_temp.transition_preserved(p uuid) returns jsonb language sql as $$
-  select jsonb_build_object('documents',(select jsonb_agg(to_jsonb(d)-array['name','parent_folder_id','storage_name_key','structure_revision'] order by document_id)
-    from public.documents d where project_id=p),'versions',(select jsonb_agg(to_jsonb(v) order by version_id) from public.document_versions v where project_id=p));
+  select jsonb_build_object('documents',(select jsonb_agg(to_jsonb(d)-array['name','parent_folder_id','storage_name_key','structure_revision','updated_at','updated_by'] order by document_id)
+    from public.documents d where project_id=p),'versions',(select jsonb_agg(to_jsonb(v) order by version_id) from public.document_versions v where project_id=p),
+    'controls',(select jsonb_agg(to_jsonb(d) order by document_id) from public.documents d where project_id=p and private.is_contract_migration_control_document(d)));
 $$;
 
 do $cases$
@@ -45,6 +46,7 @@ begin
       set local role authenticated;
       perform public.commit_document(doc,p,0,gen_random_uuid(),device,'메인/chapter.txt','unchanged body',false,null);
       reset role;
+      update public.documents set updated_at=now()-interval '1 day' where document_id=doc;
     end if;
     if c='tombstone' then update public.documents set is_deleted=true,deleted_at=now() where document_id=doc; end if;
     if c='partial_metadata' then update public.documents set name='chapter.txt' where document_id=doc; expected:='INVARIANT_VIOLATION'; end if;
@@ -107,6 +109,7 @@ begin
     if r->>'applied'<>'true' or pg_temp.transition_preserved(p) is distinct from before_rows then raise exception 'PRESERVATION_FAILED %',c; end if;
     if (select project_sync_mode from public.project_sync_settings where project_id=p)<>'MIGRATING' then raise exception 'AUTO_COMPLETED'; end if;
     if c<>'empty' and not exists(select 1 from public.documents where document_id=doc and name='chapter.txt' and parent_folder_id=f and structure_revision=1) then raise exception 'NOT_INITIALIZED'; end if;
+    if c<>'empty' and not exists(select 1 from public.documents where document_id=doc and updated_at=transaction_timestamp() and updated_by=u) then raise exception 'STRUCTURE_CHANGE_NOT_MARKED'; end if;
     if c='legacy_order' and not exists(select 1 from public.tree_orders where project_id=p and parent_folder_id=f and children=array[doc]) then raise exception 'ORDER_LOST'; end if;
     set local role authenticated;
     r:=public.prepare_project_sync_transition(request);

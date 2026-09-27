@@ -162,6 +162,15 @@ final class SyncV2ProjectTransitionTests: XCTestCase {
         XCTAssertThrowsError(try SyncV2TransitionPlan(result, projectID: identity.serverID, accountID: identity.accountID, deviceID: identity.deviceID))
         XCTAssertThrowsError(try SyncV2TransitionPlan(result, projectID: UUID(), accountID: identity.accountID, deviceID: identity.deviceID))
     }
+    func testPreparationReplayDoesNotMislabelConcurrentlyCompletedProject() async throws {
+        let transport = TransitionTransportStub(identity: identity)
+        await transport.completeAfterPreparation()
+        let model = model(transport, journal())
+        await model.inspect(); await model.prepare()
+        XCTAssertEqual(model.plan?.mode, .idBased)
+        XCTAssertTrue(model.message.contains("ID_BASED"))
+        XCTAssertFalse(model.hasPendingRequest)
+    }
 }
 
 private actor TransitionTransportStub: SyncV2TransitionTransporting {
@@ -173,6 +182,7 @@ private actor TransitionTransportStub: SyncV2TransitionTransporting {
     var losePreparation = false; var loseCompletion = false; var invalidValidation = false; var otherDevice = false
     var rejectBaseline = false
     var preparationCallback: (@Sendable () -> Void)?
+    var finishAfterPreparation = false
     init(identity: SyncV2TransitionIdentity) { self.identity = identity }
     func loseNextPreparation() { losePreparation = true }
     func loseNextCompletion() { loseCompletion = true }
@@ -181,6 +191,7 @@ private actor TransitionTransportStub: SyncV2TransitionTransporting {
     func setOtherDevice() { mode = "MIGRATING"; otherDevice = true }
     func rejectNextBaseline() { rejectBaseline = true }
     func invalidateAfterPreparation(_ callback: @escaping @Sendable () -> Void) { preparationCallback = callback }
+    func completeAfterPreparation() { finishAfterPreparation = true }
     func call(_ rpc: String, parameters: SyncV2JSON, authorize: @escaping @Sendable () throws -> Void) async throws -> SyncV2JSON {
         try authorize(); calls.append(rpc)
         switch rpc {
@@ -195,6 +206,7 @@ private actor TransitionTransportStub: SyncV2TransitionTransporting {
             if rejectBaseline { rejectBaseline = false; throw SyncV2ContractError("TRANSITION_BASELINE_CHANGED") }
             let request = try SyncV2ContractRequest(storedJSON: parameters.objectValue!["p_request"]!)
             preparations.append(request.json); mode = "MIGRATING"
+            if finishAfterPreparation { mode = "ID_BASED" }
             preparationCallback?()
             if losePreparation { losePreparation = false; throw URLError(.timedOut) }
             let intent = request.orderedIntents[0].objectValue!

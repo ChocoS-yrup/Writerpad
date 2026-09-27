@@ -215,7 +215,9 @@ final class SyncV2ProjectTransitionModel: ObservableObject {
             _ = try SyncV2Contract.validateAtomicStructureResponse(request: request, response: result)
             try auth.check()
             try await readPlan(auth)
-            message = "구조 준비 완료 · 아직 MIGRATING입니다. 검증 후 별도의 완료 버튼을 눌러 주세요."
+            if self.plan?.mode == .migrating {
+                message = "구조 준비 완료 · 아직 MIGRATING입니다. 검증 후 별도의 완료 버튼을 눌러 주세요."
+            }
         } catch { fail(error) }
     }
     func validate() async {
@@ -253,6 +255,10 @@ final class SyncV2ProjectTransitionModel: ObservableObject {
     }
     private func fail(_ error: Error) {
         plan = nil; validated = false; plannedIdentity = nil; plannedCheck = nil
+        if (error as? SyncV2ContractError)?.code == "TRANSITION_BASELINE_CHANGED" {
+            message = "계획 이후 서버 상태가 바뀌어 시작 전에 거부됐습니다. 거부된 요청은 제거했으니 새 계획을 조회해 주세요."
+            return
+        }
         message = "진행을 확인하지 못했습니다. 계획을 다시 조회하세요. 응답 유실 시 저장된 요청은 유지되며 자동 완료하지 않습니다. (\((error as? SyncV2ContractError)?.code ?? "SERVER_OR_NETWORK_UNAVAILABLE"))"
     }
 }

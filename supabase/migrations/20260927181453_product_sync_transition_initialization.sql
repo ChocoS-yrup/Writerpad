@@ -169,7 +169,8 @@ begin
   if p_intent->'payload' is distinct from v_payload then raise exception 'TRANSITION_BASELINE_CHANGED'; end if;
   for v_entry in select value from jsonb_array_elements(v_payload->'documents') loop
     update public.documents set name=v_entry->>'name',parent_folder_id=(v_entry->>'parent_folder_id')::uuid,
-      storage_name_key=private.storage_name_v1(v_entry->>'name'),structure_revision=1
+      storage_name_key=private.storage_name_v1(v_entry->>'name'),structure_revision=1,
+      updated_at=transaction_timestamp(),updated_by=p_user_id
       where document_id=(v_entry->>'id')::uuid and project_id=p_project_id;
   end loop;
   for v_entry in select value from jsonb_array_elements(v_payload->'orders') loop

@@ -68,6 +68,8 @@ payload의 baseline은 정렬된 폴더·문서 메타데이터, 본문 SHA, 기
 보존: document ID, relative_path, content, content revision, current_version_id,
 삭제 상태, 문서 버전 이력, UUID-v5 관리 문서. 일반 초기화의 structure_revision만 1로
 설정하고 기존 validator로 전체 결과를 검증한다. 과거 이력을 contract batch로 꾸미지 않는다.
+초기화한 일반 문서의 updated_at/updated_by는 구조 변경 감사 정보로 갱신한다.
+본문 revision은 그대로이며 관리 문서의 수정 시각도 보존한다.
 
 현재 안전 한계는 폴더 1000개·문서 1000개다. 초과는 begin 전에 거부한다.
 권한은 authenticated 소유자 경로에만 부여하고 private helper 직접 호출과 anon은 막는다.
