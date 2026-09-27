@@ -542,6 +542,13 @@ actor SyncV2HandshakeService {
         return try await refresh(context: context)
     }
 
+    /// A product status query must not refresh or invalidate the sender's standing
+    /// authorization. Reuse wire validation and timeout in a separate reading scope.
+    func inspectCompatibility(context: SyncV2HandshakeContext) async throws -> SyncV2ValidatedHandshake {
+        let inspection = SyncV2HandshakeService(transport: transport, now: now, timeout: timeout, sleep: sleep)
+        return try await inspection.refresh(context: context)
+    }
+
     private func finishFlight(_ id: UUID) {
         if inFlight?.id == id { inFlight = nil }
     }

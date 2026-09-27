@@ -3,6 +3,24 @@ import XCTest
 @testable import WriterPad
 
 final class SupabaseProjectBindingServiceTests: XCTestCase {
+    func testInspectionLookupDoesNotRecoverInitialSnapshotOrCallEnsure() async throws {
+        let project = makeProject(id: UUID().uuidString, name: "읽기 전용 준비 확인")
+        let recorder = InitialSyncRecorderSpy(results: [.localSavedButNotQueued(reason: "injected"), .queued(operationIDs: [UUID()])])
+        let fixture = makeFixture(projects: [project], initialSyncRecorder: recorder)
+        let first = await fixture.service.createServerProject(for: project.id)
+        XCTAssertEqual(first, .failed(.initialSnapshotNotQueued))
+        let original = await fixture.store.binding(for: project.id)
+        let inspection = await fixture.service.storedBindingForInspection(for: project.id)
+        XCTAssertEqual(inspection, original)
+        let calls = await recorder.calls(), ensures = await fixture.transport.receivedParameters()
+        XCTAssertEqual(calls.count, 1)
+        XCTAssertEqual(ensures.count, 1)
+        let recovered = await fixture.service.currentBinding(for: project.id)
+        XCTAssertEqual(recovered, original)
+        let after = await recorder.calls()
+        XCTAssertEqual(after.count, 2, "Ordinary recovery behavior remains unchanged")
+    }
+
     func testBindingCompletedAfterWatchdogIsPublishedForConnectAndDisconnect() async throws {
         for disconnect in [true, false] {
             let project = makeProject(id: UUID().uuidString, name: "느린 연결 저장")

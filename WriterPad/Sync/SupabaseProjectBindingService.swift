@@ -317,6 +317,8 @@ protocol ProjectBindingServicing: Sendable {
     ) async -> AsyncStream<ProjectSyncBinding?>
     func currentBinding(for localProjectID: ProjectID) async
         -> ProjectSyncBinding?
+    /// Inspect stored identity without recovering/enqueuing the initial snapshot.
+    func storedBindingForInspection(for localProjectID: ProjectID) async -> ProjectSyncBinding?
     func connectedBindings() async -> [ProjectSyncBinding]
     func createServerProject(for localProjectID: ProjectID) async
         -> ProjectBindingResult
@@ -335,6 +337,7 @@ protocol ProjectBindingServicing: Sendable {
 
 extension ProjectBindingServicing {
     var contractEpoch: SyncV2ContractEpoch? { nil }
+    func storedBindingForInspection(for localProjectID: ProjectID) async -> ProjectSyncBinding? { nil }
     func bindingUpdates(
         for localProjectID: ProjectID
     ) async -> AsyncStream<ProjectSyncBinding?> {
@@ -397,6 +400,12 @@ actor SupabaseProjectBindingService: ProjectBindingServicing {
         self.handshakeInvalidated = handshakeInvalidated
         self.contractDefaults = contractDefaults
         self.projectSaveGate = projectSaveGate
+    }
+
+    func storedBindingForInspection(for localProjectID: ProjectID) async -> ProjectSyncBinding? {
+        guard await bindingIsVisible(localProjectID),
+              await bindingStore.availability() == .available else { return nil }
+        return try? await bindingStore.binding(for: localProjectID)
     }
 
     func currentBinding(
