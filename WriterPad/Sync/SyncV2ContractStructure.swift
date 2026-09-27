@@ -562,6 +562,12 @@ extension LazySyncV2ProjectBindingStore: SyncV2ContractQueue {}
 /// 일반 자동 전송과 명시적 검토 전송이 공유하는 전송기다. 전송 직전에 관문과
 /// 핸드셰크를 다시 확인하고, 로컬에 먼저 저장된 불변 요청만 보낸다.
 actor SyncV2ContractStructureSender: SyncV2GeneralContractSending, SyncV2GeneralRecoveryReading, SyncV2GeneralConflictResolving, SyncV2GeneralStructureResolving {
+    /// Conversion may not strand queued legacy writes behind protocol-3 enforcement.
+    func transitionQueueAuthorization(localProjectID: ProjectID) async throws -> @Sendable () throws -> Void {
+        guard !sendingProjects.contains(localProjectID) else { throw SyncV2ContractStructureError.uploadPullGateBusy }
+        try await store.ensurePreparationQueueIsIdle(localProjectID: localProjectID, excluding: nil)
+        return try await store.preparationQueueAuthorization(localProjectID: localProjectID, excluding: nil)
+    }
     private let store: any SyncV2ContractQueue
     private let transport: any SyncV2AtomicStructureTransporting
     private let handshakeService: SyncV2HandshakeService

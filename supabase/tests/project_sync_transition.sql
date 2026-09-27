@@ -32,7 +32,7 @@ $$;
 do $cases$
 declare u uuid:='97000000-0000-4000-8000-000000000001'; other_user uuid:='97000000-0000-4000-8000-000000000002';
   p uuid; f uuid; doc uuid; device uuid; request jsonb; plan jsonb; r jsonb; before_rows jsonb;
-  c text; expected text; saved_error text; hash bytea; control uuid;
+  c text; expected text; saved_error text; hash bytea; control uuid; before_metadata jsonb;
 begin
   foreach c in array array['ordinary','empty','tombstone','legacy_order','stale_baseline','collision','missing_parent','partial_metadata','wrong_device','editor','wrong_profile','response_loss'] loop
     p:=gen_random_uuid(); f:=gen_random_uuid(); doc:=gen_random_uuid(); device:=gen_random_uuid(); expected:=null;
@@ -85,6 +85,8 @@ begin
     if c='editor' then perform set_config('request.jwt.claim.sub',other_user::text,true); expected:='FORBIDDEN'; end if;
     if c='wrong_profile' then request:=jsonb_set(request,'{ordered_intents,0,payload,profile_sha256}','"wrong"'); expected:='INVALID_ARGUMENT'; end if;
     before_rows:=pg_temp.transition_preserved(p);
+    select jsonb_build_object('documents',(select jsonb_agg(to_jsonb(d) order by document_id) from public.documents d where project_id=p),
+      'orders',(select jsonb_agg(to_jsonb(t) order by tree_order_id) from public.tree_orders t where project_id=p)) into before_metadata;
     begin
       set local role authenticated;
       r:=public.prepare_project_sync_transition(request);
@@ -95,6 +97,9 @@ begin
       reset role;
       if saved_error is distinct from expected then raise exception 'wrong prepare error %: %',c,saved_error; end if;
       if pg_temp.transition_preserved(p) is distinct from before_rows then raise exception 'FAILED_PREPARE_MUTATED_CONTENT'; end if;
+      if (select jsonb_build_object('documents',(select jsonb_agg(to_jsonb(d) order by document_id) from public.documents d where project_id=p),
+        'orders',(select jsonb_agg(to_jsonb(t) order by tree_order_id) from public.tree_orders t where project_id=p)))
+        is distinct from before_metadata then raise exception 'FAILED_PREPARE_MUTATED_STRUCTURE'; end if;
       if c<>'wrong_device' and exists(select 1 from public.project_sync_settings where project_id=p) then raise exception 'FAILED_PREPARE_LEFT_MIGRATING'; end if;
       if exists(select 1 from public.sync_batches where project_id=p) then raise exception 'FAILED_PREPARE_LEFT_LEDGER'; end if;
       continue;

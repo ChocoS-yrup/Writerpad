@@ -205,7 +205,10 @@ jobs:
       - name: Run product transition initialization regression
         run: psql -v ON_ERROR_STOP=1 -f supabase/tests/project_sync_transition.sql
       - name: Run migration lock and authorization race regression
-        run: python supabase/tests/project_sync_migration_lock.py
+        run: |
+          python supabase/tests/project_sync_migration_lock.py
+          python supabase/tests/project_sync_migration_lock.py --transition
+          python supabase/tests/project_sync_migration_lock.py --transition-prepare
       - name: Prove migration regression rejects the previous validator
         shell: bash
         run: |

@@ -1236,6 +1236,7 @@ struct SyncSettingsView: View {
     @State private var disconnectTarget: SyncProjectRow?
     @State private var generalRecoveryTarget: SyncProjectRow?
     @State private var enableProjectSyncTarget: SyncProjectRow?
+    @State private var transitionTarget: SyncProjectRow?
 #if DEBUG
     @State private var handshakeProjectIDText = ""
 #endif
@@ -1362,6 +1363,11 @@ struct SyncSettingsView: View {
             if let reader = model.generalRecoveryReader {
                 GeneralSyncRecoveryView(projectID: row.id, projectName: row.project.name, reader: reader)
             }
+        }
+        .sheet(item: $transitionTarget) { row in
+            if let transport = environment.supabaseClientProvider.makeTransitionTransport() {
+                SyncProjectTransitionView(row: row, environment: environment, transport: transport)
+            } else { Text("서버 연결을 사용할 수 없습니다.") }
         }
         .sheet(item: $connectionRequest) { request in
             ExistingProjectConnectionView(
@@ -1756,6 +1762,10 @@ struct SyncSettingsView: View {
                         }
 
                         if row.isConnected {
+                            Button("동기화 형식 전환·재개…") { transitionTarget = row }
+                                .disabled(model.isWorking || model.isSyncAllEnabled || model.isGateOpen(for: row))
+                            Text("형식 전환은 전체·작품별 일반 동기화를 끈 상태에서만 가능합니다.")
+                                .font(.caption).foregroundStyle(.secondary)
                             Button("동기화 준비 확인 · 전송 없음") {
                                 model.checkSyncPreparation(for: row)
                             }

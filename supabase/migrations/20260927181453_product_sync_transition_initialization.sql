@@ -122,6 +122,8 @@ begin
   perform pg_advisory_xact_lock(hashtextextended('project:' || p_project_id::text,0));
   if not private.has_project_role(p_project_id,auth.uid(),'owner') then raise exception 'FORBIDDEN'; end if;
   select * into v_settings from public.project_sync_settings where project_id=p_project_id;
+  if v_settings.project_sync_mode in ('MIGRATING','ID_BASED') and v_settings.active_contract_sha256 is distinct from
+    '416c1b99edb9bda694731dee4b25688d9d82d1f32610aa23ddfda571ec3c7670' then raise exception 'CONTRACT_NOT_ALLOWED'; end if;
   select * into v_migration from public.project_sync_migrations where project_id=p_project_id
     order by migration_epoch desc limit 1;
   return jsonb_build_object('profile_sha256','5c5736ec9bda42f80b75dd8f863bb01b0bba8cef1ebe96675333db634b560c81',
@@ -188,6 +190,8 @@ begin
   perform pg_advisory_xact_lock(hashtextextended('project:' || v_project::text,0));
   if not private.has_project_role(v_project,auth.uid(),'owner') then raise exception 'FORBIDDEN'; end if;
   if p_request->>'project_sync_mode' is distinct from 'MIGRATING'
+     or p_request#>>'{batch,canonical_contract_sha256}' is distinct from
+       '416c1b99edb9bda694731dee4b25688d9d82d1f32610aa23ddfda571ec3c7670'
      or (p_request->>'migration_epoch')::integer is distinct from 1
      or jsonb_array_length(p_request->'ordered_intents') is distinct from 1
      or p_request#>>'{ordered_intents,0,entity_kind}' is distinct from 'project'

@@ -278,6 +278,8 @@ def main() -> None:
     transition = (MIGRATIONS / TRANSITION_NAME).read_text(encoding="utf-8")
     profile_digest = sha256(CONTRACT_DIR / "migration-initialization-v1.json")
     require(profile_digest in transition, "transition extension digest not pinned in SQL")
+    require(profile_digest in (ROOT / "WriterPad/Sync/SyncV2ProjectTransition.swift").read_text(),
+            "transition extension digest not pinned in iPad")
     require("project_sync_transition.sql" in workflow, "transition SQL regression missing")
     require("alter default privileges for role postgres\n  revoke execute" in defaults,
             "PUBLIC EXECUTE must be revoked globally, not only per schema")
