@@ -33,6 +33,7 @@ RESTORE_HANDSHAKE_NAME = "20260825000000_restore_deployed_sync_handshake.sql"
 TRASH_PURGE_NAME = "20260910053721_general_contract_trash_purge.sql"
 CONTROL_DOCUMENTS_NAME = "20260910072310_contract_migration_control_documents.sql"
 SECURITY_HARDENING_NAME = "20260921125202_harden_legacy_function_privileges.sql"
+MIGRATION_VALIDATION_NAME = "20260927164330_harden_project_sync_migration_validation.sql"
 SOURCE_CATALOG_DIGEST = (
     "6c71ff36a90993dc327557b4a1a64c0dfb27b347134ed89e7f126dae76c6ff9a"
 )
@@ -86,7 +87,8 @@ def main() -> None:
         [path.name for path in sql_paths]
         == [BASELINE_NAME, FOUNDATION_NAME, RPC_NAME, STORAGE_V2_NAME,
             CORRECTIVE_NAME, HANDSHAKE_NAME, RESTORE_HANDSHAKE_NAME,
-            TRASH_PURGE_NAME, CONTROL_DOCUMENTS_NAME, SECURITY_HARDENING_NAME],
+            TRASH_PURGE_NAME, CONTROL_DOCUMENTS_NAME, SECURITY_HARDENING_NAME,
+            MIGRATION_VALIDATION_NAME],
         "the server chain must match the exact reviewed migration order",
     )
     for name, expected in IMMUTABLE_MIGRATION_DIGESTS.items():
@@ -260,11 +262,30 @@ def main() -> None:
         "legacy function hardening must not widen execution privileges",
     )
 
-    for name in (TRASH_PURGE_NAME, CONTROL_DOCUMENTS_NAME, SECURITY_HARDENING_NAME):
+    for name in (TRASH_PURGE_NAME, CONTROL_DOCUMENTS_NAME, SECURITY_HARDENING_NAME,
+                 MIGRATION_VALIDATION_NAME):
         require(
             workflow.count(f"supabase/migrations/{name}") == 4,
             f"CI must apply and safely re-run the reviewed migration: {name}",
         )
+
+    migration_validation = (MIGRATIONS / MIGRATION_VALIDATION_NAME).read_text(encoding="utf-8")
+    for marker in (
+        "create or replace function public.validate_project_sync_migration",
+        "set search_path = ''", "AUTH_REQUIRED", "'editor'", "pg_advisory_xact_lock",
+        "private.is_contract_migration_control_document", "with recursive rooted",
+        "FOLDER_NOT_FOUND", "FOLDER_CYCLE", "TREE_REFERENCE_NOT_FOUND",
+        "TREE_REFERENCE_DUPLICATED", "e.parent_folder_id is not distinct from t.parent_folder_id",
+        "from public, anon", "to authenticated",
+    ):
+        require(marker in migration_validation, f"migration validation guard missing: {marker}")
+    require("project_sync_migration_validation.sql" in workflow,
+            "CI must execute migration validation regression SQL")
+    require("project_sync_migration_lock.py" in workflow,
+            "CI must execute the lock/authorization race regression")
+    require("begin_project_sync_migration" not in migration_validation
+            and "complete_project_sync_migration" not in migration_validation,
+            "validation migration must not redefine or invoke mode transitions")
 
     for guard in (
         "LEGACY_EPOCH_0", "CONTRACT_BATCH", "CONTRACT_NOT_ALLOWED",
