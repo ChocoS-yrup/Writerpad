@@ -11228,6 +11228,173 @@ actor SyncV2Store:
             try NormalEditorPlan.validate(snapshot); return snapshot
         }
     }
+    /// Local-only reconciliation. Prove followers never reached SQLite; a checkpointed head
+    /// must match its immutable, once-claimed request exactly. No SQLite row is modified.
+    /// This deliberately does not require network preparation (which duplicate saves block).
+    func reconcileNormalEditorDuplicateSaves(_ resolution: NormalEditorDuplicateSaveResolution,
+        journal: NormalEditorJournal, localText: String, check: @Sendable () throws -> Void) throws {
+        try check()
+        try execute("BEGIN IMMEDIATE;")
+        defer { try? execute("ROLLBACK;") }
+        if let request = resolution.frozenRequest {
+            try validateNormalEditorCheckpointHead(resolution.sources[0], request: request)
+        }
+        let unmaterialized = resolution.frozenRequest == nil ? resolution.sources : Array(resolution.sources.dropFirst())
+        for source in unmaterialized {
+            guard case let .documentSnapshot(operation, _, _, _, _, _, _) = source.mutations[0] else { throw NormalEditorError.queue }
+            let exists = try withStatement("""
+                SELECT (SELECT COUNT(*) FROM sync_contract_local_batches WHERE batch_id=?1 OR parent_batch_id=?1 OR resolution_batch_id=?1)
+                     + (SELECT COUNT(*) FROM sync_contract_batches WHERE batch_id=?1)
+                     + (SELECT COUNT(*) FROM sync_contract_operations WHERE batch_id=?1 OR operation_id=?2)
+                     + (SELECT COUNT(*) FROM sync_batches WHERE batch_id=?1)
+                     + (SELECT COUNT(*) FROM sync_operations WHERE batch_id=?1 OR operation_id=?2);
+                """) { st -> Bool in
+                try bind(source.batchID.uuidString.lowercased(), at: 1, to: st)
+                try bind(operation.uuidString.lowercased(), at: 2, to: st)
+                guard sqlite3_step(st) == SQLITE_ROW else { throw NormalEditorError.queue }
+                return sqlite3_column_int64(st, 0) != 0
+            }
+            guard !exists else { throw NormalEditorError.queue }
+        }
+        let baseline = try normalEditorBaseline()
+        try journal.update("identicalUnsentFollowersSuperseded") { state in
+            try check()
+            guard NormalEditorDuplicateSaveResolution(state) == resolution else { throw NormalEditorError.queue }
+            try resolution.validateLocal(baseline: baseline, text: localText, draft: journal.draft())
+            let followers = Set(resolution.sources.dropFirst().map(\.batchID))
+            for index in state.saves.indices where followers.contains(state.saves[index].source.batchID) {
+                state.saves[index].phase = .superseded
+            }
+        }
+    }
+    private func validateNormalEditorCheckpointHead(_ source: LocalMutationBatch, request: SyncV2ContractRequest) throws {
+        guard try normalEditorActiveQueueIDs() == [source.batchID],
+              case let .documentSnapshot(operation, _, _, _, _, _, _) = source.mutations[0] else { throw NormalEditorError.queue }
+        try withStatement("""
+            SELECT l.source_json,b.request_json,b.batch_payload_sha256
+            FROM sync_contract_local_batches l JOIN sync_contract_batches b USING(batch_id)
+            WHERE l.batch_id=?1 AND l.local_project_id=?2 AND l.project_id=?3
+              AND b.local_project_id=?2 AND b.project_id=?3
+              AND l.status='materialized' AND l.last_error_code IS NULL
+              AND l.parent_batch_id IS NULL AND l.resolution_batch_id IS NULL AND l.local_resolution_json IS NULL
+              AND b.status='processing' AND b.attempts=1 AND b.response_json IS NULL
+              AND b.last_error_code IS NULL AND b.last_error_detail IS NULL
+              AND b.next_attempt_at IS NULL AND b.resolution_json IS NULL
+              AND NOT EXISTS(SELECT 1 FROM sync_contract_local_batches WHERE parent_batch_id=?1 OR resolution_batch_id=?1)
+              AND NOT EXISTS(SELECT 1 FROM sync_batches WHERE batch_id=?1)
+              AND NOT EXISTS(SELECT 1 FROM sync_operations WHERE batch_id=?1 OR operation_id=?4
+                  OR (local_project_id=?2 AND status NOT IN ('completed','cancelled')))
+              AND (SELECT COUNT(*) FROM sync_contract_operations WHERE batch_id=?1)=1
+              AND EXISTS(SELECT 1 FROM sync_contract_operations WHERE batch_id=?1 AND operation_id=?4
+                  AND status='inflight' AND result_revision IS NULL AND last_error_code IS NULL);
+            """) { st in
+            try bind(source.batchID.uuidString.lowercased(), at: 1, to: st)
+            try bind(NormalEditorPlan.local.rawValue.uuidString.lowercased(), at: 2, to: st)
+            try bind(NormalEditorPlan.server.uuidString.lowercased(), at: 3, to: st)
+            try bind(operation.uuidString.lowercased(), at: 4, to: st)
+            guard sqlite3_step(st) == SQLITE_ROW, let storedSource = columnText(st, at: 0),
+                  let storedRequest = columnText(st, at: 1), columnText(st, at: 2) == request.batchPayloadSHA256,
+                  try JSONDecoder().decode(LocalMutationBatch.self, from: Data(storedSource.utf8)) == source,
+                  try JSONDecoder().decode(SyncV2JSON.self, from: Data(storedRequest.utf8)) == request.json else { throw NormalEditorError.queue }
+        }
+        try withStatement("""
+            SELECT sequence,entity_kind,entity_id,intent_kind,base_revision,payload_json,payload_sha256
+            FROM sync_contract_operations WHERE batch_id=?1 AND operation_id=?2;
+            """) { st in
+            try bind(source.batchID.uuidString.lowercased(), at: 1, to: st)
+            try bind(operation.uuidString.lowercased(), at: 2, to: st)
+            guard sqlite3_step(st) == SQLITE_ROW, let intent = request.orderedIntents.first?.objectValue,
+                  let payload = columnText(st, at: 5),
+                  sqlite3_column_int64(st, 0) == Int64(intent["sequence"]?.intValue ?? -1),
+                  columnText(st, at: 1) == intent["entity_kind"]?.stringValue,
+                  columnText(st, at: 2) == (intent["entity_id"] ?? intent["document_id"])?.stringValue,
+                  columnText(st, at: 3) == intent["intent_kind"]?.stringValue,
+                  sqlite3_column_int64(st, 4) == Int64(intent["base_revision"]?.intValue ?? -1),
+                  columnText(st, at: 6) == intent["payload_sha256"]?.stringValue,
+                  try JSONDecoder().decode(SyncV2JSON.self, from: Data(payload.utf8)) == intent["payload"] else { throw NormalEditorError.queue }
+        }
+    }
+    /// Active work only: recovery pages also contain completed audit rows and are not a queue predicate.
+    /// Two rows suffice to fail closed; completed history never consumes this bound.
+    func normalEditorActiveQueueIDs() throws -> [UUID] {
+        try withStatement("""
+            SELECT batch_id FROM sync_contract_local_batches WHERE local_project_id=?1 AND status <> 'completed'
+            UNION
+            SELECT batch_id FROM sync_contract_batches WHERE local_project_id=?1 AND status <> 'completed'
+            LIMIT 2;
+            """) { st in
+            try bind(NormalEditorPlan.local.rawValue.uuidString.lowercased(), at: 1, to: st)
+            var ids: [UUID] = []
+            while true {
+                let result = sqlite3_step(st)
+                if result == SQLITE_DONE { return ids }
+                guard result == SQLITE_ROW, let id = columnText(st, at: 0).flatMap(UUID.init(uuidString:)) else { throw NormalEditorError.queue }
+                ids.append(id)
+            }
+        }
+    }
+    /// Diagnostic-only, explicit action. Keep source_json intact and record cancellation, not delivery.
+    /// No request, original TXT, server baseline, operation or dispatch-order mutation is permitted.
+    func retireNormalEditorUnsentTests(authorize: @Sendable () throws -> Void) throws {
+        guard let authority = NormalEditorAuthority.current, let journal = authority.journal,
+              NormalEditorTestQueueRetirement.canRetire(journal.state()) else { throw NormalEditorError.queue }
+        try authority.requireMutation(sending: true)
+        try transaction {
+            try authorize()
+            let project = NormalEditorPlan.local.rawValue.uuidString.lowercased()
+            let active = try normalEditorActiveQueueIDs()
+            guard active.allSatisfy({ NormalEditorTestQueueRetirement.sources[$0.uuidString.lowercased()] != nil }) else { throw NormalEditorError.queue }
+            // Do not retire dependency parents, replacement children, legacy work or uncertain requests.
+            let unsafe = try withStatement("""
+                SELECT (SELECT COUNT(*) FROM sync_operations WHERE local_project_id=?1 AND status NOT IN ('completed','cancelled'))
+                  + (SELECT COUNT(*) FROM sync_contract_batches WHERE local_project_id=?1 AND status <> 'completed')
+                  + (SELECT COUNT(*) FROM sync_contract_local_batches WHERE local_project_id=?1 AND status <> 'completed'
+                     AND batch_id NOT IN (?2,?3));
+                """) { st -> Int64 in
+                try bind(project, at: 1, to: st)
+                for (i, id) in NormalEditorTestQueueRetirement.sources.keys.sorted().enumerated() { try bind(id, at: Int32(i + 2), to: st) }
+                guard sqlite3_step(st) == SQLITE_ROW else { throw NormalEditorError.queue }
+                return sqlite3_column_int64(st, 0)
+            }
+            guard unsafe == 0 else { throw NormalEditorError.queue }
+            for (id, hash) in NormalEditorTestQueueRetirement.sources.sorted(by: { $0.key < $1.key }) {
+                let row = try withStatement("""
+                    SELECT source_json,status,last_error_code,local_resolution_json,
+                        (SELECT COUNT(*) FROM sync_contract_batches WHERE batch_id=?1),
+                        (SELECT COUNT(*) FROM sync_contract_local_batches WHERE parent_batch_id=?1 OR resolution_batch_id=?1)
+                    FROM sync_contract_local_batches WHERE batch_id=?1 AND local_project_id=?2 AND project_id=?3
+                        AND parent_batch_id IS NULL AND resolution_batch_id IS NULL;
+                    """) { st -> (String, Bool) in
+                    try bind(id, at: 1, to: st); try bind(project, at: 2, to: st)
+                    try bind(NormalEditorPlan.server.uuidString.lowercased(), at: 3, to: st)
+                    guard sqlite3_step(st) == SQLITE_ROW, let source = columnText(st, at: 0),
+                          NormalEditorPlan.hash(source) == hash, sqlite3_column_int64(st, 4) == 0,
+                          sqlite3_column_int64(st, 5) == 0 else { throw NormalEditorError.queue }
+                    let status = columnText(st, at: 1), error = columnText(st, at: 2), resolution = columnText(st, at: 3)
+                    if status == "completed", error == NormalEditorTestQueueRetirement.marker,
+                       let resolution, let fields = try JSONDecoder().decode(SyncV2JSON.self, from: Data(resolution.utf8)).objectValue,
+                       fields["kind"] == .string(NormalEditorTestQueueRetirement.marker), fields["source_sha256"] == .string(hash) {
+                        return (source, true)
+                    }
+                    guard status == "waiting", error == nil, resolution == nil else { throw NormalEditorError.queue }
+                    return (source, false)
+                }
+                if row.1 { continue }
+                let audit = try SyncV2JSON.object(["kind": .string(NormalEditorTestQueueRetirement.marker),
+                    "source_sha256": .string(hash), "created_at": .string(Self.timestamp())]).canonicalJSON()
+                try withStatement("""
+                    UPDATE sync_contract_local_batches SET status='completed',last_error_code=?1,local_resolution_json=?2
+                    WHERE batch_id=?3 AND local_project_id=?4 AND status='waiting' AND source_json=?5;
+                    """) { st in
+                    try bind(NormalEditorTestQueueRetirement.marker, at: 1, to: st); try bind(audit, at: 2, to: st)
+                    try bind(id, at: 3, to: st); try bind(project, at: 4, to: st); try bind(row.0, at: 5, to: st)
+                    try stepDone(st)
+                    guard sqlite3_changes(connection.handle) == 1 else { throw NormalEditorError.queue }
+                }
+            }
+            try authorize() // A changed run/authority rolls the entire pair back.
+        }
+    }
     func normalEditorPending(batchID: UUID) throws -> SyncV2PendingContractBatch? {
         try withStatement("SELECT request_json,status FROM sync_contract_batches WHERE batch_id=? AND local_project_id=? AND project_id=?;") { st in
             try bind(batchID.uuidString.lowercased(), at: 1, to: st)
@@ -13351,6 +13518,19 @@ actor LazySyncV2ProjectBindingStore:
     func normalEditorBaseline() async throws -> SyncV2RemoteDocumentSnapshot {
         guard let store = await resolvedStore() else { throw NormalEditorError.storage }
         return try await store.normalEditorBaseline()
+    }
+    func reconcileNormalEditorDuplicateSaves(_ resolution: NormalEditorDuplicateSaveResolution,
+        journal: NormalEditorJournal, localText: String, check: @escaping @Sendable () throws -> Void) async throws {
+        guard let store = await resolvedStore() else { throw NormalEditorError.storage }
+        try await store.reconcileNormalEditorDuplicateSaves(resolution, journal: journal, localText: localText, check: check)
+    }
+    func normalEditorActiveQueueIDs() async throws -> [UUID] {
+        guard let store = await resolvedStore() else { throw NormalEditorError.storage }
+        return try await store.normalEditorActiveQueueIDs()
+    }
+    func retireNormalEditorUnsentTests(authorize: @escaping @Sendable () throws -> Void) async throws {
+        guard let store = await resolvedStore() else { throw NormalEditorError.storage }
+        try await store.retireNormalEditorUnsentTests(authorize: authorize)
     }
     func normalEditorPending(batchID: UUID) async throws -> SyncV2PendingContractBatch? {
         guard let store = await resolvedStore() else { throw NormalEditorError.storage }

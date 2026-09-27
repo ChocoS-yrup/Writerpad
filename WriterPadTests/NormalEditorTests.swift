@@ -1,6 +1,205 @@
 import Foundation
+import SQLite3
+import SwiftUI
+import UIKit
 import XCTest
 @testable import WriterPad
+
+@MainActor
+final class NormalEditorCredentialFieldTests: XCTestCase {
+    private func withCredentialForm(_ check: (UIWindow, NormalEditorCredentialFocus, NormalEditorCredentialTextField,
+                                             NormalEditorCredentialTextField, UITextView) throws -> Void) rethrows {
+        let focus = NormalEditorCredentialFocus()
+        let window = UIWindow(frame: CGRect(x: 0, y: 0, width: 800, height: 600))
+        let host = UIViewController()
+        window.rootViewController = host
+        let email = NormalEditorCredentialTextField(frame: CGRect(x: 0, y: 0, width: 300, height: 44))
+        let password = NormalEditorCredentialTextField(frame: CGRect(x: 0, y: 50, width: 300, height: 44))
+        let manuscript = UITextView(frame: CGRect(x: 0, y: 100, width: 600, height: 400))
+        manuscript.text = "unchanged manuscript"
+        for field in [email, password] { field.credentialFocus = focus; host.view.addSubview(field) }
+        focus.register(email, secure: false); focus.register(password, secure: true)
+        password.isSecureTextEntry = true
+        host.view.addSubview(manuscript)
+        window.makeKeyAndVisible()
+        defer { window.endEditing(true); window.isHidden = true }
+        try check(window, focus, email, password, manuscript)
+    }
+
+    func testTabAndShiftTabStayInCredentialFieldsAndDoNotEditManuscript() throws {
+        try withCredentialForm { _, _, email, password, manuscript in
+            XCTAssertTrue(email.becomeFirstResponder())
+            let tab = try XCTUnwrap(email.keyCommands?.first { $0.input == "\t" && $0.modifierFlags.isEmpty })
+            XCTAssertTrue(tab.wantsPriorityOverSystemBehavior)
+            email.moveCredentialFocus(tab)
+            XCTAssertTrue(password.isFirstResponder)
+            password.insertText("synthetic-only")
+            XCTAssertEqual(password.text, "synthetic-only")
+            let back = try XCTUnwrap(password.keyCommands?.first { $0.input == "\t" && $0.modifierFlags == .shift })
+            XCTAssertTrue(back.wantsPriorityOverSystemBehavior)
+            password.moveCredentialFocus(back)
+            XCTAssertTrue(email.isFirstResponder)
+            email.moveCredentialFocus(back)
+            XCTAssertTrue(password.isFirstResponder)
+            password.moveCredentialFocus(tab)
+            XCTAssertTrue(email.isFirstResponder)
+            XCTAssertFalse(manuscript.isFirstResponder)
+            XCTAssertEqual(manuscript.text, "unchanged manuscript")
+        }
+    }
+
+    func testTabDoesNotSubmitOrMutateBindings() throws {
+        var value = "synthetic-only"
+        var submissions = 0
+        try withCredentialForm { _, focus, email, password, manuscript in
+            let subject = NormalEditorCredentialField(text: Binding(get: { value }, set: { value = $0 }),
+                isSecure: true, focus: focus, onSubmit: { submissions += 1 })
+            let coordinator = subject.makeCoordinator()
+            subject.updateTextField(password, coordinator: coordinator)
+            XCTAssertTrue(password.becomeFirstResponder())
+            let tab = try XCTUnwrap(password.keyCommands?.first { $0.input == "\t" && $0.modifierFlags.isEmpty })
+            password.moveCredentialFocus(tab)
+            XCTAssertTrue(email.isFirstResponder)
+            XCTAssertEqual(value, "synthetic-only")
+            XCTAssertEqual(submissions, 0)
+            XCTAssertEqual(manuscript.text, "unchanged manuscript")
+        }
+    }
+
+    func testMissingOrDisabledPeerDoesNotReleaseEmailFocus() {
+        withCredentialForm { _, focus, email, password, _ in
+            XCTAssertTrue(email.becomeFirstResponder())
+            password.isEnabled = false
+            focus.move(from: email)
+            XCTAssertTrue(email.isFirstResponder)
+            focus.unregister(password)
+            focus.move(from: email)
+            XCTAssertTrue(email.isFirstResponder)
+        }
+    }
+
+    func testInactiveFieldCannotStealFocusFromManuscript() {
+        withCredentialForm { _, _, email, _, manuscript in
+            XCTAssertTrue(manuscript.becomeFirstResponder())
+            email.moveCredentialFocus(UIKeyCommand(input: "\t", modifierFlags: [], action: #selector(NormalEditorCredentialTextField.moveCredentialFocus)))
+            XCTAssertTrue(manuscript.isFirstResponder)
+        }
+    }
+
+    func testEmailReturnMovesToPasswordWithoutSubmitting() {
+        withCredentialForm { _, focus, email, password, _ in
+            let subject = NormalEditorCredentialField(text: .constant("test@example.invalid"), isSecure: false, focus: focus)
+            let coordinator = subject.makeCoordinator()
+            XCTAssertTrue(email.becomeFirstResponder())
+            XCTAssertFalse(coordinator.textFieldShouldReturn(email))
+            XCTAssertTrue(password.isFirstResponder)
+            let field = subject.makeTextField(coordinator: coordinator)
+            XCTAssertEqual(field.returnKeyType, .next)
+        }
+    }
+
+    func testDismantledOldFieldDoesNotUnregisterReplacement() {
+        withCredentialForm { _, focus, email, password, _ in
+            let subject = NormalEditorCredentialField(text: .constant(""), isSecure: false, focus: focus)
+            let coordinator = subject.makeCoordinator()
+            let old = subject.makeTextField(coordinator: coordinator)
+            focus.register(email, secure: false)
+            NormalEditorCredentialField.dismantleUIView(old, coordinator: coordinator)
+            XCTAssertNil((old as? NormalEditorCredentialTextField)?.credentialFocus)
+            XCTAssertTrue(password.becomeFirstResponder())
+            focus.move(from: password)
+            XCTAssertTrue(email.isFirstResponder)
+        }
+    }
+
+    func testEmailUsesStableUIKitTraitsWithoutAssistantShortcuts() {
+        let subject = NormalEditorCredentialField(text: .constant("test@example.invalid"), isSecure: false)
+        let coordinator = subject.makeCoordinator()
+        let field = subject.makeTextField(coordinator: coordinator)
+        XCTAssertFalse(field.isSecureTextEntry)
+        XCTAssertEqual(field.textContentType, .username)
+        XCTAssertEqual(field.keyboardType, .emailAddress)
+        XCTAssertEqual(field.autocapitalizationType, .none)
+        XCTAssertEqual(field.autocorrectionType, .no)
+        XCTAssertTrue(field.inputAssistantItem.leadingBarButtonGroups.isEmpty)
+        XCTAssertTrue(field.inputAssistantItem.trailingBarButtonGroups.isEmpty)
+        XCTAssertNil(field.inputAccessoryView)
+        XCTAssertEqual(field.text, "test@example.invalid")
+    }
+
+    func testPasswordRemainsSecureAcrossUpdatesAndClearsFromModel() {
+        var value = "synthetic-password"
+        let subject = NormalEditorCredentialField(text: Binding(get: { value }, set: { value = $0 }), isSecure: true)
+        let coordinator = subject.makeCoordinator()
+        let field = subject.makeTextField(coordinator: coordinator)
+        XCTAssertTrue(field.isSecureTextEntry)
+        XCTAssertEqual(field.textContentType, .password)
+        XCTAssertTrue(field.inputAssistantItem.leadingBarButtonGroups.isEmpty)
+        XCTAssertTrue(field.inputAssistantItem.trailingBarButtonGroups.isEmpty)
+        subject.updateTextField(field, coordinator: coordinator)
+        XCTAssertEqual(field.text, value)
+        value = ""
+        subject.updateTextField(field, coordinator: coordinator)
+        XCTAssertEqual(field.text, "")
+        XCTAssertTrue(field.isSecureTextEntry)
+    }
+
+    func testEditingChangedDeliversLatestTextWithoutSubmitting() {
+        var value = ""
+        var submits = 0
+        let subject = NormalEditorCredentialField(text: Binding(get: { value }, set: { value = $0 }),
+            isSecure: true, onSubmit: { submits += 1 })
+        let coordinator = subject.makeCoordinator()
+        let field = subject.makeTextField(coordinator: coordinator)
+        field.text = "synthetic-input"
+        field.sendActions(for: .editingChanged)
+        XCTAssertEqual(value, "synthetic-input")
+        XCTAssertEqual(submits, 0)
+    }
+
+    func testReturnPublishesLatestPasswordBeforeSingleSubmission() {
+        var value = ""
+        var submitted: [String] = []
+        let subject = NormalEditorCredentialField(text: Binding(get: { value }, set: { value = $0 }),
+            isSecure: true, onSubmit: { submitted.append(value) })
+        let coordinator = subject.makeCoordinator()
+        let field = subject.makeTextField(coordinator: coordinator)
+        field.text = "latest-synthetic-input"
+        XCTAssertFalse(coordinator.textFieldShouldReturn(field))
+        XCTAssertEqual(submitted, ["latest-synthetic-input"])
+        XCTAssertEqual(field.returnKeyType, .go)
+    }
+
+    func testUpdateRefreshesCoordinatorBindingWithoutResettingSelection() {
+        var first = "unchanged"
+        var second = "unchanged"
+        let original = NormalEditorCredentialField(text: Binding(get: { first }, set: { first = $0 }), isSecure: false)
+        let coordinator = original.makeCoordinator()
+        let field = original.makeTextField(coordinator: coordinator)
+        let cursor = field.position(from: field.beginningOfDocument, offset: 3)!
+        field.selectedTextRange = field.textRange(from: cursor, to: cursor)
+        let updated = NormalEditorCredentialField(text: Binding(get: { second }, set: { second = $0 }), isSecure: false)
+        updated.updateTextField(field, coordinator: coordinator)
+        XCTAssertEqual(field.offset(from: field.beginningOfDocument, to: field.selectedTextRange!.start), 3)
+        field.text = "new"
+        field.sendActions(for: .editingChanged)
+        XCTAssertEqual(first, "unchanged")
+        XCTAssertEqual(second, "new")
+    }
+
+    func testDismantleRemovesCallbacksAndCredentialText() {
+        var value = "synthetic"
+        let subject = NormalEditorCredentialField(text: Binding(get: { value }, set: { value = $0 }), isSecure: true)
+        let coordinator = subject.makeCoordinator()
+        let field = subject.makeTextField(coordinator: coordinator)
+        NormalEditorCredentialField.dismantleUIView(field, coordinator: coordinator)
+        XCTAssertNil(field.delegate)
+        XCTAssertTrue(field.text?.isEmpty != false)
+        field.text = "late"
+        field.sendActions(for: .editingChanged)
+        XCTAssertEqual(value, "synthetic")
+    }
+}
 
 private let normalInitial = "일반 본문 검증 20260912\n이 문서는 일반 동기화 시험용 합성 원고입니다.\n끝.\niPad 일반 검증 20260912\nWindows 일반 검증 20260912\nWindows 일반 편집 검증 20260913\niPad 일반 편집 검증 20260913\nWindows 자동저장 검증 20260913\n"
 private func normalSnapshot(_ text: String = normalInitial, revision: Int64 = 6) -> SyncV2RemoteDocumentSnapshot {
@@ -45,6 +244,9 @@ private actor NormalTestBackend: NormalEditorBackend {
     var receiptReads = 0
     var finishes = 0
     var prepares = 0
+    var structureRefreshes = 0
+    var testRetirements = 0
+    var duplicateReconciliations = 0
     var beforeBaseline: (@Sendable () async -> Void)?
     let device = UUID()
     init(file: URL) { self.file = file }
@@ -60,6 +262,15 @@ private actor NormalTestBackend: NormalEditorBackend {
     }
     func localText() throws -> String { try String(contentsOf: file, encoding: .utf8) }
     func prepare() { prepares += 1; prepared = true }
+    func refreshStructureReference() throws {
+        guard prepared else { throw NormalEditorError.locked }
+        structureRefreshes += 1
+    }
+    func retireUnsentTestQueue() throws {
+        guard prepared else { throw NormalEditorError.locked }
+        testRetirements += 1
+    }
+    func reconcileDuplicateSaves() { duplicateReconciliations += 1 }
     func invalidate() { prepared = false }
     func remote() throws -> SyncV2RemoteDocumentSnapshot {
         guard prepared else { throw NormalEditorError.locked }; reads += 1; return server
@@ -99,6 +310,108 @@ private actor NormalTestBackend: NormalEditorBackend {
     }
 }
 
+private func normalStructure(expanded: Bool = false, targetRevision: Int = 6) -> SyncV2PreparationSnapshot {
+    let root = "e87a0e44-9a8d-4b18-b974-b40f4ab1eaad"
+    let parent = NormalEditorPlan.parent.uuidString.lowercased(), memo = NormalEditorStructureReference.memo.uuidString.lowercased()
+    let added = "58ed531f-56a3-4279-b0da-d5dbe5209839", existingDoc = "955ff845-aa32-4f10-956e-bac83501b205"
+    let addedDoc = "0eb1aece-7212-4e8d-a5a1-fa0dbeaa89db", target = NormalEditorPlan.document.uuidString.lowercased()
+    let project = SyncV2JSON.string(NormalEditorPlan.server.uuidString.lowercased())
+    func folder(_ id: String, _ parent: String?, _ name: String) -> SyncV2JSON {
+        .object(["folder_id": .string(id), "project_id": project, "parent_folder_id": parent.map(SyncV2JSON.string) ?? .null,
+                 "name": .string(name), "revision": .int(1), "is_deleted": .bool(false)])
+    }
+    func doc(_ id: String, _ parent: String, _ name: String, _ path: String, _ revision: Int) -> SyncV2JSON {
+        .object(["document_id": .string(id), "project_id": project, "parent_folder_id": .string(parent), "name": .string(name),
+                 "relative_path": .string(path), "revision": .int(revision), "structure_revision": .int(1), "is_deleted": .bool(false)])
+    }
+    func order(_ parent: String?, _ children: [String], _ revision: Int = 1) -> SyncV2JSON {
+        let id = syncV2UUIDv5(namespace: NormalEditorPlan.server, name: "test-order:" + (parent ?? "root"))
+        return .object(["tree_order_id": .string(id.uuidString.lowercased()), "project_id": project,
+                        "parent_folder_id": parent.map(SyncV2JSON.string) ?? .null,
+                        "children": .array(children.map(SyncV2JSON.string)), "revision": .int(revision)])
+    }
+    return .init(folders: [folder(root, nil, "메인"), folder(parent, root, "원고"), folder(memo, root, "메모장")]
+        + (expanded ? [folder(added, memo, "다른시험")] : []),
+        documents: [doc(target, parent, GeneralValidationPlan.name, NormalEditorPlan.path, targetRevision),
+                    doc(existingDoc, memo, "왕복.txt", "메인/메모장/왕복.txt", expanded ? 3 : 2)]
+        + (expanded ? [doc(addedDoc, added, "빈문서.txt", "메인/메모장/다른시험/빈문서.txt", 1)] : []),
+        treeOrders: [order(nil, [root]), order(root, [parent, memo]), order(parent, [target], 2),
+                     order(memo, [existingDoc] + (expanded ? [added] : []), expanded ? 2 : 1)]
+        + (expanded ? [order(added, [addedDoc])] : []))
+}
+
+final class NormalEditorStructureReferenceTests: XCTestCase {
+    private func changed(_ snapshot: SyncV2PreparationSnapshot, kind: String, index: Int, key: String, value: SyncV2JSON) -> SyncV2PreparationSnapshot {
+        var folders = snapshot.folders, docs = snapshot.documents, orders = snapshot.treeOrders
+        func edit(_ rows: inout [SyncV2JSON]) { var f = rows[index].objectValue!; f[key] = value; rows[index] = .object(f) }
+        if kind == "folder" { edit(&folders) } else if kind == "doc" { edit(&docs) } else { edit(&orders) }
+        return .init(folders: folders, documents: docs, treeOrders: orders)
+    }
+    func testAllowsMemoAdditionsAndOtherBodyRevisionWithoutReplacingLocalBaseline() throws {
+        let local = normalStructure(), remote = normalStructure(expanded: true)
+        let reference = try NormalEditorStructureReference(local: local, remote: remote)
+        XCTAssertEqual(try reference.comparison(local: local), remote)
+        XCTAssertEqual(local.documents.count, 2)
+        XCTAssertEqual(reference.snapshot.documents.count, 3)
+        XCTAssertEqual(try reference.comparison(local: normalStructure(targetRevision: 7)), remote)
+    }
+    func testReferenceSurvivesCodableRoundTripAndRowReordering() throws {
+        let local = normalStructure(), remote = normalStructure(expanded: true)
+        let reference = try NormalEditorStructureReference(local: local, remote: remote)
+        let decoded = try JSONDecoder().decode(NormalEditorStructureReference.self, from: JSONEncoder().encode(reference))
+        let reordered = SyncV2PreparationSnapshot(folders: local.folders.reversed(), documents: local.documents.reversed(), treeOrders: local.treeOrders.reversed())
+        XCTAssertEqual(try decoded.comparison(local: reordered), remote)
+    }
+    func testRejectsLocalMetadataChangeAfterReferenceWasCaptured() throws {
+        let reference = try NormalEditorStructureReference(local: normalStructure(), remote: normalStructure(expanded: true))
+        let changed = changed(normalStructure(), kind: "doc", index: 1, key: "revision", value: .int(3))
+        XCTAssertThrowsError(try reference.comparison(local: changed))
+    }
+    func testRejectsProtectedDocumentOrAncestorChanges() throws {
+        let remote = normalStructure(expanded: true)
+        for candidate in [
+            changed(remote, kind: "doc", index: 0, key: "structure_revision", value: .int(2)),
+            changed(remote, kind: "doc", index: 0, key: "is_deleted", value: .bool(true)),
+            changed(remote, kind: "folder", index: 1, key: "revision", value: .int(2)),
+            changed(remote, kind: "folder", index: 0, key: "name", value: .string("다른루트")),
+            changed(remote, kind: "order", index: 2, key: "revision", value: .int(3))
+        ] { XCTAssertThrowsError(try NormalEditorStructureReference(local: normalStructure(), remote: candidate)) }
+    }
+    func testRejectsForeignProjectDuplicateIDsAndCyclicFolders() throws {
+        let remote = normalStructure(expanded: true)
+        for candidate in [
+            changed(remote, kind: "doc", index: 2, key: "project_id", value: .string(UUID().uuidString.lowercased())),
+            changed(remote, kind: "doc", index: 2, key: "document_id", value: .string(NormalEditorPlan.document.uuidString.lowercased())),
+            changed(remote, kind: "folder", index: 3, key: "parent_folder_id", value: remote.folders[3].objectValue!["folder_id"]!)
+        ] { XCTAssertThrowsError(try NormalEditorStructureReference(local: normalStructure(), remote: candidate)) }
+    }
+    func testRejectsRegressingRevisionsAndPathsNotMatchingParents() throws {
+        let remote = normalStructure(expanded: true)
+        for candidate in [
+            changed(remote, kind: "doc", index: 1, key: "revision", value: .int(1)),
+            changed(remote, kind: "doc", index: 2, key: "relative_path", value: .string("메인/원고/탈출.txt")),
+            changed(remote, kind: "order", index: 3, key: "children", value: .array([]))
+        ] { XCTAssertThrowsError(try NormalEditorStructureReference(local: normalStructure(), remote: candidate)) }
+    }
+    func testRejectsValidGraphWithAdditionsOutsideMemo() throws {
+        let root = normalStructure().folders[0].objectValue!["folder_id"]!
+        var remote = changed(normalStructure(expanded: true), kind: "folder", index: 3, key: "parent_folder_id", value: root)
+        remote = changed(remote, kind: "doc", index: 2, key: "relative_path", value: .string("메인/다른시험/빈문서.txt"))
+        let added = remote.folders[3].objectValue!["folder_id"]!
+        remote = changed(remote, kind: "order", index: 1, key: "children", value: .array(remote.treeOrders[1].objectValue!["children"]!.arrayValue! + [added]))
+        remote = changed(remote, kind: "order", index: 3, key: "children", value: normalStructure().treeOrders[3].objectValue!["children"]!)
+        _ = try SyncV2GeneralTree(remote).nodes(projectID: NormalEditorPlan.local)
+        XCTAssertThrowsError(try NormalEditorStructureReference(local: normalStructure(), remote: remote))
+    }
+    func testRejectsRemovalOfPreviouslyAcknowledgedAdditions() throws {
+        XCTAssertThrowsError(try NormalEditorStructureReference.validate(local: normalStructure(expanded: true), remote: normalStructure()))
+    }
+    func testRejectsChangedOrderWithoutNewRevision() throws {
+        let remote = changed(normalStructure(expanded: true), kind: "order", index: 3, key: "revision", value: .int(1))
+        XCTAssertThrowsError(try NormalEditorStructureReference(local: normalStructure(), remote: remote))
+    }
+}
+
 @MainActor
 final class NormalEditorTests: XCTestCase {
     private struct Fixture {
@@ -126,6 +439,146 @@ final class NormalEditorTests: XCTestCase {
         XCTAssertTrue(model.opened, model.message)
         addTeardownBlock { try? FileManager.default.removeItem(at: root) }
         return .init(root: root, journal: journal, model: model, backend: backend, local: local, file: file)
+    }
+    func testDuplicateReconciliationIsAvailableBeforePreparationButRequiresCleanForeground() async throws {
+        let f = try await fixture(), text = "복원한 본문"
+        f.model.editor.updateText(text); await f.model.save()
+        await NormalEditorRecoveryInjection.$testConfiguration.withValue(runConfiguration(text, point: .beforeHTTP)) { await f.model.prepare() }
+        try f.journal.update("freezeStarted") { $0.saves[0].phase = .freezing }
+        try f.journal.record(normalBatch(text))
+        await f.model.prepare(); XCTAssertFalse(f.model.prepared)
+        XCTAssertTrue(f.model.message.contains("NORMAL_QUEUE_FAILED"))
+        await f.model.reconcileDuplicateSaves()
+        var count = await f.backend.duplicateReconciliations; XCTAssertEqual(count, 1)
+        XCTAssertFalse(f.model.prepared); XCTAssertTrue(f.model.message.contains("동일 본문 중복 대기 정리 완료"))
+        let requests = await f.backend.requests; XCTAssertTrue(requests.isEmpty)
+        f.model.editor.updateText("다른 초안")
+        await f.model.reconcileDuplicateSaves()
+        count = await f.backend.duplicateReconciliations; XCTAssertEqual(count, 1)
+        await f.model.setForeground(false); await f.model.reconcileDuplicateSaves()
+        count = await f.backend.duplicateReconciliations; XCTAssertEqual(count, 1)
+    }
+    func testDuplicateResolutionRejectsChangedTextRequestsAndOtherRunStates() async throws {
+        let f = try await fixture(), text = "복원 é"
+        f.model.editor.updateText(text); await f.model.save()
+        await NormalEditorRecoveryInjection.$testConfiguration.withValue(runConfiguration(text, point: .beforeHTTP)) { await f.model.prepare() }
+        try f.journal.update("freezeStarted") { $0.saves[0].phase = .freezing }
+        try f.journal.record(normalBatch(text))
+        let state = f.journal.state(); XCTAssertNotNil(NormalEditorDuplicateSaveResolution(state))
+        for content in ["다른 본문", "복원 e\u{301}", text + "\n"] {
+            var s = state; s.saves[1] = .init(source: normalBatch(content))
+            XCTAssertNil(NormalEditorDuplicateSaveResolution(s))
+        }
+        for index in [0, 1] {
+            var s = state; s.saves[index].attempts = [UUID()]; XCTAssertNil(NormalEditorDuplicateSaveResolution(s))
+            s = state; s.saves[index].request = .object([:]); XCTAssertNil(NormalEditorDuplicateSaveResolution(s))
+            s = state; s.saves[index].response = .object([:]); XCTAssertNil(NormalEditorDuplicateSaveResolution(s))
+        }
+        var s = state; s.saves[0].phase = .frozen; XCTAssertNil(NormalEditorDuplicateSaveResolution(s))
+        s = state; s.recoveryRuns![0].cancelled = true; XCTAssertNil(NormalEditorDuplicateSaveResolution(s))
+        s = state; s.recoveryCheckpoints = [NormalEditorRecoveryInjection.checkpointKey(s.recoveryRuns![0].configuration)]
+        XCTAssertNil(NormalEditorDuplicateSaveResolution(s))
+        s = state; s.error = "failed"; XCTAssertNil(NormalEditorDuplicateSaveResolution(s))
+        s = state; s.baseline = normalSnapshot(revision: 7); XCTAssertNil(NormalEditorDuplicateSaveResolution(s))
+    }
+    func testTestQueueRetirementRequiresExplicitPreparedCleanForegroundAction() async throws {
+        let f = try await fixture(), text = "취소 뒤 유지할 A 본문"
+        f.model.editor.updateText(text); await f.model.save()
+        await NormalEditorRecoveryInjection.$testConfiguration.withValue(runConfiguration(text, point: .beforeHTTP)) { await f.model.prepare() }
+        try f.journal.update("freezeStarted") { $0.saves[0].phase = .freezing }
+        let before = try stableJSON(f.journal.state())
+        await f.model.retireUnsentTestQueue()
+        XCTAssertFalse(f.model.prepared)
+        XCTAssertTrue(f.model.message.contains("이전 테스트 송신 대기 2건 취소 완료"))
+        XCTAssertEqual(try stableJSON(f.journal.state()), before)
+        XCTAssertEqual(try String(contentsOf: f.file, encoding: .utf8), text)
+        await f.model.retireUnsentTestQueue(); await f.model.send()
+        var count = await f.backend.testRetirements; XCTAssertEqual(count, 1)
+        let requests = await f.backend.requests; XCTAssertTrue(requests.isEmpty)
+        await f.model.prepare()
+        f.model.editor.updateText("저장 전 변경")
+        await f.model.retireUnsentTestQueue()
+        count = await f.backend.testRetirements; XCTAssertEqual(count, 1)
+        await f.model.setForeground(false); await f.model.retireUnsentTestQueue()
+        count = await f.backend.testRetirements; XCTAssertEqual(count, 1)
+    }
+    func testTestQueueRetirementGateRejectsFrozenAttemptedCancelledAndConsumedStates() async throws {
+        let f = try await fixture(), text = "취소 조건"
+        f.model.editor.updateText(text); await f.model.save()
+        await NormalEditorRecoveryInjection.$testConfiguration.withValue(runConfiguration(text, point: .beforeHTTP)) { await f.model.prepare() }
+        let original = f.journal.state(); XCTAssertTrue(NormalEditorTestQueueRetirement.canRetire(original))
+        for phase: NormalEditorJournal.Phase in [.frozen, .httpStarted, .responseStored, .completed] {
+            var s = original; s.saves[0].phase = phase; XCTAssertFalse(NormalEditorTestQueueRetirement.canRetire(s))
+        }
+        var s = original; s.saves[0].attempts = [UUID()]; XCTAssertFalse(NormalEditorTestQueueRetirement.canRetire(s))
+        s = original; s.saves[0].request = .object([:]); XCTAssertFalse(NormalEditorTestQueueRetirement.canRetire(s))
+        s = original; s.recoveryRuns![0].cancelled = true; XCTAssertFalse(NormalEditorTestQueueRetirement.canRetire(s))
+        s = original; s.recoveryCheckpoints = [NormalEditorRecoveryInjection.checkpointKey(s.recoveryRuns![0].configuration)]
+        XCTAssertFalse(NormalEditorTestQueueRetirement.canRetire(s))
+    }
+    func testStructureRefreshPreservesSavedSourceAndRunAndRequiresNewPreparation() async throws {
+        let f = try await fixture(), text = "구조 갱신 대기 본문"
+        f.model.editor.updateText(text); await f.model.save()
+        await NormalEditorRecoveryInjection.$testConfiguration.withValue(runConfiguration(text)) { await f.model.prepare() }
+        let before = try stableJSON(f.journal.state()), draft = try f.journal.draft()?.hash
+        await f.model.refreshStructureReference()
+        XCTAssertEqual(try stableJSON(f.journal.state()), before)
+        XCTAssertEqual(try f.journal.draft()?.hash, draft)
+        XCTAssertEqual(try String(contentsOf: f.file, encoding: .utf8), text)
+        XCTAssertFalse(f.model.prepared)
+        XCTAssertTrue(f.model.message.contains("구조 비교 기준 갱신 완료"))
+        await f.model.send()
+        let refreshes = await f.backend.structureRefreshes, requests = await f.backend.requests
+        XCTAssertEqual(refreshes, 1); XCTAssertTrue(requests.isEmpty)
+    }
+    func testStructureRefreshRejectsDirtyOrBackgroundSessionBeforeBackend() async throws {
+        let f = try await fixture(), text = "저장본"
+        f.model.editor.updateText(text); await f.model.save()
+        await NormalEditorRecoveryInjection.$testConfiguration.withValue(runConfiguration(text)) { await f.model.prepare() }
+        f.model.editor.updateText("저장 전 초안")
+        await f.model.refreshStructureReference()
+        let firstCount = await f.backend.structureRefreshes
+        XCTAssertEqual(firstCount, 0)
+        await f.model.setForeground(false)
+        await f.model.refreshStructureReference()
+        let secondCount = await f.backend.structureRefreshes
+        XCTAssertEqual(secondCount, 0)
+    }
+    func testStructureRefreshGateRejectsFrozenUncertainAndConsumedRuns() async throws {
+        let f = try await fixture(), text = "갱신 조건"
+        f.model.editor.updateText(text); await f.model.save()
+        XCTAssertFalse(NormalEditorStructureReference.canRefresh(f.journal.state()))
+        await NormalEditorRecoveryInjection.$testConfiguration.withValue(runConfiguration(text)) { await f.model.prepare() }
+        let clean = f.journal.state()
+        XCTAssertTrue(NormalEditorStructureReference.canRefresh(clean))
+        for phase: NormalEditorJournal.Phase in [.freezing, .frozen, .httpStarted, .responseStored, .completed, .superseded] {
+            var state = clean; state.saves[0].phase = phase
+            XCTAssertFalse(NormalEditorStructureReference.canRefresh(state))
+        }
+        var state = clean; state.saves[0].request = .object([:])
+        XCTAssertFalse(NormalEditorStructureReference.canRefresh(state))
+        state = clean; state.saves[0].attempts = [UUID()]
+        XCTAssertFalse(NormalEditorStructureReference.canRefresh(state))
+        state = clean; state.recoveryCheckpoints = [NormalEditorRecoveryInjection.checkpointKey(state.recoveryRuns![0].configuration)]
+        XCTAssertFalse(NormalEditorStructureReference.canRefresh(state))
+        state = clean; state.recoveryRuns?[0].cancelled = true
+        XCTAssertFalse(NormalEditorStructureReference.canRefresh(state))
+        state = clean; state.error = "blocked"
+        XCTAssertFalse(NormalEditorStructureReference.canRefresh(state))
+    }
+    func testStructureReferenceJournalReopenDoesNotRewriteSourceDraftOrBaseline() async throws {
+        let f = try await fixture(), text = "보존 본문"
+        f.model.editor.updateText(text); await f.model.save()
+        await NormalEditorRecoveryInjection.$testConfiguration.withValue(runConfiguration(text)) { await f.model.prepare() }
+        let before = f.journal.state(), draft = try Data(contentsOf: f.journal.root.appendingPathComponent("draft.json"))
+        let reference = try NormalEditorStructureReference(local: normalStructure(), remote: normalStructure(expanded: true))
+        try f.journal.update("structureComparisonReferenceRefreshed") { $0.structureReference = reference }
+        let reopened = try NormalEditorJournal(root: f.journal.root)
+        XCTAssertEqual(try reopened.state().structureReference?.comparison(local: normalStructure()), normalStructure(expanded: true))
+        XCTAssertEqual(try stableJSON(reopened.state().saves), try stableJSON(before.saves))
+        XCTAssertEqual(try stableJSON(reopened.state().recoveryRuns), try stableJSON(before.recoveryRuns))
+        XCTAssertEqual(try stableJSON(reopened.state().baseline), try stableJSON(before.baseline))
+        XCTAssertEqual(try Data(contentsOf: f.journal.root.appendingPathComponent("draft.json")), draft)
     }
     func testLocalSaveDoesNotRequireLoginAndPreservesUTF8AndFinalLF() async throws {
         let f = try await fixture()
@@ -340,7 +793,9 @@ private struct NormalTestAuth: AuthenticationServicing {
     func signOut() async -> AuthenticationState { .signedOut(.userInitiated) }
 }
 private actor NormalWireStub {
-    let structure: SyncV2PreparationSnapshot
+    var structure: SyncV2PreparationSnapshot
+    var afterManifest: (@Sendable () -> Void)?
+    var nextStructure: SyncV2PreparationSnapshot?
     let user: UUID
     var writes = 0
     var receiptReads = 0
@@ -351,6 +806,8 @@ private actor NormalWireStub {
     init(structure: SyncV2PreparationSnapshot, user: UUID) { self.structure = structure; self.user = user }
     func loseNextResponse() { lose = true }
     func editRemotely(_ text: String) { snapshot = normalSnapshot(text, revision: snapshot.revision + 1) }
+    func changeAfterNextManifest(to structure: SyncV2PreparationSnapshot) { nextStructure = structure }
+    func runAfterNextManifest(_ action: @escaping @Sendable () -> Void) { afterManifest = action }
     func exchange(_ request: URLRequest) throws -> (Data, URLResponse) {
         let path = request.url!.lastPathComponent
         let query = URLComponents(url: request.url!, resolvingAgainstBaseURL: false)!.queryItems ?? []
@@ -372,8 +829,12 @@ private actor NormalWireStub {
                 result = .array([try JSONDecoder().decode(SyncV2JSON.self, from: encoder.encode(snapshot))])
             } else {
                 result = .array(structure.documents.map { row in
-                    var values = row.objectValue!; values["revision"] = .int(Int(snapshot.revision)); return .object(values)
+                    var values = row.objectValue!
+                    if values["document_id"] == .string(NormalEditorPlan.document.uuidString.lowercased()) { values["revision"] = .int(Int(snapshot.revision)) }
+                    return .object(values)
                 })
+                if let nextStructure { structure = nextStructure; self.nextStructure = nil }
+                let action = afterManifest; afterManifest = nil; action?()
             }
         case "document_commit":
             let envelope = try JSONDecoder().decode(SyncV2JSON.self, from: request.httpBody!)
@@ -396,9 +857,460 @@ private actor NormalWireStub {
 }
 
 extension NormalEditorTests {
+    private struct StructureLiveFixture {
+        let base: Fixture
+        let raw: SyncV2Store
+        let wire: NormalWireStub
+        let backend: LiveNormalEditorBackend
+        let policy: ReceiveValidationPolicy
+    }
+    private func structureLiveFixture() async throws -> StructureLiveFixture {
+        let f = try await fixture(), url = f.root.appendingPathComponent("structure.sqlite"), user = UUID()
+        let metadata = normalStructure(), unrestricted = ReceiveValidationPolicy(enabled: false, configuration: nil)
+        let scope = GeneralSyncValidationScope(restricted: false, selection: nil)
+        let raw: SyncV2Store = try await ReceiveValidationPolicy.$override.withValue(unrestricted) {
+            try await GeneralSyncValidationScope.$override.withValue(scope) {
+                guard case let .available(store) = await SyncV2Store.open(at: url) else { throw NormalEditorError.storage }
+                try await store.save(ProjectSyncBinding.connected(localProjectID: NormalEditorPlan.local, serverProjectID: NormalEditorPlan.server,
+                    kind: .existingServerProject, projectName: "합성", ownerSubject: user))
+                for row in metadata.documents {
+                    let d = row.objectValue!, id = UUID(uuidString: d["document_id"]!.stringValue!)!
+                    let snapshot = SyncV2RemoteDocumentSnapshot(documentID: id, relativePath: d["relative_path"]!.stringValue!,
+                        content: id == NormalEditorPlan.document ? normalInitial : "다른 시험 본문", revision: Int64(d["revision"]!.intValue!),
+                        isDeleted: false, deletedAt: nil, updatedAt: Date(), parentFolderID: UUID(uuidString: d["parent_folder_id"]!.stringValue!),
+                        name: d["name"]!.stringValue!, structureRevision: 1)
+                    _ = try await store.applySnapshotBaseline(localProjectID: NormalEditorPlan.local, serverProjectID: NormalEditorPlan.server, snapshot: snapshot, expectedRevision: nil)
+                    try await store.adoptContractManifestMetadata(localProjectID: NormalEditorPlan.local, serverProjectID: NormalEditorPlan.server, entries: [snapshot.manifestEntry])
+                }
+                let folders: [SyncV2RemoteFolder] = metadata.folders.map { row in
+                    let f = row.objectValue!
+                    return .init(folderID: UUID(uuidString: f["folder_id"]!.stringValue!)!, parentFolderID: f["parent_folder_id"]?.stringValue.flatMap(UUID.init(uuidString:)),
+                        name: f["name"]!.stringValue!, revision: 1, isDeleted: false, updatedAt: Date())
+                }
+                try await store.applyFolderSnapshotBaselines(localProjectID: NormalEditorPlan.local, serverProjectID: NormalEditorPlan.server, folders: folders, excluding: [])
+                let orders: [SyncV2RemoteTreeOrder] = metadata.treeOrders.map { row in
+                    let f = row.objectValue!
+                    return .init(treeOrderID: UUID(uuidString: f["tree_order_id"]!.stringValue!)!, parentFolderID: f["parent_folder_id"]?.stringValue.flatMap(UUID.init(uuidString:)),
+                        children: f["children"]!.arrayValue!.map { UUID(uuidString: $0.stringValue!)! }, revision: Int64(f["revision"]!.intValue!), updatedAt: Date())
+                }
+                try await store.applyTreeOrderSnapshotBaselines(localProjectID: NormalEditorPlan.local, serverProjectID: NormalEditorPlan.server, treeOrders: orders)
+                return store
+            }
+        }
+        let wire = NormalWireStub(structure: normalStructure(expanded: true), user: user)
+        let policy = ReceiveValidationPolicy(enabled: true, configuration: .init(version: 1, revision: UUID(),
+            endpoint: ReceiveValidationPolicy.Configuration.staging, accountID: user), network: { try await wire.exchange($0) })
+        let key = ContractPathGate.storageKey(for: NormalEditorPlan.local), prior = UserDefaults.standard.object(forKey: ContractPathGate.storageKey(for: NormalEditorPlan.local))
+        ContractPathGate.setOpen(true, for: NormalEditorPlan.local)
+        addTeardownBlock { if let prior { UserDefaults.standard.set(prior, forKey: key) } else { UserDefaults.standard.removeObject(forKey: key) } }
+        let repository = NormalTestRepository()
+        await repository.addFolders(root: UUID(uuidString: "e87a0e44-9a8d-4b18-b974-b40f4ab1eaad")!)
+        let backend = LiveNormalEditorBackend(store: LazySyncV2ProjectBindingStore(databaseURL: url, deviceIdentityProvider: NormalTestIdentity()),
+            documents: repository, local: f.local,
+            applier: LocalSyncV2SnapshotApplier(documentRepository: repository, workspaceLocator: FixedWorkspaceLocator(root: f.root.appendingPathComponent("workspace"))),
+            mutationGate: SyncV2DocumentMutationGate(), auth: NormalTestAuth(user: user),
+            configuration: .init(url: URL(string: ReceiveValidationPolicy.Configuration.staging)!, publishableKey: "isolated-public-key"),
+            journal: f.journal, bindingEpoch: SyncV2ContractEpoch(), projectEpoch: SyncV2ContractEpoch())
+        let text = "갱신 뒤 같은 A 요청"
+        f.model.editor.updateText(text); await f.model.save()
+        await NormalEditorRecoveryInjection.$testConfiguration.withValue(runConfiguration(text, point: .beforeHTTP)) { await f.model.prepare() }
+        return .init(base: f, raw: raw, wire: wire, backend: backend, policy: policy)
+    }
+    func testLiveStructureRefreshKeepsSQLiteAndSourceAndReachesSameBeforeHTTPCheckpoint() async throws {
+        let f = try await structureLiveFixture(), before = f.base.journal.state()
+        let stored = try await f.raw.normalEditorStructure(), baseline = try await f.raw.normalEditorBaseline()
+        try await ReceiveValidationPolicy.$override.withValue(f.policy) {
+            try await f.backend.prepare()
+            do { _ = try await f.backend.remote(); XCTFail("stale structure must stop") } catch { XCTAssertEqual(error as? NormalEditorError, .target) }
+            try await f.backend.refreshStructureReference()
+            let remote = try await f.backend.remote()
+            XCTAssertEqual(remote.revision, 6)
+            let after = f.base.journal.state()
+            XCTAssertEqual(try stableJSON(before.saves), try stableJSON(after.saves))
+            XCTAssertEqual(try stableJSON(before.recoveryRuns), try stableJSON(after.recoveryRuns))
+            let actualStored = try await f.raw.normalEditorStructure(), actualBase = try await f.raw.normalEditorBaseline()
+            XCTAssertEqual(actualStored, stored); XCTAssertEqual(actualBase.content, baseline.content); XCTAssertEqual(actualBase.revision, baseline.revision)
+            let source = after.saves[0].source, request = try await f.backend.freeze(source)
+            try f.base.journal.update("requestFrozen") { $0.saves[0].request = request.json; $0.saves[0].requestHash = try request.json.sha256Hex(); $0.saves[0].phase = .frozen }
+            do { _ = try await f.backend.transmit(request, willStart: { XCTFail("HTTP must not start") }); XCTFail("checkpoint required") }
+            catch { XCTAssertEqual(error as? NormalEditorError, .recoveryCheckpoint) }
+            XCTAssertEqual(request.batchID, source.batchID)
+            let writes = await f.wire.writes; XCTAssertEqual(writes, 0)
+            let reopened = try NormalEditorJournal(root: f.base.journal.root)
+            XCTAssertNotNil(reopened.state().structureReference)
+            XCTAssertEqual(reopened.state().recoveryCheckpoints?.count, 1)
+        }
+    }
+    func testLiveStructureRefreshRejectsRemoteBodyChangeWithoutPublishingReference() async throws {
+        let f = try await structureLiveFixture()
+        await f.wire.editRemotely("외부 본문 변경")
+        try await ReceiveValidationPolicy.$override.withValue(f.policy) {
+            try await f.backend.prepare()
+            do { try await f.backend.refreshStructureReference(); XCTFail("changed base") }
+            catch { XCTAssertEqual(error as? NormalEditorError, .baseline) }
+        }
+        XCTAssertNil(f.base.journal.state().structureReference)
+    }
+    func testLiveStructureRefreshRejectsChangingMetadataAndRevokedAuthority() async throws {
+        for revoke in [false, true] {
+            let f = try await structureLiveFixture()
+            try await ReceiveValidationPolicy.$override.withValue(f.policy) {
+                try await f.backend.prepare()
+                if revoke { await f.wire.runAfterNextManifest { [policy = f.policy] in policy.invalidate() } }
+                else { await f.wire.changeAfterNextManifest(to: normalStructure()) }
+                do { try await f.backend.refreshStructureReference(); XCTFail("must stop") } catch {}
+            }
+            XCTAssertNil(f.base.journal.state().structureReference)
+            XCTAssertEqual(f.base.journal.state().saves[0].phase, .queued)
+            let writes = await f.wire.writes; XCTAssertEqual(writes, 0)
+        }
+    }
     private func stableJSON<T: Encodable>(_ value: T) throws -> Data {
         let encoder = JSONEncoder(); encoder.outputFormatting = [.sortedKeys]
         return try encoder.encode(value)
+    }
+
+    private func queueSQL(_ f: StructureLiveFixture, _ sql: String) throws {
+        var db: OpaquePointer?
+        guard sqlite3_open(f.base.root.appendingPathComponent("structure.sqlite").path, &db) == SQLITE_OK else { throw NormalEditorError.storage }
+        defer { sqlite3_close_v2(db) }
+        guard sqlite3_exec(db, sql, nil, nil, nil) == SQLITE_OK else { throw NormalEditorError.storage }
+    }
+    private func seedRetirementPair(_ f: StructureLiveFixture) throws {
+        let ids = NormalEditorTestQueueRetirement.sources.keys.sorted()
+        for (i, id) in ids.enumerated() {
+            let text = "iPad 보존 초안" + (i == 0 ? "" : "\n")
+            let source = LocalMutationBatch(batchID: UUID(uuidString: id)!, projectID: NormalEditorPlan.local, localTransactionID: nil,
+                mutations: [.documentSnapshot(operationID: UUID(uuidString: i == 0 ? "61dea381-b0da-4f74-b26f-1576f0596830" : "c4e299ab-fdac-416f-938c-5af2e0dd2899")!,
+                    documentID: .init(rawValue: UUID(uuidString: "955ff845-aa32-4f10-956e-bac83501b205")!),
+                    relativePath: .init(rawValue: "메인/메모장/통합검증 20260913/B/왕복.txt"), content: text,
+                    contentHash: ContentHash(rawValue: NormalEditorPlan.hash(text))!, localSaveGeneration: i == 0 ? 202205561220666 : 202207460207500, isDeleted: false)])
+            let json = String(decoding: try stableJSON(source), as: UTF8.self)
+            XCTAssertEqual(NormalEditorPlan.hash(json), NormalEditorTestQueueRetirement.sources[id])
+            try queueSQL(f, """
+                INSERT INTO sync_contract_local_batches(batch_id,local_project_id,project_id,source_json,writer_device_id,project_sync_mode,
+                    migration_epoch,contract_version,contract_sha256,protocol_version,client_build_id,status,created_at)
+                VALUES ('\(id)','\(NormalEditorPlan.local.rawValue.uuidString.lowercased())','\(NormalEditorPlan.server.uuidString.lowercased())',
+                    '\(json.replacingOccurrences(of: "'", with: "''"))','00000000-0000-4000-8000-000000000001','ID_BASED',1,
+                    '\(SyncV2Contract.version)','\(SyncV2Contract.canonicalSHA256)',\(SyncV2Contract.syncProtocolVersion),'isolated-test','waiting','2026-09-13T05:32:36Z');
+                """)
+        }
+    }
+    private func checkpointDuplicateFixture() async throws -> StructureLiveFixture {
+        let f = try await structureLiveFixture()
+        try await ReceiveValidationPolicy.$override.withValue(f.policy) {
+            try await f.backend.prepare(); try await f.backend.refreshStructureReference()
+            let request = try await f.backend.freeze(f.base.journal.state().saves[0].source)
+            try f.base.journal.update("requestFrozen") {
+                $0.saves[0].request = request.json; $0.saves[0].requestHash = try request.json.sha256Hex(); $0.saves[0].phase = .frozen
+            }
+            do { _ = try await f.backend.transmit(request, willStart: { XCTFail("before HTTP") }); XCTFail("checkpoint") }
+            catch { XCTAssertEqual(error as? NormalEditorError, .recoveryCheckpoint) }
+        }
+        try f.base.journal.record(normalBatch(try NormalEditorPlan.content(f.base.journal.state().saves[0].source)))
+        await f.backend.invalidate()
+        return f
+    }
+    func testCheckpointDuplicateReconciliationPreservesRequestAndResumesExactlyOnce() async throws {
+        let f = try await checkpointDuplicateFixture(), before = f.base.journal.state()
+        let original = before.saves[0], request = try SyncV2ContractRequest(storedJSON: XCTUnwrap(original.request))
+        let detail = try await f.raw.generalRecoveryDetail(localProjectID: NormalEditorPlan.local, batchID: original.source.batchID)
+        let oldFiles = try FileManager.default.contentsOfDirectory(at: f.base.journal.root, includingPropertiesForKeys: nil).filter { $0.pathExtension == "record" }
+        let oldBytes = try oldFiles.map { try Data(contentsOf: $0) }
+        try await f.backend.reconcileDuplicateSaves()
+        var expected = before; expected.saves[1].phase = .superseded
+        XCTAssertEqual(try stableJSON(f.base.journal.state()), try stableJSON(expected))
+        XCTAssertEqual(try oldFiles.map { try Data(contentsOf: $0) }, oldBytes)
+        let after = try await f.raw.generalRecoveryDetail(localProjectID: NormalEditorPlan.local, batchID: original.source.batchID)
+        XCTAssertEqual(after.sourceJSON, detail.sourceJSON); XCTAssertEqual(after.requestJSON, detail.requestJSON)
+        XCTAssertEqual(after.responseJSON, detail.responseJSON); XCTAssertEqual(after.row, detail.row)
+        let reopened = try NormalEditorJournal(root: f.base.journal.root)
+        XCTAssertNil(NormalEditorDuplicateSaveResolution(reopened.state()))
+        let text = try NormalEditorPlan.content(original.source), baseline = try await f.raw.normalEditorBaseline()
+        try NormalEditorRecoveryInjection.preflight(journal: reopened, baseline: baseline, localText: text,
+            dirty: false, composing: false, draftFailed: false)
+        var writes = await f.wire.writes; XCTAssertEqual(writes, 0)
+        try await ReceiveValidationPolicy.$override.withValue(f.policy) {
+            try await f.backend.prepare()
+            let resumed = try await f.backend.freeze(original.source)
+            XCTAssertEqual(resumed, request)
+            let response = try await f.backend.transmit(resumed) {
+                try f.base.journal.update("httpStarted") { $0.saves[0].phase = .httpStarted; $0.saves[0].attempts.append(UUID()) }
+            }
+            try f.base.journal.update("responseStored") { $0.saves[0].response = response; $0.saves[0].phase = .responseStored }
+            try await f.backend.complete(resumed, response: response)
+        }
+        writes = await f.wire.writes; XCTAssertEqual(writes, 1)
+        let finalBase = try await f.raw.normalEditorBaseline()
+        XCTAssertEqual(finalBase.revision, baseline.revision + 1); XCTAssertEqual(finalBase.content, text)
+    }
+    func testCheckpointDuplicateReconciliationRejectsUncertainOrChangedJournal() async throws {
+        let f = try await checkpointDuplicateFixture(), original = f.base.journal.state()
+        XCTAssertNotNil(NormalEditorDuplicateSaveResolution(original))
+        for mode in 0..<9 {
+            var state = original
+            switch mode {
+            case 0: state.saves[0].phase = .httpStarted
+            case 1: state.saves[0].attempts = [UUID()]
+            case 2: state.saves[0].response = .object([:])
+            case 3: state.saves[0].requestHash = String(repeating: "0", count: 64)
+            case 4: state.recoveryCheckpoints = []
+            case 5: state.saves[1].request = state.saves[0].request
+            case 6: state.saves[1].attempts = [UUID()]
+            case 7: state.saves[1] = .init(source: normalBatch("different content"))
+            default: state.recoveryRuns![0].completed = true
+            }
+            XCTAssertNil(NormalEditorDuplicateSaveResolution(state), "mode \(mode)")
+        }
+    }
+    func testCheckpointDuplicateReconciliationRejectsSQLiteDriftWithoutChangingJournal() async throws {
+        for sql in [
+            "UPDATE sync_contract_batches SET attempts=2;",
+            "UPDATE sync_contract_batches SET response_json='{}';",
+            "UPDATE sync_contract_batches SET status='completed';",
+            "UPDATE sync_contract_batches SET request_json='{}';",
+            "UPDATE sync_contract_local_batches SET source_json='{}';",
+            "UPDATE sync_contract_operations SET status='completed',result_revision=7;",
+            "UPDATE sync_contract_operations SET payload_json='{}';",
+            "UPDATE sync_contract_operations SET base_revision=8;",
+            "UPDATE sync_contract_batches SET next_attempt_at='2099-01-01';"
+        ] {
+            let f = try await checkpointDuplicateFixture()
+            try queueSQL(f, sql)
+            let before = try stableJSON(f.base.journal.state())
+            do { try await f.backend.reconcileDuplicateSaves(); XCTFail("must reject drift") } catch {}
+            XCTAssertEqual(try stableJSON(f.base.journal.state()), before)
+            let writes = await f.wire.writes; XCTAssertEqual(writes, 0)
+        }
+    }
+    func testCheckpointDuplicateReconciliationRejectsMaterializedFollowerAndDirtyDraft() async throws {
+        for dirtyDraft in [false, true] {
+            let f = try await checkpointDuplicateFixture()
+            if dirtyDraft { try f.base.journal.saveDraft(text: "new draft", cursor: .start) }
+            else {
+                let follower = f.base.journal.state().saves[1].source.batchID.uuidString.lowercased()
+                try queueSQL(f, """
+                    INSERT INTO sync_contract_batches(batch_id,local_project_id,project_id,request_json,batch_payload_sha256,status,created_at,updated_at)
+                    SELECT '\(follower)',local_project_id,project_id,request_json,batch_payload_sha256,'completed',created_at,updated_at FROM sync_contract_batches;
+                    """)
+            }
+            let before = try stableJSON(f.base.journal.state())
+            do { try await f.backend.reconcileDuplicateSaves(); XCTFail("unsafe follower/draft") } catch {}
+            XCTAssertEqual(try stableJSON(f.base.journal.state()), before)
+        }
+    }
+    func testDuplicateReconciliationKeepsOriginalRunAndAllowsTestRetirementThenSameCheckpoint() async throws {
+        let f = try await structureLiveFixture(); try seedRetirementPair(f)
+        try await ReceiveValidationPolicy.$override.withValue(f.policy) {
+            try await f.backend.prepare(); try await f.backend.refreshStructureReference()
+        }
+        try f.base.journal.update("freezeStarted") { $0.saves[0].phase = .freezing }
+        let original = f.base.journal.state().saves[0].source, text = try NormalEditorPlan.content(original)
+        try f.base.journal.record(normalBatch(text))
+        let before = f.base.journal.state(), metadata = try await f.raw.normalEditorStructure()
+        let staleQueue = try await f.raw.normalEditorActiveQueueIDs()
+        await f.backend.invalidate() // No login/handshake/prepared authority for local reconciliation.
+        try await f.backend.reconcileDuplicateSaves()
+        let after = f.base.journal.state()
+        XCTAssertEqual(after.saves.map(\.source), before.saves.map(\.source))
+        XCTAssertEqual(after.saves[0].phase, .freezing); XCTAssertEqual(after.saves[1].phase, .superseded)
+        XCTAssertEqual(after.recoveryRuns, before.recoveryRuns)
+        XCTAssertEqual(try stableJSON(after.baseline), try stableJSON(before.baseline))
+        XCTAssertEqual(try stableJSON(after.structureReference), try stableJSON(before.structureReference))
+        let actualMetadata = try await f.raw.normalEditorStructure(), actualQueue = try await f.raw.normalEditorActiveQueueIDs()
+        XCTAssertEqual(actualMetadata, metadata); XCTAssertEqual(actualQueue, staleQueue)
+        XCTAssertEqual(try String(contentsOf: f.base.file, encoding: .utf8), text)
+        let reopened = try NormalEditorJournal(root: f.base.journal.root)
+        XCTAssertEqual(reopened.state().saves[1].phase, .superseded)
+        XCTAssertNil(NormalEditorDuplicateSaveResolution(reopened.state()))
+        try await ReceiveValidationPolicy.$override.withValue(f.policy) {
+            try await f.backend.prepare(); try await f.backend.retireUnsentTestQueue()
+            let request = try await f.backend.freeze(original)
+            XCTAssertEqual(request.batchID, original.batchID)
+            try f.base.journal.update("requestFrozen") { $0.saves[0].request = request.json; $0.saves[0].requestHash = try request.json.sha256Hex(); $0.saves[0].phase = .frozen }
+            do { _ = try await f.backend.transmit(request, willStart: { XCTFail("no HTTP") }); XCTFail("checkpoint") }
+            catch { XCTAssertEqual(error as? NormalEditorError, .recoveryCheckpoint) }
+        }
+        let writes = await f.wire.writes; XCTAssertEqual(writes, 0)
+    }
+    func testDuplicateReconciliationRejectsAnySQLiteQueueHistoryForEitherSource() async throws {
+        for index in [0, 1] {
+            for completed in [false, true] {
+                let f = try await structureLiveFixture(); try seedRetirementPair(f)
+                try f.base.journal.update("freezeStarted") { $0.saves[0].phase = .freezing }
+                try f.base.journal.record(normalBatch(try NormalEditorPlan.content(f.base.journal.state().saves[0].source)))
+                let before = try stableJSON(f.base.journal.state()), batch = f.base.journal.state().saves[index].source.batchID.uuidString.lowercased()
+                try queueSQL(f, """
+                    INSERT INTO sync_contract_local_batches(batch_id,local_project_id,project_id,source_json,writer_device_id,project_sync_mode,
+                        migration_epoch,contract_version,contract_sha256,protocol_version,client_build_id,status,created_at)
+                    SELECT '\(batch)',local_project_id,project_id,source_json,writer_device_id,project_sync_mode,migration_epoch,
+                        contract_version,contract_sha256,protocol_version,client_build_id,'\(completed ? "completed" : "waiting")',created_at
+                    FROM sync_contract_local_batches LIMIT 1;
+                    """)
+                do { try await f.backend.reconcileDuplicateSaves(); XCTFail("SQLite source already exists") }
+                catch { XCTAssertEqual(error as? NormalEditorError, .queue) }
+                XCTAssertEqual(try stableJSON(f.base.journal.state()), before)
+            }
+        }
+    }
+    func testDuplicateReconciliationRejectsLocalTextDraftAndBaselineDrift() async throws {
+        for mode in 0..<3 {
+            let f = try await structureLiveFixture()
+            try f.base.journal.update("freezeStarted") { $0.saves[0].phase = .freezing }
+            try f.base.journal.record(normalBatch(try NormalEditorPlan.content(f.base.journal.state().saves[0].source)))
+            switch mode {
+            case 0: try Data("다른 실제 파일".utf8).write(to: f.base.file)
+            case 1: try f.base.journal.saveDraft(text: "다른 초안", cursor: .start)
+            default: try queueSQL(f, "UPDATE sync_documents SET server_revision=7 WHERE document_id='\(NormalEditorPlan.document.uuidString.lowercased())';")
+            }
+            let before = try stableJSON(f.base.journal.state())
+            do { try await f.backend.reconcileDuplicateSaves(); XCTFail("drift \(mode)") } catch {}
+            XCTAssertEqual(try stableJSON(f.base.journal.state()), before)
+        }
+    }
+    func testDuplicateReconciliationRejectsStoredRequestOrReusedOperationWithoutLocalQueueRow() async throws {
+        for reuseOperation in [false, true] {
+            let f = try await structureLiveFixture()
+            try f.base.journal.update("freezeStarted") { $0.saves[0].phase = .freezing }
+            try f.base.journal.record(normalBatch(try NormalEditorPlan.content(f.base.journal.state().saves[0].source)))
+            let source = f.base.journal.state().saves[1].source
+            guard case let .documentSnapshot(operation, _, _, _, _, _, _) = source.mutations[0] else { return XCTFail("source") }
+            let batch = (reuseOperation ? UUID() : source.batchID).uuidString.lowercased()
+            try queueSQL(f, """
+                INSERT INTO sync_contract_batches(batch_id,local_project_id,project_id,request_json,batch_payload_sha256,status,created_at,updated_at)
+                VALUES ('\(batch)','\(NormalEditorPlan.local.rawValue.uuidString.lowercased())','\(NormalEditorPlan.server.uuidString.lowercased())',
+                    '{}','\(String(repeating: "0", count: 64))','completed','2026-09-22','2026-09-22');
+                """)
+            if reuseOperation {
+                try queueSQL(f, """
+                    INSERT INTO sync_contract_operations(operation_id,batch_id,sequence,entity_kind,entity_id,intent_kind,base_revision,payload_json,payload_sha256,status,created_at,updated_at)
+                    VALUES ('\(operation.uuidString.lowercased())','\(batch)',1,'document','\(NormalEditorPlan.document.uuidString.lowercased())','update',6,'{}',
+                        '\(String(repeating: "0", count: 64))','completed','2026-09-22','2026-09-22');
+                    """)
+            }
+            let before = try stableJSON(f.base.journal.state())
+            do { try await f.backend.reconcileDuplicateSaves(); XCTFail("request history") }
+            catch { XCTAssertEqual(error as? NormalEditorError, .queue) }
+            XCTAssertEqual(try stableJSON(f.base.journal.state()), before)
+        }
+    }
+    func testDuplicateReconciliationRejectsStalePlanAndCheckFailureWithoutJournalMutation() async throws {
+        let f = try await structureLiveFixture()
+        try f.base.journal.update("freezeStarted") { $0.saves[0].phase = .freezing }
+        let text = try NormalEditorPlan.content(f.base.journal.state().saves[0].source)
+        try f.base.journal.record(normalBatch(text))
+        let plan = try XCTUnwrap(NormalEditorDuplicateSaveResolution(f.base.journal.state()))
+        let before = try stableJSON(f.base.journal.state())
+        do {
+            try await f.raw.reconcileNormalEditorDuplicateSaves(plan, journal: f.base.journal, localText: text) { throw NormalEditorError.locked }
+            XCTFail("check failed")
+        } catch { XCTAssertEqual(error as? NormalEditorError, .locked) }
+        XCTAssertEqual(try stableJSON(f.base.journal.state()), before)
+        try f.base.journal.record(normalBatch(text)) // replaces the queued follower with a new identity
+        let latest = try stableJSON(f.base.journal.state())
+        do { try await f.raw.reconcileNormalEditorDuplicateSaves(plan, journal: f.base.journal, localText: text, check: {}); XCTFail("stale") }
+        catch { XCTAssertEqual(error as? NormalEditorError, .queue) }
+        XCTAssertEqual(try stableJSON(f.base.journal.state()), latest)
+    }
+    func testTestQueueRetirementPreservesSourcesAndRunAndReachesBeforeHTTP() async throws {
+        let f = try await structureLiveFixture()
+        try seedRetirementPair(f)
+        let ids = NormalEditorTestQueueRetirement.sources.keys.sorted().map { UUID(uuidString: $0)! }
+        var originals: [String] = []
+        for id in ids { originals.append(try await f.raw.generalRecoveryDetail(localProjectID: NormalEditorPlan.local, batchID: id).sourceJSON) }
+        let before = f.base.journal.state(), local = try await f.raw.normalEditorStructure(), text = try String(contentsOf: f.base.file, encoding: .utf8)
+        try await ReceiveValidationPolicy.$override.withValue(f.policy) {
+            try await f.backend.prepare()
+            try await f.backend.refreshStructureReference()
+            let source = before.saves[0].source
+            do { _ = try await f.backend.freeze(source); XCTFail("other waiting work must block") }
+            catch { XCTAssertEqual(error as? NormalEditorError, .queue) }
+            try f.base.journal.update("freezeStarted") { $0.saves[0].phase = .freezing }
+            try await f.backend.retireUnsentTestQueue()
+            try await f.backend.retireUnsentTestQueue() // Idempotent after a crash before the UI message.
+            for (i, id) in ids.enumerated() {
+                let detail = try await f.raw.generalRecoveryDetail(localProjectID: NormalEditorPlan.local, batchID: id)
+                XCTAssertEqual(detail.sourceJSON, originals[i]); XCTAssertEqual(detail.row.sourceStatus, "completed")
+                XCTAssertEqual(detail.row.errorCode, NormalEditorTestQueueRetirement.marker)
+                XCTAssertNil(detail.requestJSON); XCTAssertNil(detail.responseJSON)
+            }
+            XCTAssertEqual(f.base.journal.state().saves[0].source, source)
+            XCTAssertEqual(f.base.journal.state().recoveryRuns, before.recoveryRuns)
+            let stored = try await f.raw.normalEditorStructure(); XCTAssertEqual(stored, local)
+            XCTAssertEqual(try String(contentsOf: f.base.file, encoding: .utf8), text)
+            let request = try await f.backend.freeze(source)
+            try f.base.journal.update("requestFrozen") { $0.saves[0].request = request.json; $0.saves[0].requestHash = try request.json.sha256Hex(); $0.saves[0].phase = .frozen }
+            do { _ = try await f.backend.transmit(request, willStart: { XCTFail("must stop before network") }); XCTFail("checkpoint") }
+            catch { XCTAssertEqual(error as? NormalEditorError, .recoveryCheckpoint) }
+            let writes = await f.wire.writes; XCTAssertEqual(writes, 0)
+        }
+    }
+    func testTestQueueRetirementRejectsChangedSourceAndRollsBackBothRows() async throws {
+        let f = try await structureLiveFixture(); try seedRetirementPair(f)
+        let ids = NormalEditorTestQueueRetirement.sources.keys.sorted()
+        try queueSQL(f, "UPDATE sync_contract_local_batches SET source_json=source_json || ' ' WHERE batch_id='\(ids[1])';")
+        try await ReceiveValidationPolicy.$override.withValue(f.policy) {
+            try await f.backend.prepare()
+            do { try await f.backend.retireUnsentTestQueue(); XCTFail("changed source") }
+            catch { XCTAssertEqual(error as? NormalEditorError, .queue) }
+        }
+        for id in ids {
+            let detail = try await f.raw.generalRecoveryDetail(localProjectID: NormalEditorPlan.local, batchID: UUID(uuidString: id)!)
+            XCTAssertEqual(detail.row.sourceStatus, "waiting"); XCTAssertNil(detail.resolutionJSON)
+        }
+    }
+    func testTestQueueRetirementRejectsOtherWorkAndDependenciesAndMaterializedRows() async throws {
+        for mode in 0..<5 {
+            let f = try await structureLiveFixture(); try seedRetirementPair(f)
+            let id = NormalEditorTestQueueRetirement.sources.keys.sorted()[0]
+            switch mode {
+            case 0: try queueSQL(f, "UPDATE sync_contract_local_batches SET status='materialized' WHERE batch_id='\(id)';")
+            case 1: try queueSQL(f, "UPDATE sync_contract_local_batches SET parent_batch_id='\(id)' WHERE batch_id<>'\(id)';")
+            case 2: try queueSQL(f, "UPDATE sync_contract_local_batches SET batch_id='00000000-0000-4000-8000-000000000099' WHERE batch_id='\(id)';")
+            case 3: try f.base.journal.update("checkpoint") { $0.recoveryCheckpoints = [NormalEditorRecoveryInjection.checkpointKey($0.recoveryRuns!.last!.configuration)] }
+            default: try queueSQL(f, """
+                INSERT INTO sync_contract_batches(batch_id,local_project_id,project_id,request_json,batch_payload_sha256,status,created_at,updated_at)
+                SELECT batch_id,local_project_id,project_id,'{}','\(String(repeating: "0", count: 64))','completed',created_at,created_at
+                FROM sync_contract_local_batches WHERE batch_id='\(id)';
+                """)
+            }
+            try await ReceiveValidationPolicy.$override.withValue(f.policy) {
+                try await f.backend.prepare()
+                do { try await f.backend.retireUnsentTestQueue(); XCTFail("unsafe retirement \(mode)") }
+                catch { XCTAssertEqual(error as? NormalEditorError, .queue) }
+            }
+            let writes = await f.wire.writes; XCTAssertEqual(writes, 0)
+        }
+    }
+    func testCompletedRecoveryHistoryDoesNotBlockFreezeEvenBeyondOnePage() async throws {
+        let f = try await structureLiveFixture(); try seedRetirementPair(f)
+        try queueSQL(f, "UPDATE sync_contract_local_batches SET status='completed',last_error_code='EXPANDED_CONTRACT_PLAN';")
+        for _ in 0..<55 {
+            try queueSQL(f, """
+                INSERT INTO sync_contract_local_batches(batch_id,local_project_id,project_id,source_json,writer_device_id,project_sync_mode,
+                    migration_epoch,contract_version,contract_sha256,protocol_version,client_build_id,status,created_at,last_error_code)
+                SELECT '\(UUID().uuidString.lowercased())',local_project_id,project_id,source_json,writer_device_id,project_sync_mode,
+                    migration_epoch,contract_version,contract_sha256,protocol_version,client_build_id,'completed',created_at,'EXPANDED_CONTRACT_PLAN'
+                FROM sync_contract_local_batches LIMIT 1;
+                """)
+        }
+        let page = try await f.raw.generalRecoveryPage(localProjectID: NormalEditorPlan.local, after: nil)
+        XCTAssertNotNil(page.nextCursor)
+        try await ReceiveValidationPolicy.$override.withValue(f.policy) {
+            try await f.backend.prepare()
+            let request = try await f.backend.freeze(f.base.journal.state().saves[0].source)
+            XCTAssertEqual(request.batchID, f.base.journal.state().saves[0].source.batchID)
+        }
+    }
+    func testTestQueueRetirementRejectsRevokedAuthorityWithoutMutation() async throws {
+        let f = try await structureLiveFixture(); try seedRetirementPair(f)
+        try await ReceiveValidationPolicy.$override.withValue(f.policy) {
+            try await f.backend.prepare(); f.policy.invalidate()
+            do { try await f.backend.retireUnsentTestQueue(); XCTFail("revoked") } catch {}
+        }
+        let ids = try await f.raw.normalEditorActiveQueueIDs()
+        XCTAssertEqual(Set(ids.map { $0.uuidString.lowercased() }), Set(NormalEditorTestQueueRetirement.sources.keys))
+        let writes = await f.wire.writes; XCTAssertEqual(writes, 0)
     }
     func testPreparedRunCancellationRecoversAfterDurableResaveWithoutRewritingHistory() async throws {
         let f = try await fixture(), first = "준비된 본문", second = "다시 저장한 본문"

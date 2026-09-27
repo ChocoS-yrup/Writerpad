@@ -257,6 +257,215 @@ enum NormalEditorPlan {
     }
 }
 
+/// Restored text can produce a second save before enqueue or at the beforeHTTP checkpoint.
+/// Keep the run-bound source; only byte-identical, never-requested followers may be superseded.
+struct NormalEditorDuplicateSaveResolution: Equatable, Sendable {
+    let run: NormalEditorJournal.RecoveryRun
+    let sources: [LocalMutationBatch] // run-bound head followed by identical queued saves
+    let frozenRequest: SyncV2ContractRequest?
+    let baselineRevision: Int64
+    let baselineHash: String
+    init?(_ state: NormalEditorJournal.State) {
+        guard let run = state.recoveryRuns?.last, run.isActive, let identity = run.configuration.run,
+              run.configuration.point == .beforeHTTP, state.receive == nil, state.conflicts.isEmpty, state.error == nil,
+              let base = state.baseline, (try? NormalEditorPlan.validate(base)) != nil,
+              base.revision == identity.baselineRevision, NormalEditorPlan.hash(base.content) == identity.baselineHash,
+              let head = state.head, state.saves[head].source.batchID == run.batchID,
+              [.freezing, .frozen].contains(state.saves[head].phase) else { return nil }
+        let original = state.saves[head]
+        let checkpoint = state.recoveryCheckpoints?.contains(NormalEditorRecoveryInjection.checkpointKey(run.configuration)) == true
+        if original.phase == .frozen {
+            guard checkpoint, original.attempts.isEmpty, original.response == nil,
+                  let json = original.request, let request = try? SyncV2ContractRequest(storedJSON: json),
+                  (try? json.sha256Hex()) == original.requestHash,
+                  (try? NormalEditorPlan.validate(request, source: original.source)) != nil,
+                  let revision = request.orderedIntents.first?.objectValue?["base_revision"]?.intValue,
+                  Int64(revision) == identity.baselineRevision else { return nil }
+            frozenRequest = request
+        } else {
+            guard !checkpoint, original.request == nil, original.requestHash == nil else { return nil }
+            frozenRequest = nil
+        }
+        let pending = state.saves.filter { ![.completed, .superseded].contains($0.phase) }
+        guard pending.count >= 2, pending.count <= 16,
+              let text = try? NormalEditorPlan.content(pending[0].source), !text.isEmpty, !text.contains("\r"),
+              NormalEditorPlan.hash(text) == run.configuration.contentHash,
+              pending.dropFirst().allSatisfy({ $0.phase == .queued }),
+              Set(pending.map { $0.source.batchID }).count == pending.count,
+              pending.allSatisfy({ save in
+                  guard (save.source.batchID == original.source.batchID || (save.request == nil && save.requestHash == nil)),
+                        save.response == nil, save.attempts.isEmpty,
+                        save.source.structureSnapshot == nil, save.source.contractStep == nil, save.source.originBatchID == nil,
+                        let content = try? NormalEditorPlan.content(save.source) else { return false }
+                  return Data(content.utf8) == Data(text.utf8)
+              }) else { return nil }
+        let operations = pending.compactMap { save -> UUID? in
+            guard case let .documentSnapshot(operation, _, _, _, _, _, _) = save.source.mutations[0] else { return nil }
+            return operation
+        }
+        guard Set(operations).count == pending.count else { return nil }
+        self.run = run; sources = pending.map(\.source)
+        baselineRevision = base.revision; baselineHash = NormalEditorPlan.hash(base.content)
+    }
+    func validateLocal(baseline: SyncV2RemoteDocumentSnapshot, text: String, draft: NormalEditorJournal.Draft?) throws {
+        try NormalEditorPlan.validate(baseline)
+        let expected = try NormalEditorPlan.content(sources[0])
+        guard baseline.revision == baselineRevision, NormalEditorPlan.hash(baseline.content) == baselineHash,
+              Data(text.utf8) == Data(expected.utf8) else { throw NormalEditorError.baseline }
+        if let draft {
+            guard draft.hash == NormalEditorPlan.hash(expected), Data(draft.text.utf8) == Data(expected.utf8) else { throw NormalEditorError.dirty }
+        }
+    }
+}
+
+/// Explicit retirement of exactly two obsolete, never-materialized test saves.
+/// This is not a general queue reset or permission to skip another active batch.
+enum NormalEditorTestQueueRetirement {
+    static let marker = "NORMAL_TEST_UNSENT_RETIRED"
+    static let sources: [String: String] = [
+        "7598ea9c-5e50-438c-917b-18aaa2d72411": "5b0913d28e7a516f047503554e243fc81e2dc2fac0a42892edb1f4850544efd3",
+        "7a235ce7-be59-41db-8290-f03410665b38": "3978ebd24951192ead91055c2ee9143ad8ac82a620b072400ab05fdb51b635e6"
+    ]
+    static func canRetire(_ state: NormalEditorJournal.State) -> Bool {
+        guard let run = state.recoveryRuns?.last, run.isActive, run.configuration.run != nil,
+              run.configuration.point == .beforeHTTP, state.receive == nil,
+              state.conflicts.isEmpty, state.error == nil, let head = state.head,
+              state.saves[head].source.batchID == run.batchID,
+              state.recoveryCheckpoints?.contains(NormalEditorRecoveryInjection.checkpointKey(run.configuration)) != true,
+              state.saves.filter({ ![.completed, .superseded].contains($0.phase) }).count == 1 else { return false }
+        let save = state.saves[head]
+        return [.queued, .freezing].contains(save.phase) && save.request == nil && save.requestHash == nil
+            && save.response == nil && save.attempts.isEmpty && sources[save.source.batchID.uuidString.lowercased()] == nil
+    }
+}
+
+/// A diagnostic comparison reference, NOT an applied workspace/content baseline.
+/// Only changes inside the existing memo test subtree may be acknowledged explicitly.
+struct NormalEditorStructureReference: Codable, Sendable {
+    static let memo = UUID(uuidString: "95b8e4d0-1d8d-4af5-b121-0888d0157661")!
+    let localFingerprint: String
+    let snapshot: SyncV2PreparationSnapshot
+
+    static func comparable(_ snapshot: SyncV2PreparationSnapshot) -> SyncV2PreparationSnapshot {
+        .init(folders: snapshot.folders, documents: snapshot.documents.map { row in
+            guard var fields = row.objectValue,
+                  fields["document_id"] == .string(NormalEditorPlan.document.uuidString.lowercased()) else { return row }
+            fields["revision"] = .int(0)
+            return .object(fields)
+        }, treeOrders: snapshot.treeOrders)
+    }
+
+    static func canRefresh(_ state: NormalEditorJournal.State) -> Bool {
+        guard let run = state.recoveryRuns?.last, run.isActive, run.configuration.run != nil,
+              run.configuration.point != .afterOriginalApply, state.receive == nil,
+              state.conflicts.isEmpty, state.error == nil, let head = state.head,
+              state.saves[head].source.batchID == run.batchID,
+              state.recoveryCheckpoints?.contains(NormalEditorRecoveryInjection.checkpointKey(run.configuration)) != true else { return false }
+        let pending = state.saves.filter { ![.completed, .superseded].contains($0.phase) }
+        return pending.count == 1 && pending.allSatisfy {
+            $0.phase == .queued && $0.request == nil && $0.requestHash == nil && $0.response == nil && $0.attempts.isEmpty
+        }
+    }
+
+    init(local: SyncV2PreparationSnapshot, remote: SyncV2PreparationSnapshot) throws {
+        try Self.validate(local: local, remote: remote)
+        localFingerprint = try Self.comparable(local).fingerprint()
+        snapshot = remote
+    }
+
+    func comparison(local: SyncV2PreparationSnapshot) throws -> SyncV2PreparationSnapshot {
+        guard try Self.comparable(local).fingerprint() == localFingerprint else { throw NormalEditorError.target }
+        try Self.validate(local: local, remote: snapshot)
+        return snapshot
+    }
+
+    private static func validatedTree(_ snapshot: SyncV2PreparationSnapshot) throws -> SyncV2GeneralTree {
+        guard snapshot.folders.count <= 100, snapshot.documents.count <= 100, snapshot.treeOrders.count <= 100 else { throw NormalEditorError.target }
+        let project = SyncV2JSON.string(NormalEditorPlan.server.uuidString.lowercased())
+        var identities = Set<UUID>()
+        for (rows, key) in [(snapshot.folders, "folder_id"), (snapshot.documents, "document_id"), (snapshot.treeOrders, "tree_order_id")] {
+            for row in rows {
+                guard let fields = row.objectValue, fields["project_id"] == project,
+                      let raw = fields[key]?.stringValue, let id = UUID(uuidString: raw), raw == id.uuidString.lowercased(),
+                      identities.insert(id).inserted, (fields["revision"]?.intValue ?? 0) > 0 else { throw NormalEditorError.target }
+                if key != "tree_order_id" {
+                    guard fields["is_deleted"] == .bool(false) || fields["is_deleted"] == .bool(true) else { throw NormalEditorError.target }
+                }
+                if key == "document_id", fields["relative_path"]?.stringValue?.hasPrefix("__antigravity__/") != true {
+                    guard (fields["structure_revision"]?.intValue ?? 0) > 0 else { throw NormalEditorError.target }
+                }
+            }
+        }
+        let tree = try SyncV2GeneralTree(snapshot)
+        _ = try tree.nodes(projectID: NormalEditorPlan.local)
+        for id in tree.activeDocumentIDs {
+            guard let fields = tree.documents[id], fields["relative_path"]?.stringValue == (try tree.documentPath(fields)) else { throw NormalEditorError.target }
+        }
+        guard try tree.folderPath(memo) == "메인/메모장",
+              try tree.folderPath(NormalEditorPlan.parent) == "메인/원고",
+              let document = tree.documents[NormalEditorPlan.document],
+              document["parent_folder_id"] == .string(NormalEditorPlan.parent.uuidString.lowercased()),
+              document["relative_path"] == .string(NormalEditorPlan.path), document["name"] == .string(GeneralValidationPlan.name),
+              document["structure_revision"] == .int(1), document["is_deleted"] == .bool(false),
+              tree.orders[NormalEditorPlan.parent]?["revision"] == .int(2),
+              tree.orders[NormalEditorPlan.parent]?["children"] == .array([.string(NormalEditorPlan.document.uuidString.lowercased())]) else { throw NormalEditorError.target }
+        return tree
+    }
+
+    static func validate(local: SyncV2PreparationSnapshot, remote: SyncV2PreparationSnapshot) throws {
+        let old = try validatedTree(local), new = try validatedTree(remote)
+        func descendants(_ tree: SyncV2GeneralTree) throws -> Set<UUID> {
+            var ids: Set<UUID> = [memo]
+            for _ in 0..<tree.folders.count {
+                for (id, fields) in tree.folders where try SyncV2GeneralTree.parent(fields).map(ids.contains) == true { ids.insert(id) }
+            }
+            for (id, fields) in tree.documents where try SyncV2GeneralTree.parent(fields).map(ids.contains) == true { ids.insert(id) }
+            return ids
+        }
+        let before = try descendants(old), after = try descendants(new)
+        func compare(_ previous: [UUID: [String: SyncV2JSON]], _ current: [UUID: [String: SyncV2JSON]], document: Bool) throws {
+            guard Set(previous.keys).isSubset(of: Set(current.keys)) else { throw NormalEditorError.target }
+            for (id, fields) in current {
+                if let original = previous[id] {
+                    // The memo root itself is immutable. No existing entity may enter/leave its subtree.
+                    if id != memo, before.contains(id), after.contains(id) {
+                        guard (fields["revision"]?.intValue ?? 0) >= (original["revision"]?.intValue ?? 0),
+                              !document || (fields["structure_revision"]?.intValue ?? 0) >= (original["structure_revision"]?.intValue ?? 0) else { throw NormalEditorError.target }
+                        if fields != original {
+                            guard (fields["revision"]?.intValue ?? 0) > (original["revision"]?.intValue ?? 0) else { throw NormalEditorError.target }
+                            if document, ["name", "relative_path", "parent_folder_id", "is_deleted"].contains(where: { fields[$0] != original[$0] }) {
+                                guard (fields["structure_revision"]?.intValue ?? 0) > (original["structure_revision"]?.intValue ?? 0) else { throw NormalEditorError.target }
+                            }
+                        }
+                    } else {
+                        var lhs = original, rhs = fields
+                        if document && id == NormalEditorPlan.document { lhs["revision"] = .int(0); rhs["revision"] = .int(0) }
+                        guard lhs == rhs else { throw NormalEditorError.target }
+                    }
+                } else {
+                    guard after.contains(id), id != memo else { throw NormalEditorError.target }
+                }
+            }
+        }
+        try compare(old.folders, new.folders, document: false)
+        try compare(old.documents, new.documents, document: true)
+        guard Set(old.orders.keys).isSubset(of: Set(new.orders.keys)) else { throw NormalEditorError.target }
+        for (parent, fields) in new.orders {
+            if let original = old.orders[parent] {
+                if parent.map({ before.contains($0) && after.contains($0) }) == true {
+                    guard fields["tree_order_id"] == original["tree_order_id"],
+                          (fields["revision"]?.intValue ?? 0) >= (original["revision"]?.intValue ?? 0) else { throw NormalEditorError.target }
+                    if fields != original {
+                        guard (fields["revision"]?.intValue ?? 0) > (original["revision"]?.intValue ?? 0) else { throw NormalEditorError.target }
+                    }
+                } else { guard fields == original else { throw NormalEditorError.target } }
+            } else {
+                guard parent.map(after.contains) == true else { throw NormalEditorError.target }
+            }
+        }
+    }
+}
+
 enum NormalEditorError: String, Error, LocalizedError {
     case target = "NORMAL_TARGET_MISMATCH", storage = "NORMAL_STORAGE", corrupt = "NORMAL_RECORD_CORRUPT"
     case locked = "NORMAL_AUTHORITY_EXPIRED", busy = "NORMAL_BUSY", baseline = "NORMAL_BASELINE_MISMATCH"
@@ -270,7 +479,7 @@ enum NormalEditorError: String, Error, LocalizedError {
 /// Draft replaces only its private file; accepted operations and transitions are append-only.
 /// A new instance verifies the complete hash chain before using the latest state.
 final class NormalEditorJournal: @unchecked Sendable {
-    struct RecoveryRun: Codable, Sendable {
+    struct RecoveryRun: Codable, Equatable, Sendable {
         let configuration: NormalEditorRecoveryInjection.Configuration
         let batchID: UUID?
         var completed = false
@@ -317,6 +526,7 @@ final class NormalEditorJournal: @unchecked Sendable {
         // Optional for compatibility with the installed candidate's existing journal.
         var recoveryCheckpoints: [String]?
         var recoveryRuns: [RecoveryRun]?
+        var structureReference: NormalEditorStructureReference?
         var message = "통신 잠김. 로컬 편집·저장은 로그인 없이 가능합니다."
         var head: Int? { saves.firstIndex { $0.phase != .completed && $0.phase != .superseded } }
     }
