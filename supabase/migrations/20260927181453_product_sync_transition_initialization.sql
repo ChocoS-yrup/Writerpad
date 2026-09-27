@@ -6,7 +6,7 @@ returns jsonb language plpgsql security definer set search_path = '' as $$
 declare
   v_folders jsonb; v_documents jsonb; v_orders jsonb; v_paths jsonb;
   v_initial jsonb := '[]'; v_projected jsonb := '[]'; v_children jsonb;
-  v_doc record; v_entry record; v_child record; v_parent uuid; v_id uuid;
+  v_doc public.documents%rowtype; v_entry record; v_child record; v_parent uuid; v_id uuid;
   v_name text; v_parent_path text; v_count integer; v_control jsonb;
   v_baseline text; v_hash bytea;
 begin
