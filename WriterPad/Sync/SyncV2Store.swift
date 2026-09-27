@@ -2521,7 +2521,8 @@ actor SyncV2Store:
     }
 
     func enqueue(
-        _ batch: SyncV2EnqueueBatch
+        _ batch: SyncV2EnqueueBatch,
+        handoffOrigin: LocalSyncHandoffOrigin? = nil
     ) throws -> SyncV2EnqueueReceipt {
         try GeneralSyncValidationScope.current.require(local: batch.localProjectID)
         try ReceiveValidationPolicy.current.requireBodyEnqueue(batch)
@@ -2545,6 +2546,9 @@ actor SyncV2Store:
                 throw SyncV2EnqueueError.projectNotConnected
             }
             projectBinding = stored
+            if let handoffOrigin, handoffOrigin != LocalSyncHandoffOrigin(stored) {
+                throw SyncV2EnqueueError.projectNotConnected
+            }
         } catch let error as SyncV2EnqueueError {
             throw error
         } catch {
@@ -11423,6 +11427,12 @@ actor SyncV2Store:
     func enqueueGeneralContract(_ batch: LocalMutationBatch, binding: ProjectSyncBinding,
         handshake: SyncV2ValidatedHandshake, writerDeviceID: UUID,
         authorize: @Sendable () throws -> Void = {}) throws -> [UUID] {
+        if let origin = batch.handoffOrigin {
+            guard origin == LocalSyncHandoffOrigin(binding),
+                  let current = try self.binding(for: batch.projectID),
+                  origin == LocalSyncHandoffOrigin(current)
+            else { throw SyncV2EnqueueError.projectNotConnected }
+        }
         try GeneralSyncValidationScope.current.require(local: batch.projectID, server: binding.serverProjectID)
         guard binding.localProjectID == batch.projectID, let serverID = binding.serverProjectID,
               handshake.serverProjectID == serverID, handshake.projectSyncMode == .idBased,
@@ -12952,6 +12962,13 @@ actor LazySyncV2ProjectBindingStore:
         }
     }
 
+    nonisolated var requiresHandoffOrigin: Bool { true }
+
+    func handoffOrigin(for projectID: ProjectID) async -> LocalSyncHandoffOrigin? {
+        guard let binding = try? await binding(for: projectID) else { return nil }
+        return LocalSyncHandoffOrigin(binding)
+    }
+
     func hasRecordedInitialSnapshot(
         for projectID: ProjectID,
         kind: DurableLocalBatchKind
@@ -12986,6 +13003,9 @@ actor LazySyncV2ProjectBindingStore:
         }
         guard let binding, binding.kind != .localOnly else {
             return .localOnly
+        }
+        if let origin = batch.handoffOrigin, origin != LocalSyncHandoffOrigin(binding) {
+            return .localSavedButNotQueued(reason: "저장 당시 서버·계정 연결과 달라 기록을 보류했습니다.")
         }
         guard let deviceIdentityProvider else {
             return .localSavedButNotQueued(
@@ -13178,7 +13198,8 @@ actor LazySyncV2ProjectBindingStore:
                     localTransactionID: batch.localTransactionID,
                     kind: Self.syncBatchKind(batch.kind),
                     mutations: syncMutations
-                )
+                ),
+                handoffOrigin: batch.handoffOrigin
             )
             if let enqueueReservation, let uploadPullCoordinator {
                 let queue = (try? await store.uploadQueueSnapshot(

@@ -3,6 +3,37 @@ import XCTest
 @testable import WriterPad
 
 final class SupabaseProjectBindingServiceTests: XCTestCase {
+    func testBindingChangesRevokeOptInButNameRefreshKeepsIt() async throws {
+        for change in 0..<3 {
+            let suite = "BindingGate-\(UUID())"
+            let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+            defer { defaults.removePersistentDomain(forName: suite) }
+            let project = makeProject(id: UUID().uuidString, name: "연결 승인 시험")
+            let f = makeFixture(projects: [project], contractDefaults: .init(value: defaults))
+            let original = ProjectSyncBinding.connected(localProjectID: project.id, serverProjectID: UUID(),
+                kind: .existingServerProject, projectName: project.name,
+                ownerSubject: change == 2 ? UUID() : f.userID)
+            try await f.store.save(original)
+            ContractPathGate.setOpen(true, for: project.id, in: defaults)
+            if change == 0 {
+                _ = await f.service.refreshServerName(for: project.id)
+                XCTAssertTrue(ContractPathGate.isOpen(for: project.id, in: defaults))
+                _ = await f.service.disconnect(localProjectID: project.id)
+                XCTAssertFalse(ContractPathGate.isOpen(for: project.id, in: defaults))
+                let target = original.serverProjectID!
+                _ = await f.service.connectExistingProject(localProjectID: project.id,
+                    confirmation: try ConfirmedServerProjectID(expectedServerProjectID: target, userEnteredUUID: target.uuidString))
+            } else {
+                let target = change == 1 ? UUID() : original.serverProjectID!
+                let confirmed = try ConfirmedServerProjectID(expectedServerProjectID: target, userEnteredUUID: target.uuidString)
+                _ = await f.service.connectExistingProject(localProjectID: project.id, confirmation: confirmed)
+            }
+            XCTAssertFalse(ContractPathGate.isOpen(for: project.id, in: defaults), "change=\(change)")
+            let reopened = try XCTUnwrap(UserDefaults(suiteName: suite))
+            XCTAssertFalse(ContractPathGate.isOpen(for: project.id, in: reopened))
+        }
+    }
+
     func testNewServerProjectUsesLocalUUIDAndPersistsBinding() async {
         let project = makeProject(
             id: "00000000-0000-0000-0000-000000000401",
@@ -643,7 +674,8 @@ final class SupabaseProjectBindingServiceTests: XCTestCase {
         initialSyncRecorder: any InitialProjectSyncRecording =
             NoOpInitialProjectSyncRecorder(),
         serverDocuments: [SyncV2RemoteDocumentSnapshot] = [],
-        snapshotClientFails: Bool = false
+        snapshotClientFails: Bool = false,
+        contractDefaults: ContractDefaults = .standard
     ) -> BindingFixture {
         let store = InMemoryProjectBindingStore()
         let transport = EnsureProjectTransportStub(result: transportResult)
@@ -661,7 +693,8 @@ final class SupabaseProjectBindingServiceTests: XCTestCase {
             snapshotClient: BindingSnapshotClientStub(
                 documents: serverDocuments,
                 shouldFail: snapshotClientFails
-            )
+            ),
+            contractDefaults: contractDefaults
         )
         let userID: UUID
         if case let .authenticated(account) =

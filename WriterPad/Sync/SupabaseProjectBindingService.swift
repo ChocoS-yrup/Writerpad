@@ -359,6 +359,7 @@ extension ProjectBindingServicing {
 actor SupabaseProjectBindingService: ProjectBindingServicing {
     nonisolated let contractEpoch: SyncV2ContractEpoch?
     private let handshakeInvalidated: @Sendable () -> Void
+    private let contractDefaults: ContractDefaults
     private let transport: (any EnsureProjectTransporting)?
     private let bindingStore: any ProjectBindingStoring
     private let projectRepository: any ProjectRepository
@@ -380,7 +381,8 @@ actor SupabaseProjectBindingService: ProjectBindingServicing {
         snapshotClient: (any SyncV2SnapshotClienting)? = nil,
         bindingIsVisible: @escaping @Sendable (ProjectID) async -> Bool = { _ in true },
         contractEpoch: SyncV2ContractEpoch = SyncV2ContractEpoch(),
-        handshakeInvalidated: @escaping @Sendable () -> Void = {}
+        handshakeInvalidated: @escaping @Sendable () -> Void = {},
+        contractDefaults: ContractDefaults = .standard
     ) {
         self.transport = transport
         self.bindingStore = bindingStore
@@ -391,6 +393,7 @@ actor SupabaseProjectBindingService: ProjectBindingServicing {
         self.bindingIsVisible = bindingIsVisible
         self.contractEpoch = contractEpoch
         self.handshakeInvalidated = handshakeInvalidated
+        self.contractDefaults = contractDefaults
     }
 
     func currentBinding(
@@ -510,6 +513,7 @@ actor SupabaseProjectBindingService: ProjectBindingServicing {
     func disconnect(
         localProjectID: ProjectID
     ) async -> ProjectBindingResult {
+        ContractPathGate.close(for: localProjectID, in: contractDefaults.value)
         contractEpoch?.beginTransition()
         defer { contractEpoch?.endTransition(); handshakeInvalidated() }
         guard await bindingStore.availability() == .available else {
@@ -670,6 +674,10 @@ actor SupabaseProjectBindingService: ProjectBindingServicing {
             ownerSubject: account.userID
         )
         do {
+            let previous = try await bindingStore.binding(for: localProjectID)
+            if previous.flatMap(LocalSyncHandoffOrigin.init) != LocalSyncHandoffOrigin(binding) {
+                ContractPathGate.close(for: localProjectID, in: contractDefaults.value)
+            }
             try await bindingStore.save(binding)
             guard await prepareInitialSnapshotIfNeeded(for: binding) else {
                 return .failed(.initialSnapshotNotQueued)

@@ -3539,6 +3539,79 @@ extension SyncV2HandshakeTests {
             dispatcher: dispatcher, legacy: legacy, mutationGate: mutationGate)
     }
 
+    func testFileHandoffRejectsChangedServerAccountAndUnknownLegacyOriginAfterReopen() async throws {
+        for mode in 0..<3 {
+            let f = try await productDocumentsFixture()
+            ContractPathGate.close(for: f.base.localID, in: f.base.defaults)
+            _ = try await f.save(0, "원래 연결에서 저장한 본문")
+            let files = try FileManager.default.contentsOfDirectory(atPath: f.root.path)
+            let marker = f.root.appendingPathComponent(try XCTUnwrap(files.first { $0.hasPrefix(LocalDocumentStore.syncHandoffPrefix) }))
+            var replayStore = f.store
+            if mode == 2 {
+                var json = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(contentsOf: marker)) as? [String: Any])
+                var batches = try XCTUnwrap(json["batches"] as? [[String: Any]])
+                batches[0].removeValue(forKey: "handoffOrigin")
+                json["batches"] = batches
+                try JSONSerialization.data(withJSONObject: json, options: [.sortedKeys]).write(to: marker)
+            } else {
+                // Existing baseline FKs reject direct server-ID replacement. Model
+                // a fresh binding store with surviving handoff files, without bypassing FKs.
+                replayStore = LazySyncV2ProjectBindingStore(databaseURL: f.root.appendingPathComponent("rebound.sqlite"),
+                    deviceIdentityProvider: DeviceIdentityService(store: InMemoryDeviceIdentityStore()))
+                try await replayStore.save(.connected(localProjectID: f.base.localID,
+                    serverProjectID: mode == 0 ? UUID() : f.base.context.serverProjectID,
+                    kind: .existingServerProject, projectName: "변경된 연결",
+                    ownerSubject: mode == 1 ? UUID() : f.base.context.accountID))
+            }
+            let bytes = try Data(contentsOf: marker)
+            let recorder = SyncV2ContractPathRecorder(store: replayStore, handshakeService: f.base.service,
+                authenticationService: f.base.auth, defaults: .init(value: f.base.defaults),
+                bindingEpoch: f.base.bindingEpoch, structureAuthority: f.base.authority,
+                localProjectEpoch: f.base.localEpoch, isLocalProjectActive: { _ in true })
+            let reopened = LocalDocumentStore(workspaceLocator: FixedWorkspaceLocator(root: f.root),
+                metadataUpdater: f.repository, durableChangeRecorder: recorder)
+            let result = await reopened.retryPendingSyncHandoff(for: f.documents[0])
+            guard case .localSavedButNotQueued = result else { return XCTFail("다른 연결/출처 불명 기록을 재생함: \(mode)") }
+            XCTAssertEqual(try Data(contentsOf: marker), bytes)
+            let queue = try await replayStore.generalQueueStatus(localProjectID: f.base.localID)
+            XCTAssertEqual(queue.pendingCount, 0)
+            let body = try await reopened.loadText(for: f.documents[0])
+            XCTAssertEqual(body, "원래 연결에서 저장한 본문")
+            // The contract path must reject provenance too, even when its gate is open.
+            ContractPathGate.setOpen(true, for: f.base.localID, in: f.base.defaults)
+            let again = await reopened.retryPendingSyncHandoff(for: f.documents[0])
+            guard case .localSavedButNotQueued = again else { return XCTFail("열린 관문이 출처 검사를 우회함") }
+            XCTAssertEqual(try Data(contentsOf: marker), bytes)
+        }
+    }
+
+    func testResumePublishesBaselineBeforePullReadyAndStillRejectsRevocationOnRelease() async throws {
+        for revoke in [false, true] {
+            let f = try await productDocumentsFixture()
+            _ = f.base.authority.beginBaseline(f.base.context)
+            let saved = try await f.store.generalHandoffBaseline(localProjectID: f.base.localID)
+            await f.base.transport.setPreparationSnapshot(saved)
+            let published = SyncV2ContractEpoch()
+            await f.base.transport.setBeforeGeneralRead { [coordinator = f.base.coordinator,
+                authority = f.base.authority, context = f.base.context, epoch = f.base.bindingEpoch] count in
+                guard count == 2 else { return }
+                _ = await coordinator.observeServerChange(localProjectID: context.localProjectID, queue: .idle, bootstrapAllowed: false)
+                await coordinator.installPullReadyHandler(id: UUID()) {
+                    if authority.proof(context, requiresActiveServer: true) != nil { published.advance() }
+                    if revoke { epoch.advance() }
+                }
+            }
+            do {
+                try await f.sender.prepareGeneralHandoffResume(context: f.base.context, authorizeCaller: {})
+                XCTAssertFalse(revoke)
+            } catch { XCTAssertTrue(revoke, "\(error)") }
+            XCTAssertEqual(published.value, 1, "수신 준비 알림 전에 기준 승인이 공개되어야 함")
+            let state = await f.base.coordinator.snapshot(localProjectID: f.base.localID)
+            XCTAssertEqual(state.runningUploadCount, 0)
+            if revoke { XCTAssertNil(f.base.authority.proof(f.base.context, requiresActiveServer: false)) }
+        }
+    }
+
     func testProductResumeReconnectsFileOnlySavesAfterProjectChangeReloginAndStoreReopen() async throws {
         for mode in 0..<3 {
             let original = try await productDocumentsFixture()

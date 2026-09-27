@@ -219,6 +219,10 @@ extension SyncV2ContractRequest {
 /// 있을 때만 contract 대기열로 보낸다. 관문이 열려 있는데 답이 없으면
 /// 레거시로 후퇴하지 않고 로컬 완료+미대기로 남긴다.
 actor SyncV2ContractPathRecorder: DurableLocalChangeRecording {
+    nonisolated let requiresHandoffOrigin = true
+    func handoffOrigin(for projectID: ProjectID) async -> LocalSyncHandoffOrigin? {
+        await store.handoffOrigin(for: projectID)
+    }
     private let store: LazySyncV2ProjectBindingStore
     private let handshakeService: SyncV2HandshakeService?
     private let authenticationService: any AuthenticationServicing
@@ -288,6 +292,9 @@ actor SyncV2ContractPathRecorder: DurableLocalChangeRecording {
             return .localSavedButNotQueued(
                 reason: "서버 작품 연결을 확인할 수 없습니다."
             )
+        }
+        if let origin = batch.handoffOrigin, origin != LocalSyncHandoffOrigin(binding) {
+            return .localSavedButNotQueued(reason: "저장 당시 서버·계정 연결과 달라 기록을 보류했습니다.")
         }
         let state = await authenticationService.currentState()
         let context = SyncV2HandshakeContext.make(
@@ -1042,6 +1049,7 @@ actor SyncV2ContractStructureSender: SyncV2GeneralContractSending, SyncV2General
               let permit = await uploadPullCoordinator.beginUploadDrain(localProjectID: localID, queue: queue)
         else { throw SyncV2ContractStructureError.uploadPullGateBusy }
         let token = structureAuthority.beginBaseline(context)
+        var published: SyncV2ContractStructureAuthority.Proof?
         do {
             let local = try await resumeBaseline(localID: localID, forHandoff: forHandoff).fingerprint()
             try authorizeQueue()
@@ -1056,10 +1064,12 @@ actor SyncV2ContractStructureSender: SyncV2GeneralContractSending, SyncV2General
                 throw SyncV2ContractStructureError.structureAuthorityUnavailable
             }
             let latestQueue = try await store.uploadQueueSnapshot(localProjectID: localID)
+            try authorizeQueue()
+            published = structureAuthority.finishBaseline(context, token: token, allowed: true)
             await uploadPullCoordinator.finishUploadDrain(permit, queue: latestQueue)
             try authorizeQueue()
-            structureAuthority.finishBaseline(context, token: token, allowed: true)
         } catch {
+            if let published { structureAuthority.invalidate(published) }
             structureAuthority.finishBaseline(context, token: token, allowed: false)
             let latestQueue = (try? await store.uploadQueueSnapshot(localProjectID: localID))
                 ?? SyncV2UploadQueueSnapshot(retryWaitingCount: 1)
@@ -1420,11 +1430,21 @@ final class SyncV2ContractStructureAuthority: @unchecked Sendable {
             return token
         }
     }
-    func finishBaseline(_ context: SyncV2HandshakeContext, token: UUID, allowed: Bool) {
+    @discardableResult
+    func finishBaseline(_ context: SyncV2HandshakeContext, token: UUID, allowed: Bool) -> Proof? {
         lock.withLock {
-            guard var e = entries[context.localProjectID], e.baselineToken == token else { return }
+            guard var e = entries[context.localProjectID], e.baselineToken == token else { return nil }
             e.revision &+= 1; e.baselineToken = nil; e.baselineAllowed = allowed
             entries[context.localProjectID] = e
+            return allowed ? Proof(context: context, revision: e.revision, requiresActiveServer: false) : nil
+        }
+    }
+    /// Do not revoke a newer pull's approval when an older continuation loses authority.
+    func invalidate(_ proof: Proof) {
+        lock.withLock {
+            guard var e = entries[proof.context.localProjectID], e.revision == proof.revision else { return }
+            e.revision &+= 1; e.baselineAllowed = false
+            entries[proof.context.localProjectID] = e
         }
     }
     func observeQueue(_ queue: SyncV2UploadQueueSnapshot, projectID: ProjectID) {

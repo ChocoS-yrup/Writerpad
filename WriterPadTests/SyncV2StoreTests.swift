@@ -11148,6 +11148,40 @@ final class SyncV2GeneralSyncTests: XCTestCase {
         await f.store.close()
     }
 
+    func testHandoffOriginIsRecheckedInsideBothQueueWriters() async throws {
+        for changeAccount in [false, true] {
+            let f = try await fixture()
+            var source = save(f, content: "이전 연결의 본문")
+            let original = ProjectSyncBinding.connected(localProjectID: f.local,
+                serverProjectID: changeAccount ? f.server : UUID(), kind: .existingServerProject,
+                projectName: "이전 연결", ownerSubject: changeAccount ? UUID() : f.binding.ownerSubject!)
+            source.handoffOrigin = LocalSyncHandoffOrigin(original)
+            let roundTrip = try JSONDecoder().decode(LocalMutationBatch.self, from: JSONEncoder().encode(source))
+            XCTAssertEqual(roundTrip, source)
+            let replacement = LocalMutationBatch(replacing: source, batchID: UUID(), mutations: source.mutations)
+            XCTAssertEqual(replacement.handoffOrigin, source.handoffOrigin)
+            do {
+                _ = try await f.store.enqueueGeneralContract(source, binding: original,
+                    handshake: f.handshake, writerDeviceID: f.device)
+                XCTFail("큐 기록 직전 연결 변경을 놓침")
+            }
+            catch { XCTAssertEqual(error as? SyncV2EnqueueError, .projectNotConnected) }
+            do {
+                _ = try await f.store.enqueue(.init(batchID: source.batchID, localProjectID: f.local,
+                    localTransactionID: nil, kind: .documentSave,
+                    mutations: [.document(.init(operationID: UUID(), documentID: f.document,
+                        deviceID: f.device, localSaveGeneration: 1, kind: .documentCommit,
+                        localPath: "문서.txt", relativePath: "문서.txt", content: "이전 본문", isDeleted: false))]),
+                    handoffOrigin: source.handoffOrigin)
+                XCTFail("구형 큐가 출처 불일치를 우회함")
+            } catch { XCTAssertEqual(error as? SyncV2EnqueueError, .projectNotConnected) }
+            let raw = try RawSQLite(url: f.url)
+            XCTAssertEqual(try raw.scalarInt("SELECT COUNT(*) FROM sync_contract_local_batches;"), 0)
+            XCTAssertEqual(try raw.scalarInt("SELECT COUNT(*) FROM sync_operations;"), 0)
+            await f.store.close()
+        }
+    }
+
     func testHandoffBaselineReadsAcknowledgedMetadataWithoutQueueOrNewRequests() async throws {
         let f = try await fixture()
         let raw = try RawSQLite(url: f.url)

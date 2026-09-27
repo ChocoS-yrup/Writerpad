@@ -150,6 +150,7 @@ actor LocalDocumentStore: LocalDocumentStoring {
     private func performSave(_ request: DocumentSaveRequest,
         compared: ComparedDocumentSaveState?,
         authorize: @Sendable () throws -> Void) async throws -> DocumentSaveReceipt {
+        let handoffOrigin = await durableChangeRecorder.handoffOrigin(for: request.projectID)
         try await metadataUpdater.validateBeforeFileSave(request)
         let workspaceRoot = try await workspaceLocator.workspaceRoot(for: request.projectID)
         let destinationURL = try validatedTextURL(
@@ -221,6 +222,7 @@ actor LocalDocumentStore: LocalDocumentStoring {
                 let recordResult = await recordSavedDocument(
                     receipt,
                     batchKind: request.durableBatchKind,
+                    handoffOrigin: handoffOrigin,
                     workspaceRoot: workspaceRoot,
                     reconciliationURL: markerURL
                 )
@@ -279,6 +281,7 @@ actor LocalDocumentStore: LocalDocumentStoring {
     private func recordSavedDocument(
         _ receipt: DocumentSaveReceipt,
         batchKind: DurableLocalBatchKind,
+        handoffOrigin: LocalSyncHandoffOrigin?,
         workspaceRoot: URL,
         reconciliationURL: URL
     ) async -> DurableRecordResult {
@@ -292,7 +295,7 @@ actor LocalDocumentStore: LocalDocumentStoring {
         guard let content = receipt.savedContent else {
             return .localSavedButNotQueued(reason: "저장 snapshot을 복구할 수 없습니다.")
         }
-        let batch = LocalMutationBatch(
+        var batch = LocalMutationBatch(
             batchID: GeneralValidationRuntimeValues.current?.batch ?? syncUUIDGenerator.makeUUID(),
             projectID: receipt.projectID,
             localTransactionID: nil,
@@ -309,6 +312,7 @@ actor LocalDocumentStore: LocalDocumentStoring {
                 )
             ]
         )
+        batch.handoffOrigin = handoffOrigin
         do {
             try loadPendingSyncHandoffsIfNeeded(
                 for: receipt.documentID,
@@ -340,6 +344,9 @@ actor LocalDocumentStore: LocalDocumentStoring {
         var sizeLimitFailure: (byteCount: Int, limit: Int)?
 
         while let batch = pendingSyncHandoffs[documentID]?.first {
+            if durableChangeRecorder.requiresHandoffOrigin && batch.handoffOrigin == nil {
+                return .localSavedButNotQueued(reason: "저장 당시 서버·계정 연결을 확인할 수 없어 이전 기록을 보류했습니다.")
+            }
             let result = await durableChangeRecorder.record(batch)
             switch result {
             case .queued(let operationIDs):

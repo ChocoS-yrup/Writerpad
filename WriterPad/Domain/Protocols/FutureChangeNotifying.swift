@@ -61,6 +61,20 @@ struct LocalStructureSnapshotNode: Codable, Equatable, Sendable {
 
 /// 로컬 저장 성공 뒤 Sync v2 SQLite로 넘기는 불변 handoff다.
 /// 서버 전송과는 분리되며, 동일 batch/operation ID로 안전하게 재기록할 수 있다.
+struct LocalSyncHandoffOrigin: Codable, Equatable, Sendable {
+    let localProjectID: ProjectID
+    let serverProjectID: UUID
+    let accountID: UUID
+
+    init?(_ binding: ProjectSyncBinding) {
+        guard binding.kind != .localOnly, let server = binding.serverProjectID,
+              let account = binding.ownerSubject else { return nil }
+        localProjectID = binding.localProjectID
+        serverProjectID = server
+        accountID = account
+    }
+}
+
 struct LocalMutationBatch: Codable, Equatable, Sendable {
     let batchID: UUID
     let projectID: ProjectID
@@ -71,6 +85,9 @@ struct LocalMutationBatch: Codable, Equatable, Sendable {
     let structureSnapshot: [LocalStructureSnapshotNode]?
     var contractStep: SyncV2GeneralContractStep? = nil
     var originBatchID: UUID? = nil
+    /// File handoff provenance, captured before TXT replacement. Nil is not consent
+    /// to assign an old file record to whatever binding exists during replay.
+    var handoffOrigin: LocalSyncHandoffOrigin? = nil
 
     init(
         batchID: UUID,
@@ -97,6 +114,7 @@ struct LocalMutationBatch: Codable, Equatable, Sendable {
         self.mutations = mutations
         self.structureSnapshot = source.structureSnapshot
         self.contractStep = source.contractStep; self.originBatchID = source.originBatchID
+        self.handoffOrigin = source.handoffOrigin
     }
 
     private enum CodingKeys: String, CodingKey {
@@ -105,7 +123,7 @@ struct LocalMutationBatch: Codable, Equatable, Sendable {
         case localTransactionID
         case kind
         case mutations
-        case structureSnapshot, contractStep, originBatchID
+        case structureSnapshot, contractStep, originBatchID, handoffOrigin
     }
 
     init(from decoder: Decoder) throws {
@@ -123,6 +141,7 @@ struct LocalMutationBatch: Codable, Equatable, Sendable {
         structureSnapshot = try container.decodeIfPresent([LocalStructureSnapshotNode].self, forKey: .structureSnapshot)
         contractStep = try container.decodeIfPresent(SyncV2GeneralContractStep.self, forKey: .contractStep)
         originBatchID = try container.decodeIfPresent(UUID.self, forKey: .originBatchID)
+        handoffOrigin = try container.decodeIfPresent(LocalSyncHandoffOrigin.self, forKey: .handoffOrigin)
         mutations = try container.decode(
             [DurableLocalMutation].self,
             forKey: .mutations
@@ -188,6 +207,8 @@ enum DurableRecordingRequirement: Equatable, Sendable {
 }
 
 protocol DurableLocalChangeRecording: Sendable {
+    var requiresHandoffOrigin: Bool { get }
+    func handoffOrigin(for projectID: ProjectID) async -> LocalSyncHandoffOrigin?
     func requirement(for projectID: ProjectID) async -> DurableRecordingRequirement
     func hasRecordedInitialSnapshot(
         for projectID: ProjectID,
@@ -201,6 +222,8 @@ protocol DurableLocalChangeRecording: Sendable {
 }
 
 extension DurableLocalChangeRecording {
+    var requiresHandoffOrigin: Bool { false }
+    func handoffOrigin(for projectID: ProjectID) async -> LocalSyncHandoffOrigin? { nil }
     func requirement(for projectID: ProjectID) async -> DurableRecordingRequirement {
         .durableQueue
     }
