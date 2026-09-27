@@ -137,6 +137,18 @@ struct ProjectWorkspaceView: View {
         )
     }
 
+    private func makeHandoffResumer() -> SyncV2WorkspaceHandoffResume? {
+        guard let handshakeService, let contractStructureSender else { return nil }
+        let resumer = SyncV2ProjectHandoffResumer(
+            projectLister: ProjectManagerSyncProjectLister(projectManager: projectManager),
+            authenticationService: authenticationService, projectBindingService: projectBindingService,
+            handshakeService: handshakeService, sender: contractStructureSender,
+            repository: documentRepository, store: documentStore)
+        return { id, authorize in
+            try await resumer.resume(localProjectID: id, onlyIfPending: true, authorizeCaller: authorize)
+        }
+    }
+
     var body: some View {
         Group {
             if let project = model.selectedProject {
@@ -157,6 +169,7 @@ struct ProjectWorkspaceView: View {
                         authenticationService: authenticationService,
                         projectBindingService: projectBindingService,
                         syncDispatcher: syncDispatcher,
+                        resumeProjectHandoffs: makeHandoffResumer(),
                         conflictResolutionService:
                             conflictResolutionService,
                         conflictRecoveryStore: conflictRecoveryStore,

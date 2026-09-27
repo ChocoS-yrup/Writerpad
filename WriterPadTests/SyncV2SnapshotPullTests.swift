@@ -5,6 +5,74 @@ import XCTest
 @testable import WriterPad
 
 final class SyncV2SnapshotPullTests: XCTestCase {
+    @MainActor
+    func testWorkspaceHandoffResumeIsSingleFlightAndDrainsCancelledPassBeforeForegroundRerun() async throws {
+        let previous = GlobalSyncPreference.isEnabled()
+        GlobalSyncPreference.setEnabled(true)
+        let id = ProjectID(rawValue: UUID())
+        ContractPathGate.setOpen(true, for: id)
+        defer { GlobalSyncPreference.setEnabled(previous); ContractPathGate.close(for: id) }
+        let probe = WorkspaceHandoffResumeProbe()
+        let model = SyncV2WorkspaceSyncModel(localProjectID: id, puller: WorkspacePullerStub(), realtime: nil,
+            authenticationService: WorkspaceAuthenticationStub(state: .authenticated(.init(userID: UUID(), maskedEmail: "test"))),
+            projectBindingService: WorkspaceBindingStub(binding: .connected(localProjectID: id, serverProjectID: UUID(),
+                kind: .existingServerProject, projectName: "resume", ownerSubject: UUID())),
+            resumeProjectHandoffs: { _, authorize in try await probe.run(authorize: authorize) },
+            periodicDelay: .seconds(600))
+        let initial = Task { await model.start(editingGuards: { [:] }) { _ in } }
+        for _ in 0..<1000 where await probe.calls == 0 { await Task.yield() }
+        let retry = Task { await model.retry() }
+        for _ in 0..<100 { await Task.yield() }
+        let before = await probe.calls
+        XCTAssertEqual(before, 1)
+        await model.updateSceneActivity(false)
+        let reenter = Task { await model.updateSceneActivity(true) }
+        for _ in 0..<100 { await Task.yield() }
+        let draining = await probe.calls
+        XCTAssertEqual(draining, 1, "Cancelled operation still owns the single-flight slot")
+        await probe.release()
+        await initial.value; await retry.value; await reenter.value
+        for _ in 0..<1000 where await probe.calls < 2 { await Task.yield() }
+        let calls = await probe.calls, accepted = await probe.accepted, maxRunning = await probe.maxRunning
+        XCTAssertEqual(calls, 2)
+        XCTAssertEqual(accepted, 1, "Old workspace authority cannot survive reentry")
+        XCTAssertEqual(maxRunning, 1)
+        XCTAssertNil(model.handoffResumeMessage)
+        await model.stop()
+    }
+
+    @MainActor
+    func testWorkspaceHandoffResumeHonorsOptInGlobalSwitchAndReportsDeferredFiles() async {
+        let previous = GlobalSyncPreference.isEnabled()
+        let id = ProjectID(rawValue: UUID()), calls = SyncV2ContractEpoch()
+        defer { GlobalSyncPreference.setEnabled(previous); ContractPathGate.close(for: id) }
+        GlobalSyncPreference.setEnabled(true)
+        let model = SyncV2WorkspaceSyncModel(localProjectID: id, puller: WorkspacePullerStub(), realtime: nil,
+            authenticationService: WorkspaceAuthenticationStub(state: .authenticated(.init(userID: UUID(), maskedEmail: "test"))),
+            projectBindingService: WorkspaceBindingStub(binding: .connected(localProjectID: id, serverProjectID: UUID(),
+                kind: .existingServerProject, projectName: "resume", ownerSubject: UUID())),
+            resumeProjectHandoffs: { _, authorize in try authorize(); calls.advance(); return 2 },
+            periodicDelay: .seconds(600))
+        await model.start(editingGuards: { [:] }) { _ in }
+        XCTAssertEqual(calls.value, 0)
+        ContractPathGate.setOpen(true, for: id)
+        GlobalSyncPreference.setEnabled(false)
+        await model.retry()
+        XCTAssertEqual(calls.value, 0)
+        GlobalSyncPreference.setEnabled(true)
+        await model.retry()
+        XCTAssertEqual(calls.value, 1)
+        XCTAssertTrue(model.handoffResumeMessage?.contains("2개") == true)
+        let presentation = WorkspaceSyncStatusReducer.presentation(saveState: .idle, handoffState: .idle,
+            workspaceState: .init(lastResult: .synced(at: Date())), leaseState: .localOnly,
+            handoffResumeMessage: model.handoffResumeMessage)
+        XCTAssertEqual(presentation.label, "저장 기록 확인 필요")
+        XCTAssertTrue(presentation.allowsRetry)
+        await model.stop()
+        await model.retry()
+        XCTAssertEqual(calls.value, 1)
+    }
+
     func testGeneralScopeStopsOtherProjectBeforeSnapshotFetchOrApply() async throws {
         let local = ProjectID(rawValue: UUID()), server = UUID(), document = UUID()
         let client = GeneralScopeSnapshotSpy(snapshot: makeSnapshot(id: document, revision: 1))
@@ -8858,6 +8926,31 @@ private actor SnapshotWorkspaceLocator: ProjectWorkspaceLocating {
 
     func workspaceRoot(for projectID: ProjectID) async throws -> URL {
         root
+    }
+}
+
+private actor WorkspaceHandoffResumeProbe {
+    private(set) var calls = 0
+    private(set) var accepted = 0
+    private(set) var maxRunning = 0
+    private var running = 0
+    private var continuation: CheckedContinuation<Void, Never>?
+    private var released = false
+
+    func run(authorize: @escaping @Sendable () throws -> Void) async throws -> Int {
+        calls += 1; running += 1; maxRunning = max(maxRunning, running)
+        defer { running -= 1 }
+        if calls == 1, !released {
+            await withCheckedContinuation { continuation = $0 }
+        }
+        try authorize()
+        accepted += 1
+        return 0
+    }
+
+    func release() {
+        released = true
+        continuation?.resume(); continuation = nil
     }
 }
 

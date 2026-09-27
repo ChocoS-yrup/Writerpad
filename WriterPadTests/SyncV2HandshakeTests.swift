@@ -3691,6 +3691,115 @@ extension SyncV2HandshakeTests {
         }
     }
 
+    private struct ProductResumePuller: SyncV2SnapshotPulling {
+        func pull(localProjectID: ProjectID, serverProjectID: UUID,
+            editingGuards: [UUID: SyncV2EditingGuard]) async throws -> SyncV2SnapshotPullReport {
+            .init(outcomes: [], appliedSnapshots: [])
+        }
+    }
+
+    func testProductWorkspaceAutomaticallyReconnectsUnopenedFileOnlySavesOnForegroundAndNetworkRecovery() async throws {
+        let f = try await productDocumentsFixture()
+        let previous = GlobalSyncPreference.isEnabled()
+        GlobalSyncPreference.setEnabled(true)
+        ContractPathGate.setOpen(true, for: f.base.localID)
+        defer { GlobalSyncPreference.setEnabled(previous); ContractPathGate.close(for: f.base.localID) }
+        _ = f.base.authority.beginBaseline(f.base.context)
+        _ = try await f.save(0, "자동 재개 1")
+        _ = try await f.save(1, "자동 재개 2")
+        await f.base.transport.setPreparationSnapshot(try await f.store.generalHandoffBaseline(localProjectID: f.base.localID))
+        let project = ManagedProject(project: .init(id: f.base.localID, name: "자동 재개",
+            createdAt: Date(), modifiedAt: Date()), userOrder: 0, lifecycleState: .active)
+        let bindings = LifecycleBindings([f.base.queue.savedBinding])
+        let resumer = SyncV2ProjectHandoffResumer(
+            projectLister: ProductProjectList(project: project, contractEpoch: f.base.localEpoch),
+            authenticationService: f.base.auth, projectBindingService: bindings,
+            handshakeService: f.base.service, sender: f.sender, repository: f.repository,
+            store: f.localStore, defaults: ContractDefaults(value: f.base.defaults))
+        let model = SyncV2WorkspaceSyncModel(localProjectID: f.base.localID, puller: ProductResumePuller(), realtime: nil,
+            authenticationService: f.base.auth, projectBindingService: bindings,
+            resumeProjectHandoffs: { id, authorize in
+                try await resumer.resume(localProjectID: id, onlyIfPending: true, authorizeCaller: authorize)
+            },
+            periodicDelay: .seconds(600))
+        await model.start(sceneIsActive: false, editingGuards: { [:] }) { _ in }
+        let idle = try await f.store.generalQueueStatus(localProjectID: f.base.localID)
+        XCTAssertEqual(idle.pendingCount, 0)
+        await model.updateSceneActivity(true)
+        XCTAssertNil(model.handoffResumeMessage)
+        let pending = try await f.store.generalQueueStatus(localProjectID: f.base.localID)
+        XCTAssertEqual(pending.pendingCount, 2)
+        await model.networkRecovered()
+        let repeated = try await f.store.generalQueueStatus(localProjectID: f.base.localID)
+        XCTAssertEqual(repeated.pendingCount, 2, "Repeated events must not duplicate saved requests")
+        let reads = await f.base.transport.generalReadProjects
+        XCTAssertEqual(reads.count, 2, "No remaining file handoff means no new baseline request")
+        await f.dispatcher.dispatchReadyOperations(now: Date())
+        let requests = await f.base.transport.requests
+        XCTAssertEqual(requests.count, 2)
+        for index in 0..<2 {
+            let body = try await f.localStore.loadText(for: f.documents[index])
+            XCTAssertEqual(body, "자동 재개 \(index + 1)")
+        }
+        await model.stop()
+    }
+
+    func testAutomaticResumeSkipsEmptyFilesButPreservesMalformedHandoff() async throws {
+        let f = try await productDocumentsFixture()
+        let project = ManagedProject(project: .init(id: f.base.localID, name: "자동 재개",
+            createdAt: Date(), modifiedAt: Date()), userOrder: 0, lifecycleState: .active)
+        let resumer = SyncV2ProjectHandoffResumer(
+            projectLister: ProductProjectList(project: project, contractEpoch: f.base.localEpoch),
+            authenticationService: f.base.auth, projectBindingService: LifecycleBindings([f.base.queue.savedBinding]),
+            handshakeService: f.base.service, sender: f.sender, repository: f.repository,
+            store: f.reopenedLocalStore(), defaults: ContractDefaults(value: f.base.defaults))
+        _ = f.base.authority.beginBaseline(f.base.context)
+        let empty = try await resumer.resume(localProjectID: f.base.localID, onlyIfPending: true, authorizeCaller: {})
+        XCTAssertEqual(empty, 0)
+        let reads = await f.base.transport.generalReadProjects
+        XCTAssertTrue(reads.isEmpty, "No files must not trigger server-baseline validation")
+        let marker = f.root.appendingPathComponent(LocalDocumentStore.syncHandoffPrefix
+            + f.documents[0].id.rawValue.uuidString.lowercased() + LocalDocumentStore.syncHandoffSuffix)
+        let bytes = Data("malformed synthetic record".utf8)
+        try bytes.write(to: marker)
+        await f.base.transport.setPreparationSnapshot(try await f.store.generalHandoffBaseline(localProjectID: f.base.localID))
+        let deferred = try await resumer.resume(localProjectID: f.base.localID, onlyIfPending: true, authorizeCaller: {})
+        XCTAssertEqual(deferred, 1)
+        XCTAssertEqual(try Data(contentsOf: marker), bytes)
+        let queue = try await f.store.generalQueueStatus(localProjectID: f.base.localID)
+        XCTAssertEqual(queue.pendingCount, 0)
+    }
+
+    func testAutomaticResumeRechecksCallerInsideRecorderBeforeSQLiteEnqueue() async throws {
+        let f = try await productDocumentsFixture()
+        ContractPathGate.close(for: f.base.localID, in: f.base.defaults)
+        _ = try await f.save(0, "취소된 자동 재개 본문")
+        ContractPathGate.setOpen(true, for: f.base.localID, in: f.base.defaults)
+        let files = try FileManager.default.contentsOfDirectory(atPath: f.root.path)
+        let marker = f.root.appendingPathComponent(try XCTUnwrap(files.first { $0.hasPrefix(LocalDocumentStore.syncHandoffPrefix) }))
+        let bytes = try Data(contentsOf: marker)
+        let caller = SyncV2ContractEpoch()
+        let recorder = SyncV2ContractPathRecorder(store: f.store, handshakeService: f.base.service,
+            authenticationService: f.base.auth, defaults: ContractDefaults(value: f.base.defaults),
+            bindingEpoch: f.base.bindingEpoch, structureAuthority: f.base.authority,
+            localProjectEpoch: f.base.localEpoch, isLocalProjectActive: { _ in
+                caller.advance() // Workspace leaves while the recorder is suspended.
+                return true
+            })
+        let local = LocalDocumentStore(workspaceLocator: FixedWorkspaceLocator(root: f.root),
+            metadataUpdater: f.repository, durableChangeRecorder: recorder, syncMutationGate: f.mutationGate)
+        let result = await local.retryPendingSyncHandoff(for: f.documents[0]) {
+            guard caller.value == 0 else { throw CancellationError() }
+        }
+        guard case .localSavedButNotQueued = result else { return XCTFail("Revoked caller entered the queue") }
+        XCTAssertEqual(caller.value, 1, "Test must reach the final recorder boundary")
+        XCTAssertEqual(try Data(contentsOf: marker), bytes)
+        let queue = try await f.store.generalQueueStatus(localProjectID: f.base.localID)
+        XCTAssertEqual(queue.pendingCount, 0)
+        let body = try await local.loadText(for: f.documents[0])
+        XCTAssertEqual(body, "취소된 자동 재개 본문")
+    }
+
     func testProductResumeMismatchAndChangingServerKeepEveryFileAndBaselineUnchanged() async throws {
         for changedSecondRead in [false, true] {
             let f = try await productDocumentsFixture()

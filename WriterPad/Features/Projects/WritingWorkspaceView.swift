@@ -251,6 +251,7 @@ struct WritingWorkspaceShell: View {
         authenticationService: any AuthenticationServicing,
         projectBindingService: any ProjectBindingServicing,
         syncDispatcher: SyncV2Dispatcher? = nil,
+        resumeProjectHandoffs: SyncV2WorkspaceHandoffResume? = nil,
         conflictResolutionService:
             (any SyncV2ConflictResolving)? = nil,
         conflictRecoveryStore: ConflictRecoveryStore? = nil,
@@ -296,6 +297,7 @@ struct WritingWorkspaceShell: View {
                 requestDispatchRetry: {
                     await syncDispatcher?.userRequestedRetry()
                 },
+                resumeProjectHandoffs: resumeProjectHandoffs,
                 readStalledFolderChanges: { localProjectID in
                     await syncDispatcher?.stalledFolderChanges(
                         localProjectID: localProjectID
@@ -2503,6 +2505,7 @@ private struct EditorSaveStatusBadge: View {
             syncHandoffState: model.syncHandoffState,
             workspaceState: workspaceSyncModel.state,
             leaseState: model.editLeaseState,
+            handoffResumeMessage: workspaceSyncModel.handoffResumeMessage,
             onRetry: onRetry,
             onResolveConflict: onResolveConflict
         )
@@ -2515,6 +2518,7 @@ private struct SaveStatusBadge: View {
     let syncHandoffState: SyncHandoffState
     let workspaceState: SyncV2WorkspaceState
     let leaseState: EditLeaseDisplayState
+    var handoffResumeMessage: String? = nil
     let onRetry: () -> Void
     let onResolveConflict: (() -> Void)?
 
@@ -2531,7 +2535,8 @@ private struct SaveStatusBadge: View {
             saveState: state,
             handoffState: syncHandoffState,
             workspaceState: workspaceState,
-            leaseState: leaseState
+            leaseState: leaseState,
+            handoffResumeMessage: handoffResumeMessage
         )
     }
 

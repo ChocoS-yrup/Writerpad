@@ -20,7 +20,8 @@ enum WorkspaceSyncStatusReducer {
         saveState: SaveState,
         handoffState: SyncHandoffState,
         workspaceState: SyncV2WorkspaceState,
-        leaseState: EditLeaseDisplayState
+        leaseState: EditLeaseDisplayState,
+        handoffResumeMessage: String? = nil
     ) -> WorkspaceSyncStatusPresentation {
         let isCloudConnected = workspaceState.lastResult != .localOnly
         switch saveState {
@@ -85,6 +86,11 @@ enum WorkspaceSyncStatusReducer {
             )
         default:
             break
+        }
+
+        if let handoffResumeMessage {
+            return value("저장 기록 확인 필요", "exclamationmark.icloud", handoffResumeMessage,
+                severity: .warning, retry: true)
         }
 
         switch workspaceState.progress {
