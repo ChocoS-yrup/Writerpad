@@ -81,3 +81,46 @@ LocalBinderRepository 16, SyncSettingsModel 6, GeneralSync 73, Handshake 148, Sn
 같은 브랜치에서 이동·순서 변경, 재개와 명시적 복구의 동시 실행, 작품·계정·전경 변경 경계를
 추가 점검한다. 현재 4개 신규 테스트가 모든 구조 명령이나 실제 OS 수명을 검증한 것은 아니다.
 관련 보완을 마친 최종 head만 한 PR로 검토 요청하며, iPad 전용 범위에는 Windows 회신을 요구하지 않는다.
+
+## 후속 경계 검증 완료 — 로컬 체크포인트
+
+구현 체크포인트 `d258249` 이후 제품 코드는 그대로 두고 테스트 5개를 추가했다.
+기존 보수적 보류 검사도 8종에서 14종으로 확장했다.
+
+- 일반 폴더의 문서 이동, 하위 폴더 전체 이동, 자식 순서 변경을 실제 binder 명령으로 수행한다.
+  설정 재개 후 원래 batch/source 유지, metadata·본문 bytes·파일 수정 시각 불변, 합성 계약 요청 1건,
+  완료 후 대기·재시도·주의 큐 0건과 구형 송신 0건을 확인했다. 원고 계층 보호 규칙은 유지한다.
+- 같은 mutation gate를 공유하는 서로 다른 binder actor에서 자동 재개와 명시적 전체 복구를
+  양쪽 순서로 겹쳐 실행했다. recorder 내부를 continuation으로 멈추고 두 번째 호출을 시작하며,
+  짧은 bounded inverted expectation으로 중복 진입을 검사한다. 해제 후 recorder 호출·송신이 각 1회다.
+- 실제 SQLite 등록 직후 호출자 권한이 바뀌면 journal bytes를 보존한다.
+  다음 정상 재시도가 같은 batch/source를 재사용하며 큐 수가 늘지 않고 요청 1회로 이어진다.
+- 작품 구조 잠금을 다른 작업이 보유한 상태에서 기다리는 재개를 호출자 epoch 변경 또는 Task 취소로
+  중단했다. journal·빈 큐를 보존하고, 잠금이 풀린 뒤 새 정상 호출이 성공한다.
+- 서버 기준 조회 중 재로그인, 연결 epoch, 로컬 작품 epoch, 설정 작업 취소, 작품 관문 닫기,
+  전역 동기화 끄기, 비활성 전경, 작품 전환 8종을 주입했다. 구조 journal·metadata 유지,
+  큐/원격 쓰기 0건, 새 구조 권한 미부여를 확인했다.
+- 보류 검사에 휴지통/복원/영구 삭제/전체 비우기 종류, 거래 ID 불일치, journal 출처만 누락된
+  경우를 추가했다. 종류 검사는 기존 완료 journal의 종류를 바꾼 합성 입력이며 실제 휴지통 거래의
+  전체 수명주기 검증을 뜻하지 않는다.
+
+최종 선택 회귀 **561개 통과, 실패·건너뜀 0**. 기존 8개 class 중 Handshake만 148→153개이며,
+나머지 class 수는 위와 같다. 컴파일 `warning:`·`error:` 0건, xcresult `runtimeWarnings: []`.
+콘솔에는 기존 UIKit appearance/TextKit 안내가 있으며 이전 회귀에도 같은 합산 65건이 있다.
+로그 전체가 무경고라고 선언하지 않는다.
+
+- 로그: `/private/tmp/writerpad-structure-boundaries-regression-v1.log`.
+- xcresult: `/private/tmp/WriterPad-RecoveryRun-Fix-DD/Logs/Test/Test-WriterPad-2026.09.27_23-36-55-+0900.xcresult`.
+- 초기 집중 검사의 자료형 비교 컴파일 오류와 미대기 XCTest expectation 오류는 테스트 코드에서
+  수정했다. 제품 오류로 집계하지 않으며 최종 회귀에 두 보정이 포함됐다.
+- 계약 0.2.0 재검증 통과, canonical SHA-256은 위와 동일하다.
+- 이번 변경은 테스트와 이 문서뿐이다. `WriterPad`, Xcode project, 계약 파일은 `d258249`와 같으므로
+  해당 제품 코드의 이전 Release 성공 증거를 유지한다. 이번 단계에서 Release를 다시 실행하지 않았다.
+- Supabase 스킬에 따라 변경 목록과 Swift 인증 공식 문서를 확인했으며 기존 인증 경계를 유지했다.
+  실제 Supabase·실기기는 조작하지 않았다.
+- GitHub CLI 읽기 조회 시 main은 `f97995845b28a0d0888e0400eb671ee6c8f1ba8d`, 이 브랜치 PR은 없음.
+  이번 단계는 로컬 검증·커밋까지이며 push·PR 생성·원격 검토·병합은 아직 수행하지 않았다.
+
+다음 단계는 이 브랜치의 구현·검증 변경을 한 PR로 제출하고 최종 head에 한 번 검토를 요청하는 것이다.
+Windows 의존성이나 계약·교차 플랫폼 입력 변경이 없으므로 Windows 회신을 대기하지 않는다.
+여러 미완료 journal, 파괴적 구조 거래, 출처 없는 이전 journal의 자동 복구는 계속 제외한다.

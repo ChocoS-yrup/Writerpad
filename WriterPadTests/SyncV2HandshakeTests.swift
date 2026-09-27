@@ -3292,7 +3292,8 @@ extension SyncV2HandshakeTests {
         return (model, try XCTUnwrap(model.projectRows.first))
     }
 
-    private func productDocumentsFixture(contractMetadata: Bool = true, withVolume: Bool = false) async throws -> ProductDocumentsFixture {
+    private func productDocumentsFixture(contractMetadata: Bool = true, withVolume: Bool = false,
+        generalStructure: Bool = false) async throws -> ProductDocumentsFixture {
         let base = try await senderFixture(generalDocument: true)
         let root = FileManager.default.temporaryDirectory.appendingPathComponent("ProductDocuments-\(UUID())")
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
@@ -3306,7 +3307,8 @@ extension SyncV2HandshakeTests {
         try await store.save(base.queue.savedBinding)
         var folders: [SyncV2RemoteFolder] = []
         var parentID: DocumentID?
-        let folderPaths = withVolume ? ["메인", "메인/원고", "메인/원고/1권"] : ["메인", "메인/원고"]
+        let folderPaths = generalStructure ? ["메인", "메인/메모장", "메인/메모장/하위"]
+            : (withVolume ? ["메인", "메인/원고", "메인/원고/1권"] : ["메인", "메인/원고"])
         for path in folderPaths {
             let id = DocumentID(rawValue: UUID()), name = (path as NSString).lastPathComponent
             try FileManager.default.createDirectory(at: root.appendingPathComponent(path), withIntermediateDirectories: true)
@@ -3336,7 +3338,7 @@ extension SyncV2HandshakeTests {
             XCTAssertTrue(applied)
             documents.append(document)
         }
-        if withVolume {
+        if withVolume || generalStructure {
             let nodes = try await repository.documents(in: base.localID)
             let orders = ([nil] + folders.map { Optional($0.folderID) }).map { parent in
                 SyncV2RemoteTreeOrder(treeOrderID: UUID(), parentFolderID: parent,
@@ -3411,7 +3413,7 @@ extension SyncV2HandshakeTests {
     }
 
     func testStructureAutomaticRetryPreservesUnsafeOrUnprovenJournals() async throws {
-        for variant in 0..<8 {
+        for variant in 0..<14 {
             let f = try await productDocumentsFixture(withVolume: true)
             let commands = LocalBinderCommandService(metadataStore: f.repository, workspaceStateRepository: f.repository,
                 workspaceLocator: FixedWorkspaceLocator(root: f.root), durableChangeRecorder: f.recorder,
@@ -3432,7 +3434,18 @@ extension SyncV2HandshakeTests {
                 serverProjectID: UUID(), kind: .existingServerProject, projectName: "다른 연결", ownerSubject: UUID()))
                 journal.durableBatch?.handoffOrigin = journal.handoffOrigin
             case 4: journal.durableBatch = nil
+            case 13: journal.handoffOrigin = nil
             default: break
+            }
+            if (8...12).contains(variant) {
+                let original = journal
+                let kinds: [BinderCommandJournal.Kind] = [.trash, .restore, .permanentDelete, .emptyTrash, .relocate]
+                journal = BinderCommandJournal(transactionID: variant == 12 ? UUID() : original.transactionID,
+                    projectID: original.projectID, kind: kinds[variant - 8], phase: original.phase,
+                    sourcePath: original.sourcePath, destinationPath: original.destinationPath,
+                    createdKind: original.createdKind, oldNodes: original.oldNodes, newNodes: original.newNodes,
+                    trashRecord: original.trashRecord, durableBatch: original.durableBatch)
+                journal.handoffOrigin = original.handoffOrigin
             }
             let bytes = variant == 5 ? Data("malformed".utf8) : try encoder.encode(journal)
             try bytes.write(to: url)
@@ -3513,6 +3526,280 @@ extension SyncV2HandshakeTests {
             let requests = await f.base.transport.requests
             XCTAssertFalse(requests.isEmpty)
             let legacyCalls = await f.legacy.calls; XCTAssertEqual(legacyCalls, 0)
+        }
+    }
+
+    private func structureCommands(_ f: ProductDocumentsFixture,
+        recorder: (any DurableLocalChangeRecording)? = nil) -> LocalBinderCommandService {
+        LocalBinderCommandService(metadataStore: f.repository, workspaceStateRepository: f.repository,
+            workspaceLocator: FixedWorkspaceLocator(root: f.root), durableChangeRecorder: recorder ?? f.recorder,
+            syncMutationGate: f.mutationGate, recoverProjectAliases: false)
+    }
+
+    private func structureJournal(_ f: ProductDocumentsFixture) throws -> (URL, Data, BinderCommandJournal) {
+        let url = try XCTUnwrap(FileManager.default.contentsOfDirectory(at: f.root, includingPropertiesForKeys: nil)
+            .first { $0.lastPathComponent.hasPrefix(LocalBinderCommandService.journalPrefix) })
+        let bytes = try Data(contentsOf: url)
+        let decoder = JSONDecoder(); decoder.dateDecodingStrategy = .iso8601
+        return (url, bytes, try decoder.decode(BinderCommandJournal.self, from: bytes))
+    }
+
+    func testStructureMoveSubtreeAndReorderResumeOriginalBatchWithoutRewritingFiles() async throws {
+        for mode in 0..<3 {
+            let f = try await productDocumentsFixture(generalStructure: true)
+            let commands = structureCommands(f)
+            ContractPathGate.close(for: f.base.localID, in: f.base.defaults)
+            switch mode {
+            case 0:
+                _ = try await commands.move(documentID: f.documents[0].id,
+                    to: .folder(DocumentID(rawValue: f.folders[1].folderID)), projectID: f.base.localID)
+            case 1:
+                _ = try await commands.move(documentID: DocumentID(rawValue: f.folders[2].folderID),
+                    to: .folder(DocumentID(rawValue: f.folders[0].folderID)), projectID: f.base.localID)
+            default:
+                try await commands.reorder(childIDs: f.documents.reversed().map(\.id),
+                    in: DocumentID(rawValue: f.folders[2].folderID), projectID: f.base.localID)
+            }
+            let (url, _, journal) = try structureJournal(f)
+            XCTAssertEqual(journal.kind, mode == 2 ? .reorder : .relocate)
+            let original = try XCTUnwrap(journal.durableBatch)
+            let nodes = try await f.repository.documents(in: f.base.localID)
+            let textNodes = nodes.filter { $0.kind == .text }
+            if mode == 0 {
+                XCTAssertEqual(nodes.first { $0.id == f.documents[0].id }?.relativePath.rawValue, "메인/메모장/001화.txt")
+            } else if mode == 1 {
+                XCTAssertTrue(textNodes.allSatisfy { $0.relativePath.rawValue.hasPrefix("메인/하위/") })
+            } else {
+                XCTAssertEqual(textNodes.sorted { $0.userOrder < $1.userOrder }.map(\.id), f.documents.reversed().map(\.id))
+            }
+            let bodies = try textNodes.map { try Data(contentsOf: f.root.appendingPathComponent($0.relativePath.rawValue)) }
+            let modified = try textNodes.map {
+                try f.root.appendingPathComponent($0.relativePath.rawValue).resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate
+            }
+            ContractPathGate.setOpen(true, for: f.base.localID, in: f.base.defaults)
+            _ = f.base.authority.beginBaseline(f.base.context)
+            await f.base.transport.setPreparationSnapshot(try await f.store.generalHandoffBaseline(localProjectID: f.base.localID))
+            let (model, row) = try await productRetryModel(f)
+            await model.retryGeneralSync(for: row, documentRepository: f.repository,
+                documentStore: f.localStore, binderCommands: commands)
+            XCTAssertNil(model.errorMessage, "mode \(mode)")
+            XCTAssertFalse(FileManager.default.fileExists(atPath: url.path))
+            let detail = try await f.store.generalRecoveryDetail(localProjectID: f.base.localID, batchID: original.batchID)
+            XCTAssertEqual(detail.source, original)
+            let after = try await f.repository.documents(in: f.base.localID)
+            XCTAssertEqual(after.sorted { $0.id.rawValue.uuidString < $1.id.rawValue.uuidString },
+                nodes.sorted { $0.id.rawValue.uuidString < $1.id.rawValue.uuidString })
+            for (index, node) in textNodes.enumerated() {
+                let file = f.root.appendingPathComponent(node.relativePath.rawValue)
+                XCTAssertEqual(try Data(contentsOf: file), bodies[index])
+                XCTAssertEqual(try file.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate, modified[index])
+            }
+            await f.dispatcher.dispatchReadyOperations(now: Date())
+            let requests = await f.base.transport.requests
+            XCTAssertEqual(requests.count, 1, "mode \(mode)")
+            XCTAssertEqual(requests.first?.objectValue?["batch"]?.objectValue?["batch_id"]?.stringValue,
+                original.batchID.uuidString.lowercased())
+            let status = try await f.store.generalQueueStatus(localProjectID: f.base.localID)
+            XCTAssertEqual(status.pendingCount + status.retryCount + status.attentionCount, 0, "mode \(mode): \(status)")
+            let legacy = await f.legacy.calls; XCTAssertEqual(legacy, 0)
+        }
+    }
+
+    /// Pauses exactly one recorder call, before or after the real SQLite recorder.
+    /// Expectations bound the wait and expose accidental concurrent entry.
+    private actor StructureRecorderPause: DurableLocalChangeRecording {
+        let recorder: SyncV2ContractPathRecorder
+        let entered: XCTestExpectation
+        let overlapped: XCTestExpectation?
+        let afterRecord: Bool
+        private var releaseContinuation: CheckedContinuation<Void, Never>?
+        private var released = false
+        private(set) var calls = 0
+        init(recorder: SyncV2ContractPathRecorder, entered: XCTestExpectation,
+            overlapped: XCTestExpectation? = nil, afterRecord: Bool = false) {
+            self.recorder = recorder; self.entered = entered; self.overlapped = overlapped; self.afterRecord = afterRecord
+        }
+        nonisolated var requiresHandoffOrigin: Bool { true }
+        func handoffOrigin(for id: ProjectID) async -> LocalSyncHandoffOrigin? { await recorder.handoffOrigin(for: id) }
+        func hasRecordedInitialSnapshot(for id: ProjectID, kind: DurableLocalBatchKind) async throws -> Bool {
+            try await recorder.hasRecordedInitialSnapshot(for: id, kind: kind)
+        }
+        func record(_ batch: LocalMutationBatch) async -> DurableRecordResult { await run(batch, authorize: nil) }
+        func record(_ batch: LocalMutationBatch, authorize: @escaping @Sendable () throws -> Void) async -> DurableRecordResult {
+            await run(batch, authorize: authorize)
+        }
+        private func run(_ batch: LocalMutationBatch, authorize: (@Sendable () throws -> Void)?) async -> DurableRecordResult {
+            calls += 1
+            let first = calls == 1
+            if !first { overlapped?.fulfill() }
+            if first && !afterRecord { await pause() }
+            let result: DurableRecordResult
+            if let authorize { result = await recorder.record(batch, authorize: authorize) }
+            else { result = await recorder.record(batch) }
+            if first && afterRecord { await pause() }
+            return result
+        }
+        private func pause() async {
+            entered.fulfill()
+            if !released { await withCheckedContinuation { releaseContinuation = $0 } }
+        }
+        func release() {
+            released = true
+            releaseContinuation?.resume(); releaseContinuation = nil
+        }
+    }
+
+    func testStructureAutomaticAndFullRecoverySerializeInEitherOrder() async throws {
+        for automaticFirst in [true, false] {
+            let f = try await productDocumentsFixture(withVolume: true)
+            ContractPathGate.close(for: f.base.localID, in: f.base.defaults)
+            _ = try await structureCommands(f).renameChapter(documentID: f.documents[0].id,
+                titleSuffix: " 동시 복구", projectID: f.base.localID)
+            let (url, _, journal) = try structureJournal(f)
+            ContractPathGate.setOpen(true, for: f.base.localID, in: f.base.defaults)
+            let entered = expectation(description: "First recovery reached recorder")
+            let overlapped = expectation(description: "Second recovery cannot enter recorder"); overlapped.isInverted = true
+            let probe = StructureRecorderPause(recorder: f.recorder, entered: entered, overlapped: overlapped)
+            // Separate service actors sharing the product's project mutation gate.
+            let firstCommands = structureCommands(f, recorder: probe), secondCommands = structureCommands(f, recorder: probe)
+            let first = Task {
+                if automaticFirst { _ = try await firstCommands.retryPendingStructureSyncHandoffs(in: f.base.localID, authorize: {}) }
+                else { try await firstCommands.recoverPendingTransactions(in: f.base.localID) }
+            }
+            await fulfillment(of: [entered], timeout: 3)
+            let started = expectation(description: "Second recovery started")
+            let second = Task {
+                started.fulfill()
+                if automaticFirst { try await secondCommands.recoverPendingTransactions(in: f.base.localID) }
+                else { _ = try await secondCommands.retryPendingStructureSyncHandoffs(in: f.base.localID, authorize: {}) }
+            }
+            await fulfillment(of: [started], timeout: 3)
+            await fulfillment(of: [overlapped], timeout: 0.15)
+            await probe.release()
+            try await first.value; try await second.value
+            let calls = await probe.calls; XCTAssertEqual(calls, 1)
+            XCTAssertFalse(FileManager.default.fileExists(atPath: url.path))
+            let source = try XCTUnwrap(journal.durableBatch)
+            let detail = try await f.store.generalRecoveryDetail(localProjectID: f.base.localID, batchID: source.batchID)
+            XCTAssertEqual(detail.source, source)
+            await f.dispatcher.dispatchReadyOperations(now: Date())
+            let requests = await f.base.transport.requests; XCTAssertEqual(requests.count, 1)
+        }
+    }
+
+    func testStructureCancellationAfterEnqueueRetainsJournalAndRetryIsIdempotent() async throws {
+        let f = try await productDocumentsFixture(withVolume: true)
+        let commands = structureCommands(f)
+        ContractPathGate.close(for: f.base.localID, in: f.base.defaults)
+        _ = try await commands.renameChapter(documentID: f.documents[0].id, titleSuffix: " 등록 뒤 취소", projectID: f.base.localID)
+        let (url, bytes, journal) = try structureJournal(f)
+        ContractPathGate.setOpen(true, for: f.base.localID, in: f.base.defaults)
+        let entered = expectation(description: "SQLite registration completed")
+        let probe = StructureRecorderPause(recorder: f.recorder, entered: entered, afterRecord: true)
+        let pausedCommands = structureCommands(f, recorder: probe), caller = SyncV2ContractEpoch()
+        let retry = Task {
+            try await pausedCommands.retryPendingStructureSyncHandoffs(in: f.base.localID) {
+                guard caller.value == 0 else { throw CancellationError() }
+            }
+        }
+        await fulfillment(of: [entered], timeout: 3)
+        caller.advance()
+        await probe.release()
+        do { _ = try await retry.value; XCTFail("Invalidated caller removed its journal") } catch is CancellationError { }
+        let calls = await probe.calls; XCTAssertEqual(calls, 1)
+        XCTAssertEqual(try Data(contentsOf: url), bytes)
+        let before = try await f.store.generalQueueStatus(localProjectID: f.base.localID)
+        XCTAssertGreaterThan(before.pendingCount, 0)
+        let deferred = try await commands.retryPendingStructureSyncHandoffs(in: f.base.localID, authorize: {})
+        XCTAssertEqual(deferred, 0)
+        let after = try await f.store.generalQueueStatus(localProjectID: f.base.localID)
+        XCTAssertEqual(after.pendingCount, before.pendingCount)
+        let source = try XCTUnwrap(journal.durableBatch)
+        let detail = try await f.store.generalRecoveryDetail(localProjectID: f.base.localID, batchID: source.batchID)
+        XCTAssertEqual(detail.source, source)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: url.path))
+        await f.dispatcher.dispatchReadyOperations(now: Date())
+        let requests = await f.base.transport.requests; XCTAssertEqual(requests.count, 1)
+    }
+
+    func testStructureRetryRechecksCancellationAndCallerAfterWaitingForMutationGate() async throws {
+        for cancelTask in [false, true] {
+            let f = try await productDocumentsFixture(withVolume: true)
+            let commands = structureCommands(f)
+            ContractPathGate.close(for: f.base.localID, in: f.base.defaults)
+            _ = try await commands.renameChapter(documentID: f.documents[0].id, titleSuffix: " 대기 중 취소", projectID: f.base.localID)
+            let (url, bytes, _) = try structureJournal(f)
+            ContractPathGate.setOpen(true, for: f.base.localID, in: f.base.defaults)
+            let held = expectation(description: "Project mutation gate held")
+            let release = AsyncStream<Void>.makeStream()
+            let holder = Task {
+                try await f.mutationGate.withCriticalSection(documentID: syncV2ProjectStructureMutationID(f.base.localID)) {
+                    held.fulfill()
+                    for await _ in release.stream { break }
+                }
+            }
+            await fulfillment(of: [held], timeout: 3)
+            let authorized = expectation(description: "Caller authorized before gate acquisition")
+            let caller = SyncV2ContractEpoch(), checks = SyncV2ContractEpoch()
+            let retry = Task {
+                try await commands.retryPendingStructureSyncHandoffs(in: f.base.localID) {
+                    guard caller.value == 0 else { throw CancellationError() }
+                    if checks.value == 0 { checks.advance(); authorized.fulfill() }
+                }
+            }
+            await fulfillment(of: [authorized], timeout: 3)
+            if cancelTask { retry.cancel() } else { caller.advance() }
+            release.continuation.yield(()); release.continuation.finish()
+            try await holder.value
+            do { _ = try await retry.value; XCTFail("Revoked waiter replayed structure") } catch is CancellationError { }
+            XCTAssertEqual(try Data(contentsOf: url), bytes)
+            let queue = try await f.store.generalQueueStatus(localProjectID: f.base.localID)
+            XCTAssertEqual(queue.pendingCount + queue.retryCount + queue.attentionCount, 0)
+            // A cancelled waiter must also release the gate for a later valid attempt.
+            let deferred = try await commands.retryPendingStructureSyncHandoffs(in: f.base.localID, authorize: {})
+            XCTAssertEqual(deferred, 0)
+            XCTAssertFalse(FileManager.default.fileExists(atPath: url.path))
+        }
+    }
+
+    func testStructureResumeLosesAuthorityDuringBaselineReadWithoutReplay() async throws {
+        for mode in 0..<8 {
+            let f = try await productDocumentsFixture(withVolume: true)
+            let commands = structureCommands(f)
+            ContractPathGate.close(for: f.base.localID, in: f.base.defaults)
+            _ = try await commands.renameChapter(documentID: f.documents[0].id, titleSuffix: " 권한 변경", projectID: f.base.localID)
+            let (url, bytes, _) = try structureJournal(f)
+            let nodes = try await f.repository.documents(in: f.base.localID)
+            ContractPathGate.setOpen(true, for: f.base.localID, in: f.base.defaults)
+            _ = f.base.authority.beginBaseline(f.base.context)
+            await f.base.transport.setPreparationSnapshot(try await f.store.generalHandoffBaseline(localProjectID: f.base.localID))
+            let bindings = LifecycleBindings([f.base.queue.savedBinding])
+            let (model, row) = try await productRetryModel(f, bindings: bindings)
+            let defaults = ContractDefaults(value: f.base.defaults)
+            await f.base.transport.setBeforeGeneralRead { [auth = f.base.auth, localEpoch = f.base.localEpoch, service = f.base.service] count in
+                guard count == 1 else { return }
+                switch mode {
+                case 0: await auth.relogin()
+                case 1: bindings.contractEpoch?.advance()
+                case 2: localEpoch.advance()
+                case 3: await MainActor.run { model.cancelPendingGateOpenings() }
+                case 4: ContractPathGate.close(for: row.id, in: defaults.value)
+                case 5: GlobalSyncPreference.setEnabled(false, in: defaults.value)
+                case 6: await service.updateSceneActivity(false)
+                default: await service.projectChanged()
+                }
+            }
+            await model.retryGeneralSync(for: row, documentRepository: f.repository,
+                documentStore: f.localStore, binderCommands: commands)
+            XCTAssertNotNil(model.errorMessage, "mode \(mode)"); XCTAssertNil(model.informationMessage)
+            XCTAssertEqual(try Data(contentsOf: url), bytes)
+            let after = try await f.repository.documents(in: f.base.localID)
+            XCTAssertEqual(after.sorted { $0.id.rawValue.uuidString < $1.id.rawValue.uuidString },
+                nodes.sorted { $0.id.rawValue.uuidString < $1.id.rawValue.uuidString })
+            let queue = try await f.store.generalQueueStatus(localProjectID: f.base.localID)
+            XCTAssertEqual(queue.pendingCount + queue.retryCount + queue.attentionCount, 0)
+            let requests = await f.base.transport.requests; XCTAssertTrue(requests.isEmpty)
+            XCTAssertNil(f.base.authority.proof(f.base.context, requiresActiveServer: false))
         }
     }
 
