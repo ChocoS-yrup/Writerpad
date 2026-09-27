@@ -112,3 +112,38 @@ Supabase 스킬의 인증 보안 기준에 따라 기존 인증·계정 검사�
 
 서버·공유 계약·Windows·교차 플랫폼 입력은 여전히 변경하지 않는다.
 Supabase 변경사항과 공식 인증 문서를 확인했으며 기존 인증 transport/출처 검사를 유지한다.
+
+## 세 번째 검토: 시간 초과 뒤 작업 종료 순서
+
+검토 기준: `adc9322510a91a8cc1f673716a0bfe1f4875c002`.
+검토 지적: https://github.com/ChocoS-yrup/Writerpad/pull/44#discussion_r4114568725
+
+기존 gate는 20초 뒤 취소 요청만 하고 비협조적 작업을 기다리지 않았다.
+따라서 큰 초기 snapshot이나 느린 SQLite 기록이 계속되는 동안 후속 저장이 먼저
+진행해 옛 snapshot을 뒤늦게 큐에 넣을 수 있었다.
+
+- 공통 gate helper에 명시적 `drainOnTimeout` 옵션을 추가했다. 시간 초과 진단과
+  취소 요청은 그대로 수행하되, 이 옵션에서는 operation task의 실제 종료를 기다린
+  뒤에만 timeout 오류를 반환하고 gate를 해제한다.
+- 연결 확정/초기 snapshot, 해제, 조회 기반 초기 재개, 로컬 저장/파일 인계 재시도에
+  적용한다. 로컬 저장 안의 문서 gate에도 적용해 안쪽 잠금이 먼저 풀리는 우회를 막는다.
+- 일반 수신·실시간 gate의 기본 즉시 반환 동작은 변경하지 않는다.
+- 순서 안전성을 위해 비협조적 로컬 작업이 끝날 때까지 해당 작품/문서의 후속 작업은
+  기다린다. timeout을 성공으로 보고하지 않으며, 이미 durable 기록이 끝났다면 기존
+  조회 재개가 그 완료 상태를 확인한다. 강제 중단과 순서 보장을 동시에 주장하지 않는다.
+- 시험은 실제 제품의 20초 제한을 넘겨 초기 enqueue를 지연시키고 TXT/큐의 순서를
+  확인한다. 별도 수동 타이머 시험은 timeout 발생 뒤에도 waiter가 시작되지 않고,
+  작업을 해제한 뒤 timeout 반환과 후속 작업 완료가 일어나는지 확인한다.
+
+최종 회귀 **567개 통과, 실패 0, 건너뜀 0**, `runtimeWarnings: []`.
+컴파일 경고·오류 0건. 기존 566개에서 SnapshotPull gate 시험 1개를 추가하고,
+첫 연결 시험에 실제 21초 지연 사례를 추가했다. 기존 즉시 반환 gate 시험도 통과했다.
+
+- AppEnvironment 116, LocalDocumentStore 17, LocalDocumentStoreRecovery 3,
+  ReceiveValidationPolicy 18, SupabaseProjectBindingService 25, SyncSettingsModel 6,
+  Dispatcher 31, GeneralSync 73, Handshake 138, SnapshotPull 140.
+- 로그: `/private/tmp/writerpad-pr44-drain-fix-tests-v1.log`.
+- xcresult: `/private/tmp/WriterPad-RecoveryRun-Fix-DD/Logs/Test/Test-WriterPad-2026.09.27_17-04-10-+0900.xcresult`.
+- Release 로그: `/private/tmp/writerpad-pr44-drain-fix-release-v1.log`.
+  Release 완료 및 새 커밋 CI·재검토 요청은 PR 본문/댓글에 기록한다.
+- 계약 검증기와 `git diff --check` 재통과. 실제 서버·실기기 변경 없음.

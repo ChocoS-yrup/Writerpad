@@ -544,7 +544,7 @@ actor SupabaseProjectBindingService: ProjectBindingServicing {
             name: name
         )
         do {
-            try await projectSaveGate.withCriticalSection(documentID: localProjectID.rawValue) {
+            try await projectSaveGate.withCriticalSection(documentID: localProjectID.rawValue, drainOnTimeout: true) {
                 try await self.bindingStore.save(localOnly)
             }
             publish(localOnly, localProjectID: localProjectID)
@@ -679,7 +679,7 @@ actor SupabaseProjectBindingService: ProjectBindingServicing {
             ownerSubject: account.userID
         )
         do {
-            let prepared = try await projectSaveGate.withCriticalSection(documentID: localProjectID.rawValue) {
+            let prepared = try await projectSaveGate.withCriticalSection(documentID: localProjectID.rawValue, drainOnTimeout: true) {
                 try await self.persistBindingAndPrepareInitialSnapshot(binding)
             }
             guard prepared else {
@@ -698,7 +698,7 @@ actor SupabaseProjectBindingService: ProjectBindingServicing {
     private func prepareInitialSnapshotIfNeeded(
         for binding: ProjectSyncBinding
     ) async -> Bool {
-        (try? await projectSaveGate.withCriticalSection(documentID: binding.localProjectID.rawValue) {
+        (try? await projectSaveGate.withCriticalSection(documentID: binding.localProjectID.rawValue, drainOnTimeout: true) {
             guard try await self.bindingStore.binding(for: binding.localProjectID) == binding else { return false }
             return await self.prepareInitialSnapshotWhileLocked(for: binding)
         }) ?? false

@@ -4,7 +4,9 @@ import XCTest
 
 final class SupabaseProjectBindingServiceTests: XCTestCase {
     func testFirstConnectionAndSaveSerializeInBothOrders() async throws {
-        for saveFirst in [true, false] {
+        for scenario in 0..<3 {
+            let saveFirst = scenario == 0
+            let initialEnqueueTimesOut = scenario == 2
             let workspace = try LocalDocumentTestWorkspace.create()
             defer { workspace.remove() }
             try Data("연결 전 본문".utf8).write(to: workspace.fileURL)
@@ -33,6 +35,9 @@ final class SupabaseProjectBindingServiceTests: XCTestCase {
             } else {
                 connect = Task { await f.service.createServerProject(for: project.id) }
                 await barrier.waitUntilEntered()
+                // 실제 제품의 20초 watchdog을 넘겨도 비협조적 초기 기록의
+                // 완료 전에는 후속 저장이 TXT/큐를 바꾸면 안 된다.
+                if initialEnqueueTimesOut { try await Task.sleep(for: .seconds(21)) }
                 save = Task { try await local.save(workspace.request(text: "경합 중 새 본문", generation: 1)) }
                 for _ in 0..<30 { await Task.yield() }
                 XCTAssertEqual(try String(contentsOf: workspace.fileURL, encoding: .utf8), "연결 전 본문")
@@ -40,7 +45,15 @@ final class SupabaseProjectBindingServiceTests: XCTestCase {
             await barrier.release()
             let receipt = try await save.value
             let connected = await connect.value
-            guard case .connected(let binding) = connected else { return XCTFail("\(connected)") }
+            let binding: ProjectSyncBinding
+            if initialEnqueueTimesOut {
+                guard case .failed = connected else { return XCTFail("시간 초과 결과 유실") }
+                let stored = await store.binding(for: project.id)
+                binding = try XCTUnwrap(stored)
+            } else {
+                guard case .connected(let value) = connected else { return XCTFail("\(connected)") }
+                binding = value
+            }
             let batches = await durable.batches
             if saveFirst {
                 XCTAssertEqual(receipt.durableRecordResult, .localOnly)

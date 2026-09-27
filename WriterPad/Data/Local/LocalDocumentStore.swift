@@ -125,9 +125,9 @@ actor LocalDocumentStore: LocalDocumentStoring {
             if let previous { _ = try? await previous.value }
             guard let self else { throw CancellationError() }
             return try await self.projectSaveGate.withCriticalSection(
-                documentID: request.projectID.rawValue
+                documentID: request.projectID.rawValue, drainOnTimeout: true
             ) {
-                try await self.syncMutationGate.withCriticalSection(documentID: request.documentID.rawValue) {
+                try await self.syncMutationGate.withCriticalSection(documentID: request.documentID.rawValue, drainOnTimeout: true) {
                     try await self.performSave(request, compared: compared, authorize: authorize)
                 }
             }
@@ -254,8 +254,8 @@ actor LocalDocumentStore: LocalDocumentStoring {
         for document: DocumentNode
     ) async -> DurableRecordResult {
         do {
-            return try await projectSaveGate.withCriticalSection(documentID: document.projectID.rawValue) {
-                try await self.syncMutationGate.withCriticalSection(documentID: document.id.rawValue) {
+            return try await projectSaveGate.withCriticalSection(documentID: document.projectID.rawValue, drainOnTimeout: true) {
+                try await self.syncMutationGate.withCriticalSection(documentID: document.id.rawValue, drainOnTimeout: true) {
                     await self.performRetryPendingSyncHandoff(for: document)
                 }
             }
