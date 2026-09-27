@@ -41,6 +41,8 @@ begin
     if private.is_contract_migration_control_document(v_doc) then continue; end if;
     if split_part(v_doc.relative_path,'/',1)='__antigravity__' then raise exception 'INVALID_CONTROL_DOCUMENT'; end if;
     if v_doc.name is not null and v_doc.structure_revision is not null then
+      if v_doc.structure_revision<1 then raise exception 'INVARIANT_VIOLATION'; end if;
+      perform private.storage_name_v1(v_doc.name);
       -- Existing contract metadata must agree with the immutable recorded path.
       select p->>'path' into v_parent_path from jsonb_array_elements(v_paths) p
         where (p->>'id')::uuid=v_doc.parent_folder_id;
@@ -159,6 +161,8 @@ begin
        where b.batch_id=(p_intent->>'batch_id')::uuid and b.project_id=p_project_id
          and b.writer_user_id=p_user_id and m.started_by_user_id=p_user_id
          and b.writer_device_id=m.started_by_device_id and m.completed_at is null
+         and b.canonical_contract_sha256='416c1b99edb9bda694731dee4b25688d9d82d1f32610aa23ddfda571ec3c7670'
+         and s.active_contract_sha256=b.canonical_contract_sha256
          and s.project_sync_mode='MIGRATING' and s.migration_epoch=b.migration_epoch
          and b.project_sync_mode='MIGRATING') then raise exception 'MIGRATION_LOCKED'; end if;
   v_payload := private.project_transition_payload(p_project_id);
