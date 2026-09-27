@@ -81,3 +81,26 @@ SQL/RLS/RPC/공유 계약/Windows 구현/교차 플랫폼 입력/패키지/서�
   `/private/tmp/writerpad-pr45-review-fix-tests-v2.log`, `/private/tmp/writerpad-pr45-review-fix-release-v1.log`.
 - 이번 보완은 iPad 표시·로컬 설정 수명만 변경한다. 공유 계약, Windows, 서버, 교차 플랫폼 입력 변경과
   실기기/실서버 시험은 없다. Windows 회신 및 추가 백업은 요청하지 않는다.
+
+## 추가 검토: 자동 재개의 레거시 우회 차단
+
+- `a7e418a`의 576개 회귀·Release·CI는 모두 통과했으나,
+  [후속 P2](https://github.com/ChocoS-yrup/Writerpad/pull/45#discussion_r4114925638)에서
+  최초 호출자 승인 직후 관문이 닫히면 무검증 일반 recorder로 우회하는 경계가 확인됐다.
+- 신규 테스트 2개를 수정 전 실행해 레거시 큐 등록과 원래 인계 파일 삭제를 재현했다.
+  합성 TXT·SwiftData·SQLite만 사용했으며 실제 기기나 서버 데이터는 변경하지 않았다.
+- 일반 `record(batch)`와 승인 포함 `record(batch, authorize:)`의 경로 선택을 분리했다.
+  승인 포함 경로는 관문 닫힘 또는 non-ID_BASED handshake에서 보류하며, 두 레거시 우회 지점에
+  진입하지 않는다. 계약 큐에서는 기존 최종 SQLite 승인 검사를 그대로 사용한다.
+- 일반 저장의 닫힌 관문/LEGACY 본문 동작은 유지한다. 새 테스트는 계약 이력이 없는 작품의
+  최초 승인 직후 닫힘을 결정적으로 재현하고, 큐 미등록·파일 바이트·본문 보존을 검사한다.
+  별도 LEGACY handshake 테스트는 자동 재개 거부 뒤 명시적 일반 재시도 성공도 확인한다.
+- 수정 후 선택 회귀 **578개 통과, 실패/건너뜀/런타임 경고 0**, 컴파일 경고·오류 0건.
+  Handshake 143개, SnapshotPull 145개이며 나머지 8개 클래스 검사 수는 동일하다.
+- xcresult: `/private/tmp/WriterPad-RecoveryRun-Fix-DD/Logs/Test/Test-WriterPad-2026.09.27_19-29-27-+0900.xcresult`.
+- 이 수정 체크포인트의 Release arm64/x86_64 빌드는 진행 중이며 최종 증거는 PR 본문에 갱신한다.
+  계약 0.2.0 검증은 재통과했고 digest는 불변이다. 최종 검증 후 새 head에 재검토를 한 번 요청한다.
+- 재현 로그: `/private/tmp/writerpad-pr45-recorder-red.log`.
+  수정 검증 로그: `/private/tmp/writerpad-pr45-recorder-tests-v1.log`,
+  `/private/tmp/writerpad-pr45-recorder-release-v1.log`.
+- 변경은 iPad 로컬 기록 경로에 한정된다. Windows 구현·공유 wire 계약·SQL/RPC/RLS·입력 동작 변경은 없다.

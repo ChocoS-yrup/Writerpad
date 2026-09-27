@@ -359,16 +359,26 @@ actor SyncV2ContractPathRecorder: DurableLocalChangeRecording {
     }
 
     func record(_ batch: LocalMutationBatch) async -> DurableRecordResult {
-        await record(batch, authorize: {})
+        await record(batch, allowsLegacyFallback: true, authorize: {})
     }
 
     func record(_ batch: LocalMutationBatch,
+        authorize authorizeCaller: @escaping @Sendable () throws -> Void) async -> DurableRecordResult {
+        await record(batch, allowsLegacyFallback: false, authorize: authorizeCaller)
+    }
+
+    private func record(_ batch: LocalMutationBatch, allowsLegacyFallback: Bool,
         authorize authorizeCaller: @escaping @Sendable () throws -> Void) async -> DurableRecordResult {
         do { try authorizeCaller() }
         catch { return .localSavedButNotQueued(reason: "자동 재개 수명이 변경되어 기록을 보류했습니다.") }
         do { try GeneralSyncValidationScope.current.require(local: batch.projectID) }
         catch { return .localSavedButNotQueued(reason: "이 작품은 현재 동기화 검증 범위에 포함되지 않습니다.") }
         guard ContractPathGate.isOpen(for: batch.projectID, in: defaults.value) else {
+            // Automatic replay must never drop its caller authorization by
+            // entering the ordinary recorder, even with no contract history yet.
+            guard allowsLegacyFallback else {
+                return .localSavedButNotQueued(reason: "동기화 관문이 닫혀 자동 재개 기록을 보류했습니다.")
+            }
             return await store.record(batch)
         }
         guard let handshakeService else {
@@ -409,6 +419,9 @@ actor SyncV2ContractPathRecorder: DurableLocalChangeRecording {
             return .localSavedButNotQueued(
                 reason: "이 작품에 서 있는 계약 핸드셰크가 없어 구조 쓰기를 보내지 않습니다."
             )
+        }
+        guard allowsLegacyFallback || handshake.projectSyncMode == .idBased else {
+            return .localSavedButNotQueued(reason: "UUID 계약을 확인할 수 없어 자동 재개 기록을 보류했습니다.")
         }
         // LEGACY의 일반 본문 저장은 이관하지 않는다. UUID 계약임이 확인된
         // 작품만 일반 계약 큐를 사용하고 기존 검토용 구조 경로는 유지한다.
