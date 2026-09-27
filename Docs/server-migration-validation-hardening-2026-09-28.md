@@ -25,6 +25,7 @@ begin/complete RPC, 요청·응답 형태, 계약 0.2/0.3 pin, Swift/Windows 코
   모든 빈 폴더에 정렬 행을 강제로 만들거나 본문을 수정하지 않는다.
 - 기존 이름·충돌 검사 및 owner/editor 권한을 유지한다. standalone 검사도 완료 함수와
   같은 트랜잭션 project advisory lock을 사용한다.
+  잠금 대기 중 권한이 철회될 수 있어 잠금을 얻은 뒤에도 membership을 다시 확인한다.
 
 기존 응답 `issues` 배열에 기존 코드 `FOLDER_NOT_FOUND`, `FOLDER_CYCLE`,
 `TREE_REFERENCE_NOT_FOUND`, `TREE_REFERENCE_DUPLICATED`를 사용한다.
@@ -45,6 +46,12 @@ fixture 생성만 DB owner로 수행하고, 실제 begin/validate/complete는 au
 - 다른 작품의 잘못된 정렬 참조가 대상 작품 검사에 섞이지 않음.
 - 이전 validator로 새 회귀를 실행하면 `document_deleted_parent` 사례에서 반드시 실패해야 함.
 - CI에서 전체 migration 설치·재적용 및 기존 서버 conformance도 함께 실행.
+- 두 세션으로 잠금 대기 중 editor 권한 철회를 재현하고, 잠금 획득 후 FORBIDDEN을 확인.
+
+첫 CI에서는 새 25개 사례와 권한 검사가 통과했으나 이전 버전 비교용 두 번째 DB에서
+cluster-wide 역할을 중복 생성하여 시험 설정이 실패했다. 두 번째 bootstrap은 역할을
+재생성하지 않도록 고쳤다. 그 뒤 서버 conformance와 이전 validator 음성 대조는 통과했다.
+이를 최초 CI 전체 성공으로 기록하지 않는다. 최종 head에서는 추가 잠금 경합 시험까지 재검증한다.
 
 로컬 계약 verifier, 11개 migration 정적 검사, Stage 7 harness 정적 검사는 통과했다.
 클라이언트 canonical SHA-256은

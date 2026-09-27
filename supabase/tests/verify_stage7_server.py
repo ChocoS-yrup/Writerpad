@@ -281,6 +281,8 @@ def main() -> None:
         require(marker in migration_validation, f"migration validation guard missing: {marker}")
     require("project_sync_migration_validation.sql" in workflow,
             "CI must execute migration validation regression SQL")
+    require("project_sync_migration_lock.py" in workflow,
+            "CI must execute the lock/authorization race regression")
     require("begin_project_sync_migration" not in migration_validation
             and "complete_project_sync_migration" not in migration_validation,
             "validation migration must not redefine or invoke mode transitions")

@@ -27,6 +27,10 @@ begin
   perform pg_catalog.pg_advisory_xact_lock(
     pg_catalog.hashtextextended('project:' || p_project_id::text, 0)
   );
+  -- Membership or project visibility may have changed while waiting for the lock.
+  if not private.has_project_role(p_project_id, v_user_id, 'editor') then
+    raise exception using errcode = 'P0001', message = 'FORBIDDEN';
+  end if;
 
   select active_contract_sha256 into v_contract_sha256
   from public.project_sync_settings

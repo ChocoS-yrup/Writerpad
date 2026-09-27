@@ -177,6 +177,8 @@ jobs:
           psql -v ON_ERROR_STOP=1 -f supabase/migrations/20260927164330_harden_project_sync_migration_validation.sql
       - name: Run migration validation and completion regression
         run: psql -v ON_ERROR_STOP=1 -f supabase/tests/project_sync_migration_validation.sql
+      - name: Run migration lock and authorization race regression
+        run: python supabase/tests/project_sync_migration_lock.py
       - name: Prove migration regression rejects the previous validator
         shell: bash
         run: |
