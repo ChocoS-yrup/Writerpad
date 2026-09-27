@@ -34,6 +34,7 @@ TRASH_PURGE_NAME = "20260910053721_general_contract_trash_purge.sql"
 CONTROL_DOCUMENTS_NAME = "20260910072310_contract_migration_control_documents.sql"
 SECURITY_HARDENING_NAME = "20260921125202_harden_legacy_function_privileges.sql"
 MIGRATION_VALIDATION_NAME = "20260927164330_harden_project_sync_migration_validation.sql"
+FUNCTION_DEFAULTS_NAME = "20260927174805_correct_function_default_privileges.sql"
 SOURCE_CATALOG_DIGEST = (
     "6c71ff36a90993dc327557b4a1a64c0dfb27b347134ed89e7f126dae76c6ff9a"
 )
@@ -51,6 +52,9 @@ IMMUTABLE_MIGRATION_DIGESTS = {
     ),
     SECURITY_HARDENING_NAME: (
         "cc5a914d9fe0fe1c3f0067a8c41fb1bf9ec129a5e7cedb18fde7475450dc44c5"
+    ),
+    MIGRATION_VALIDATION_NAME: (
+        "bb957e7aa1af11978a22f969ca87e867539ad8adb1485b80bf23a57c77da1154"
     ),
 }
 
@@ -88,7 +92,7 @@ def main() -> None:
         == [BASELINE_NAME, FOUNDATION_NAME, RPC_NAME, STORAGE_V2_NAME,
             CORRECTIVE_NAME, HANDSHAKE_NAME, RESTORE_HANDSHAKE_NAME,
             TRASH_PURGE_NAME, CONTROL_DOCUMENTS_NAME, SECURITY_HARDENING_NAME,
-            MIGRATION_VALIDATION_NAME],
+            MIGRATION_VALIDATION_NAME, FUNCTION_DEFAULTS_NAME],
         "the server chain must match the exact reviewed migration order",
     )
     for name, expected in IMMUTABLE_MIGRATION_DIGESTS.items():
@@ -263,11 +267,20 @@ def main() -> None:
     )
 
     for name in (TRASH_PURGE_NAME, CONTROL_DOCUMENTS_NAME, SECURITY_HARDENING_NAME,
-                 MIGRATION_VALIDATION_NAME):
+                 MIGRATION_VALIDATION_NAME, FUNCTION_DEFAULTS_NAME):
         require(
             workflow.count(f"supabase/migrations/{name}") == 4,
             f"CI must apply and safely re-run the reviewed migration: {name}",
         )
+
+    defaults = (MIGRATIONS / FUNCTION_DEFAULTS_NAME).read_text(encoding="utf-8")
+    require("alter default privileges for role postgres\n  revoke execute" in defaults,
+            "PUBLIC EXECUTE must be revoked globally, not only per schema")
+    require("pg_catalog.acldefault('f', 'postgres'::regrole)" in defaults,
+            "default ACL verification must account for implicit global defaults")
+    require("function_default_privileges.sql" in workflow
+            and "NEW_FUNCTION_EXECUTE_EXPOSED" in workflow,
+            "CI must check new-function behavior and reject the prior migration")
 
     migration_validation = (MIGRATIONS / MIGRATION_VALIDATION_NAME).read_text(encoding="utf-8")
     for marker in (
