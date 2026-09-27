@@ -181,7 +181,9 @@ jobs:
         shell: bash
         run: |
           createdb writerpad_migration_validation_before
-          PGDATABASE=writerpad_migration_validation_before psql -v ON_ERROR_STOP=1 -f supabase/tests/bootstrap_postgres.sql
+          # Roles are cluster-wide and were created by the first bootstrap.
+          # The second database still needs its own auth schema/functions.
+          sed '/^create role /d' supabase/tests/bootstrap_postgres.sql | PGDATABASE=writerpad_migration_validation_before psql -v ON_ERROR_STOP=1
           for migration in supabase/migrations/*.sql; do
             case "$migration" in *harden_project_sync_migration_validation.sql) break ;; esac
             PGDATABASE=writerpad_migration_validation_before psql -v ON_ERROR_STOP=1 -f "$migration"
