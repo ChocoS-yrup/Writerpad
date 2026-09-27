@@ -35,6 +35,7 @@ CONTROL_DOCUMENTS_NAME = "20260910072310_contract_migration_control_documents.sq
 SECURITY_HARDENING_NAME = "20260921125202_harden_legacy_function_privileges.sql"
 MIGRATION_VALIDATION_NAME = "20260927164330_harden_project_sync_migration_validation.sql"
 FUNCTION_DEFAULTS_NAME = "20260927174805_correct_function_default_privileges.sql"
+TRANSITION_NAME = "20260927181453_product_sync_transition_initialization.sql"
 SOURCE_CATALOG_DIGEST = (
     "6c71ff36a90993dc327557b4a1a64c0dfb27b347134ed89e7f126dae76c6ff9a"
 )
@@ -92,7 +93,7 @@ def main() -> None:
         == [BASELINE_NAME, FOUNDATION_NAME, RPC_NAME, STORAGE_V2_NAME,
             CORRECTIVE_NAME, HANDSHAKE_NAME, RESTORE_HANDSHAKE_NAME,
             TRASH_PURGE_NAME, CONTROL_DOCUMENTS_NAME, SECURITY_HARDENING_NAME,
-            MIGRATION_VALIDATION_NAME, FUNCTION_DEFAULTS_NAME],
+            MIGRATION_VALIDATION_NAME, FUNCTION_DEFAULTS_NAME, TRANSITION_NAME],
         "the server chain must match the exact reviewed migration order",
     )
     for name, expected in IMMUTABLE_MIGRATION_DIGESTS.items():
@@ -267,13 +268,17 @@ def main() -> None:
     )
 
     for name in (TRASH_PURGE_NAME, CONTROL_DOCUMENTS_NAME, SECURITY_HARDENING_NAME,
-                 MIGRATION_VALIDATION_NAME, FUNCTION_DEFAULTS_NAME):
+                 MIGRATION_VALIDATION_NAME, FUNCTION_DEFAULTS_NAME, TRANSITION_NAME):
         require(
             workflow.count(f"supabase/migrations/{name}") == 4,
             f"CI must apply and safely re-run the reviewed migration: {name}",
         )
 
     defaults = (MIGRATIONS / FUNCTION_DEFAULTS_NAME).read_text(encoding="utf-8")
+    transition = (MIGRATIONS / TRANSITION_NAME).read_text(encoding="utf-8")
+    profile_digest = sha256(CONTRACT_DIR / "migration-initialization-v1.json")
+    require(profile_digest in transition, "transition extension digest not pinned in SQL")
+    require("project_sync_transition.sql" in workflow, "transition SQL regression missing")
     require("alter default privileges for role postgres\n  revoke execute" in defaults,
             "PUBLIC EXECUTE must be revoked globally, not only per schema")
     require("pg_catalog.acldefault('f', 'postgres'::regrole)" in defaults,
