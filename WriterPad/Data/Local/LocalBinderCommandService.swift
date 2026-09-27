@@ -30,6 +30,7 @@ struct BinderCommandJournal: Codable {
     let newNodes: [DocumentNode]
     let trashRecord: TrashRecord?
     var durableBatch: LocalMutationBatch?
+    var handoffOrigin: LocalSyncHandoffOrigin?
 
     init(
         transactionID: UUID,
@@ -129,6 +130,15 @@ actor LocalBinderCommandService: BinderCommanding {
 
     func recoverPendingTransactions(in projectID: ProjectID) async throws {
         let workspaceRoot = try await workspaceLocator.workspaceRoot(for: projectID)
+        try await syncMutationGate.withCriticalSection(
+            documentID: syncV2ProjectStructureMutationID(projectID), drainOnTimeout: true
+        ) { try await self.recoverPendingJournals(in: projectID, workspaceRoot: workspaceRoot) }
+        guard recoverProjectAliases else { return }
+        try await removeEmptyLegacySyncRootAliases(in: projectID, workspaceRoot: workspaceRoot)
+        try await ensureCanonicalStoryPlotFolder(in: projectID, workspaceRoot: workspaceRoot)
+    }
+
+    private func recoverPendingJournals(in projectID: ProjectID, workspaceRoot: URL) async throws {
         let urls = try fileManager.contentsOfDirectory(
             at: workspaceRoot,
             includingPropertiesForKeys: nil
@@ -184,15 +194,58 @@ actor LocalBinderCommandService: BinderCommanding {
                 throw BinderCommandError.recoveryRequired(url.path)
             }
         }
-        guard recoverProjectAliases else { return }
-        try await removeEmptyLegacySyncRootAliases(
-            in: projectID,
-            workspaceRoot: workspaceRoot
-        )
-        try await ensureCanonicalStoryPlotFolder(
-            in: projectID,
-            workspaceRoot: workspaceRoot
-        )
+    }
+
+    func hasPendingStructureSyncHandoff(in projectID: ProjectID) async throws -> Bool {
+        let root = try await workspaceLocator.workspaceRoot(for: projectID)
+        return try !structureJournalURLs(in: root).isEmpty
+    }
+
+    private func structureJournalURLs(in root: URL) throws -> [URL] {
+        try fileManager.contentsOfDirectory(at: root, includingPropertiesForKeys: nil).filter {
+            $0.lastPathComponent.hasPrefix(Self.journalPrefix) && $0.lastPathComponent.hasSuffix(Self.journalSuffix)
+        }
+    }
+
+    /// Transmission-only replay. Never rolls back files, reapplies metadata, builds
+    /// a new batch, migrates aliases, or performs deferred trash deletion.
+    func retryPendingStructureSyncHandoffs(in projectID: ProjectID,
+        authorize: @escaping @Sendable () throws -> Void) async throws -> Int {
+        try authorize()
+        let root = try await workspaceLocator.workspaceRoot(for: projectID)
+        return try await syncMutationGate.withCriticalSection(
+            documentID: syncV2ProjectStructureMutationID(projectID), drainOnTimeout: true
+        ) { try await self.retryStructureHandoffInsideGate(in: projectID, root: root, authorize: authorize) }
+    }
+
+    private func retryStructureHandoffInsideGate(in projectID: ProjectID, root: URL,
+        authorize: @escaping @Sendable () throws -> Void) async throws -> Int {
+        try authorize()
+        let urls = try structureJournalURLs(in: root)
+        // Normal commands stop at the first unfinished journal. Multiple files
+        // need full transaction recovery; UUID filename order is not causal order.
+        guard urls.count == 1, let url = urls.first else { return urls.count }
+        let bytes = try Data(contentsOf: url)
+        let decoder = JSONDecoder(); decoder.dateDecodingStrategy = .iso8601
+        guard let journal = try? decoder.decode(BinderCommandJournal.self, from: bytes),
+              journal.projectID == projectID, shouldRecover(journal), journal.phase == .metadataSaved,
+              [.create, .createVolume, .relocate, .reorder].contains(journal.kind),
+              let batch = journal.durableBatch, batch.projectID == projectID,
+              batch.localTransactionID == journal.transactionID,
+              let origin = journal.handoffOrigin, batch.handoffOrigin == origin,
+              origin == (await durableChangeRecorder.handoffOrigin(for: projectID))
+        else { return 1 }
+        try authorize()
+        let result = await durableChangeRecorder.record(batch, authorize: authorize)
+        try authorize()
+        switch result {
+        case .queued, .notNeeded:
+            guard try Data(contentsOf: url) == bytes else { return 1 }
+            try removeIfExists(url)
+            return 0
+        case .localOnly, .localSavedButNotQueued, .serverSizeLimitExceeded:
+            return 1
+        }
     }
 
     func commandDescriptors(

@@ -29,6 +29,9 @@ protocol BinderMetadataStoring: Sendable {
 }
 
 protocol BinderCommanding: Sendable {
+    func hasPendingStructureSyncHandoff(in projectID: ProjectID) async throws -> Bool
+    func retryPendingStructureSyncHandoffs(in projectID: ProjectID,
+        authorize: @escaping @Sendable () throws -> Void) async throws -> Int
     func recoverPendingTransactions(in projectID: ProjectID) async throws
     func commandDescriptors(
         for documentID: DocumentID,
@@ -86,6 +89,12 @@ protocol BinderCommanding: Sendable {
 }
 
 extension BinderCommanding {
+    func hasPendingStructureSyncHandoff(in projectID: ProjectID) async throws -> Bool { false }
+    func retryPendingStructureSyncHandoffs(in projectID: ProjectID,
+        authorize: @escaping @Sendable () throws -> Void) async throws -> Int {
+        throw CancellationError()
+    }
+
     func commandDescriptors(
         for documentIDs: [DocumentID],
         in projectID: ProjectID

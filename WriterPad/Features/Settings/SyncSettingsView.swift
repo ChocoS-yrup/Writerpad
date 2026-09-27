@@ -272,7 +272,8 @@ final class SyncSettingsModel: ObservableObject {
 
     func retryGeneralSync(for row: SyncProjectRow,
         documentRepository: (any DocumentRepository)? = nil,
-        documentStore: (any LocalDocumentStoring)? = nil) async {
+        documentStore: (any LocalDocumentStoring)? = nil,
+        binderCommands: (any BinderCommanding)? = nil) async {
         guard !isWorking, let contractStructureSender else { return }
         isWorking = true
         defer { isWorking = false }
@@ -281,7 +282,8 @@ final class SyncSettingsModel: ObservableObject {
         do {
             var deferredCount = 0
             if let documentRepository, let documentStore {
-                deferredCount = try await retryProjectHandoffs(for: row, repository: documentRepository, store: documentStore)
+                deferredCount = try await retryProjectHandoffs(for: row, repository: documentRepository,
+                    store: documentStore, binderCommands: binderCommands)
             }
             try await contractStructureSender.retryGeneralContract(localProjectID: row.id)
             if deferredCount == 0 {
@@ -298,7 +300,7 @@ final class SyncSettingsModel: ObservableObject {
     /// Queue retries alone cannot see per-document handoff files left while offline or opted out.
     /// Replay the selected project's existing records only; never save/rewrite manuscript text here.
     private func retryProjectHandoffs(for row: SyncProjectRow, repository: any DocumentRepository,
-        store: any LocalDocumentStoring) async throws -> Int {
+        store: any LocalDocumentStoring, binderCommands: (any BinderCommanding)?) async throws -> Int {
         guard let handshakeService, let contractStructureSender else {
             throw SyncV2ContractStructureError.unavailable
         }
@@ -307,7 +309,7 @@ final class SyncSettingsModel: ObservableObject {
         let deferred = try await SyncV2ProjectHandoffResumer(projectLister: projectLister,
             authenticationService: authenticationService, projectBindingService: projectBindingService,
             handshakeService: handshakeService, sender: contractStructureSender,
-            repository: repository, store: store, defaults: ContractDefaults(value: defaults))
+            repository: repository, store: store, defaults: ContractDefaults(value: defaults), binderCommands: binderCommands)
             .resume(localProjectID: row.id, expectedBinding: binding) {
                 guard retryEpoch.value == generation else { throw CancellationError() }
             }
@@ -1650,11 +1652,12 @@ struct SyncSettingsView: View {
                                 Button("저장 기록 연결 및 재시도") {
                                     Task { await model.retryGeneralSync(for: row,
                                         documentRepository: environment.documentRepository,
-                                        documentStore: environment.localDocumentStore) }
+                                        documentStore: environment.localDocumentStore,
+                                        binderCommands: environment.binderCommands) }
                                 }
                                 .disabled(model.isWorking || !model.isSyncAllEnabled ||
                                     (model.generalQueueStatuses[row.id]?.attentionCount ?? 0) > 0)
-                                Text("이 작품에서 아직 대기열에 들어가지 못한 문서별 저장 기록도 다시 연결합니다. 본문을 새로 저장하거나 덮어쓰지 않습니다.")
+                                Text("문서별 저장 기록과 로컬 작업이 완료된 구조 변경 기록을 다시 연결합니다. 본문을 덮어쓰거나 미완료 파일 작업을 자동 복구하지 않습니다.")
                                     .font(.caption).foregroundStyle(.secondary)
                             }
                             Button("동기화 상태 새로 고침") { Task { await model.refreshGeneralQueueStatus(for: row) } }

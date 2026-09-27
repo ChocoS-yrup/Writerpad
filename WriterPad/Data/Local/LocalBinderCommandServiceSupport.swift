@@ -491,6 +491,7 @@ extension LocalBinderCommandService {
         workspaceRoot: URL
     ) async throws {
         var journal = originalJournal
+        journal.handoffOrigin = await durableChangeRecorder.handoffOrigin(for: journal.projectID)
         let journalURL = transactionJournalURL(
             journal.transactionID,
             workspaceRoot: workspaceRoot
@@ -585,6 +586,7 @@ extension LocalBinderCommandService {
                 for: journal,
                 workspaceRoot: workspaceRoot
             )
+            journal.durableBatch?.handoffOrigin = journal.handoffOrigin
             try writeJournal(journal, to: journalURL)
         }
         guard let batch = journal.durableBatch else {

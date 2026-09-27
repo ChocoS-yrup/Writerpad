@@ -1056,6 +1056,8 @@ extension SyncV2HandshakeTests {
         var beforeReservation: (@Sendable () async -> Void)?
         var afterReservation: (@Sendable () async -> Void)?
         private(set) var requests: [SyncV2JSON] = []
+        var advancesAtomicRevisions = false
+        func advanceAtomicRevisions() { advancesAtomicRevisions = true }
         var reject = false
         var projectState: SyncV2ContractServerProjectState = .active
         var beforeProjectRead: (@Sendable () async -> Void)?
@@ -1092,7 +1094,7 @@ extension SyncV2HandshakeTests {
             let results = fields["ordered_intents"]!.arrayValue!.map { intent -> SyncV2JSON in
                 let f = intent.objectValue!
                 return .object(["sequence": f["sequence"]!, "operation_id": f["operation_id"]!,
-                    "entity_id": f["entity_id"]!, "result_revision": .int(1)])
+                    "entity_id": f["entity_id"]!, "result_revision": .int(advancesAtomicRevisions ? f["base_revision"]!.intValue! + 1 : 1)])
             }
             return .object(["kind": .string("atomic_structure_commit_success"),
                 "batch_id": batch["batch_id"]!, "batch_payload_sha256": batch["batch_payload_sha256"]!,
@@ -3290,7 +3292,7 @@ extension SyncV2HandshakeTests {
         return (model, try XCTUnwrap(model.projectRows.first))
     }
 
-    private func productDocumentsFixture(contractMetadata: Bool = true) async throws -> ProductDocumentsFixture {
+    private func productDocumentsFixture(contractMetadata: Bool = true, withVolume: Bool = false) async throws -> ProductDocumentsFixture {
         let base = try await senderFixture(generalDocument: true)
         let root = FileManager.default.temporaryDirectory.appendingPathComponent("ProductDocuments-\(UUID())")
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
@@ -3304,7 +3306,8 @@ extension SyncV2HandshakeTests {
         try await store.save(base.queue.savedBinding)
         var folders: [SyncV2RemoteFolder] = []
         var parentID: DocumentID?
-        for path in ["메인", "메인/원고"] {
+        let folderPaths = withVolume ? ["메인", "메인/원고", "메인/원고/1권"] : ["메인", "메인/원고"]
+        for path in folderPaths {
             let id = DocumentID(rawValue: UUID()), name = (path as NSString).lastPathComponent
             try FileManager.default.createDirectory(at: root.appendingPathComponent(path), withIntermediateDirectories: true)
             try await repository.save(DocumentNode(id: id, projectID: base.localID, kind: .folder,
@@ -3318,7 +3321,7 @@ extension SyncV2HandshakeTests {
         var documents: [DocumentNode] = []
         for (index, revision) in [Int64(1), 7, 3].enumerated() {
             let name = String(format: "%03d화.txt", index + 1), content = "기준 \(index)"
-            let path = "메인/원고/" + name
+            let path = folderPaths.last! + "/" + name
             let document = DocumentNode(id: .init(rawValue: UUID()), projectID: base.localID, kind: .text,
                 parentID: parentID, relativePath: .init(rawValue: path), userOrder: index, modifiedAt: Date(),
                 contentHash: SHA256ContentHasher().sha256(for: Data(content.utf8)))
@@ -3332,6 +3335,17 @@ extension SyncV2HandshakeTests {
                     structureRevision: contractMetadata ? 3 : nil), expectedRevision: nil)
             XCTAssertTrue(applied)
             documents.append(document)
+        }
+        if withVolume {
+            let nodes = try await repository.documents(in: base.localID)
+            let orders = ([nil] + folders.map { Optional($0.folderID) }).map { parent in
+                SyncV2RemoteTreeOrder(treeOrderID: UUID(), parentFolderID: parent,
+                    children: nodes.filter { $0.parentID?.rawValue == parent }.sorted { $0.userOrder < $1.userOrder }
+                        .map { $0.id.rawValue }, revision: 1, updatedAt: Date())
+            }
+            try await store.applyTreeOrderSnapshotBaselines(localProjectID: base.localID,
+                serverProjectID: base.context.serverProjectID, treeOrders: orders)
+            await base.transport.advanceAtomicRevisions()
         }
         let recorder = SyncV2ContractPathRecorder(store: store, handshakeService: base.service,
             authenticationService: base.auth, defaults: ContractDefaults(value: base.defaults), bindingEpoch: base.bindingEpoch,
@@ -3348,6 +3362,158 @@ extension SyncV2HandshakeTests {
             uploadPullCoordinator: base.coordinator)
         return .init(base: base, root: root, repository: repository, store: store, recorder: recorder,
             documents: documents, folders: folders, localStore: localStore, sender: sender, dispatcher: dispatcher, legacy: legacy, mutationGate: gate)
+    }
+
+    func testProductStructureOnlyHandoffResumesWithoutOpeningADocument() async throws {
+        let f = try await productDocumentsFixture(withVolume: true)
+        let commands = LocalBinderCommandService(metadataStore: f.repository, workspaceStateRepository: f.repository,
+            workspaceLocator: FixedWorkspaceLocator(root: f.root), durableChangeRecorder: f.recorder,
+            syncMutationGate: f.mutationGate, recoverProjectAliases: false)
+        ContractPathGate.close(for: f.base.localID, in: f.base.defaults)
+        let renamed = try await commands.renameChapter(documentID: f.documents[0].id,
+            titleSuffix: " 재개 시험", projectID: f.base.localID)
+        let files = try FileManager.default.contentsOfDirectory(at: f.root, includingPropertiesForKeys: nil)
+            .filter { $0.lastPathComponent.hasPrefix(LocalBinderCommandService.journalPrefix) }
+        let journalURL = try XCTUnwrap(files.first)
+        let decoder = JSONDecoder(); decoder.dateDecodingStrategy = .iso8601
+        let journal = try decoder.decode(BinderCommandJournal.self, from: Data(contentsOf: journalURL))
+        let original = try XCTUnwrap(journal.durableBatch)
+        XCTAssertEqual(journal.phase, .metadataSaved)
+        XCTAssertEqual(try Data(contentsOf: f.root.appendingPathComponent(renamed.relativePath.rawValue)), Data("기준 0".utf8))
+        ContractPathGate.setOpen(true, for: f.base.localID, in: f.base.defaults)
+        _ = f.base.authority.beginBaseline(f.base.context)
+        await f.base.transport.setPreparationSnapshot(try await f.store.generalHandoffBaseline(localProjectID: f.base.localID))
+        let project = ManagedProject(project: .init(id: f.base.localID, name: "구조 재개",
+            createdAt: Date(), modifiedAt: Date()), userOrder: 0, lifecycleState: .active)
+        let resumer = SyncV2ProjectHandoffResumer(
+            projectLister: ProductProjectList(project: project, contractEpoch: f.base.localEpoch),
+            authenticationService: f.base.auth, projectBindingService: LifecycleBindings([f.base.queue.savedBinding]),
+            handshakeService: f.base.service, sender: f.sender, repository: f.repository,
+            store: f.localStore, defaults: ContractDefaults(value: f.base.defaults), binderCommands: commands)
+        let deferred = try await resumer.resume(localProjectID: f.base.localID, onlyIfPending: true, authorizeCaller: {})
+        XCTAssertEqual(deferred, 0)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: journalURL.path))
+        let queued = try await f.store.generalQueueStatus(localProjectID: f.base.localID)
+        XCTAssertGreaterThan(queued.pendingCount, 0)
+        _ = try await resumer.resume(localProjectID: f.base.localID, onlyIfPending: true, authorizeCaller: {})
+        let repeated = try await f.store.generalQueueStatus(localProjectID: f.base.localID)
+        XCTAssertEqual(repeated.pendingCount, queued.pendingCount)
+        let detail = try await f.store.generalRecoveryDetail(localProjectID: f.base.localID, batchID: original.batchID)
+        XCTAssertEqual(detail.source, original)
+        await f.dispatcher.dispatchReadyOperations(now: Date())
+        let requests = await f.base.transport.requests
+        XCTAssertEqual(requests.count, 1)
+        XCTAssertEqual(requests.first?.objectValue?["batch"]?.objectValue?["batch_id"]?.stringValue,
+            original.batchID.uuidString.lowercased())
+        let finished = try await f.store.generalQueueStatus(localProjectID: f.base.localID)
+        XCTAssertEqual(finished.pendingCount, 0, "\(finished)")
+        let legacyCalls = await f.legacy.calls; XCTAssertEqual(legacyCalls, 0)
+    }
+
+    func testStructureAutomaticRetryPreservesUnsafeOrUnprovenJournals() async throws {
+        for variant in 0..<8 {
+            let f = try await productDocumentsFixture(withVolume: true)
+            let commands = LocalBinderCommandService(metadataStore: f.repository, workspaceStateRepository: f.repository,
+                workspaceLocator: FixedWorkspaceLocator(root: f.root), durableChangeRecorder: f.recorder,
+                syncMutationGate: f.mutationGate, recoverProjectAliases: false)
+            ContractPathGate.close(for: f.base.localID, in: f.base.defaults)
+            let renamed = try await commands.renameChapter(documentID: f.documents[0].id,
+                titleSuffix: " 보류 시험", projectID: f.base.localID)
+            let url = try XCTUnwrap(FileManager.default.contentsOfDirectory(at: f.root, includingPropertiesForKeys: nil)
+                .first { $0.lastPathComponent.hasPrefix(LocalBinderCommandService.journalPrefix) })
+            let decoder = JSONDecoder(); decoder.dateDecodingStrategy = .iso8601
+            let encoder = JSONEncoder(); encoder.dateEncodingStrategy = .iso8601
+            var journal = try decoder.decode(BinderCommandJournal.self, from: Data(contentsOf: url))
+            switch variant {
+            case 0: journal.phase = .filesApplied
+            case 1: journal.phase = .prepared
+            case 2: journal.handoffOrigin = nil; journal.durableBatch?.handoffOrigin = nil
+            case 3: journal.handoffOrigin = LocalSyncHandoffOrigin(.connected(localProjectID: f.base.localID,
+                serverProjectID: UUID(), kind: .existingServerProject, projectName: "다른 연결", ownerSubject: UUID()))
+                journal.durableBatch?.handoffOrigin = journal.handoffOrigin
+            case 4: journal.durableBatch = nil
+            default: break
+            }
+            let bytes = variant == 5 ? Data("malformed".utf8) : try encoder.encode(journal)
+            try bytes.write(to: url)
+            if variant == 6 {
+                try bytes.write(to: f.root.appendingPathComponent(LocalBinderCommandService.journalPrefix
+                    + UUID().uuidString + LocalBinderCommandService.journalSuffix))
+            }
+            ContractPathGate.setOpen(true, for: f.base.localID, in: f.base.defaults)
+            if variant == 7 { ContractPathGate.close(for: f.base.localID, in: f.base.defaults) }
+            let deferred = try await commands.retryPendingStructureSyncHandoffs(in: f.base.localID, authorize: {})
+            XCTAssertEqual(deferred, variant == 6 ? 2 : 1, "variant \(variant)")
+            XCTAssertEqual(try Data(contentsOf: url), bytes)
+            XCTAssertEqual(try Data(contentsOf: f.root.appendingPathComponent(renamed.relativePath.rawValue)), Data("기준 0".utf8))
+            let queue = try await f.store.generalQueueStatus(localProjectID: f.base.localID)
+            XCTAssertEqual(queue.pendingCount, 0)
+        }
+    }
+
+    func testStructureRetryRechecksCallerAtFinalRecorderBoundary() async throws {
+        let f = try await productDocumentsFixture(withVolume: true)
+        let originalCommands = LocalBinderCommandService(metadataStore: f.repository, workspaceStateRepository: f.repository,
+            workspaceLocator: FixedWorkspaceLocator(root: f.root), durableChangeRecorder: f.recorder,
+            syncMutationGate: f.mutationGate, recoverProjectAliases: false)
+        ContractPathGate.close(for: f.base.localID, in: f.base.defaults)
+        _ = try await originalCommands.renameChapter(documentID: f.documents[0].id,
+            titleSuffix: " 취소 시험", projectID: f.base.localID)
+        let url = try XCTUnwrap(FileManager.default.contentsOfDirectory(at: f.root, includingPropertiesForKeys: nil)
+            .first { $0.lastPathComponent.hasPrefix(LocalBinderCommandService.journalPrefix) })
+        let bytes = try Data(contentsOf: url), caller = SyncV2ContractEpoch()
+        ContractPathGate.setOpen(true, for: f.base.localID, in: f.base.defaults)
+        let recorder = SyncV2ContractPathRecorder(store: f.store, handshakeService: f.base.service,
+            authenticationService: f.base.auth, defaults: ContractDefaults(value: f.base.defaults),
+            bindingEpoch: f.base.bindingEpoch, structureAuthority: f.base.authority,
+            localProjectEpoch: f.base.localEpoch, isLocalProjectActive: { _ in caller.advance(); return true })
+        let commands = LocalBinderCommandService(metadataStore: f.repository, workspaceStateRepository: f.repository,
+            workspaceLocator: FixedWorkspaceLocator(root: f.root), durableChangeRecorder: recorder,
+            syncMutationGate: f.mutationGate, recoverProjectAliases: false)
+        do {
+            _ = try await commands.retryPendingStructureSyncHandoffs(in: f.base.localID) {
+                guard caller.value == 0 else { throw CancellationError() }
+            }
+            XCTFail("Revoked caller must not complete replay")
+        } catch is CancellationError { }
+        XCTAssertEqual(caller.value, 1)
+        XCTAssertEqual(try Data(contentsOf: url), bytes)
+        let queue = try await f.store.generalQueueStatus(localProjectID: f.base.localID)
+        XCTAssertEqual(queue.pendingCount, 0)
+    }
+
+    func testSettingsReconnectsCompletedFolderAndVolumeStructureHandoffs() async throws {
+        for volume in [false, true] {
+            let f = try await productDocumentsFixture(withVolume: true)
+            let commands = LocalBinderCommandService(metadataStore: f.repository, workspaceStateRepository: f.repository,
+                workspaceLocator: FixedWorkspaceLocator(root: f.root), durableChangeRecorder: f.recorder,
+                syncMutationGate: f.mutationGate, recoverProjectAliases: false)
+            ContractPathGate.close(for: f.base.localID, in: f.base.defaults)
+            if volume {
+                _ = try await commands.addNewVolume(projectID: f.base.localID)
+            } else {
+                _ = try await commands.create(kind: .folder, named: "구조 재개 폴더",
+                    in: DocumentID(rawValue: f.folders[0].folderID), projectID: f.base.localID)
+            }
+            let pending = try await commands.hasPendingStructureSyncHandoff(in: f.base.localID)
+            XCTAssertTrue(pending)
+            ContractPathGate.setOpen(true, for: f.base.localID, in: f.base.defaults)
+            _ = f.base.authority.beginBaseline(f.base.context)
+            await f.base.transport.setPreparationSnapshot(try await f.store.generalHandoffBaseline(localProjectID: f.base.localID))
+            let (model, row) = try await productRetryModel(f)
+            await model.retryGeneralSync(for: row, documentRepository: f.repository,
+                documentStore: f.localStore, binderCommands: commands)
+            XCTAssertNil(model.errorMessage)
+            XCTAssertNotNil(model.informationMessage)
+            let remaining = try await commands.hasPendingStructureSyncHandoff(in: f.base.localID)
+            XCTAssertFalse(remaining)
+            await f.dispatcher.dispatchReadyOperations(now: Date())
+            let status = try await f.store.generalQueueStatus(localProjectID: f.base.localID)
+            XCTAssertEqual(status.pendingCount, 0, "volume=\(volume): \(status)")
+            let requests = await f.base.transport.requests
+            XCTAssertFalse(requests.isEmpty)
+            let legacyCalls = await f.legacy.calls; XCTAssertEqual(legacyCalls, 0)
+        }
     }
 
     func testProductMultipleDocumentsSaveDispatchAndReceiveKeepIndependentRevisions() async throws {
