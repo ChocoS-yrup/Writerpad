@@ -62,10 +62,12 @@ jobs:
           psql -v ON_ERROR_STOP=1 -f supabase/migrations/20260910053721_general_contract_trash_purge.sql
           psql -v ON_ERROR_STOP=1 -f supabase/migrations/20260910072310_contract_migration_control_documents.sql
           psql -v ON_ERROR_STOP=1 -f supabase/migrations/20260921125202_harden_legacy_function_privileges.sql
+          psql -v ON_ERROR_STOP=1 -f supabase/migrations/20260927164330_harden_project_sync_migration_validation.sql
           psql -v ON_ERROR_STOP=1 -f supabase/migrations/20260825000000_restore_deployed_sync_handshake.sql
           psql -v ON_ERROR_STOP=1 -f supabase/migrations/20260910053721_general_contract_trash_purge.sql
           psql -v ON_ERROR_STOP=1 -f supabase/migrations/20260910072310_contract_migration_control_documents.sql
           psql -v ON_ERROR_STOP=1 -f supabase/migrations/20260921125202_harden_legacy_function_privileges.sql
+          psql -v ON_ERROR_STOP=1 -f supabase/migrations/20260927164330_harden_project_sync_migration_validation.sql
       - name: Run authenticated sync handshake conformance
         run: psql -v ON_ERROR_STOP=1 -f supabase/tests/authenticated_sync_handshake.sql
 
@@ -162,6 +164,7 @@ jobs:
           psql -v ON_ERROR_STOP=1 -f supabase/migrations/20260910053721_general_contract_trash_purge.sql
           psql -v ON_ERROR_STOP=1 -f supabase/migrations/20260910072310_contract_migration_control_documents.sql
           psql -v ON_ERROR_STOP=1 -f supabase/migrations/20260921125202_harden_legacy_function_privileges.sql
+          psql -v ON_ERROR_STOP=1 -f supabase/migrations/20260927164330_harden_project_sync_migration_validation.sql
           psql -v ON_ERROR_STOP=1 -f supabase/migrations/20260811010000_sync_contract_0_1_0_foundation.sql
           psql -v ON_ERROR_STOP=1 -f supabase/migrations/20260811020000_sync_contract_0_1_0_rpcs.sql
           psql -v ON_ERROR_STOP=1 -f supabase/migrations/20260813063251_sync_contract_0_3_0_storage_name_v2.sql
@@ -171,6 +174,24 @@ jobs:
           psql -v ON_ERROR_STOP=1 -f supabase/migrations/20260910053721_general_contract_trash_purge.sql
           psql -v ON_ERROR_STOP=1 -f supabase/migrations/20260910072310_contract_migration_control_documents.sql
           psql -v ON_ERROR_STOP=1 -f supabase/migrations/20260921125202_harden_legacy_function_privileges.sql
+          psql -v ON_ERROR_STOP=1 -f supabase/migrations/20260927164330_harden_project_sync_migration_validation.sql
+      - name: Run migration validation and completion regression
+        run: psql -v ON_ERROR_STOP=1 -f supabase/tests/project_sync_migration_validation.sql
+      - name: Prove migration regression rejects the previous validator
+        shell: bash
+        run: |
+          createdb writerpad_migration_validation_before
+          PGDATABASE=writerpad_migration_validation_before psql -v ON_ERROR_STOP=1 -f supabase/tests/bootstrap_postgres.sql
+          for migration in supabase/migrations/*.sql; do
+            case "$migration" in *harden_project_sync_migration_validation.sql) break ;; esac
+            PGDATABASE=writerpad_migration_validation_before psql -v ON_ERROR_STOP=1 -f "$migration"
+          done
+          if PGDATABASE=writerpad_migration_validation_before psql -v ON_ERROR_STOP=1 -f supabase/tests/project_sync_migration_validation.sql > /tmp/migration-validation-before.log 2>&1; then
+            echo "previous validator unexpectedly passed the regression"
+            exit 1
+          fi
+          cat /tmp/migration-validation-before.log
+          grep -Fq "validation mismatch for document_deleted_parent" /tmp/migration-validation-before.log
       - name: Run atomic, replay, cancellation, and migration checks
         run: psql -v ON_ERROR_STOP=1 -f supabase/tests/stage7_server_contract.sql
       - name: Run storage-name-v2 server conformance
