@@ -110,6 +110,62 @@ final class SyncV2SnapshotPullTests: XCTestCase {
     }
 
     @MainActor
+    func testSettingsHandoffNotificationIsProjectScopedAndDoesNotBlindlyClearWarnings() async throws {
+        let previous = GlobalSyncPreference.isEnabled(), id = ProjectID(rawValue: UUID())
+        GlobalSyncPreference.setEnabled(true)
+        ContractPathGate.setOpen(true, for: id)
+        defer { GlobalSyncPreference.setEnabled(previous); ContractPathGate.close(for: id) }
+        let calls = SyncV2ContractEpoch()
+        let model = makeHandoffPreferenceModel(id: id) { _, authorize in
+            try authorize(); calls.advance()
+            if calls.value == 2 { throw CocoaError(.fileReadUnknown) }
+            return calls.value == 1 ? 2 : 0
+        }
+        await model.start(editingGuards: { [:] }) { _ in }
+        XCTAssertNotNil(model.handoffResumeMessage)
+        SyncV2HandoffNotifications.postSettingsRetryFinished(for: .init(rawValue: UUID()))
+        try await Task.sleep(for: .milliseconds(30))
+        XCTAssertEqual(calls.value, 1)
+        SyncV2HandoffNotifications.postSettingsRetryFinished(for: id)
+        for _ in 0..<200 where calls.value < 2 { try await Task.sleep(for: .milliseconds(10)) }
+        XCTAssertEqual(calls.value, 2)
+        XCTAssertNotNil(model.handoffResumeMessage, "A failed fresh read is not proof that handoffs disappeared")
+        SyncV2HandoffNotifications.postSettingsRetryFinished(for: id)
+        for _ in 0..<200 where model.handoffResumeMessage != nil { try await Task.sleep(for: .milliseconds(10)) }
+        XCTAssertEqual(calls.value, 3)
+        XCTAssertNil(model.handoffResumeMessage)
+        await model.stop()
+        SyncV2HandoffNotifications.postSettingsRetryFinished(for: id)
+        try await Task.sleep(for: .milliseconds(30))
+        XCTAssertEqual(calls.value, 3)
+    }
+
+    @MainActor
+    func testSettingsHandoffNotificationDrainsOlderPassBeforeFreshRead() async throws {
+        let previous = GlobalSyncPreference.isEnabled(), id = ProjectID(rawValue: UUID())
+        GlobalSyncPreference.setEnabled(true)
+        ContractPathGate.setOpen(true, for: id)
+        defer { GlobalSyncPreference.setEnabled(previous); ContractPathGate.close(for: id) }
+        let probe = WorkspaceHandoffResumeProbe()
+        let model = makeHandoffPreferenceModel(id: id) { _, authorize in try await probe.run(authorize: authorize) }
+        let start = Task { await model.start(editingGuards: { [:] }) { _ in } }
+        for _ in 0..<1000 where await probe.calls == 0 { await Task.yield() }
+        SyncV2HandoffNotifications.postSettingsRetryFinished(for: id)
+        try await Task.sleep(for: .milliseconds(30))
+        let draining = await probe.calls
+        XCTAssertEqual(draining, 1)
+        await probe.release()
+        await start.value
+        for _ in 0..<200 where await probe.calls < 2 { try await Task.sleep(for: .milliseconds(10)) }
+        let calls = await probe.calls, accepted = await probe.accepted, maxRunning = await probe.maxRunning
+        XCTAssertEqual(calls, 2)
+        XCTAssertEqual(accepted, 1, "The pre-Settings pass must lose its authorization")
+        XCTAssertEqual(maxRunning, 1)
+        XCTAssertNil(model.handoffResumeMessage)
+        await model.stop()
+    }
+
+    @MainActor
     func testWorkspaceHandoffResumeIsSingleFlightAndDrainsCancelledPassBeforeForegroundRerun() async throws {
         let previous = GlobalSyncPreference.isEnabled()
         GlobalSyncPreference.setEnabled(true)

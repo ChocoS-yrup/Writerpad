@@ -2,6 +2,15 @@ import Foundation
 import SwiftUI
 import UIKit
 
+enum SyncV2HandoffNotifications {
+    /// A hint to re-read local handoffs, not proof that the project is synced.
+    static let settingsRetryFinished = Notification.Name("writerpad.sync-v2.settings-handoff-retry-finished")
+
+    static func postSettingsRetryFinished(for projectID: ProjectID) {
+        NotificationCenter.default.post(name: settingsRetryFinished, object: projectID.rawValue)
+    }
+}
+
 enum GlobalSyncPreference {
     static let storageKey = "writerpad.sync-all-projects-enabled"
     static let contractEpoch = SyncV2ContractEpoch()
@@ -295,13 +304,16 @@ final class SyncSettingsModel: ObservableObject {
         }
         guard let binding = row.binding else { throw SyncV2ContractStructureError.projectNotConnected }
         let retryEpoch = generalRetryEpoch, generation = retryEpoch.value
-        return try await SyncV2ProjectHandoffResumer(projectLister: projectLister,
+        let deferred = try await SyncV2ProjectHandoffResumer(projectLister: projectLister,
             authenticationService: authenticationService, projectBindingService: projectBindingService,
             handshakeService: handshakeService, sender: contractStructureSender,
             repository: repository, store: store, defaults: ContractDefaults(value: defaults))
             .resume(localProjectID: row.id, expectedBinding: binding) {
                 guard retryEpoch.value == generation else { throw CancellationError() }
             }
+        guard retryEpoch.value == generation else { throw CancellationError() }
+        SyncV2HandoffNotifications.postSettingsRetryFinished(for: row.id)
+        return deferred
     }
 
 #if DEBUG

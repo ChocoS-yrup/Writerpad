@@ -104,3 +104,27 @@ SQL/RLS/RPC/공유 계약/Windows 구현/교차 플랫폼 입력/패키지/서�
   수정 검증 로그: `/private/tmp/writerpad-pr45-recorder-tests-v1.log`,
   `/private/tmp/writerpad-pr45-recorder-release-v1.log`.
 - 변경은 iPad 로컬 기록 경로에 한정된다. Windows 구현·공유 wire 계약·SQL/RPC/RLS·입력 동작 변경은 없다.
+
+## 추가 검토: 설정 재시도 후 작업 화면 경고 갱신
+
+- `8f1ed18`의 578개 회귀·Release·CI는 모두 통과했다. 후속 검토의
+  [P2](https://github.com/ChocoS-yrup/Writerpad/pull/45#discussion_r4115019044)는 설정에서 파일 인계를
+  처리한 뒤에도 작업 화면의 이전 경고가 남는 문제였다. 수정 전 실제 설정 모델·TXT·SwiftData·SQLite를
+  사용하는 통합 테스트에서 경고 잔존과 재확인 누락을 재현했다.
+- 설정의 파일 인계 재시도가 반환하면 작품 UUID를 담은 내부 알림을 보낸다. 이 알림은 동기화 성공의
+  증거가 아니라 현재 파일 상태를 다시 확인하라는 신호다. 활성 상태인 동일 작품의 작업 화면만 처리한다.
+- 작업 화면에 경고 또는 진행 중인 재개가 있을 때 이전 재개 세대를 취소하고 기존 공유 재개 경로를
+  다시 실행한다. 이전 작업은 종료할 때까지 single-flight 자리를 유지한다. 기존 경고는 재확인 동안
+  보존하고, 남은 기록 없음이 확인돼야 지운다. 실패·손상 파일이 남으면 경고를 유지한다.
+- 관찰자는 start/stop 수명에 묶고 관찰 ID로 stop 이전에 예약된 늦은 알림도 거절한다.
+  미개봉 작품 순회, 주기적 스캔, Windows/공유 계약/서버/교차 플랫폼 입력 변경은 없다.
+- 신규 회귀 3개: 실제 설정의 성공·부분 처리 후 별도 전경/네트워크/배지 조작 없이 갱신,
+  다른 작품·종료된 화면 알림 무시 및 읽기 실패 시 경고 유지, 오래된 재개 종료 후 재확인 직렬화.
+- 선택 회귀 **581개 통과, 실패/건너뜀/런타임 경고 0**, 컴파일 경고·오류 0건.
+  Handshake 144개, SnapshotPull 147개이며 나머지 8개 클래스 검사 수는 동일하다.
+- xcresult: `/private/tmp/WriterPad-RecoveryRun-Fix-DD/Logs/Test/Test-WriterPad-2026.09.27_22-03-06-+0900.xcresult`.
+- 이 수정 체크포인트의 Release 빌드는 진행 중이며 최종 증거는 PR 본문에 갱신한다.
+  계약 검증은 재통과했고 canonical digest는 불변이다. 검증 후 새 최종 head에 한 번 재검토를 요청한다.
+- 재현 로그: `/private/tmp/writerpad-pr45-settings-warning-red.log`.
+  수정 검증 로그: `/private/tmp/writerpad-pr45-settings-warning-tests-v1.log`,
+  `/private/tmp/writerpad-pr45-settings-warning-release-v1.log`.

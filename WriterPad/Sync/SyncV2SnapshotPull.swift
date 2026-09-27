@@ -1021,6 +1021,8 @@ final class SyncV2WorkspaceSyncModel: ObservableObject {
     private var handoffResumeTask: Task<Void, Never>?
     private var handoffResumePending = false
     private var handoffPreferenceObservation: AnyCancellable?
+    private var handoffSettingsObservation: AnyCancellable?
+    private var handoffSettingsObservationID: UUID?
     private let readStalledFolderChanges:
         SyncV2WorkspaceStalledFolderReader?
     private let uploadPullCoordinator:
@@ -1209,6 +1211,25 @@ final class SyncV2WorkspaceSyncModel: ObservableObject {
                 }
             }
         }
+        if handoffSettingsObservation == nil {
+            let observationID = UUID()
+            handoffSettingsObservationID = observationID
+            handoffSettingsObservation = NotificationCenter.default.publisher(
+                for: SyncV2HandoffNotifications.settingsRetryFinished
+            ).sink { [weak self] notification in
+                guard let projectID = notification.object as? UUID else { return }
+                Task { @MainActor [weak self] in
+                    guard let self, self.handoffSettingsObservationID == observationID,
+                          self.isActive, self.localProjectID.rawValue == projectID,
+                          self.handoffResumeMessage != nil || self.handoffResumeTask != nil
+                    else { return }
+                    // Supersede an older pass, but keep its warning until a
+                    // fresh authorized read confirms the remaining file state.
+                    self.cancelHandoffResume(clearMessage: false)
+                    await self.resumeHandoffsIfNeeded()
+                }
+            }
+        }
         if pendingDiagnosticsContext == nil {
             pendingDiagnosticsContext = SyncV2PullDiagnostics.current
         }
@@ -1310,6 +1331,8 @@ final class SyncV2WorkspaceSyncModel: ObservableObject {
     func stop() async {
         cancelHandoffResume()
         handoffPreferenceObservation = nil
+        handoffSettingsObservation = nil
+        handoffSettingsObservationID = nil
         activationRequestID &+= 1
         await cancelInitialSubscriptionBoundary()
         await releaseCoordinatorPullPermit()
@@ -1421,11 +1444,11 @@ final class SyncV2WorkspaceSyncModel: ObservableObject {
         return true
     }
 
-    private func cancelHandoffResume() {
+    private func cancelHandoffResume(clearMessage: Bool = true) {
         handoffResumeEpoch.advance()
         handoffResumeTask?.cancel()
         handoffResumePending = false
-        handoffResumeMessage = nil
+        if clearMessage { handoffResumeMessage = nil }
     }
 
     func networkRecovered() async {
