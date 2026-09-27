@@ -7247,6 +7247,40 @@ final class SyncV2SnapshotPullTests: XCTestCase {
         await operation.releaseHungOperation()
     }
 
+    func testDrainingDocumentGateKeepsWaiterBlockedAfterTimeoutUntilOperationEnds() async {
+        let gate = SyncV2DocumentMutationGate()
+        let id = UUID()
+        let operation = SequencedRealtimeGateOperation()
+        let timer = ManualWorkspaceSleep()
+        let first = Task { () -> Bool in
+            do {
+                try await gate.withCriticalSection(documentID: id,
+                    timeoutSleep: { try await timer.sleep($0) }, drainOnTimeout: true) {
+                    await operation.run()
+                }
+                return false
+            } catch SyncV2DocumentMutationGateError.holdTimedOut { return true }
+            catch { return false }
+        }
+        await operation.waitUntilStarted(1)
+        let second = Task { () -> Bool in
+            do {
+                try await gate.withCriticalSection(documentID: id) { await operation.run() }
+                return true
+            } catch { return false }
+        }
+        await timer.waitUntilCalled(1)
+        await timer.resumeNext()
+        for _ in 0..<100 { await Task.yield() }
+        let started = await operation.startCount()
+        XCTAssertEqual(started, 1, "취소 요청만으로 후속 작업을 시작하면 안 됨")
+        await operation.releaseHungOperation()
+        let timedOut = await first.value
+        let completed = await second.value
+        XCTAssertTrue(timedOut)
+        XCTAssertTrue(completed)
+    }
+
     func testDocumentMutationGateTimesOutHungOperationAndReleasesWaiter()
         async {
         let gate = SyncV2DocumentMutationGate()

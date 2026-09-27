@@ -29,6 +29,7 @@ actor LocalDocumentStore: LocalDocumentStoring {
     static let reconciliationSuffix = ".json"
     static let syncHandoffPrefix = ".writerpad-sync-handoff-"
     static let syncHandoffSuffix = ".json"
+    static let quarantinedHandoffPrefix = ".writerpad-quarantined-handoff-"
 
     let workspaceLocator: any ProjectWorkspaceLocating
     let metadataUpdater: any DocumentFileMetadataUpdating
@@ -40,6 +41,7 @@ actor LocalDocumentStore: LocalDocumentStoring {
     let hasher: any ContentHashing
     private let writer: POSIXAtomicFileWriter
     private let syncMutationGate: SyncV2DocumentMutationGate
+    private let projectSaveGate: SyncV2DocumentMutationGate
     let staleTemporaryFileAge: TimeInterval
     private var latestSubmittedGeneration: [DocumentID: UInt64] = [:]
     private var saveTails: [DocumentID: Task<DocumentSaveReceipt, Error>] = [:]
@@ -59,7 +61,8 @@ actor LocalDocumentStore: LocalDocumentStoring {
         faultPlan: AtomicWriteFaultPlan? = nil,
         staleTemporaryFileAge: TimeInterval = 60 * 60,
         syncMutationGate: SyncV2DocumentMutationGate =
-            SyncV2DocumentMutationGate()
+            SyncV2DocumentMutationGate(),
+        projectSaveGate: SyncV2DocumentMutationGate = SyncV2DocumentMutationGate()
     ) {
         self.workspaceLocator = workspaceLocator
         self.metadataUpdater = metadataUpdater
@@ -72,6 +75,7 @@ actor LocalDocumentStore: LocalDocumentStoring {
         self.writer = POSIXAtomicFileWriter(faultPlan: faultPlan)
         self.staleTemporaryFileAge = staleTemporaryFileAge
         self.syncMutationGate = syncMutationGate
+        self.projectSaveGate = projectSaveGate
     }
 
     func loadText(for document: DocumentNode) async throws -> String {
@@ -120,10 +124,12 @@ actor LocalDocumentStore: LocalDocumentStoring {
         let task = Task { [weak self] in
             if let previous { _ = try? await previous.value }
             guard let self else { throw CancellationError() }
-            return try await self.syncMutationGate.withCriticalSection(
-                documentID: request.documentID.rawValue
+            return try await self.projectSaveGate.withCriticalSection(
+                documentID: request.projectID.rawValue, drainOnTimeout: true
             ) {
-                try await self.performSave(request, compared: compared, authorize: authorize)
+                try await self.syncMutationGate.withCriticalSection(documentID: request.documentID.rawValue, drainOnTimeout: true) {
+                    try await self.performSave(request, compared: compared, authorize: authorize)
+                }
             }
         }
         saveTails[request.documentID] = task
@@ -150,6 +156,7 @@ actor LocalDocumentStore: LocalDocumentStoring {
     private func performSave(_ request: DocumentSaveRequest,
         compared: ComparedDocumentSaveState?,
         authorize: @Sendable () throws -> Void) async throws -> DocumentSaveReceipt {
+        let handoffOrigin = await durableChangeRecorder.handoffOrigin(for: request.projectID)
         try await metadataUpdater.validateBeforeFileSave(request)
         let workspaceRoot = try await workspaceLocator.workspaceRoot(for: request.projectID)
         let destinationURL = try validatedTextURL(
@@ -221,6 +228,7 @@ actor LocalDocumentStore: LocalDocumentStoring {
                 let recordResult = await recordSavedDocument(
                     receipt,
                     batchKind: request.durableBatchKind,
+                    handoffOrigin: handoffOrigin,
                     workspaceRoot: workspaceRoot,
                     reconciliationURL: markerURL
                 )
@@ -245,6 +253,18 @@ actor LocalDocumentStore: LocalDocumentStoring {
     func retryPendingSyncHandoff(
         for document: DocumentNode
     ) async -> DurableRecordResult {
+        do {
+            return try await projectSaveGate.withCriticalSection(documentID: document.projectID.rawValue, drainOnTimeout: true) {
+                try await self.syncMutationGate.withCriticalSection(documentID: document.id.rawValue, drainOnTimeout: true) {
+                    await self.performRetryPendingSyncHandoff(for: document)
+                }
+            }
+        } catch {
+            return .localSavedButNotQueued(reason: "동기화 재시도 순서를 확보할 수 없습니다.")
+        }
+    }
+
+    private func performRetryPendingSyncHandoff(for document: DocumentNode) async -> DurableRecordResult {
         let requirement = await durableChangeRecorder.requirement(
             for: document.projectID
         )
@@ -279,6 +299,7 @@ actor LocalDocumentStore: LocalDocumentStoring {
     private func recordSavedDocument(
         _ receipt: DocumentSaveReceipt,
         batchKind: DurableLocalBatchKind,
+        handoffOrigin: LocalSyncHandoffOrigin?,
         workspaceRoot: URL,
         reconciliationURL: URL
     ) async -> DurableRecordResult {
@@ -292,7 +313,7 @@ actor LocalDocumentStore: LocalDocumentStoring {
         guard let content = receipt.savedContent else {
             return .localSavedButNotQueued(reason: "저장 snapshot을 복구할 수 없습니다.")
         }
-        let batch = LocalMutationBatch(
+        var batch = LocalMutationBatch(
             batchID: GeneralValidationRuntimeValues.current?.batch ?? syncUUIDGenerator.makeUUID(),
             projectID: receipt.projectID,
             localTransactionID: nil,
@@ -309,6 +330,7 @@ actor LocalDocumentStore: LocalDocumentStoring {
                 )
             ]
         )
+        batch.handoffOrigin = handoffOrigin
         do {
             try loadPendingSyncHandoffsIfNeeded(
                 for: receipt.documentID,
@@ -340,6 +362,23 @@ actor LocalDocumentStore: LocalDocumentStoring {
         var sizeLimitFailure: (byteCount: Int, limit: Int)?
 
         while let batch = pendingSyncHandoffs[documentID]?.first {
+            if durableChangeRecorder.requiresHandoffOrigin && batch.handoffOrigin == nil {
+                let currentOrigin = await durableChangeRecorder.handoffOrigin(for: batch.projectID)
+                let hasSourcedSuccessor = currentOrigin != nil
+                    && pendingSyncHandoffs[documentID, default: []].dropFirst().contains {
+                        $0.projectID == batch.projectID && $0.handoffOrigin == currentOrigin
+                            && isFullDocumentSave($0, documentID: documentID)
+                    }
+                if isFullDocumentSave(batch, documentID: documentID), hasSourcedSuccessor {
+                    do {
+                        try quarantineLegacyHandoff(batch, documentID: documentID, workspaceRoot: workspaceRoot)
+                        continue
+                    } catch {
+                        return .localSavedButNotQueued(reason: "이전 기록을 별도로 보존할 수 없어 새 기록도 보류했습니다.")
+                    }
+                }
+                return .localSavedButNotQueued(reason: "저장 당시 서버·계정 연결을 확인할 수 없어 이전 기록을 보류했습니다.")
+            }
             let result = await durableChangeRecorder.record(batch)
             switch result {
             case .queued(let operationIDs):
@@ -387,6 +426,38 @@ actor LocalDocumentStore: LocalDocumentStoring {
             return .notNeeded
         }
         return .localOnly
+    }
+
+    private func isFullDocumentSave(_ batch: LocalMutationBatch, documentID: DocumentID) -> Bool {
+        guard batch.kind == .documentSave, batch.mutations.count == 1,
+              case let .documentSnapshot(_, id, _, _, _, _, isDeleted) = batch.mutations[0] else { return false }
+        return id == documentID && !isDeleted
+    }
+
+    /// 출처 없는 옛 본문에 새 연결을 붙이지 않는다. 더 최근의 완전한 저장이
+    /// 있을 때만 별도 파일에 원래 ID/본문 그대로 보존하고 활성 재시도에서 뺀다.
+    private func quarantineLegacyHandoff(_ batch: LocalMutationBatch, documentID: DocumentID,
+        workspaceRoot: URL) throws {
+        let url = workspaceRoot.appendingPathComponent(Self.quarantinedHandoffPrefix
+            + batch.batchID.uuidString.lowercased() + Self.syncHandoffSuffix)
+        if fileManager.fileExists(atPath: url.path) {
+            guard try JSONDecoder().decode(LocalMutationBatch.self, from: Data(contentsOf: url)) == batch else {
+                throw CocoaError(.fileReadCorruptFile)
+            }
+        } else {
+            let encoder = JSONEncoder()
+            encoder.outputFormatting = [.sortedKeys]
+            let data = try encoder.encode(batch)
+            try ReceiveValidationPolicy.current.mutateIfReceiving { try data.write(to: url, options: [.atomic]) }
+        }
+        let previous = pendingSyncHandoffs[documentID]
+        pendingSyncHandoffs[documentID]?.removeFirst()
+        do {
+            try persistPendingSyncHandoffs(for: documentID, workspaceRoot: workspaceRoot)
+        } catch {
+            pendingSyncHandoffs[documentID] = previous
+            throw error
+        }
     }
 
     private struct SyncHandoffEnvelope: Codable {

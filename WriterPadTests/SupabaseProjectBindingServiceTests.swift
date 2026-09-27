@@ -3,6 +3,151 @@ import XCTest
 @testable import WriterPad
 
 final class SupabaseProjectBindingServiceTests: XCTestCase {
+    func testBindingCompletedAfterWatchdogIsPublishedForConnectAndDisconnect() async throws {
+        for disconnect in [true, false] {
+            let project = makeProject(id: UUID().uuidString, name: "느린 연결 저장")
+            let store = InMemoryProjectBindingStore()
+            let barrier = BindingSaveBarrier()
+            let delayed = DelayedBindingStore(store: store, barrier: barrier)
+            let f = makeFixture(projects: [project], store: store, serviceBindingStore: delayed)
+            let original = ProjectSyncBinding.connected(localProjectID: project.id, serverProjectID: UUID(),
+                kind: .existingServerProject, projectName: project.name, ownerSubject: f.userID)
+            try await store.save(original)
+            let updates = await f.service.bindingUpdates(for: project.id)
+            let probe = BindingUpdateProbe()
+            let observer = Task { for await binding in updates { await probe.record(binding) } }
+            defer { observer.cancel() }
+            let target = UUID()
+            let confirmation = try ConfirmedServerProjectID(expectedServerProjectID: target, userEnteredUUID: target.uuidString)
+            let change = Task {
+                if disconnect { return await f.service.disconnect(localProjectID: project.id) }
+                return await f.service.connectExistingProject(localProjectID: project.id, confirmation: confirmation)
+            }
+            await barrier.waitUntilEntered()
+            try await Task.sleep(for: .seconds(21))
+            let before = await probe.values
+            XCTAssertTrue(before.isEmpty, "미완료 저장을 공개하면 안 됨")
+            await barrier.release()
+            let result = await change.value
+            guard case .failed = result else { return XCTFail("watchdog 결과는 유지해야 함") }
+            for _ in 0..<100 { await Task.yield() }
+            let durable = await store.binding(for: project.id)
+            let published = await probe.values
+            XCTAssertEqual(published, [durable], "늦게 완료된 실제 연결 상태의 알림이 누락됨")
+            XCTAssertEqual(durable?.serverProjectID, disconnect ? nil : target)
+        }
+    }
+
+    func testFirstConnectionAndSaveSerializeInBothOrders() async throws {
+        for scenario in 0..<3 {
+            let saveFirst = scenario == 0
+            let initialEnqueueTimesOut = scenario == 2
+            let workspace = try LocalDocumentTestWorkspace.create()
+            defer { workspace.remove() }
+            try Data("연결 전 본문".utf8).write(to: workspace.fileURL)
+            let project = makeProject(id: workspace.projectID.rawValue.uuidString, name: "첫 연결 경합")
+            let store = InMemoryProjectBindingStore()
+            let gate = SyncV2DocumentMutationGate()
+            let barrier = BindingSaveBarrier()
+            let durable = BindingRaceRecorder(store: store, initialBarrier: saveFirst ? nil : barrier)
+            let initial = ProjectInitialSyncRecorder(documentRepository: BindingRaceDocuments(document: workspace.document()),
+                workspaceLocator: FixedWorkspaceLocator(root: workspace.root), durableChangeRecorder: durable)
+            let f = makeFixture(projects: [project], initialSyncRecorder: initial, store: store, projectSaveGate: gate)
+            let updates = await f.service.bindingUpdates(for: project.id)
+            let probe = BindingUpdateProbe()
+            let observer = Task { for await binding in updates { await probe.record(binding) } }
+            defer { observer.cancel() }
+            let local = LocalDocumentStore(workspaceLocator: FixedWorkspaceLocator(root: workspace.root),
+                metadataUpdater: BindingSaveMetadata(barrier: saveFirst ? barrier : nil),
+                durableChangeRecorder: durable, projectSaveGate: gate)
+            let save: Task<DocumentSaveReceipt, Error>
+            let connect: Task<ProjectBindingResult, Never>
+            if saveFirst {
+                save = Task { try await local.save(workspace.request(text: "경합 중 새 본문", generation: 1)) }
+                await barrier.waitUntilEntered()
+                connect = Task { await f.service.createServerProject(for: project.id) }
+                while await f.transport.receivedParameters().isEmpty { await Task.yield() }
+                // The binding must not become durable while pre-TXT validation is suspended.
+                for _ in 0..<30 { await Task.yield() }
+                let binding = await store.binding(for: project.id)
+                XCTAssertNil(binding)
+            } else {
+                connect = Task { await f.service.createServerProject(for: project.id) }
+                await barrier.waitUntilEntered()
+                // 실제 제품의 20초 watchdog을 넘겨도 비협조적 초기 기록의
+                // 완료 전에는 후속 저장이 TXT/큐를 바꾸면 안 된다.
+                if initialEnqueueTimesOut { try await Task.sleep(for: .seconds(21)) }
+                save = Task { try await local.save(workspace.request(text: "경합 중 새 본문", generation: 1)) }
+                for _ in 0..<30 { await Task.yield() }
+                XCTAssertEqual(try String(contentsOf: workspace.fileURL, encoding: .utf8), "연결 전 본문")
+            }
+            await barrier.release()
+            let receipt = try await save.value
+            let connected = await connect.value
+            let binding: ProjectSyncBinding
+            if initialEnqueueTimesOut {
+                guard case .failed = connected else { return XCTFail("시간 초과 결과 유실") }
+                let stored = await store.binding(for: project.id)
+                binding = try XCTUnwrap(stored)
+            } else {
+                guard case .connected(let value) = connected else { return XCTFail("\(connected)") }
+                binding = value
+            }
+            let batches = await durable.batches
+            for _ in 0..<100 { await Task.yield() }
+            let published = await probe.values
+            XCTAssertEqual(published, [binding], "초기 enqueue가 늦게 완료돼도 준비된 연결을 공개해야 함")
+            if saveFirst {
+                XCTAssertEqual(receipt.durableRecordResult, .localOnly)
+                XCTAssertEqual(batches.count, 1)
+                XCTAssertEqual(batches[0].kind, .projectBinding)
+            } else {
+                guard case .queued = receipt.durableRecordResult else { return XCTFail("새 저장 출처 유실") }
+                XCTAssertEqual(batches.map(\.kind), [.projectBinding, .documentSave])
+                XCTAssertEqual(batches.last?.handoffOrigin, LocalSyncHandoffOrigin(binding))
+            }
+            let latest = try XCTUnwrap(batches.last?.mutations.last(where: {
+                if case .documentSnapshot = $0 { return true }; return false
+            }))
+            guard case let .documentSnapshot(_, _, _, content, _, _, _) = latest else { return XCTFail() }
+            XCTAssertEqual(content, "경합 중 새 본문")
+            XCTAssertEqual(try String(contentsOf: workspace.fileURL, encoding: .utf8), content)
+            let markers = try FileManager.default.contentsOfDirectory(atPath: workspace.root.path)
+            XCTAssertFalse(markers.contains { $0.hasPrefix(LocalDocumentStore.syncHandoffPrefix) })
+        }
+    }
+
+    func testBindingChangesRevokeOptInButNameRefreshKeepsIt() async throws {
+        for change in 0..<3 {
+            let suite = "BindingGate-\(UUID())"
+            let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+            defer { defaults.removePersistentDomain(forName: suite) }
+            let project = makeProject(id: UUID().uuidString, name: "연결 승인 시험")
+            let f = makeFixture(projects: [project], contractDefaults: .init(value: defaults))
+            let original = ProjectSyncBinding.connected(localProjectID: project.id, serverProjectID: UUID(),
+                kind: .existingServerProject, projectName: project.name,
+                ownerSubject: change == 2 ? UUID() : f.userID)
+            try await f.store.save(original)
+            ContractPathGate.setOpen(true, for: project.id, in: defaults)
+            if change == 0 {
+                _ = await f.service.refreshServerName(for: project.id)
+                XCTAssertTrue(ContractPathGate.isOpen(for: project.id, in: defaults))
+                _ = await f.service.disconnect(localProjectID: project.id)
+                XCTAssertFalse(ContractPathGate.isOpen(for: project.id, in: defaults))
+                let target = original.serverProjectID!
+                _ = await f.service.connectExistingProject(localProjectID: project.id,
+                    confirmation: try ConfirmedServerProjectID(expectedServerProjectID: target, userEnteredUUID: target.uuidString))
+            } else {
+                let target = change == 1 ? UUID() : original.serverProjectID!
+                let confirmed = try ConfirmedServerProjectID(expectedServerProjectID: target, userEnteredUUID: target.uuidString)
+                _ = await f.service.connectExistingProject(localProjectID: project.id, confirmation: confirmed)
+            }
+            XCTAssertFalse(ContractPathGate.isOpen(for: project.id, in: defaults), "change=\(change)")
+            let reopened = try XCTUnwrap(UserDefaults(suiteName: suite))
+            XCTAssertFalse(ContractPathGate.isOpen(for: project.id, in: reopened))
+        }
+    }
+
     func testNewServerProjectUsesLocalUUIDAndPersistsBinding() async {
         let project = makeProject(
             id: "00000000-0000-0000-0000-000000000401",
@@ -643,9 +788,12 @@ final class SupabaseProjectBindingServiceTests: XCTestCase {
         initialSyncRecorder: any InitialProjectSyncRecording =
             NoOpInitialProjectSyncRecorder(),
         serverDocuments: [SyncV2RemoteDocumentSnapshot] = [],
-        snapshotClientFails: Bool = false
+        snapshotClientFails: Bool = false,
+        contractDefaults: ContractDefaults = .standard,
+        store: InMemoryProjectBindingStore = InMemoryProjectBindingStore(),
+        serviceBindingStore: (any ProjectBindingStoring)? = nil,
+        projectSaveGate: SyncV2DocumentMutationGate = SyncV2DocumentMutationGate()
     ) -> BindingFixture {
-        let store = InMemoryProjectBindingStore()
         let transport = EnsureProjectTransportStub(result: transportResult)
         let auth = AuthenticationServiceStub(
             state: authenticationState ?? authenticatedState
@@ -654,14 +802,16 @@ final class SupabaseProjectBindingServiceTests: XCTestCase {
             ?? ProjectRepositoryStub(projects: projects)
         let service = SupabaseProjectBindingService(
             transport: transport,
-            bindingStore: store,
+            bindingStore: serviceBindingStore ?? store,
             projectRepository: projectRepository,
             authenticationService: auth,
             initialSyncRecorder: initialSyncRecorder,
             snapshotClient: BindingSnapshotClientStub(
                 documents: serverDocuments,
                 shouldFail: snapshotClientFails
-            )
+            ),
+            contractDefaults: contractDefaults,
+            projectSaveGate: projectSaveGate
         )
         let userID: UUID
         if case let .authenticated(account) =
@@ -680,6 +830,81 @@ final class SupabaseProjectBindingServiceTests: XCTestCase {
 }
 
 private struct BindingSnapshotClientStubError: Error {}
+
+private actor BindingUpdateProbe {
+    private(set) var values: [ProjectSyncBinding?] = []
+    func record(_ binding: ProjectSyncBinding?) { values.append(binding) }
+}
+
+private actor DelayedBindingStore: ProjectBindingStoring {
+    let store: InMemoryProjectBindingStore
+    let barrier: BindingSaveBarrier
+    init(store: InMemoryProjectBindingStore, barrier: BindingSaveBarrier) {
+        self.store = store; self.barrier = barrier
+    }
+    func availability() async -> ProjectBindingStoreAvailability { .available }
+    func binding(for localProjectID: ProjectID) async throws -> ProjectSyncBinding? {
+        await store.binding(for: localProjectID)
+    }
+    func binding(forServerProjectID serverProjectID: UUID) async throws -> ProjectSyncBinding? {
+        await store.binding(forServerProjectID: serverProjectID)
+    }
+    func allBindings() async throws -> [ProjectSyncBinding] { await store.allBindings() }
+    func save(_ binding: ProjectSyncBinding) async throws {
+        await barrier.suspend() // Deliberately ignores task cancellation, like a slow durable write.
+        try await store.save(binding)
+    }
+}
+
+private actor BindingSaveBarrier {
+    private var entered = false
+    private var continuation: CheckedContinuation<Void, Never>?
+    func suspend() async {
+        entered = true
+        await withCheckedContinuation { continuation = $0 }
+    }
+    func waitUntilEntered() async { while !entered { await Task.yield() } }
+    func release() { continuation?.resume(); continuation = nil }
+}
+
+private struct BindingSaveMetadata: DocumentFileMetadataUpdating {
+    let barrier: BindingSaveBarrier?
+    func validateBeforeFileSave(_ request: DocumentSaveRequest) async throws { await barrier?.suspend() }
+    func updateAfterFileSave(_ receipt: DocumentSaveReceipt) async throws {}
+}
+
+private actor BindingRaceRecorder: DurableLocalChangeRecording {
+    nonisolated let requiresHandoffOrigin = true
+    let store: InMemoryProjectBindingStore
+    let initialBarrier: BindingSaveBarrier?
+    private(set) var batches: [LocalMutationBatch] = []
+    init(store: InMemoryProjectBindingStore, initialBarrier: BindingSaveBarrier?) {
+        self.store = store; self.initialBarrier = initialBarrier
+    }
+    func handoffOrigin(for projectID: ProjectID) async -> LocalSyncHandoffOrigin? {
+        await store.binding(for: projectID).flatMap(LocalSyncHandoffOrigin.init)
+    }
+    func requirement(for projectID: ProjectID) async -> DurableRecordingRequirement {
+        await handoffOrigin(for: projectID) == nil ? .localOnly : .durableQueue
+    }
+    func hasRecordedInitialSnapshot(for projectID: ProjectID, kind: DurableLocalBatchKind) async throws -> Bool {
+        batches.contains { $0.projectID == projectID && $0.kind == kind }
+    }
+    func record(_ batch: LocalMutationBatch) async -> DurableRecordResult {
+        if batch.kind == .projectBinding { await initialBarrier?.suspend() }
+        batches.append(batch)
+        return .queued(operationIDs: [batch.batchID])
+    }
+}
+
+private actor BindingRaceDocuments: DocumentRepository {
+    var document: DocumentNode
+    init(document: DocumentNode) { self.document = document }
+    func documents(in projectID: ProjectID) async throws -> [DocumentNode] { [document] }
+    func document(id: DocumentID) async throws -> DocumentNode? { document }
+    func save(_ document: DocumentNode) async throws { self.document = document }
+    func removeMetadata(id: DocumentID) async throws {}
+}
 
 private actor BindingSnapshotClientStub: SyncV2SnapshotClienting {
     private let documents: [SyncV2RemoteDocumentSnapshot]

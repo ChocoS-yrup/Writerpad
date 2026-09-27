@@ -21,11 +21,17 @@ enum GlobalSyncPreference {
 }
 
 protocol SyncProjectListing: Sendable {
+    var contractEpoch: SyncV2ContractEpoch? { get }
     func projects() async throws -> [ManagedProject]
+}
+
+extension SyncProjectListing {
+    var contractEpoch: SyncV2ContractEpoch? { nil }
 }
 
 private struct ProjectManagerSyncProjectLister: SyncProjectListing {
     let projectManager: any ProjectManaging
+    var contractEpoch: SyncV2ContractEpoch? { projectManager.syncLifecycleEpoch }
 
     func projects() async throws -> [ManagedProject] {
         try await projectManager.projects()
@@ -81,6 +87,7 @@ final class SyncSettingsModel: ObservableObject {
     var generalRecoveryReader: (any SyncV2GeneralRecoveryReading)? { contractStructureSender }
     private let snapshotPuller: (any SyncV2SnapshotPulling)?
     private let defaults: UserDefaults
+    private let generalRetryEpoch = SyncV2ContractEpoch()
 
     init(
         projectManager: any ProjectManaging,
@@ -154,19 +161,20 @@ final class SyncSettingsModel: ObservableObject {
     /// 하려는 자리에서 그걸 켜면, 이름은 같고 id 가 다른 로컬 폴더가 서버로
     /// 나가 중복이 되거나 FOLDER_NAME_CONFLICT 로 막힌다. 그래서 pull 만 부른다.
     @Published private(set) var pullReport: String?
+#endif
 
-    /// 작품별 계약 경로 관문이다. 로컬 스위치이고 서버에 나가는 것이 없다.
-    ///
-    /// 켜도 그 자체로는 아무것도 쓰지 않는다. 서 있는 핸드셰이크와 함께여야
-    /// 계약 경로가 쓰이고, 그 둘 중 어느 것도 서버가 움직일 수 없다.
+    /// Product opt-in, independent of the global automatic-sync preference.
+    /// Opening validates compatibility; existing sender guards still authorize each write.
     @Published private(set) var openContractPathProjectIDs: Set<ProjectID> = []
+    @Published private(set) var openingContractPathProjectIDs: Set<ProjectID> = []
+    @Published private(set) var gateReport: String?
 
     func isGateOpen(for row: SyncProjectRow) -> Bool {
         openContractPathProjectIDs.contains(row.project.id)
     }
 
     @discardableResult
-    func setGateOpen(_ isOpen: Bool, for row: SyncProjectRow) -> Task<Void, Never> {
+    func setGateOpen(_ isOpen: Bool, for row: SyncProjectRow, requiresIDBased: Bool = true) -> Task<Void, Never> {
         // 닫힘은 await 전에 반영한다. 열기는 새 조회가 끝난 뒤에만 허용한다.
         if !isOpen {
             ContractPathGate.close(for: row.project.id, in: defaults)
@@ -174,40 +182,78 @@ final class SyncSettingsModel: ObservableObject {
             gateReport = "\(row.project.name) 관문: 닫힘"
             return Task { await handshakeService?.gateClosed() }
         }
+        guard !isWorking, ReceiveValidationPolicy.current.sendingAllowed,
+              openingContractPathProjectIDs.insert(row.id).inserted else { return Task {} }
         let revision = ContractPathGate.revision(for: row.project.id, in: defaults)
         let authEpoch = authenticationService.contractEpoch?.value ?? 0
         let bindingEpoch = projectBindingService.contractEpoch?.value ?? 0
+        let localEpoch = projectLister.contractEpoch
+        let localRevision = localEpoch?.value
+        let activityRevision = handshakeService?.activityEpoch.value
+        gateReport = "\(row.project.name) 서버 호환성 확인 중…"
         return Task {
+            defer { openingContractPathProjectIDs.remove(row.id) }
             guard let handshakeService else {
                 gateReport = "새 핸드셰이크를 확인할 수 없어 관문을 열지 않았습니다."
                 return
             }
             let state = await authenticationService.currentState()
             let binding = await projectBindingService.currentBinding(for: row.project.id)
-            guard let serverID = binding?.serverProjectID,
+            guard case let .authenticated(account) = state,
+                  let binding, binding.localProjectID == row.id, binding == row.binding,
+                  binding.kind != .localOnly, binding.ownerSubject == account.userID,
+                  localEpoch?.isAvailable == true,
+                  (try? await projectLister.projects().contains { $0.id == row.id && $0.isActive }) == true,
+                  let serverID = binding.serverProjectID,
                   let context = SyncV2HandshakeContext.make(authenticationState: state,
                       localProjectID: row.project.id, serverProjectID: serverID,
                       authenticationEpoch: authEpoch, bindingEpoch: bindingEpoch)
             else { gateReport = "로그인과 작품 연결을 확인해 주세요."; return }
             do {
                 // 캐시가 있어도 명시적 열기는 서버를 새로 확인한다.
-                _ = try await handshakeService.refreshForGate(context: context)
+                guard await handshakeService.canStartContractWrite(),
+                      authEpoch == authenticationService.contractEpoch?.value,
+                      bindingEpoch == projectBindingService.contractEpoch?.value,
+                      localEpoch?.value == localRevision,
+                      ContractPathGate.revision(for: row.id, in: defaults) == revision,
+                      !Task.isCancelled else { return }
+                let handshake = try await handshakeService.refreshForGate(context: context)
+                guard !requiresIDBased || handshake.projectSyncMode == .idBased else {
+                    gateReport = "이 작품은 일반 동기화 형식으로 준비되지 않았습니다. 서버 작품을 임의로 이관하지 않았습니다."
+                    return
+                }
                 let handshakeEpoch = handshakeService.authorizationEpoch.value
-                guard await handshakeService.isFresh(for: context), !Task.isCancelled else { return }
+                guard await handshakeService.isFresh(for: context),
+                      await handshakeService.canStartContractWrite(), !Task.isCancelled else { return }
                 let opened = ContractPathGate.openAfterValidation(for: row.project.id,
                     in: defaults, revision: revision) {
+                    ReceiveValidationPolicy.current.sendingAllowed &&
+                    authenticationService.contractEpoch?.isAvailable == true &&
                     authEpoch == (authenticationService.contractEpoch?.value ?? 0) &&
                     bindingEpoch == (projectBindingService.contractEpoch?.value ?? 0) &&
                     (projectBindingService.contractEpoch?.isAvailable ?? false) &&
+                    localEpoch?.isAvailable == true && localEpoch?.value == localRevision &&
+                    handshakeService.activityEpoch.isAvailable && handshakeService.activityEpoch.value == activityRevision &&
                     handshakeEpoch == handshakeService.authorizationEpoch.value
                 }
                 if opened { openContractPathProjectIDs.insert(row.project.id) }
                 gateReport = opened ? "\(row.project.name) 관문: 열림" : "상태가 바뀌어 관문을 열지 않았습니다."
             } catch {
                 guard ContractPathGate.revision(for: row.project.id, in: defaults) == revision else { return }
-                gateReport = "새 핸드셰이크에 실패하여 관문을 열지 않았습니다: \(error)"
+                gateReport = "서버 호환성을 확인하지 못해 동기화를 활성화하지 않았습니다. 연결 상태를 확인하고 다시 시도하세요."
             }
         }
+    }
+
+    /// A late server response must not opt a project in after leaving the settings UI.
+    func cancelPendingGateOpenings() {
+        generalRetryEpoch.advance()
+        guard !openingContractPathProjectIDs.isEmpty else { return }
+        for id in openingContractPathProjectIDs {
+            ContractPathGate.close(for: id, in: defaults)
+            openContractPathProjectIDs.remove(id)
+        }
+        gateReport = "동기화 활성화 확인을 취소했습니다. 다시 선택해 주세요."
     }
 
     func refreshGeneralQueueStatus(for row: SyncProjectRow) async {
@@ -215,18 +261,95 @@ final class SyncSettingsModel: ObservableObject {
         generalQueueStatuses[row.id] = try? await contractStructureSender.generalQueueStatus(localProjectID: row.id)
     }
 
-    func retryGeneralSync(for row: SyncProjectRow) async {
+    func retryGeneralSync(for row: SyncProjectRow,
+        documentRepository: (any DocumentRepository)? = nil,
+        documentStore: (any LocalDocumentStoring)? = nil) async {
         guard !isWorking, let contractStructureSender else { return }
         isWorking = true
         defer { isWorking = false }
+        errorMessage = nil
+        informationMessage = nil
         do {
+            var deferredCount = 0
+            if let documentRepository, let documentStore {
+                deferredCount = try await retryProjectHandoffs(for: row, repository: documentRepository, store: documentStore)
+            }
             try await contractStructureSender.retryGeneralContract(localProjectID: row.id)
-            informationMessage = "저장된 변경의 재시도를 요청했습니다. 응답이 확인될 때까지 로컬 원본을 유지합니다."
+            if deferredCount == 0 {
+                informationMessage = "저장된 변경의 재시도를 요청했습니다. 응답이 확인될 때까지 로컬 원본을 유지합니다."
+            } else {
+                errorMessage = "저장 기록 \(deferredCount)개는 아직 대기열에 연결하지 못했습니다. 본문과 기록은 유지되며, 서버 기준과 연결 상태를 확인한 뒤 다시 시도할 수 있습니다."
+            }
+        } catch SyncV2ContractStructureError.structureAuthorityUnavailable {
+            errorMessage = "서버와 마지막 동기화 기준이 다르거나 기준을 확인하지 못했습니다. 본문과 저장 기록은 그대로 두었습니다. 서버 변경과 동기화 상태를 확인해 주세요."
         } catch { errorMessage = "재시도를 시작하지 못했습니다. 동기화 연결 상태를 확인해 주세요." }
         await refreshGeneralQueueStatus(for: row)
     }
 
-    @Published private(set) var gateReport: String?
+    /// Queue retries alone cannot see per-document handoff files left while offline or opted out.
+    /// Replay the selected project's existing records only; never save/rewrite manuscript text here.
+    private func retryProjectHandoffs(for row: SyncProjectRow, repository: any DocumentRepository,
+        store: any LocalDocumentStoring) async throws -> Int {
+        try ReceiveValidationPolicy.current.requireSending()
+        try GeneralSyncValidationScope.current.require(local: row.id)
+        guard let handshakeService, let authEpoch = authenticationService.contractEpoch,
+              let bindingEpoch = projectBindingService.contractEpoch, let localEpoch = projectLister.contractEpoch
+        else { throw SyncV2ContractStructureError.authenticationRequired }
+        let authRevision = authEpoch.value, bindingRevision = bindingEpoch.value, localRevision = localEpoch.value
+        let gateRevision = ContractPathGate.revision(for: row.id, in: defaults)
+        let globalRevision = GlobalSyncPreference.contractEpoch.value
+        let activityEpoch = handshakeService.activityEpoch, activityRevision = activityEpoch.value
+        let retryEpoch = generalRetryEpoch, generation = retryEpoch.value
+        let sharedDefaults = ContractDefaults(value: defaults)
+        let authorize: @Sendable () throws -> Void = {
+            try Task.checkCancellation()
+            guard ReceiveValidationPolicy.current.sendingAllowed, generation == retryEpoch.value,
+                  GlobalSyncPreference.isEnabled(in: sharedDefaults.value), GlobalSyncPreference.contractEpoch.value == globalRevision,
+                  ContractPathGate.isOpen(for: row.id, in: sharedDefaults.value), ContractPathGate.revision(for: row.id, in: sharedDefaults.value) == gateRevision,
+                  authEpoch.isAvailable, authEpoch.value == authRevision,
+                  bindingEpoch.isAvailable, bindingEpoch.value == bindingRevision,
+                  localEpoch.isAvailable, localEpoch.value == localRevision,
+                  activityEpoch.isAvailable, activityEpoch.value == activityRevision
+            else { throw SyncV2ContractStructureError.gateClosed }
+        }
+        try authorize()
+        let state = await authenticationService.currentState()
+        guard case .authenticated(let account) = state,
+              let binding = await projectBindingService.currentBinding(for: row.id), binding == row.binding,
+              binding.localProjectID == row.id, binding.kind != .localOnly, binding.ownerSubject == account.userID,
+              let serverID = binding.serverProjectID,
+              try await projectLister.projects().contains(where: { $0.id == row.id && $0.isActive })
+        else { throw SyncV2ContractStructureError.projectNotConnected }
+        try authorize()
+        let context = SyncV2HandshakeContext(localProjectID: row.id, serverProjectID: serverID, accountID: account.userID,
+            authenticationEpoch: authRevision, bindingEpoch: bindingRevision)
+        let handshake = try await handshakeService.refresh(context: context)
+        try authorize()
+        guard handshake.projectSyncMode == .idBased else { throw SyncV2ContractStructureError.projectNotConnected }
+        guard let contractStructureSender else { throw SyncV2ContractStructureError.unavailable }
+        // An uncertain request may already be applied remotely. Let the existing
+        // sender recover its receipt even if file-handoff baseline comparison fails.
+        try await contractStructureSender.retryGeneralContract(localProjectID: row.id)
+        try authorize()
+        try await contractStructureSender.prepareGeneralHandoffResume(context: context, authorizeCaller: authorize)
+        try authorize()
+        let documents = try await repository.documents(in: row.id)
+        try authorize()
+        var deferredCount = 0
+        for document in documents.sorted(by: { $0.relativePath.rawValue < $1.relativePath.rawValue })
+            where document.projectID == row.id && document.kind == .text && document.deletionStatus == .active {
+            try authorize()
+            let result = await store.retryPendingSyncHandoff(for: document)
+            try authorize()
+            switch result {
+            case .localSavedButNotQueued, .serverSizeLimitExceeded: deferredCount += 1
+            case .queued, .notNeeded, .localOnly: break
+            }
+        }
+        return deferredCount
+    }
+
+#if DEBUG
     @Published private(set) var contractSendReport: String?
     @Published private(set) var contractPreparations: [ProjectID: SyncV2ContractPreparation] = [:]
     @Published private(set) var preparationExportURLs: [ProjectID: URL] = [:]
@@ -673,7 +796,6 @@ final class SyncSettingsModel: ObservableObject {
                 )
             }
             projectRows = rows
-#if DEBUG
             // UserDefaults만 읽으면 토글 자체는 관찰할 상태가 없어 탭 직후 예전
             // 값으로 돌아간다. 로드할 때 저장값을 화면 상태로 한 번 끌어올린다.
             openContractPathProjectIDs = Set(
@@ -686,6 +808,7 @@ final class SyncSettingsModel: ObservableObject {
                     }
                     .map(\.project.id)
             )
+#if DEBUG
             for row in rows where row.binding?.serverProjectID == SyncV2EmptyVolumeReview.projectID {
                 if let value = try await contractStructureSender?.reviewedPreparation(localProjectID: row.id) {
                     try publishPreparation(value)
@@ -1006,6 +1129,7 @@ private struct AuthenticationTextField: UIViewRepresentable {
 
 struct SyncSettingsView: View {
     @EnvironmentObject private var environment: AppEnvironment
+    @Environment(\.scenePhase) private var scenePhase
     @StateObject private var model: SyncSettingsModel
     @State private var authenticationMode: AuthenticationFormMode = .signIn
     @State private var email = ""
@@ -1016,6 +1140,7 @@ struct SyncSettingsView: View {
     @State private var connectionRequest: ExistingConnectionRequest?
     @State private var disconnectTarget: SyncProjectRow?
     @State private var generalRecoveryTarget: SyncProjectRow?
+    @State private var enableProjectSyncTarget: SyncProjectRow?
 #if DEBUG
     @State private var handshakeProjectIDText = ""
 #endif
@@ -1066,7 +1191,13 @@ struct SyncSettingsView: View {
             }
         }
         .navigationTitle("서버 동기화")
-        .onDisappear { if ReceiveValidationPolicy.current.enabled { ReceiveValidationPolicy.current.invalidate() } }
+        .onDisappear {
+            model.cancelPendingGateOpenings()
+            if ReceiveValidationPolicy.current.enabled { ReceiveValidationPolicy.current.invalidate() }
+        }
+        .onChange(of: scenePhase) { _, phase in
+            if phase != .active { model.cancelPendingGateOpenings() }
+        }
         .navigationBarTitleDisplayMode(.inline)
         .onChange(of: authenticationMode) { _, mode in
             if mode == .signIn,
@@ -1097,6 +1228,21 @@ struct SyncSettingsView: View {
             Button("취소", role: .cancel) {}
         } message: {
             Text("기존 서버 또는 Windows에 이미 있는 작품은 취소한 뒤 작품별 ‘기존 서버 연결’을 먼저 사용하세요.")
+        }
+        .confirmationDialog(
+            "‘\(enableProjectSyncTarget?.project.name ?? "")’의 일반 동기화를 활성화할까요?",
+            isPresented: Binding(get: { enableProjectSyncTarget != nil },
+                set: { if !$0 { enableProjectSyncTarget = nil } }),
+            titleVisibility: .visible
+        ) {
+            Button("서버 호환성 확인 후 활성화") {
+                guard let row = enableProjectSyncTarget else { return }
+                enableProjectSyncTarget = nil
+                model.setGateOpen(true, for: row)
+            }
+            Button("취소", role: .cancel) { enableProjectSyncTarget = nil }
+        } message: {
+            Text("전체 동기화가 켜져 있으면 이 작품의 저장된 변경을 서버와 주고받을 수 있습니다. 서버 연결·본문·대기 기록은 초기화하지 않습니다.")
         }
         .confirmationDialog(
             "‘\(disconnectTarget?.project.name ?? "")’의 서버 연결을 해제할까요?",
@@ -1187,7 +1333,7 @@ struct SyncSettingsView: View {
                     isOn: Binding(
                         get: { model.isGateOpen(for: row) },
                         set: { newValue in
-                            model.setGateOpen(newValue, for: row)
+                            model.setGateOpen(newValue, for: row, requiresIDBased: false)
                         }
                     )
                 )
@@ -1515,12 +1661,34 @@ struct SyncSettingsView: View {
                         }
 
                         if row.isConnected {
+                            Toggle("이 작품의 일반 동기화", isOn: Binding(
+                                get: { model.isGateOpen(for: row) },
+                                set: { enabled in
+                                    if enabled { enableProjectSyncTarget = row }
+                                    else { model.setGateOpen(false, for: row) }
+                                }))
+                                .disabled(model.openingContractPathProjectIDs.contains(row.id))
+                                .accessibilityIdentifier("writerpad.project-sync-" + row.id.rawValue.uuidString)
+                            if model.openingContractPathProjectIDs.contains(row.id) {
+                                ProgressView("서버 호환성 확인 중…")
+                            }
+                            Text(model.isGateOpen(for: row)
+                                ? "일반 동기화 활성화됨 · 자동 송수신은 전체 동기화 설정을 따릅니다."
+                                : "서버 연결만 저장된 상태입니다. 일반 동기화를 활성화해야 새 계약 경로를 사용할 수 있습니다.")
+                                .font(.caption).foregroundStyle(.secondary)
                             if let status = model.generalQueueStatuses[row.id], status.pendingCount > 0 {
                                 Text(status.message).font(.caption).foregroundStyle(.secondary)
-                                if (status.retryCount > 0 || status.resumeMessage != nil) && status.attentionCount == 0 {
-                                    Button("일반 동기화 재시도") { Task { await model.retryGeneralSync(for: row) } }
-                                        .disabled(model.isWorking || !model.isSyncAllEnabled)
+                            }
+                            if model.isGateOpen(for: row) {
+                                Button("저장 기록 연결 및 재시도") {
+                                    Task { await model.retryGeneralSync(for: row,
+                                        documentRepository: environment.documentRepository,
+                                        documentStore: environment.localDocumentStore) }
                                 }
+                                .disabled(model.isWorking || !model.isSyncAllEnabled ||
+                                    (model.generalQueueStatuses[row.id]?.attentionCount ?? 0) > 0)
+                                Text("이 작품에서 아직 대기열에 들어가지 못한 문서별 저장 기록도 다시 연결합니다. 본문을 새로 저장하거나 덮어쓰지 않습니다.")
+                                    .font(.caption).foregroundStyle(.secondary)
                             }
                             Button("동기화 상태 새로 고침") { Task { await model.refreshGeneralQueueStatus(for: row) } }
                                 .task { await model.refreshGeneralQueueStatus(for: row) }
@@ -1564,6 +1732,7 @@ struct SyncSettingsView: View {
                     }
                     .padding(.vertical, 4)
                 }
+                if let report = model.gateReport { Text(report).font(.footnote) }
             }
 
             Text("작품별 연결 해제는 이 iPad만 로컬 전용으로 전환합니다. 서버 데이터는 삭제하지 않습니다.")

@@ -1,5 +1,6 @@
 import XCTest
 import Foundation
+import SwiftData
 import Supabase
 @testable import WriterPad
 
@@ -1037,10 +1038,12 @@ extension SyncV2HandshakeTests {
             return receipt
         }
         private(set) var generalReads = 0
+        private(set) var generalReadProjects: [UUID] = []
         var beforeGeneralRead: (@Sendable (Int) async -> Void)?
         func setBeforeGeneralRead(_ hook: @escaping @Sendable (Int) async -> Void) { beforeGeneralRead = hook }
         func fetchGeneralBaseline(projectID: UUID) async throws -> SyncV2PreparationSnapshot {
             generalReads += 1
+            generalReadProjects.append(projectID)
             await beforeGeneralRead?(generalReads)
             return try await fetchPreparationSnapshot(projectID: projectID)
         }
@@ -2351,12 +2354,153 @@ extension SyncV2HandshakeTests {
             await eventually { await transport.count == 1 }
             XCTAssertFalse(ContractPathGate.isOpen(for: project.id, in: defaults))
             if closeDuringWait { await model.setGateOpen(false, for: row).value }
-            await transport.finish(.success(supportedResponse(projectID: server)))
+            await transport.finish(.success(supportedResponse(projectID: server, mode: .idBased, epoch: 1)))
             await opening.value
             XCTAssertEqual(model.isGateOpen(for: row), !closeDuringWait)
             XCTAssertEqual(ContractPathGate.isOpen(for: project.id, in: defaults), !closeDuringWait)
             if closeDuringWait { XCTAssertEqual(model.gateReport, "관문 화면 시험 관문: 닫힘") }
         }
+    }
+}
+
+extension SyncV2HandshakeTests {
+    private struct ProductGateFixture {
+        let environment: AppEnvironment
+        let row: SyncProjectRow
+        let auth: LifecycleAuth
+        let bindings: LifecycleBindings
+        let transport: ControlledTransport
+        let service: SyncV2HandshakeService
+        let defaults: UserDefaults
+        let model: SyncSettingsModel
+    }
+
+    @MainActor
+    private func productGateFixture(wrongOwner: Bool = false) async throws -> ProductGateFixture {
+        let environment = try AppEnvironment.testing()
+        let project = try await environment.projectManager.createProject(named: "일반 동기화 작품")
+        let account = UUID(), server = UUID()
+        let auth = LifecycleAuth(account: account)
+        let binding = ProjectSyncBinding.connected(localProjectID: project.id, serverProjectID: server,
+            kind: .existingServerProject, projectName: project.name, ownerSubject: wrongOwner ? UUID() : account)
+        let bindings = LifecycleBindings([binding]), transport = ControlledTransport()
+        let service = SyncV2HandshakeService(transport: transport), defaults = makeDefaults(function: UUID().uuidString)
+        let model = SyncSettingsModel(projectManager: environment.projectManager, authenticationService: auth,
+            projectBindingService: bindings, syncDispatcher: nil, handshakeService: service, defaults: defaults)
+        await model.load()
+        return .init(environment: environment, row: try XCTUnwrap(model.projectRows.first), auth: auth,
+            bindings: bindings, transport: transport, service: service, defaults: defaults, model: model)
+    }
+
+    @MainActor
+    func testProductGateRejectsForeignOwnerAndStaleDisplayedBindingWithoutNetwork() async throws {
+        for wrongOwner in [true, false] {
+            let f = try await productGateFixture(wrongOwner: wrongOwner)
+            let row = wrongOwner ? f.row : SyncProjectRow(project: f.row.project, binding: nil)
+            await f.model.setGateOpen(true, for: row).value
+            XCTAssertFalse(f.model.isGateOpen(for: row))
+            let count = await f.transport.count; XCTAssertEqual(count, 0)
+            XCTAssertTrue(f.model.openingContractPathProjectIDs.isEmpty)
+        }
+    }
+
+    @MainActor
+    func testProductGateRejectsLegacyAndIncompatibleServerWithoutOptIn() async throws {
+        for legacy in [true, false] {
+            let f = try await productGateFixture(), server = try XCTUnwrap(f.row.binding?.serverProjectID)
+            let task = f.model.setGateOpen(true, for: f.row)
+            await eventually { [transport = f.transport] in await transport.count == 1 }
+            let response = legacy ? supportedResponse(projectID: server)
+                : supportedResponse(projectID: server, mode: .idBased, epoch: 1, serverDigest: String(repeating: "0", count: 64))
+            await f.transport.finish(.success(response)); await task.value
+            XCTAssertFalse(ContractPathGate.isOpen(for: f.row.id, in: f.defaults))
+            XCTAssertFalse(GlobalSyncPreference.isEnabled(in: f.defaults))
+            XCTAssertTrue(f.model.openingContractPathProjectIDs.isEmpty)
+        }
+    }
+
+    @MainActor
+    func testProductGateRejectsLifecycleChangesAndSettingsDismissalDuringHandshake() async throws {
+        for change in 0..<6 {
+            let f = try await productGateFixture(), server = try XCTUnwrap(f.row.binding?.serverProjectID)
+            let task = f.model.setGateOpen(true, for: f.row)
+            await eventually { [transport = f.transport] in await transport.count == 1 }
+            switch change {
+            case 0: await f.auth.relogin()
+            case 1: f.bindings.contractEpoch?.advance()
+            case 2: f.environment.projectManager.syncLifecycleEpoch?.advance()
+            case 3: await f.service.updateSceneActivity(false)
+            case 4: f.model.cancelPendingGateOpenings()
+            default: task.cancel()
+            }
+            await f.transport.finish(.success(supportedResponse(projectID: server, mode: .idBased, epoch: 1)))
+            await task.value
+            XCTAssertFalse(ContractPathGate.isOpen(for: f.row.id, in: f.defaults), "change \(change)")
+            XCTAssertTrue(f.model.openingContractPathProjectIDs.isEmpty)
+        }
+    }
+
+    @MainActor
+    func testProductGateDeduplicatesOpeningAndDoesNotEnableGlobalSync() async throws {
+        let f = try await productGateFixture(), server = try XCTUnwrap(f.row.binding?.serverProjectID)
+        let task = f.model.setGateOpen(true, for: f.row)
+        await f.model.setGateOpen(true, for: f.row).value
+        await eventually { [transport = f.transport] in await transport.count == 1 }
+        await f.transport.finish(.success(supportedResponse(projectID: server, mode: .idBased, epoch: 1)))
+        await task.value
+        XCTAssertTrue(f.model.isGateOpen(for: f.row))
+        XCTAssertFalse(GlobalSyncPreference.isEnabled(in: f.defaults))
+        let count = await f.transport.count; XCTAssertEqual(count, 1)
+        await f.model.load()
+        XCTAssertTrue(f.model.isGateOpen(for: f.row))
+        await f.model.setGateOpen(false, for: f.row).value
+        XCTAssertFalse(f.model.isGateOpen(for: f.row))
+        let current = await (f.bindings as any ProjectBindingServicing).currentBinding(for: f.row.id)
+        XCTAssertEqual(current, f.row.binding)
+    }
+
+    @MainActor
+    func testProductGateEnablesOnlySelectedProjectAmongMultipleProjects() async throws {
+        let f = try await productGateFixture(), server = try XCTUnwrap(f.row.binding?.serverProjectID)
+        let other = try await f.environment.projectManager.createProject(named: "다른 작품")
+        let task = f.model.setGateOpen(true, for: f.row)
+        await eventually { [transport = f.transport] in await transport.count == 1 }
+        await f.transport.finish(.success(supportedResponse(projectID: server, mode: .idBased, epoch: 1)))
+        await task.value
+        XCTAssertTrue(f.model.isGateOpen(for: f.row))
+        XCTAssertFalse(ContractPathGate.isOpen(for: other.id, in: f.defaults))
+        XCTAssertFalse(GlobalSyncPreference.isEnabled(in: f.defaults))
+    }
+
+    @MainActor
+    func testProductGateRejectsDeletedProjectOrSignedOutAccountBeforeNetwork() async throws {
+        for deleted in [true, false] {
+            let f = try await productGateFixture()
+            if deleted {
+                let confirmation = try await f.environment.projectManager.prepareDeletion(id: f.row.id)
+                try await f.environment.projectManager.confirmDeletion(confirmation)
+            } else { _ = await f.auth.signOut() }
+            await f.model.setGateOpen(true, for: f.row).value
+            let count = await f.transport.count; XCTAssertEqual(count, 0)
+            XCTAssertFalse(ContractPathGate.isOpen(for: f.row.id, in: f.defaults))
+        }
+    }
+
+    @MainActor
+    func testProductGateNetworkFailureAllowsExplicitRetryWithoutGlobalPreferenceChange() async throws {
+        let f = try await productGateFixture(), server = try XCTUnwrap(f.row.binding?.serverProjectID)
+        let failed = f.model.setGateOpen(true, for: f.row)
+        await eventually { [transport = f.transport] in await transport.count == 1 }
+        await f.transport.finish(.failure(SyncV2HandshakeTransportError.networkUnavailable))
+        await failed.value
+        XCTAssertFalse(f.model.isGateOpen(for: f.row))
+        XCTAssertTrue(f.model.openingContractPathProjectIDs.isEmpty)
+        let retry = f.model.setGateOpen(true, for: f.row)
+        await eventually { [transport = f.transport] in await transport.count == 2 }
+        await f.transport.finish(.success(supportedResponse(projectID: server, mode: .idBased, epoch: 1)))
+        await retry.value
+        XCTAssertTrue(f.model.isGateOpen(for: f.row))
+        XCTAssertFalse(GlobalSyncPreference.isEnabled(in: f.defaults))
     }
 }
 
@@ -3059,5 +3203,663 @@ extension SyncV2HandshakeTests {
         let metadata = LiveSyncV2PreparationMetadata(client: client, serverURL: url)
         do { _ = try await metadata.fetch(projectID: SyncV2EmptyVolumeReview.projectID); XCTFail() }
         catch { XCTAssertEqual(error as? SyncV2ContractStructureError, .projectNotConnected) }
+    }
+}
+
+// Product components, real TXT/SwiftData/SQLite; only remote transports are synthetic.
+extension SyncV2HandshakeTests {
+    private actor ProductLegacyClient: SyncV2CommitClienting {
+        private(set) var calls = 0
+        func commitDocument(_ parameters: SyncV2CommitDocumentParameters) async throws -> SyncV2CommitDocumentResult {
+            calls += 1
+            throw SyncV2ClientError.invalidResponse
+        }
+        func commitFolder(_ parameters: SyncV2CommitFolderParameters) async throws -> SyncV2CommitFolderResult {
+            calls += 1
+            throw SyncV2ClientError.invalidResponse
+        }
+    }
+
+    private struct ProductSnapshots: SyncV2SnapshotClienting {
+        let snapshots: [SyncV2RemoteDocumentSnapshot]
+        let folders: [SyncV2RemoteFolder]
+        func fetchDocuments(projectID: UUID) async throws -> [SyncV2RemoteDocumentSnapshot] { snapshots }
+        func fetchFolders(projectID: UUID) async throws -> [SyncV2RemoteFolder] { folders }
+        func fetchTreeOrders(projectID: UUID) async throws -> [SyncV2RemoteTreeOrder] { [] }
+    }
+
+    private struct ProductDocumentsFixture {
+        let base: SenderFixture
+        let root: URL
+        let repository: SwiftDataMetadataRepository
+        let store: LazySyncV2ProjectBindingStore
+        let recorder: SyncV2ContractPathRecorder
+        let documents: [DocumentNode]
+        let folders: [SyncV2RemoteFolder]
+        let localStore: LocalDocumentStore
+        let sender: SyncV2ContractStructureSender
+        let dispatcher: SyncV2Dispatcher
+        let legacy: ProductLegacyClient
+        let mutationGate: SyncV2DocumentMutationGate
+
+        func reopenedLocalStore() -> LocalDocumentStore {
+            LocalDocumentStore(workspaceLocator: FixedWorkspaceLocator(root: root), metadataUpdater: repository,
+                durableChangeRecorder: recorder, syncMutationGate: mutationGate)
+        }
+
+        func save(_ index: Int, _ content: String, generation: UInt64 = 1) async throws -> DocumentSaveReceipt {
+            let document = documents[index]
+            return try await localStore.save(.init(projectID: base.localID, documentID: document.id,
+                relativePath: document.relativePath, text: content, generation: generation, cursor: nil))
+        }
+
+        func remote(_ index: Int, content: String, revision: Int64) -> SyncV2RemoteDocumentSnapshot {
+            let document = documents[index]
+            return .init(documentID: document.id.rawValue, relativePath: document.relativePath.rawValue,
+                content: content, revision: revision, isDeleted: false, deletedAt: nil, updatedAt: Date(),
+                parentFolderID: document.parentID?.rawValue,
+                name: (document.relativePath.rawValue as NSString).lastPathComponent, structureRevision: 3)
+        }
+
+        func pull(_ snapshots: [SyncV2RemoteDocumentSnapshot], guards: [UUID: SyncV2EditingGuard] = [:]) async throws -> SyncV2SnapshotPullReport {
+            let locator = FixedWorkspaceLocator(root: root)
+            let puller = SyncV2SnapshotPullService(client: ProductSnapshots(snapshots: snapshots, folders: folders), stateStore: store,
+                localApplier: LocalSyncV2SnapshotApplier(documentRepository: repository, workspaceLocator: locator),
+                mergeStore: LocalSyncV2SnapshotMergeStore(workspaceLocator: locator),
+                folderApplier: SyncV2RemoteFolderApplier(documentRepository: repository, workspaceLocator: locator),
+                folderDocuments: repository, mutationGate: mutationGate)
+            return try await puller.pull(localProjectID: base.localID, serverProjectID: base.context.serverProjectID,
+                editingGuards: guards)
+        }
+    }
+
+    private struct ProductProjectList: SyncProjectListing {
+        let project: ManagedProject
+        let contractEpoch: SyncV2ContractEpoch?
+        func projects() async throws -> [ManagedProject] { [project] }
+    }
+
+    private func productRetryModel(_ f: ProductDocumentsFixture, handshake: SyncV2HandshakeService? = nil,
+        bindings: LifecycleBindings? = nil) async throws -> (SyncSettingsModel, SyncProjectRow) {
+        let project = ManagedProject(project: .init(id: f.base.localID, name: "다중 문서 합성 작품",
+            createdAt: Date(), modifiedAt: Date()), userOrder: 0, lifecycleState: .active)
+        let model = SyncSettingsModel(projectLister: ProductProjectList(project: project, contractEpoch: f.base.localEpoch),
+            authenticationService: f.base.auth, projectBindingService: bindings ?? LifecycleBindings([f.base.queue.savedBinding]),
+            handshakeService: handshake ?? f.base.service, contractStructureSender: f.sender, defaults: f.base.defaults)
+        await model.load()
+        return (model, try XCTUnwrap(model.projectRows.first))
+    }
+
+    private func productDocumentsFixture(contractMetadata: Bool = true) async throws -> ProductDocumentsFixture {
+        let base = try await senderFixture(generalDocument: true)
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("ProductDocuments-\(UUID())")
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        addTeardownBlock { try? FileManager.default.removeItem(at: root) }
+        let repository = SwiftDataMetadataRepository(modelContainer: try WriterPadMetadataStore.makeContainer(isStoredInMemoryOnly: true))
+        try await repository.save(Project(id: base.localID, name: "다중 문서 합성 작품", createdAt: Date(), modifiedAt: Date()))
+        let deviceID = UUID(uuidString: base.request.json.objectValue!["batch"]!.objectValue!["writer_device_id"]!.stringValue!)!
+        let device = DeviceIdentityService(store: InMemoryDeviceIdentityStore(), generateUUID: { deviceID })
+        let store = LazySyncV2ProjectBindingStore(databaseURL: root.appendingPathComponent("queue.sqlite"),
+            deviceIdentityProvider: device, uploadPullCoordinator: base.coordinator)
+        try await store.save(base.queue.savedBinding)
+        var folders: [SyncV2RemoteFolder] = []
+        var parentID: DocumentID?
+        for path in ["메인", "메인/원고"] {
+            let id = DocumentID(rawValue: UUID()), name = (path as NSString).lastPathComponent
+            try FileManager.default.createDirectory(at: root.appendingPathComponent(path), withIntermediateDirectories: true)
+            try await repository.save(DocumentNode(id: id, projectID: base.localID, kind: .folder,
+                parentID: parentID, relativePath: .init(rawValue: path), userOrder: 0, modifiedAt: Date(), contentHash: nil))
+            folders.append(.init(folderID: id.rawValue, parentFolderID: parentID?.rawValue, name: name,
+                revision: 1, isDeleted: false, updatedAt: Date()))
+            parentID = id
+        }
+        try await store.applyFolderSnapshotBaselines(localProjectID: base.localID,
+            serverProjectID: base.context.serverProjectID, folders: folders, excluding: [])
+        var documents: [DocumentNode] = []
+        for (index, revision) in [Int64(1), 7, 3].enumerated() {
+            let name = String(format: "%03d화.txt", index + 1), content = "기준 \(index)"
+            let path = "메인/원고/" + name
+            let document = DocumentNode(id: .init(rawValue: UUID()), projectID: base.localID, kind: .text,
+                parentID: parentID, relativePath: .init(rawValue: path), userOrder: index, modifiedAt: Date(),
+                contentHash: SHA256ContentHasher().sha256(for: Data(content.utf8)))
+            try Data(content.utf8).write(to: root.appendingPathComponent(path))
+            try await repository.save(document)
+            let applied = try await store.applySnapshotBaseline(localProjectID: base.localID,
+                serverProjectID: base.context.serverProjectID,
+                snapshot: .init(documentID: document.id.rawValue, relativePath: path, content: content, revision: revision,
+                    isDeleted: false, deletedAt: nil, updatedAt: Date(), parentFolderID: parentID?.rawValue,
+                    name: contractMetadata ? name : nil,
+                    structureRevision: contractMetadata ? 3 : nil), expectedRevision: nil)
+            XCTAssertTrue(applied)
+            documents.append(document)
+        }
+        let recorder = SyncV2ContractPathRecorder(store: store, handshakeService: base.service,
+            authenticationService: base.auth, defaults: ContractDefaults(value: base.defaults), bindingEpoch: base.bindingEpoch,
+            structureAuthority: base.authority, localProjectEpoch: base.localEpoch, isLocalProjectActive: { _ in true })
+        let gate = SyncV2DocumentMutationGate()
+        let localStore = LocalDocumentStore(workspaceLocator: FixedWorkspaceLocator(root: root), metadataUpdater: repository,
+            durableChangeRecorder: recorder, syncMutationGate: gate)
+        let sender = SyncV2ContractStructureSender(store: store, transport: base.transport, handshakeService: base.service,
+            authenticationService: base.auth, uploadPullCoordinator: base.coordinator, defaults: ContractDefaults(value: base.defaults),
+            bindingEpoch: base.bindingEpoch, deviceIdentityProvider: device, structureAuthority: base.authority,
+            localProjectEpoch: base.localEpoch, isLocalProjectActive: { _ in true })
+        let legacy = ProductLegacyClient()
+        let dispatcher = SyncV2Dispatcher(store: store, client: legacy, contractSender: sender,
+            uploadPullCoordinator: base.coordinator)
+        return .init(base: base, root: root, repository: repository, store: store, recorder: recorder,
+            documents: documents, folders: folders, localStore: localStore, sender: sender, dispatcher: dispatcher, legacy: legacy, mutationGate: gate)
+    }
+
+    func testProductMultipleDocumentsSaveDispatchAndReceiveKeepIndependentRevisions() async throws {
+        let f = try await productDocumentsFixture()
+        for (index, content, generation) in [(0, "첫 문서 é", UInt64(1)), (1, "두 번째 👩🏽‍💻", 1),
+                                               (0, "첫 문서 e\u{301} 최신", 2), (2, "", 1)] {
+            let receipt = try await f.save(index, content, generation: generation)
+            guard case .queued = receipt.durableRecordResult else { return XCTFail("파일 저장이 일반 큐에 연결되지 않음") }
+        }
+        await f.dispatcher.dispatchReadyOperations(now: Date())
+        let requests = await f.base.transport.requests
+        XCTAssertEqual(requests.count, 4)
+        let intents = try requests.map { try XCTUnwrap($0.objectValue?["ordered_intents"]?.arrayValue?.first?.objectValue) }
+        XCTAssertEqual(intents.compactMap { $0["document_id"]?.stringValue }, [0, 1, 0, 2].map { f.documents[$0].id.rawValue.uuidString.lowercased() })
+        XCTAssertEqual(intents.compactMap { $0["base_revision"]?.intValue }, [1, 7, 2, 3])
+        XCTAssertEqual(intents.compactMap { $0["payload"]?.objectValue?["content"]?.stringValue }.map { Data($0.utf8) },
+            ["첫 문서 é", "두 번째 👩🏽‍💻", "첫 문서 e\u{301} 최신", ""].map { Data($0.utf8) })
+        let status = try await f.store.generalQueueStatus(localProjectID: f.base.localID)
+        XCTAssertEqual(status.pendingCount + status.attentionCount + status.retryCount, 0)
+        let legacyCalls = await f.legacy.calls; XCTAssertEqual(legacyCalls, 0)
+        for (index, revision) in [Int64(3), 8, 4].enumerated() {
+            let state = try await f.store.snapshotState(localProjectID: f.base.localID,
+                serverProjectID: f.base.context.serverProjectID, documentID: f.documents[index].id.rawValue)
+            XCTAssertEqual(state?.serverRevision, revision)
+        }
+        let received = try await f.pull([f.remote(0, content: "서버 후속 1", revision: 4),
+            f.remote(1, content: "서버 후속 2", revision: 9), f.remote(2, content: "", revision: 4)])
+        XCTAssertEqual(Set(received.appliedSnapshots.map(\.documentID)), Set(f.documents.prefix(2).map { $0.id.rawValue }), "\(received)")
+        for (index, content) in ["서버 후속 1", "서버 후속 2", ""].enumerated() {
+            XCTAssertEqual(try Data(contentsOf: f.root.appendingPathComponent(f.documents[index].relativePath.rawValue)), Data(content.utf8))
+        }
+        let afterPull = await f.base.transport.requests; XCTAssertEqual(afterPull, requests, "수신을 새 로컬 송신으로 기록하면 안 됨")
+    }
+
+    func testProductClosedContractGatePreservesTwoFileHandoffsAndReopensWithoutLegacyQueue() async throws {
+        let f = try await productDocumentsFixture()
+        ContractPathGate.setOpen(false, for: f.base.localID, in: f.base.defaults)
+        for index in 0..<2 {
+            let receipt = try await f.save(index, "닫힌 관문 저장 \(index)")
+            guard case .localSavedButNotQueued = receipt.durableRecordResult else {
+                return XCTFail("UUID 계약 문서가 관문을 닫자 구형 큐에 들어감: \(String(describing: receipt.durableRecordResult))")
+            }
+        }
+        let legacyRows = try await f.store.claimReadyOperations(localProjectID: f.base.localID, limit: 10, now: Date())
+        XCTAssertTrue(legacyRows.isEmpty)
+        let markers = try FileManager.default.contentsOfDirectory(atPath: f.root.path).filter { $0.hasPrefix(LocalDocumentStore.syncHandoffPrefix) }
+        XCTAssertEqual(markers.count, 2)
+        let reopened = f.reopenedLocalStore()
+        ContractPathGate.setOpen(true, for: f.base.localID, in: f.base.defaults)
+        for document in f.documents.prefix(2) {
+            guard case .queued = await reopened.retryPendingSyncHandoff(for: document) else { return XCTFail("보존된 파일 인계 재개 실패") }
+        }
+        await f.dispatcher.dispatchReadyOperations(now: Date())
+        let requests = await f.base.transport.requests; XCTAssertEqual(requests.count, 2)
+        let status = try await f.store.generalQueueStatus(localProjectID: f.base.localID); XCTAssertEqual(status.pendingCount, 0)
+        let remaining = try FileManager.default.contentsOfDirectory(atPath: f.root.path)
+        XCTAssertFalse(remaining.contains { $0.hasPrefix(LocalDocumentStore.syncHandoffPrefix) })
+        for index in 0..<2 {
+            XCTAssertEqual(try Data(contentsOf: f.root.appendingPathComponent(f.documents[index].relativePath.rawValue)), Data("닫힌 관문 저장 \(index)".utf8))
+        }
+    }
+
+    func testProductClosedLegacyGateStillRecordsLegacyDocument() async throws {
+        let f = try await productDocumentsFixture(contractMetadata: false)
+        ContractPathGate.setOpen(false, for: f.base.localID, in: f.base.defaults)
+        let receipt = try await f.save(0, "구형 작품 저장")
+        guard case .queued = receipt.durableRecordResult else { return XCTFail("기존 LEGACY 저장을 차단하면 안 됨") }
+        let legacy = try await f.store.claimReadyOperations(localProjectID: f.base.localID, limit: 10, now: Date())
+        XCTAssertEqual(legacy.map(\.documentID), [f.documents[0].id.rawValue])
+        let history = try await f.store.hasGeneralContractHistory(localProjectID: f.base.localID); XCTAssertFalse(history)
+    }
+
+    func testProductSettingsRetryReconnectsUnopenedDocumentsWithoutSavingTextAgain() async throws {
+        let f = try await productDocumentsFixture()
+        ContractPathGate.setOpen(false, for: f.base.localID, in: f.base.defaults)
+        let first = try await f.save(0, "다시 열지 않은 문서 1"), second = try await f.save(1, "다시 열지 않은 문서 2")
+        let before = try await f.repository.documents(in: f.base.localID)
+        ContractPathGate.setOpen(true, for: f.base.localID, in: f.base.defaults)
+        let (model, row) = try await productRetryModel(f)
+        await model.retryGeneralSync(for: row, documentRepository: f.repository, documentStore: f.reopenedLocalStore())
+        XCTAssertNil(model.errorMessage); XCTAssertNotNil(model.informationMessage)
+        let after = try await f.repository.documents(in: f.base.localID); XCTAssertEqual(after, before)
+        let status = try await f.store.generalQueueStatus(localProjectID: f.base.localID); XCTAssertEqual(status.pendingCount, 2)
+        let files = try FileManager.default.contentsOfDirectory(atPath: f.root.path)
+        XCTAssertFalse(files.contains { $0.hasPrefix(LocalDocumentStore.syncHandoffPrefix) })
+        await f.dispatcher.dispatchReadyOperations(now: Date())
+        let requests = await f.base.transport.requests; XCTAssertEqual(requests.count, 2)
+        for receipt in [first, second] {
+            let data = try Data(contentsOf: f.root.appendingPathComponent(receipt.relativePath.rawValue))
+            XCTAssertEqual(SHA256ContentHasher().sha256(for: data), receipt.contentHash)
+        }
+    }
+
+    func testProductSettingsRetryRejectsLateAuthorityAndScreenChangesBeforeReplayingFiles() async throws {
+        for mode in 0..<8 {
+            let f = try await productDocumentsFixture()
+            ContractPathGate.setOpen(false, for: f.base.localID, in: f.base.defaults)
+            _ = try await f.save(0, "오래된 재시도가 연결하면 안 되는 저장")
+            ContractPathGate.setOpen(true, for: f.base.localID, in: f.base.defaults)
+            let transport = ControlledTransport(), bindings = LifecycleBindings([f.base.queue.savedBinding])
+            let service = SyncV2HandshakeService(transport: transport)
+            let (model, row) = try await productRetryModel(f, handshake: service, bindings: bindings)
+            let task = Task { await model.retryGeneralSync(for: row, documentRepository: f.repository, documentStore: f.reopenedLocalStore()) }
+            await eventually { await transport.count == 1 }
+            switch mode {
+            case 0: await f.base.auth.relogin()
+            case 1: bindings.contractEpoch?.advance()
+            case 2: f.base.localEpoch.advance()
+            case 3: model.cancelPendingGateOpenings()
+            case 4: ContractPathGate.setOpen(false, for: f.base.localID, in: f.base.defaults)
+            case 5: GlobalSyncPreference.setEnabled(false, in: f.base.defaults)
+            case 6: await service.updateSceneActivity(false)
+            default: task.cancel()
+            }
+            await transport.finish(.success(supportedResponse(projectID: f.base.context.serverProjectID, mode: .idBased, epoch: 1)))
+            await task.value
+            XCTAssertNotNil(model.errorMessage); XCTAssertNil(model.informationMessage)
+            let status = try await f.store.generalQueueStatus(localProjectID: f.base.localID); XCTAssertEqual(status.pendingCount, 0)
+            let files = try FileManager.default.contentsOfDirectory(atPath: f.root.path)
+            XCTAssertEqual(files.filter { $0.hasPrefix(LocalDocumentStore.syncHandoffPrefix) }.count, 1)
+        }
+    }
+
+    func testProductSettingsRetryRejectsForeignOwnerStaleRowAndSignedOutBeforeNetwork() async throws {
+        for mode in 0..<3 {
+            let f = try await productDocumentsFixture()
+            ContractPathGate.setOpen(false, for: f.base.localID, in: f.base.defaults)
+            _ = try await f.save(0, "계정 확인 전에는 연결하지 않을 저장")
+            ContractPathGate.setOpen(true, for: f.base.localID, in: f.base.defaults)
+            let transport = ControlledTransport(), service = SyncV2HandshakeService(transport: transport)
+            let foreign = ProjectSyncBinding.connected(localProjectID: f.base.localID, serverProjectID: f.base.context.serverProjectID,
+                kind: .existingServerProject, projectName: "다른 계정 연결", ownerSubject: UUID())
+            let (model, row) = try await productRetryModel(f, handshake: service,
+                bindings: LifecycleBindings([mode == 0 ? foreign : f.base.queue.savedBinding]))
+            if mode == 2 { _ = await f.base.auth.signOut() }
+            let displayed = mode == 1 ? SyncProjectRow(project: row.project, binding: nil) : row
+            await model.retryGeneralSync(for: displayed, documentRepository: f.repository, documentStore: f.reopenedLocalStore())
+            XCTAssertNotNil(model.errorMessage); XCTAssertNil(model.informationMessage)
+            let count = await transport.count; XCTAssertEqual(count, 0)
+            let status = try await f.store.generalQueueStatus(localProjectID: f.base.localID); XCTAssertEqual(status.pendingCount, 0)
+            let files = try FileManager.default.contentsOfDirectory(atPath: f.root.path)
+            XCTAssertEqual(files.filter { $0.hasPrefix(LocalDocumentStore.syncHandoffPrefix) }.count, 1)
+        }
+    }
+
+    func testProductSettingsRetryKeepsDeferredFilesAndDoesNotReportSuccessWithoutBaseline() async throws {
+        let f = try await productDocumentsFixture()
+        ContractPathGate.setOpen(false, for: f.base.localID, in: f.base.defaults)
+        _ = try await f.save(0, "기준 대기 중인 저장")
+        ContractPathGate.setOpen(true, for: f.base.localID, in: f.base.defaults)
+        _ = f.base.authority.beginBaseline(f.base.context)
+        let (model, row) = try await productRetryModel(f)
+        await model.retryGeneralSync(for: row, documentRepository: f.repository, documentStore: f.reopenedLocalStore())
+        XCTAssertNotNil(model.errorMessage); XCTAssertNil(model.informationMessage)
+        let status = try await f.store.generalQueueStatus(localProjectID: f.base.localID); XCTAssertEqual(status.pendingCount, 0)
+        let files = try FileManager.default.contentsOfDirectory(atPath: f.root.path)
+        XCTAssertEqual(files.filter { $0.hasPrefix(LocalDocumentStore.syncHandoffPrefix) }.count, 1)
+        let content = try await f.localStore.loadText(for: f.documents[0]); XCTAssertEqual(content, "기준 대기 중인 저장")
+    }
+
+    /// Recreate transient sync services and reopen the existing SQLite/TXT files.
+    /// SwiftData stays in memory; this is not a physical process-kill/UI test.
+    private func restartedProductSync(_ f: ProductDocumentsFixture) throws -> ProductDocumentsFixture {
+        let auth = LifecycleAuth(account: f.base.context.accountID), bindingEpoch = SyncV2ContractEpoch(), localEpoch = SyncV2ContractEpoch()
+        let service = SyncV2HandshakeService(transport: StubTransport(results: Array(repeating:
+            .success(supportedResponse(projectID: f.base.context.serverProjectID, mode: .idBased, epoch: 1)), count: 8)))
+        let coordinator = SyncV2ProjectUploadPullCoordinator(), transport = ContractTransportStub()
+        let deviceID = UUID(uuidString: f.base.request.json.objectValue!["batch"]!.objectValue!["writer_device_id"]!.stringValue!)!
+        let device = DeviceIdentityService(store: InMemoryDeviceIdentityStore(), generateUUID: { deviceID })
+        let store = LazySyncV2ProjectBindingStore(databaseURL: f.root.appendingPathComponent("queue.sqlite"),
+            deviceIdentityProvider: device, uploadPullCoordinator: coordinator)
+        let recorder = SyncV2ContractPathRecorder(store: store, handshakeService: service, authenticationService: auth,
+            defaults: ContractDefaults(value: f.base.defaults), bindingEpoch: bindingEpoch,
+            structureAuthority: coordinator.contractStructureAuthority, localProjectEpoch: localEpoch, isLocalProjectActive: { _ in true })
+        let mutationGate = SyncV2DocumentMutationGate()
+        let localStore = LocalDocumentStore(workspaceLocator: FixedWorkspaceLocator(root: f.root), metadataUpdater: f.repository,
+            durableChangeRecorder: recorder, syncMutationGate: mutationGate)
+        let sender = SyncV2ContractStructureSender(store: store, transport: transport, handshakeService: service,
+            authenticationService: auth, uploadPullCoordinator: coordinator, defaults: ContractDefaults(value: f.base.defaults),
+            bindingEpoch: bindingEpoch, deviceIdentityProvider: device, structureAuthority: coordinator.contractStructureAuthority,
+            localProjectEpoch: localEpoch, isLocalProjectActive: { _ in true })
+        let legacy = ProductLegacyClient()
+        let dispatcher = SyncV2Dispatcher(store: store, client: legacy, contractSender: sender, uploadPullCoordinator: coordinator)
+        let base = SenderFixture(coordinator: coordinator, authority: coordinator.contractStructureAuthority, context: f.base.context,
+            localEpoch: localEpoch, sender: sender, service: service, auth: auth, bindingEpoch: bindingEpoch, queue: f.base.queue,
+            transport: transport, localID: f.base.localID, defaults: f.base.defaults, request: f.base.request)
+        return .init(base: base, root: f.root, repository: f.repository, store: store, recorder: recorder,
+            documents: f.documents, folders: f.folders, localStore: localStore, sender: sender,
+            dispatcher: dispatcher, legacy: legacy, mutationGate: mutationGate)
+    }
+
+    func testFileHandoffRejectsChangedServerAccountAndUnknownLegacyOriginAfterReopen() async throws {
+        for mode in 0..<3 {
+            let f = try await productDocumentsFixture()
+            ContractPathGate.close(for: f.base.localID, in: f.base.defaults)
+            _ = try await f.save(0, "원래 연결에서 저장한 본문")
+            let files = try FileManager.default.contentsOfDirectory(atPath: f.root.path)
+            let marker = f.root.appendingPathComponent(try XCTUnwrap(files.first { $0.hasPrefix(LocalDocumentStore.syncHandoffPrefix) }))
+            var replayStore = f.store
+            if mode == 2 {
+                var json = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(contentsOf: marker)) as? [String: Any])
+                var batches = try XCTUnwrap(json["batches"] as? [[String: Any]])
+                batches[0].removeValue(forKey: "handoffOrigin")
+                json["batches"] = batches
+                try JSONSerialization.data(withJSONObject: json, options: [.sortedKeys]).write(to: marker)
+            } else {
+                // Existing baseline FKs reject direct server-ID replacement. Model
+                // a fresh binding store with surviving handoff files, without bypassing FKs.
+                replayStore = LazySyncV2ProjectBindingStore(databaseURL: f.root.appendingPathComponent("rebound.sqlite"),
+                    deviceIdentityProvider: DeviceIdentityService(store: InMemoryDeviceIdentityStore()))
+                try await replayStore.save(.connected(localProjectID: f.base.localID,
+                    serverProjectID: mode == 0 ? UUID() : f.base.context.serverProjectID,
+                    kind: .existingServerProject, projectName: "변경된 연결",
+                    ownerSubject: mode == 1 ? UUID() : f.base.context.accountID))
+            }
+            let bytes = try Data(contentsOf: marker)
+            let recorder = SyncV2ContractPathRecorder(store: replayStore, handshakeService: f.base.service,
+                authenticationService: f.base.auth, defaults: .init(value: f.base.defaults),
+                bindingEpoch: f.base.bindingEpoch, structureAuthority: f.base.authority,
+                localProjectEpoch: f.base.localEpoch, isLocalProjectActive: { _ in true })
+            let reopened = LocalDocumentStore(workspaceLocator: FixedWorkspaceLocator(root: f.root),
+                metadataUpdater: f.repository, durableChangeRecorder: recorder)
+            let result = await reopened.retryPendingSyncHandoff(for: f.documents[0])
+            guard case .localSavedButNotQueued = result else { return XCTFail("다른 연결/출처 불명 기록을 재생함: \(mode)") }
+            XCTAssertEqual(try Data(contentsOf: marker), bytes)
+            let queue = try await replayStore.generalQueueStatus(localProjectID: f.base.localID)
+            XCTAssertEqual(queue.pendingCount, 0)
+            let body = try await reopened.loadText(for: f.documents[0])
+            XCTAssertEqual(body, "원래 연결에서 저장한 본문")
+            // The contract path must reject provenance too, even when its gate is open.
+            ContractPathGate.setOpen(true, for: f.base.localID, in: f.base.defaults)
+            let again = await reopened.retryPendingSyncHandoff(for: f.documents[0])
+            guard case .localSavedButNotQueued = again else { return XCTFail("열린 관문이 출처 검사를 우회함") }
+            XCTAssertEqual(try Data(contentsOf: marker), bytes)
+        }
+    }
+
+    func testNewSourcedSaveQuarantinesLegacyHandoffAndSurvivesReopen() async throws {
+        for blockQuarantine in [false, true] {
+            let f = try await productDocumentsFixture()
+            ContractPathGate.close(for: f.base.localID, in: f.base.defaults)
+            _ = try await f.save(0, "출처 없는 이전 저장")
+            let files = try FileManager.default.contentsOfDirectory(atPath: f.root.path)
+            let marker = f.root.appendingPathComponent(try XCTUnwrap(files.first { $0.hasPrefix(LocalDocumentStore.syncHandoffPrefix) }))
+            var json = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(contentsOf: marker)) as? [String: Any])
+            var batches = try XCTUnwrap(json["batches"] as? [[String: Any]])
+            batches[0].removeValue(forKey: "handoffOrigin")
+            json["batches"] = batches
+            try JSONSerialization.data(withJSONObject: json, options: [.sortedKeys]).write(to: marker)
+            let old = try JSONDecoder().decode(LocalMutationBatch.self,
+                from: JSONSerialization.data(withJSONObject: batches[0]))
+            let quarantine = f.root.appendingPathComponent(LocalDocumentStore.quarantinedHandoffPrefix
+                + old.batchID.uuidString.lowercased() + LocalDocumentStore.syncHandoffSuffix)
+            if blockQuarantine {
+                try FileManager.default.createDirectory(at: quarantine, withIntermediateDirectories: false)
+            }
+            let reopened = f.reopenedLocalStore()
+            ContractPathGate.setOpen(true, for: f.base.localID, in: f.base.defaults)
+            let saved = try await reopened.save(.init(projectID: f.base.localID, documentID: f.documents[0].id,
+                relativePath: f.documents[0].relativePath, text: "출처 확인된 새 저장", generation: 2, cursor: nil))
+            if blockQuarantine {
+                guard case .localSavedButNotQueued = saved.durableRecordResult else { return XCTFail("보존 실패인데 진행함") }
+                let remaining = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(contentsOf: marker)) as? [String: Any])
+                XCTAssertEqual((remaining["batches"] as? [Any])?.count, 2)
+                let queue = try await f.store.generalQueueStatus(localProjectID: f.base.localID)
+                XCTAssertEqual(queue.pendingCount, 0)
+                try FileManager.default.removeItem(at: quarantine)
+                _ = await f.reopenedLocalStore().retryPendingSyncHandoff(for: f.documents[0])
+            } else {
+                guard case .queued = saved.durableRecordResult else { return XCTFail("옛 기록이 새 저장을 막음: \(String(describing: saved.durableRecordResult))") }
+            }
+            XCTAssertEqual(try JSONDecoder().decode(LocalMutationBatch.self, from: Data(contentsOf: quarantine)), old)
+            XCTAssertFalse(FileManager.default.fileExists(atPath: marker.path))
+            let status = try await f.store.generalQueueStatus(localProjectID: f.base.localID)
+            XCTAssertEqual(status.pendingCount, 1)
+            _ = await f.reopenedLocalStore().retryPendingSyncHandoff(for: f.documents[0])
+            let after = try await f.store.generalQueueStatus(localProjectID: f.base.localID)
+            XCTAssertEqual(after.pendingCount, 1, "격리한 기록은 재시작해도 재송신하지 않음")
+            let text = try await reopened.loadText(for: f.documents[0])
+            XCTAssertEqual(text, "출처 확인된 새 저장")
+        }
+    }
+
+    func testResumePublishesBaselineBeforePullReadyAndStillRejectsRevocationOnRelease() async throws {
+        for revoke in [false, true] {
+            let f = try await productDocumentsFixture()
+            _ = f.base.authority.beginBaseline(f.base.context)
+            let saved = try await f.store.generalHandoffBaseline(localProjectID: f.base.localID)
+            await f.base.transport.setPreparationSnapshot(saved)
+            let published = SyncV2ContractEpoch()
+            await f.base.transport.setBeforeGeneralRead { [coordinator = f.base.coordinator,
+                authority = f.base.authority, context = f.base.context, epoch = f.base.bindingEpoch] count in
+                guard count == 2 else { return }
+                _ = await coordinator.observeServerChange(localProjectID: context.localProjectID, queue: .idle, bootstrapAllowed: false)
+                await coordinator.installPullReadyHandler(id: UUID()) {
+                    if authority.proof(context, requiresActiveServer: true) != nil { published.advance() }
+                    if revoke { epoch.advance() }
+                }
+            }
+            do {
+                try await f.sender.prepareGeneralHandoffResume(context: f.base.context, authorizeCaller: {})
+                XCTAssertFalse(revoke)
+            } catch { XCTAssertTrue(revoke, "\(error)") }
+            XCTAssertEqual(published.value, 1, "수신 준비 알림 전에 기준 승인이 공개되어야 함")
+            let state = await f.base.coordinator.snapshot(localProjectID: f.base.localID)
+            XCTAssertEqual(state.runningUploadCount, 0)
+            if revoke { XCTAssertNil(f.base.authority.proof(f.base.context, requiresActiveServer: false)) }
+        }
+    }
+
+    func testProductResumeReconnectsFileOnlySavesAfterProjectChangeReloginAndStoreReopen() async throws {
+        for mode in 0..<3 {
+            let original = try await productDocumentsFixture()
+            ContractPathGate.setOpen(false, for: original.base.localID, in: original.base.defaults)
+            _ = try await original.save(0, "재개할 첫 문서")
+            _ = try await original.save(1, "재개할 두 번째 문서")
+            ContractPathGate.setOpen(true, for: original.base.localID, in: original.base.defaults)
+            let f = mode == 2 ? try restartedProductSync(original) : original
+            if mode == 0 { await f.base.service.projectChanged() }
+            if mode == 1 { await f.base.auth.relogin() }
+            _ = f.base.authority.beginBaseline(f.base.context)
+            let savedBaseline = try await f.store.generalHandoffBaseline(localProjectID: f.base.localID)
+            await f.base.transport.setPreparationSnapshot(savedBaseline)
+            let before = try await f.repository.documents(in: f.base.localID)
+            let (model, row) = try await productRetryModel(f)
+            await model.retryGeneralSync(for: row, documentRepository: f.repository, documentStore: f.localStore)
+            XCTAssertNil(model.errorMessage, "mode=\(mode): \(model.errorMessage ?? "")")
+            let reads = await f.base.transport.generalReadProjects
+            XCTAssertEqual(reads, Array(repeating: f.base.context.serverProjectID, count: 2))
+            let writesBeforeDispatch = await f.base.transport.requests; XCTAssertTrue(writesBeforeDispatch.isEmpty)
+            let after = try await f.repository.documents(in: f.base.localID); XCTAssertEqual(after, before)
+            let afterBaseline = try await f.store.generalHandoffBaseline(localProjectID: f.base.localID)
+            XCTAssertEqual(try afterBaseline.fingerprint(), try savedBaseline.fingerprint())
+            let pending = try await f.store.generalQueueStatus(localProjectID: f.base.localID); XCTAssertEqual(pending.pendingCount, 2)
+            await f.dispatcher.dispatchReadyOperations(now: Date())
+            let writes = await f.base.transport.requests; XCTAssertEqual(writes.count, 2)
+            let final = try await f.store.generalQueueStatus(localProjectID: f.base.localID); XCTAssertEqual(final.pendingCount, 0)
+            for (index, text) in ["재개할 첫 문서", "재개할 두 번째 문서"].enumerated() {
+                let body = try await f.localStore.loadText(for: f.documents[index]); XCTAssertEqual(body, text)
+            }
+        }
+    }
+
+    func testProductResumeMismatchAndChangingServerKeepEveryFileAndBaselineUnchanged() async throws {
+        for changedSecondRead in [false, true] {
+            let f = try await productDocumentsFixture()
+            ContractPathGate.setOpen(false, for: f.base.localID, in: f.base.defaults)
+            _ = try await f.save(0, "서버 기준 불일치 중 본문")
+            ContractPathGate.setOpen(true, for: f.base.localID, in: f.base.defaults)
+            _ = f.base.authority.beginBaseline(f.base.context)
+            let saved = try await f.store.generalHandoffBaseline(localProjectID: f.base.localID)
+            let mismatch = SyncV2PreparationSnapshot(folders: [], documents: [], treeOrders: [])
+            await f.base.transport.setPreparationSnapshot(changedSecondRead ? saved : mismatch)
+            if changedSecondRead {
+                await f.base.transport.setBeforeGeneralRead { [transport = f.base.transport] count in
+                    if count == 2 { await transport.setPreparationSnapshot(mismatch) }
+                }
+            }
+            let beforeFiles = try FileManager.default.contentsOfDirectory(atPath: f.root.path)
+            let marker = try XCTUnwrap(beforeFiles.first { $0.hasPrefix(LocalDocumentStore.syncHandoffPrefix) })
+            let markerBytes = try Data(contentsOf: f.root.appendingPathComponent(marker))
+            let (model, row) = try await productRetryModel(f)
+            await model.retryGeneralSync(for: row, documentRepository: f.repository, documentStore: f.localStore)
+            XCTAssertTrue(model.errorMessage?.contains("서버와 마지막 동기화 기준") == true)
+            XCTAssertNil(model.informationMessage)
+            XCTAssertEqual(try Data(contentsOf: f.root.appendingPathComponent(marker)), markerBytes)
+            let body = try await f.localStore.loadText(for: f.documents[0]); XCTAssertEqual(body, "서버 기준 불일치 중 본문")
+            let latest = try await f.store.generalHandoffBaseline(localProjectID: f.base.localID)
+            XCTAssertEqual(try latest.fingerprint(), try saved.fingerprint())
+            XCTAssertNil(f.base.authority.proof(f.base.context, requiresActiveServer: false))
+            let writes = await f.base.transport.requests; XCTAssertTrue(writes.isEmpty)
+            let queue = try await f.store.generalQueueStatus(localProjectID: f.base.localID); XCTAssertEqual(queue.pendingCount, 0)
+            let permit = await f.base.coordinator.beginUploadDrain(localProjectID: f.base.localID, queue: .idle)
+            XCTAssertNotNil(permit)
+            if let permit { await f.base.coordinator.finishUploadDrain(permit, queue: .idle) }
+        }
+    }
+
+    func testProductResumeLosesAuthorityDuringBaselineReadWithoutGrantOrReplay() async throws {
+        for mode in 0..<8 {
+            let f = try await productDocumentsFixture()
+            ContractPathGate.setOpen(false, for: f.base.localID, in: f.base.defaults)
+            _ = try await f.save(0, "권한 변경 중 보존")
+            ContractPathGate.setOpen(true, for: f.base.localID, in: f.base.defaults)
+            _ = f.base.authority.beginBaseline(f.base.context)
+            await f.base.transport.setPreparationSnapshot(try await f.store.generalHandoffBaseline(localProjectID: f.base.localID))
+            let bindings = LifecycleBindings([f.base.queue.savedBinding])
+            let (model, row) = try await productRetryModel(f, bindings: bindings)
+            let defaults = ContractDefaults(value: f.base.defaults)
+            await f.base.transport.setBeforeGeneralRead { [auth = f.base.auth, localEpoch = f.base.localEpoch, service = f.base.service] count in
+                guard count == 1 else { return }
+                switch mode {
+                case 0: await auth.relogin()
+                case 1: bindings.contractEpoch?.advance()
+                case 2: localEpoch.advance()
+                case 3: await MainActor.run { model.cancelPendingGateOpenings() }
+                case 4: ContractPathGate.setOpen(false, for: row.id, in: defaults.value)
+                case 5: GlobalSyncPreference.setEnabled(false, in: defaults.value)
+                case 6: await service.updateSceneActivity(false)
+                default: await service.projectChanged()
+                }
+            }
+            await model.retryGeneralSync(for: row, documentRepository: f.repository, documentStore: f.localStore)
+            XCTAssertNotNil(model.errorMessage); XCTAssertNil(model.informationMessage)
+            XCTAssertNil(f.base.authority.proof(f.base.context, requiresActiveServer: false))
+            let files = try FileManager.default.contentsOfDirectory(atPath: f.root.path)
+            XCTAssertEqual(files.filter { $0.hasPrefix(LocalDocumentStore.syncHandoffPrefix) }.count, 1)
+            let queue = try await f.store.generalQueueStatus(localProjectID: f.base.localID); XCTAssertEqual(queue.pendingCount, 0)
+            let writes = await f.base.transport.requests; XCTAssertTrue(writes.isEmpty)
+        }
+    }
+
+    func testProductResumeRejectsInactiveServerAndCanRetryAfterReadFailure() async throws {
+        for inactive in [false, true] {
+            let f = try await productDocumentsFixture()
+            ContractPathGate.setOpen(false, for: f.base.localID, in: f.base.defaults)
+            _ = try await f.save(0, "서버 확인 실패 뒤 재개")
+            ContractPathGate.setOpen(true, for: f.base.localID, in: f.base.defaults)
+            _ = f.base.authority.beginBaseline(f.base.context)
+            let saved = try await f.store.generalHandoffBaseline(localProjectID: f.base.localID)
+            if inactive { await f.base.transport.configureProjectRead(state: .trashed) }
+            // Without a snapshot the stub fails the baseline read, like a network failure.
+            let (model, row) = try await productRetryModel(f)
+            await model.retryGeneralSync(for: row, documentRepository: f.repository, documentStore: f.localStore)
+            XCTAssertNotNil(model.errorMessage)
+            let empty = try await f.store.generalQueueStatus(localProjectID: f.base.localID); XCTAssertEqual(empty.pendingCount, 0)
+            XCTAssertNil(f.base.authority.proof(f.base.context, requiresActiveServer: false))
+            await f.base.transport.configureProjectRead()
+            await f.base.transport.setPreparationSnapshot(saved)
+            await model.retryGeneralSync(for: row, documentRepository: f.repository, documentStore: f.localStore)
+            XCTAssertNil(model.errorMessage)
+            let pending = try await f.store.generalQueueStatus(localProjectID: f.base.localID); XCTAssertEqual(pending.pendingCount, 1)
+        }
+    }
+
+    func testProductRetryStillRecoversLostReceiptWhenFileHandoffBaselineDiffers() async throws {
+        let f = try await productDocumentsFixture()
+        _ = try await f.save(0, "서버에 반영됐지만 응답을 잃은 본문")
+        await f.base.transport.configure(reject: true)
+        await f.dispatcher.dispatchReadyOperations(now: Date())
+        let uncertain = try await f.store.recoverableGeneralContract(localProjectID: f.base.localID)
+        let pending = try XCTUnwrap(uncertain)
+        let receipt = try makeGeneralCommitReceiptForTesting(pending, accountID: f.base.context.accountID,
+            response: makeGeneralCommitResponseForTesting(pending))
+        await f.base.transport.configureReceipt(receipt)
+        _ = f.base.authority.beginBaseline(f.base.context)
+        _ = try await f.save(1, "기준 확인을 기다리는 별도 문서")
+        let files = try FileManager.default.contentsOfDirectory(atPath: f.root.path)
+        let marker = try XCTUnwrap(files.first { $0.hasPrefix(LocalDocumentStore.syncHandoffPrefix) })
+        let markerURL = f.root.appendingPathComponent(marker)
+        let markerBytes = try Data(contentsOf: markerURL)
+        await f.base.transport.setPreparationSnapshot(.init(folders: [], documents: [], treeOrders: []))
+        let (model, row) = try await productRetryModel(f)
+        await model.retryGeneralSync(for: row, documentRepository: f.repository, documentStore: f.localStore)
+        XCTAssertNotNil(model.errorMessage, "파일 인계가 연결되지 않았는데 전체 성공으로 표시하면 안 됨")
+        XCTAssertNil(model.informationMessage)
+        await f.dispatcher.dispatchReadyOperations(now: Date())
+        let status = try await f.store.generalQueueStatus(localProjectID: f.base.localID)
+        XCTAssertEqual(status.pendingCount, 0, "파일 기준 불일치가 기존 요청의 receipt 복구까지 막으면 안 됨")
+        let requests = await f.base.transport.requests
+        XCTAssertEqual(requests.count, 1, "이미 적용된 요청의 새 commit을 만들면 안 됨")
+        XCTAssertEqual(try Data(contentsOf: markerURL), markerBytes)
+        let body = try await f.localStore.loadText(for: f.documents[1])
+        XCTAssertEqual(body, "기준 확인을 기다리는 별도 문서")
+    }
+
+    func testProductMultipleDocumentTransportRetryKeepsOriginalRequestAndLaterSaves() async throws {
+        let f = try await productDocumentsFixture()
+        _ = try await f.save(0, "처음 송신")
+        _ = try await f.save(1, "다른 문서")
+        await f.base.transport.configure(reject: true)
+        await f.dispatcher.dispatchReadyOperations(now: Date())
+        let failed = await f.base.transport.requests; XCTAssertEqual(failed.count, 1)
+        _ = try await f.save(0, "그동안 새 저장", generation: 2)
+        await f.base.transport.configure()
+        try await f.sender.retryGeneralContract(localProjectID: f.base.localID)
+        await f.dispatcher.dispatchReadyOperations(now: Date())
+        let requests = await f.base.transport.requests
+        XCTAssertEqual(requests.count, 4)
+        guard requests.count == 4 else { return }
+        XCTAssertEqual(requests[0], requests[1], "실패한 요청의 ID·본문·해시를 재작성하면 안 됨")
+        let intents = requests.dropFirst().compactMap { $0.objectValue?["ordered_intents"]?.arrayValue?.first?.objectValue }
+        XCTAssertEqual(intents.compactMap { $0["base_revision"]?.intValue }, [1, 7, 2])
+        let status = try await f.store.generalQueueStatus(localProjectID: f.base.localID); XCTAssertEqual(status.pendingCount, 0)
+        let text = try await f.localStore.loadText(for: f.documents[0]); XCTAssertEqual(text, "그동안 새 저장")
+        let legacyCalls = await f.legacy.calls; XCTAssertEqual(legacyCalls, 0)
+    }
+
+    func testProductPullDefersPendingProjectThenReceivesCleanDocumentsAndProtectsDirtyEditor() async throws {
+        let f = try await productDocumentsFixture()
+        _ = try await f.save(0, "아직 송신 전")
+        let report = try await f.pull([f.remote(0, content: "동시에 바뀐 서버", revision: 2),
+            f.remote(1, content: "다른 문서 수신", revision: 8), f.remote(2, content: "입력 중 서버", revision: 4)],
+            guards: [f.documents[2].id.rawValue: .init(isOpen: true, isDirty: true, isComposing: false)])
+        XCTAssertTrue(report.outcomes.contains(.mergeRequired(documentID: f.documents[0].id.rawValue, revision: 2, reason: .pendingOperation)))
+        // 일반 계약의 구조 의존성은 작품 단위다. 다른 문서도 큐가 비기 전에는 수신을 보류한다.
+        XCTAssertTrue(report.outcomes.contains(.mergeRequired(documentID: f.documents[1].id.rawValue, revision: 8, reason: .pendingOperation)))
+        XCTAssertTrue(report.outcomes.contains(.mergeRequired(documentID: f.documents[2].id.rawValue, revision: 4, reason: .pendingOperation)))
+        XCTAssertTrue(report.appliedSnapshots.isEmpty)
+        for (index, content) in ["아직 송신 전", "기준 1", "기준 2"].enumerated() {
+            let actual = try await f.localStore.loadText(for: f.documents[index]); XCTAssertEqual(actual, content)
+        }
+        let requests = await f.base.transport.requests; XCTAssertTrue(requests.isEmpty)
+        let status = try await f.store.generalQueueStatus(localProjectID: f.base.localID); XCTAssertEqual(status.pendingCount, 1)
+        await f.dispatcher.dispatchReadyOperations(now: Date())
+        let resumed = try await f.pull([f.remote(0, content: "후속 서버", revision: 3),
+            f.remote(1, content: "다른 문서 수신", revision: 8), f.remote(2, content: "입력 중 서버", revision: 4)],
+            guards: [f.documents[2].id.rawValue: .init(isOpen: true, isDirty: true, isComposing: false)])
+        XCTAssertTrue(resumed.outcomes.contains(.mergeRequired(documentID: f.documents[2].id.rawValue, revision: 4, reason: .dirtyEditor)))
+        XCTAssertEqual(Set(resumed.appliedSnapshots.map(\.documentID)), Set(f.documents.prefix(2).map { $0.id.rawValue }), "\(resumed)")
+        for (index, content) in ["후속 서버", "다른 문서 수신", "기준 2"].enumerated() {
+            let actual = try await f.localStore.loadText(for: f.documents[index]); XCTAssertEqual(actual, content)
+        }
     }
 }

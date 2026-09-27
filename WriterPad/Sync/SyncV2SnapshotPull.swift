@@ -47,7 +47,8 @@ private enum SyncV2GateHoldOutcome: Sendable {
 
 /// Gate가 작업의 취소 협조 여부와 무관하게 정해진 시간 안에 보유권을
 /// 반환하도록 하는 공통 상한이다. 시간 초과 뒤 작업은 취소만 요청하고
-/// 기다리지 않아 다음 waiter에게 Gate를 넘길 수 있게 한다.
+/// 기다리지 않아 다음 waiter에게 Gate를 넘길 수 있게 한다. 단, 순서 보존이
+/// 필요한 로컬 저장/초기 enqueue는 drainOnTimeout으로 실제 종료까지 기다린다.
 private func withSyncV2GateHoldLimit<
     Value: Sendable,
     TimeoutError: Error & Sendable
@@ -56,6 +57,7 @@ private func withSyncV2GateHoldLimit<
     timeoutSleep: @escaping SyncV2GateTimeoutSleep,
     timeoutError: TimeoutError,
     timeoutDiagnosticName: String,
+    drainOnTimeout: Bool = false,
     operation: @escaping @Sendable () async throws -> Value
 ) async throws -> Value {
     let race = SyncV2OneShotRace<SyncV2GateHoldOutcome>()
@@ -86,6 +88,11 @@ private func withSyncV2GateHoldLimit<
     case .operationFinished:
         return try await operationTask.value
     case .timedOut:
+        if drainOnTimeout {
+            // 취소는 종료가 아니다. 비협조적 SQLite/파일 작업이 뒤늦게
+            // 완료해 다음 저장을 추월하지 않도록 gate를 아직 반환하지 않는다.
+            _ = await operationTask.result
+        }
         throw timeoutError
     }
 }
@@ -117,6 +124,7 @@ actor SyncV2DocumentMutationGate {
         timeoutSleep: @escaping SyncV2GateTimeoutSleep = { duration in
             try await ContinuousClock().sleep(for: duration)
         },
+        drainOnTimeout: Bool = false,
         operation: @escaping @Sendable () async throws -> Value
     ) async throws -> Value {
         await acquire(documentID)
@@ -127,6 +135,7 @@ actor SyncV2DocumentMutationGate {
             timeoutSleep: timeoutSleep,
             timeoutError: SyncV2DocumentMutationGateError.holdTimedOut,
             timeoutDiagnosticName: "SyncV2DocumentMutationGate",
+            drainOnTimeout: drainOnTimeout,
             operation: operation
         )
     }

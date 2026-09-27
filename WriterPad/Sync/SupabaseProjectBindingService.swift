@@ -359,6 +359,8 @@ extension ProjectBindingServicing {
 actor SupabaseProjectBindingService: ProjectBindingServicing {
     nonisolated let contractEpoch: SyncV2ContractEpoch?
     private let handshakeInvalidated: @Sendable () -> Void
+    private let contractDefaults: ContractDefaults
+    private let projectSaveGate: SyncV2DocumentMutationGate
     private let transport: (any EnsureProjectTransporting)?
     private let bindingStore: any ProjectBindingStoring
     private let projectRepository: any ProjectRepository
@@ -380,7 +382,9 @@ actor SupabaseProjectBindingService: ProjectBindingServicing {
         snapshotClient: (any SyncV2SnapshotClienting)? = nil,
         bindingIsVisible: @escaping @Sendable (ProjectID) async -> Bool = { _ in true },
         contractEpoch: SyncV2ContractEpoch = SyncV2ContractEpoch(),
-        handshakeInvalidated: @escaping @Sendable () -> Void = {}
+        handshakeInvalidated: @escaping @Sendable () -> Void = {},
+        contractDefaults: ContractDefaults = .standard,
+        projectSaveGate: SyncV2DocumentMutationGate = SyncV2DocumentMutationGate()
     ) {
         self.transport = transport
         self.bindingStore = bindingStore
@@ -391,6 +395,8 @@ actor SupabaseProjectBindingService: ProjectBindingServicing {
         self.bindingIsVisible = bindingIsVisible
         self.contractEpoch = contractEpoch
         self.handshakeInvalidated = handshakeInvalidated
+        self.contractDefaults = contractDefaults
+        self.projectSaveGate = projectSaveGate
     }
 
     func currentBinding(
@@ -412,7 +418,7 @@ actor SupabaseProjectBindingService: ProjectBindingServicing {
 
     func bindingUpdates(
         for localProjectID: ProjectID
-    ) -> AsyncStream<ProjectSyncBinding?> {
+    ) async -> AsyncStream<ProjectSyncBinding?> {
         let observerID = UUID()
         return AsyncStream(bufferingPolicy: .bufferingNewest(1)) {
             continuation in
@@ -510,6 +516,7 @@ actor SupabaseProjectBindingService: ProjectBindingServicing {
     func disconnect(
         localProjectID: ProjectID
     ) async -> ProjectBindingResult {
+        ContractPathGate.close(for: localProjectID, in: contractDefaults.value)
         contractEpoch?.beginTransition()
         defer { contractEpoch?.endTransition(); handshakeInvalidated() }
         guard await bindingStore.availability() == .available else {
@@ -537,8 +544,9 @@ actor SupabaseProjectBindingService: ProjectBindingServicing {
             name: name
         )
         do {
-            try await bindingStore.save(localOnly)
-            publish(localOnly, localProjectID: localProjectID)
+            try await projectSaveGate.withCriticalSection(documentID: localProjectID.rawValue, drainOnTimeout: true) {
+                try await self.persistDisconnectedBinding(localOnly)
+            }
             return .disconnected(localOnly)
         } catch {
             return .failed(storeFailure(error))
@@ -670,15 +678,23 @@ actor SupabaseProjectBindingService: ProjectBindingServicing {
             ownerSubject: account.userID
         )
         do {
-            try await bindingStore.save(binding)
-            guard await prepareInitialSnapshotIfNeeded(for: binding) else {
+            let prepared = try await projectSaveGate.withCriticalSection(documentID: localProjectID.rawValue, drainOnTimeout: true) {
+                try await self.persistBindingAndPrepareInitialSnapshot(binding)
+            }
+            guard prepared else {
                 return .failed(.initialSnapshotNotQueued)
             }
-            publish(binding, localProjectID: localProjectID)
             return .connected(binding)
         } catch {
             return .failed(storeFailure(error))
         }
+    }
+
+    /// Watchdog가 먼저 만료돼도 실제 완료된 저장은 관찰자에게 알려야 한다.
+    /// 다음 연결 작업에 gate를 넘기기 전에 알림도 순서대로 발행한다.
+    private func persistDisconnectedBinding(_ binding: ProjectSyncBinding) async throws {
+        try await bindingStore.save(binding)
+        publish(binding, localProjectID: binding.localProjectID)
     }
 
     /// Native identity 연결은 초기 batch가 durable queue에 들어가기 전까지 다른
@@ -687,6 +703,29 @@ actor SupabaseProjectBindingService: ProjectBindingServicing {
     private func prepareInitialSnapshotIfNeeded(
         for binding: ProjectSyncBinding
     ) async -> Bool {
+        (try? await projectSaveGate.withCriticalSection(documentID: binding.localProjectID.rawValue, drainOnTimeout: true) {
+            guard try await self.bindingStore.binding(for: binding.localProjectID) == binding else { return false }
+            return await self.prepareInitialSnapshotWhileLocked(for: binding)
+        }) ?? false
+    }
+
+    /// TXT 저장과 binding 확정/초기 snapshot을 같은 작품 gate로 직렬화한다.
+    /// 저장이 먼저면 초기 snapshot에 새 TXT가 포함되고, 연결이 먼저면 이후
+    /// 저장은 처음부터 확정된 출처를 잡는다. 네트워크 사전 검사는 gate 밖이다.
+    private func persistBindingAndPrepareInitialSnapshot(_ binding: ProjectSyncBinding) async throws -> Bool {
+        let previous = try await bindingStore.binding(for: binding.localProjectID)
+        if previous.flatMap(LocalSyncHandoffOrigin.init) != LocalSyncHandoffOrigin(binding) {
+            ContractPathGate.close(for: binding.localProjectID, in: contractDefaults.value)
+        }
+        try await bindingStore.save(binding)
+        let prepared = await prepareInitialSnapshotWhileLocked(for: binding)
+        // 초기 기록까지 준비된 연결만 공개하되, watchdog의 반환 여부와
+        // 무관하게 실제 완료된 상태를 gate 안에서 순서대로 전달한다.
+        if prepared { publish(binding, localProjectID: binding.localProjectID) }
+        return prepared
+    }
+
+    private func prepareInitialSnapshotWhileLocked(for binding: ProjectSyncBinding) async -> Bool {
         guard ReceiveValidationPolicy.current.sendingAllowed else { return true }
         let batchKind: DurableLocalBatchKind
         switch binding.kind {
