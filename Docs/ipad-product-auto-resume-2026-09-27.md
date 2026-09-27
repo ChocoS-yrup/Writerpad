@@ -40,7 +40,7 @@
 - iPad Pro 11-inch (M5) / iOS 26.5 simulator, Debug 격리 bundle, 빈 서버 URL/key, 고정 package 버전, 서명 비활성.
 - 로그: `/private/tmp/writerpad-auto-resume-tests-v3.log`.
 - 결과: `/private/tmp/WriterPad-RecoveryRun-Fix-DD/Logs/Test/Test-WriterPad-2026.09.27_18-27-57-+0900.xcresult`.
-- `git diff --check` 통과. 최종 소스 Release 빌드와 원격 CI/PR 검토는 아직 수행하지 않았다.
+- `git diff --check` 통과. 이 구현 체크포인트 당시 Release 빌드와 원격 CI/PR 검토는 미수행이었다. 후속 결과는 아래에 기록한다.
 - 계약 검증 통과: 0.2.0, 스키마 7개/전이 12개/저장 이름 15개/atomic wire 4개/document wire 7개.
 - canonical SHA-256: `416c1b99edb9bda694731dee4b25688d9d82d1f32610aa23ddfda571ec3c7670`.
 - 실제 TXT·SwiftData·SQLite와 합성 원격 transport를 사용한다. 수명 재개는 모델/저장소 경계 테스트이며 실제 프로세스 강제 종료 증거가 아니다.
@@ -57,3 +57,27 @@ SQL/RLS/RPC/공유 계약/Windows 구현/교차 플랫폼 입력/패키지/서�
 
 후속은 자동 재개 경계 추가 점검과 최종 Release 빌드, 관련 변경을 묶은 PR 검토다.
 현재 단계의 구현만으로 전체 자동 동기화나 실기기 검증 완료를 주장하지 않는다.
+
+## PR #45 검토 후 보완
+
+- 최초 head `a53f9bba832a9d97a20d5d78afce05f261a30bd5`: Release arm64/x86_64 빌드와 CI 3개 통과.
+- GitHub CLI로 확인한 Codex 검토에서 P2 두 건을 확인했다.
+  - [충돌·실패 안내 우선순위](https://github.com/ChocoS-yrup/Writerpad/pull/45#discussion_r4114876182):
+    저장 기록 경고는 idle/localOnly/synced/automaticallyMerged만 대체한다. 나머지 수신·큐 결과는
+    기존 진단 상세, 심각도와 재시도 가능 여부를 유지한다.
+  - [동기화 해제 후 경고 잔존](https://github.com/ChocoS-yrup/Writerpad/pull/45#discussion_r4114876187):
+    실제 UserDefaults 변경 알림으로 전체/작품별 설정 닫힘을 관찰해 재개를 취소하고 경고를 지운다.
+    재시도 진입점도 같은 정리를 수행한다. 전역/작품 설정 revision을 호출자 검증에 포함하므로
+    빠른 off/on 뒤 늦게 완료된 작업도 기록을 등록하거나 실패 경고를 다시 게시하지 못한다.
+- 관찰자는 workspace start에서 설치하고 stop에서 해제한다. 기존 single-flight 슬롯은 작업 종료까지 유지한다.
+- 신규 회귀 3개 포함 SnapshotPull 145개 통과, 실패 0. 실제 설정 알림, 전역/작품 off/on,
+  12개 비성공 결과 × 4개 연결 상태 및 성공/idle 4개 결과의 경고 표시를 검증했다.
+- 최종 확장 회귀 **576개 통과, 실패/건너뜀/런타임 경고 0**, 컴파일 경고·오류 0건.
+  기존 10개 클래스 중 SnapshotPull만 142→145개이며 나머지 검사 수는 동일하다.
+- xcresult: `/private/tmp/WriterPad-RecoveryRun-Fix-DD/Logs/Test/Test-WriterPad-2026.09.27_18-53-55-+0900.xcresult`.
+- 공유 계약 검증 재통과, canonical SHA-256 불변. 이 수정 체크포인트의 Release 재검증은 진행 중이며,
+  최종 Release/CI 증거는 PR 본문에 갱신한다. 검증 후 수정 최종 head에 한 번 재검토를 요청한다.
+- 검증 로그: `/private/tmp/writerpad-pr45-review-fix-tests-v1.log`,
+  `/private/tmp/writerpad-pr45-review-fix-tests-v2.log`, `/private/tmp/writerpad-pr45-review-fix-release-v1.log`.
+- 이번 보완은 iPad 표시·로컬 설정 수명만 변경한다. 공유 계약, Windows, 서버, 교차 플랫폼 입력 변경과
+  실기기/실서버 시험은 없다. Windows 회신 및 추가 백업은 요청하지 않는다.

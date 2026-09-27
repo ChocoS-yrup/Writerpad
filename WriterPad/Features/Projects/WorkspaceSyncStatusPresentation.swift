@@ -89,8 +89,14 @@ enum WorkspaceSyncStatusReducer {
         }
 
         if let handoffResumeMessage {
-            return value("저장 기록 확인 필요", "exclamationmark.icloud", handoffResumeMessage,
-                severity: .warning, retry: true)
+            switch workspaceState.lastResult {
+            case .idle, .localOnly, .synced, .automaticallyMerged:
+                return value("저장 기록 확인 필요", "exclamationmark.icloud", handoffResumeMessage,
+                    severity: .warning, retry: true)
+            default:
+                // Keep actionable pull/queue results and their diagnostic details.
+                break
+            }
         }
 
         switch workspaceState.progress {

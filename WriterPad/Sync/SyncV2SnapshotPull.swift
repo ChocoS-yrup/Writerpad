@@ -1020,6 +1020,7 @@ final class SyncV2WorkspaceSyncModel: ObservableObject {
     private let handoffResumeEpoch = SyncV2ContractEpoch()
     private var handoffResumeTask: Task<Void, Never>?
     private var handoffResumePending = false
+    private var handoffPreferenceObservation: AnyCancellable?
     private let readStalledFolderChanges:
         SyncV2WorkspaceStalledFolderReader?
     private let uploadPullCoordinator:
@@ -1198,6 +1199,16 @@ final class SyncV2WorkspaceSyncModel: ObservableObject {
             ([SyncV2RemoteDocumentSnapshot]) -> Void
     ) async {
         guard ReceiveValidationPolicy.current.sendingAllowed else { return }
+        // Observe both preference switches without introducing a file polling loop.
+        if handoffPreferenceObservation == nil {
+            handoffPreferenceObservation = NotificationCenter.default.publisher(
+                for: UserDefaults.didChangeNotification
+            ).sink { [weak self] _ in
+                Task { @MainActor [weak self] in
+                    self?.cancelHandoffResumeIfDisabled()
+                }
+            }
+        }
         if pendingDiagnosticsContext == nil {
             pendingDiagnosticsContext = SyncV2PullDiagnostics.current
         }
@@ -1298,6 +1309,7 @@ final class SyncV2WorkspaceSyncModel: ObservableObject {
 
     func stop() async {
         cancelHandoffResume()
+        handoffPreferenceObservation = nil
         activationRequestID &+= 1
         await cancelInitialSubscriptionBoundary()
         await releaseCoordinatorPullPermit()
@@ -1357,8 +1369,7 @@ final class SyncV2WorkspaceSyncModel: ObservableObject {
     /// revokes the caller epoch immediately, but retains the slot until the old
     /// operation really finishes. A new foreground event may request one rerun.
     private func resumeHandoffsIfNeeded() async {
-        guard isActive, GlobalSyncPreference.isEnabled(),
-              ContractPathGate.isOpen(for: localProjectID), let resumeProjectHandoffs else { return }
+        guard !cancelHandoffResumeIfDisabled(), isActive, let resumeProjectHandoffs else { return }
         if let handoffResumeTask {
             // Repeated events in the same epoch share the existing pass. Only a
             // new lifecycle after cancellation needs another pass once it drains.
@@ -1368,10 +1379,17 @@ final class SyncV2WorkspaceSyncModel: ObservableObject {
         }
         let epoch = handoffResumeEpoch, revision = epoch.value
         let projectID = localProjectID
+        let globalRevision = GlobalSyncPreference.contractEpoch.value
+        let projectRevision = ContractPathGate.revision(for: projectID)
         let task = Task { [weak self] in
             let authorize: @Sendable () throws -> Void = {
                 try Task.checkCancellation()
-                guard epoch.value == revision else { throw CancellationError() }
+                guard epoch.value == revision,
+                      GlobalSyncPreference.isEnabled(),
+                      GlobalSyncPreference.contractEpoch.value == globalRevision,
+                      ContractPathGate.isOpen(for: projectID),
+                      ContractPathGate.revision(for: projectID) == projectRevision
+                else { throw CancellationError() }
             }
             do {
                 try authorize()
@@ -1380,7 +1398,7 @@ final class SyncV2WorkspaceSyncModel: ObservableObject {
                 self?.handoffResumeMessage = deferred == 0 ? nil
                     : "저장 기록 \(deferred)개는 연결 확인이 필요합니다. 설정에서 동기화 상태를 확인해 주세요."
             } catch {
-                if epoch.value == revision, !Task.isCancelled {
+                if (try? authorize()) != nil {
                     self?.handoffResumeMessage = "저장 기록 자동 재개를 보류했습니다. 본문과 기록은 유지됩니다. 설정에서 재시도할 수 있습니다."
                 }
             }
@@ -1393,6 +1411,14 @@ final class SyncV2WorkspaceSyncModel: ObservableObject {
         }
         handoffResumeTask = task
         await task.value
+    }
+
+    @discardableResult
+    private func cancelHandoffResumeIfDisabled() -> Bool {
+        guard !GlobalSyncPreference.isEnabled() || !ContractPathGate.isOpen(for: localProjectID)
+        else { return false }
+        cancelHandoffResume()
+        return true
     }
 
     private func cancelHandoffResume() {

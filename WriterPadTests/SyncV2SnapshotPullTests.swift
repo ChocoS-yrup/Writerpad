@@ -5,6 +5,110 @@ import XCTest
 @testable import WriterPad
 
 final class SyncV2SnapshotPullTests: XCTestCase {
+    func testHandoffWarningPreservesActionableWorkspaceResults() {
+        let results: [SyncV2WorkspaceState.Result] = [
+            .conflictRequired(detail: "본문 충돌 상세"),
+            .structuralConflict(detail: "구조 충돌 상세"),
+            .notApplied(detail: "미적용 상세"), .notPublished(detail: "미송신 상세"),
+            .blocked(count: 2), .actualConflict(count: 3),
+            .authenticationRequired, .failed(detail: "수신 실패 상세"),
+            .retryWaiting(count: 1), .uploadPending(count: 1), .waiting,
+            .reconcilingStructure(count: 1),
+        ]
+        for result in results {
+            for connection in [SyncV2WorkspaceState.Connection.healthy, .unknown, .reconnecting, .offline] {
+                let state = SyncV2WorkspaceState(connection: connection, lastResult: result)
+                let original = WorkspaceSyncStatusReducer.presentation(saveState: .idle, handoffState: .idle,
+                    workspaceState: state, leaseState: .localOnly)
+                let warning = WorkspaceSyncStatusReducer.presentation(saveState: .idle, handoffState: .idle,
+                    workspaceState: state, leaseState: .localOnly, handoffResumeMessage: "보류 기록")
+                XCTAssertEqual(warning, original, "\(result), \(connection)")
+            }
+        }
+        for result in [SyncV2WorkspaceState.Result.idle, .localOnly, .synced(at: Date()), .automaticallyMerged] {
+            let warning = WorkspaceSyncStatusReducer.presentation(saveState: .idle, handoffState: .idle,
+                workspaceState: .init(lastResult: result), leaseState: .localOnly, handoffResumeMessage: "보류 기록")
+            XCTAssertEqual(warning.label, "저장 기록 확인 필요")
+        }
+    }
+
+    @MainActor
+    func testHandoffWarningClearsOnEitherPreferenceWithoutRetry() async throws {
+        let previous = GlobalSyncPreference.isEnabled()
+        defer { GlobalSyncPreference.setEnabled(previous) }
+        for global in [true, false] {
+            let id = ProjectID(rawValue: UUID())
+            GlobalSyncPreference.setEnabled(true)
+            ContractPathGate.setOpen(true, for: id)
+            let model = makeHandoffPreferenceModel(id: id) { _, authorize in
+                try authorize(); return 2
+            }
+            await model.start(editingGuards: { [:] }) { _ in }
+            XCTAssertNotNil(model.handoffResumeMessage)
+            if global { GlobalSyncPreference.setEnabled(false) }
+            else { ContractPathGate.close(for: id) }
+            // Exercise the actual UserDefaults notification, not a test-only
+            // model callback or manual retry that could hide missing observation.
+            for _ in 0..<200 where model.handoffResumeMessage != nil {
+                try await Task.sleep(for: .milliseconds(10))
+            }
+            XCTAssertNil(model.handoffResumeMessage, "global=\(global)")
+            await model.retry()
+            XCTAssertNil(model.handoffResumeMessage)
+            await model.stop()
+            ContractPathGate.close(for: id)
+        }
+    }
+
+    @MainActor
+    func testPreferenceRevocationRejectsLateResumeAndAllowsFreshRetry() async throws {
+        let previous = GlobalSyncPreference.isEnabled()
+        defer { GlobalSyncPreference.setEnabled(previous) }
+        for global in [true, false] {
+            let id = ProjectID(rawValue: UUID())
+            GlobalSyncPreference.setEnabled(true)
+            ContractPathGate.setOpen(true, for: id)
+            let probe = WorkspaceHandoffResumeProbe()
+            let model = makeHandoffPreferenceModel(id: id) { _, authorize in
+                _ = try await probe.run(authorize: authorize)
+                return 2
+            }
+            let initial = Task { await model.start(editingGuards: { [:] }) { _ in } }
+            for _ in 0..<1000 where await probe.calls == 0 { await Task.yield() }
+            let started = await probe.calls
+            XCTAssertEqual(started, 1)
+            // A rapid off/on cycle must still revoke the old operation even if
+            // notification delivery only observes the final enabled value.
+            if global {
+                GlobalSyncPreference.setEnabled(false)
+                GlobalSyncPreference.setEnabled(true)
+            } else {
+                ContractPathGate.close(for: id)
+                ContractPathGate.setOpen(true, for: id)
+            }
+            await probe.release()
+            await initial.value
+            let accepted = await probe.accepted
+            XCTAssertEqual(accepted, 0)
+            XCTAssertNil(model.handoffResumeMessage)
+            await model.retry()
+            XCTAssertTrue(model.handoffResumeMessage?.contains("2개") == true)
+            await model.stop()
+            ContractPathGate.close(for: id)
+        }
+    }
+
+    @MainActor
+    private func makeHandoffPreferenceModel(
+        id: ProjectID, resume: @escaping SyncV2WorkspaceHandoffResume
+    ) -> SyncV2WorkspaceSyncModel {
+        SyncV2WorkspaceSyncModel(localProjectID: id, puller: WorkspacePullerStub(), realtime: nil,
+            authenticationService: WorkspaceAuthenticationStub(state: .authenticated(.init(userID: UUID(), maskedEmail: "test"))),
+            projectBindingService: WorkspaceBindingStub(binding: .connected(localProjectID: id, serverProjectID: UUID(),
+                kind: .existingServerProject, projectName: "resume", ownerSubject: UUID())),
+            resumeProjectHandoffs: resume, periodicDelay: .seconds(600))
+    }
+
     @MainActor
     func testWorkspaceHandoffResumeIsSingleFlightAndDrainsCancelledPassBeforeForegroundRerun() async throws {
         let previous = GlobalSyncPreference.isEnabled()
