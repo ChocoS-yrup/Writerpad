@@ -1,6 +1,8 @@
 import Foundation
 
 protocol ProjectManaging: Sendable {
+    /// Nil means the implementation cannot authorize lifecycle-sensitive sync activation.
+    var syncLifecycleEpoch: SyncV2ContractEpoch? { get }
     func projects() async throws -> [ManagedProject]
     func createProject(named name: String) async throws -> ManagedProject
     func restoreProjectBackup(at packageURL: URL) async throws -> ManagedProject
@@ -28,4 +30,8 @@ protocol ProjectManaging: Sendable {
     ) async throws -> ManagedProject?
     func exportDescriptor(id: ProjectID) async throws -> ProjectExportDescriptor
     func recoverPendingTransactions() async throws
+}
+
+extension ProjectManaging {
+    var syncLifecycleEpoch: SyncV2ContractEpoch? { nil }
 }

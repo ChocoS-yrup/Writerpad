@@ -11137,6 +11137,18 @@ actor SyncV2Store:
         return try generalStoredBaseline(localProjectID: localProjectID)
     }
 
+    /// File handoffs may exist before any general source reaches SQLite. Use only
+    /// previously acknowledged ID-based metadata; an empty/new project is not proof.
+    func generalHandoffBaseline(localProjectID: ProjectID) async throws -> SyncV2PreparationSnapshot {
+        let general = try generalQueueStatus(localProjectID: localProjectID)
+        if general.pendingCount > 0 { return try await generalResumeBaseline(localProjectID: localProjectID) }
+        let queue = try await uploadQueueSnapshot(localProjectID: localProjectID)
+        guard !queue.hasUnsentLocalChanges, try hasGeneralContractHistory(localProjectID: localProjectID) else {
+            throw SyncV2ContractStructureError.structureAuthorityUnavailable
+        }
+        return try generalStoredBaseline(localProjectID: localProjectID)
+    }
+
     private func generalStoredBaseline(localProjectID: ProjectID, inTransaction: Bool = false) throws -> SyncV2PreparationSnapshot {
         let id = localProjectID.rawValue.uuidString.lowercased()
         func rows(_ table: String, columns: [(String, String, String)]) throws -> [SyncV2JSON] {
@@ -13601,6 +13613,11 @@ actor LazySyncV2ProjectBindingStore:
     func generalResumeBaseline(localProjectID: ProjectID) async throws -> SyncV2PreparationSnapshot {
         guard let store = await resolvedStore() else { throw SyncV2ContractStructureError.unavailable }
         return try await store.generalResumeBaseline(localProjectID: localProjectID)
+    }
+
+    func generalHandoffBaseline(localProjectID: ProjectID) async throws -> SyncV2PreparationSnapshot {
+        guard let store = await resolvedStore() else { throw SyncV2ContractStructureError.unavailable }
+        return try await store.generalHandoffBaseline(localProjectID: localProjectID)
     }
 
     func makeGeneralRetriesReady(localProjectID: ProjectID) async throws {

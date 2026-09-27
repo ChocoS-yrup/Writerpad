@@ -390,6 +390,7 @@ protocol SyncV2ContractQueue: Sendable {
     func recoverGeneralContract(_ pending: SyncV2PendingContractBatch, receipt: SyncV2GeneralCommitReceipt,
         accountID: UUID, authorize: @escaping @Sendable () throws -> Void) async throws
     func generalResumeBaseline(localProjectID: ProjectID) async throws -> SyncV2PreparationSnapshot
+    func generalHandoffBaseline(localProjectID: ProjectID) async throws -> SyncV2PreparationSnapshot
     func generalQueueStatus(localProjectID: ProjectID) async throws -> SyncV2GeneralQueueStatus
     func makeGeneralRetriesReady(localProjectID: ProjectID) async throws
     func hasGeneralContractHistory(localProjectID: ProjectID) async throws -> Bool
@@ -414,6 +415,7 @@ extension SyncV2ContractQueue {
     func recoverGeneralContract(_ pending: SyncV2PendingContractBatch, receipt: SyncV2GeneralCommitReceipt,
         accountID: UUID, authorize: @escaping @Sendable () throws -> Void) async throws { throw SyncV2ContractStructureError.unavailable }
     func generalResumeBaseline(localProjectID: ProjectID) async throws -> SyncV2PreparationSnapshot { throw SyncV2ContractStructureError.unavailable }
+    func generalHandoffBaseline(localProjectID: ProjectID) async throws -> SyncV2PreparationSnapshot { throw SyncV2ContractStructureError.unavailable }
     func generalQueueStatus(localProjectID: ProjectID) async throws -> SyncV2GeneralQueueStatus { throw SyncV2ContractStructureError.unavailable }
     func makeGeneralRetriesReady(localProjectID: ProjectID) async throws { throw SyncV2ContractStructureError.unavailable }
     func hasGeneralContractHistory(localProjectID: ProjectID) async throws -> Bool { false }
@@ -961,10 +963,74 @@ actor SyncV2ContractStructureSender: SyncV2GeneralContractSending, SyncV2General
         return generalRetries.values.map(\.date).min()
     }
 
+    /// Explicit product retry can precede the first SQLite enqueue. Reconfirm the
+    /// saved server baseline without pulling into local TXT or claiming a request.
+    func prepareGeneralHandoffResume(context: SyncV2HandshakeContext,
+        authorizeCaller: @escaping @Sendable () throws -> Void) async throws {
+        try ReceiveValidationPolicy.current.requireSending()
+        try GeneralSyncValidationScope.current.require(local: context.localProjectID, server: context.serverProjectID)
+        let localID = context.localProjectID
+        guard sendingProjects.insert(localID).inserted else { throw SyncV2ContractStructureError.uploadPullGateBusy }
+        defer { sendingProjects.remove(localID) }
+        guard let authEpoch = authenticationService.contractEpoch, let bindingEpoch,
+              let localProjectEpoch, let structureAuthority else { throw SyncV2ContractStructureError.unavailable }
+        let localRevision = localProjectEpoch.value, gateRevision = ContractPathGate.revision(for: localID, in: defaults.value)
+        let globalRevision = GlobalSyncPreference.contractEpoch.value
+        let activityEpoch = handshakeService.activityEpoch, activityRevision = activityEpoch.value
+        let handshakeEpoch = handshakeService.authorizationEpoch, handshakeRevision = handshakeEpoch.value
+        let defaults = self.defaults
+        let authorize: @Sendable () throws -> Void = {
+            try Task.checkCancellation()
+            try authorizeCaller()
+            try ContractPathGate.reserveStart(for: localID, in: defaults.value, revision: gateRevision) {
+                authEpoch.isAvailable && authEpoch.value == context.authenticationEpoch &&
+                bindingEpoch.isAvailable && bindingEpoch.value == context.bindingEpoch &&
+                localProjectEpoch.isAvailable && localProjectEpoch.value == localRevision &&
+                activityEpoch.isAvailable && activityEpoch.value == activityRevision &&
+                handshakeEpoch.value == handshakeRevision &&
+                GlobalSyncPreference.contractEpoch.value == globalRevision && GlobalSyncPreference.isEnabled(in: defaults.value)
+            }
+        }
+        try authorize()
+        guard let binding = try await store.binding(for: localID), binding.localProjectID == localID,
+              binding.kind != .localOnly, binding.serverProjectID == context.serverProjectID, binding.ownerSubject == context.accountID,
+              SyncV2HandshakeContext.make(authenticationState: await authenticationService.currentState(),
+                localProjectID: localID, serverProjectID: context.serverProjectID,
+                authenticationEpoch: authEpoch.value, bindingEpoch: bindingEpoch.value) == context,
+              try await isLocalProjectActive(localID), await handshakeService.canStartContractWrite(),
+              let handshake = await handshakeService.standingHandshake(for: context), handshake.projectSyncMode == .idBased
+        else { throw SyncV2ContractStructureError.projectNotConnected }
+        try authorize()
+        if structureAuthority.proof(context, requiresActiveServer: false) != nil { return }
+        let authorizeQueue = try await store.contractQueueAuthorization(localProjectID: localID)
+        let authorizeRead: @Sendable () throws -> Void = { try authorize(); try authorizeQueue() }
+        let token = structureAuthority.beginServerRead(context)
+        do {
+            try authorizeRead()
+            let state = try await transport.fetchProjectState(projectID: context.serverProjectID)
+            try authorizeRead()
+            structureAuthority.finishServerRead(context, token: token, state: state)
+            guard state == .active else { throw SyncV2ContractStructureError.projectInactive }
+            try await restoreGeneralBaseline(context: context, authorizeQueue: authorizeRead, forHandoff: true)
+            try authorizeRead()
+            guard structureAuthority.proof(context, requiresActiveServer: true) != nil else {
+                throw SyncV2ContractStructureError.structureAuthorityUnavailable
+            }
+        } catch {
+            structureAuthority.finishServerRead(context, token: token, state: nil)
+            throw error
+        }
+    }
+
+    private func resumeBaseline(localID: ProjectID, forHandoff: Bool) async throws -> SyncV2PreparationSnapshot {
+        if forHandoff { return try await store.generalHandoffBaseline(localProjectID: localID) }
+        return try await store.generalResumeBaseline(localProjectID: localID)
+    }
+
     /// 디스크 기준과 서버가 모두 그대로일 때만 재시작으로 잃은 승인을 복원한다.
     /// 원고·바인더를 apply하거나 요청의 revision/신원을 바꾸는 경로가 아니다.
     private func restoreGeneralBaseline(context: SyncV2HandshakeContext,
-        authorizeQueue: @escaping @Sendable () throws -> Void) async throws {
+        authorizeQueue: @escaping @Sendable () throws -> Void, forHandoff: Bool = false) async throws {
         guard let structureAuthority, let uploadPullCoordinator else {
             throw SyncV2ContractStructureError.structureAuthorityUnavailable
         }
@@ -977,18 +1043,22 @@ actor SyncV2ContractStructureSender: SyncV2GeneralContractSending, SyncV2General
         else { throw SyncV2ContractStructureError.uploadPullGateBusy }
         let token = structureAuthority.beginBaseline(context)
         do {
-            let local = try await store.generalResumeBaseline(localProjectID: localID).fingerprint()
+            let local = try await resumeBaseline(localID: localID, forHandoff: forHandoff).fingerprint()
+            try authorizeQueue()
             let first = try await transport.fetchGeneralBaseline(projectID: context.serverProjectID).fingerprint()
+            try authorizeQueue()
             let second = try await transport.fetchGeneralBaseline(projectID: context.serverProjectID).fingerprint()
-            let latest = try await store.generalResumeBaseline(localProjectID: localID).fingerprint()
+            try authorizeQueue()
+            let latest = try await resumeBaseline(localID: localID, forHandoff: forHandoff).fingerprint()
             try Task.checkCancellation()
             try authorizeQueue()
             guard local == first, first == second, local == latest else {
                 throw SyncV2ContractStructureError.structureAuthorityUnavailable
             }
-            structureAuthority.finishBaseline(context, token: token, allowed: true)
             let latestQueue = try await store.uploadQueueSnapshot(localProjectID: localID)
             await uploadPullCoordinator.finishUploadDrain(permit, queue: latestQueue)
+            try authorizeQueue()
+            structureAuthority.finishBaseline(context, token: token, allowed: true)
         } catch {
             structureAuthority.finishBaseline(context, token: token, allowed: false)
             let latestQueue = (try? await store.uploadQueueSnapshot(localProjectID: localID))

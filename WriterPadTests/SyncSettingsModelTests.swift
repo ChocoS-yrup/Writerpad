@@ -4,7 +4,6 @@ import XCTest
 
 @MainActor
 final class SyncSettingsModelTests: XCTestCase {
-#if DEBUG
     func testContractGateCannotOpenWithoutFreshHandshakeButStoredGateCanClose()
         async throws {
         let project = makeManagedProject(
@@ -61,7 +60,6 @@ final class SyncSettingsModelTests: XCTestCase {
         )
         XCTAssertEqual(restoredModel.gateReport, "관문 확인 관문: 닫힘")
     }
-#endif
 
     func testSignUpConfirmationKeepsProtectedCloudRoutesLocked() async {
         let project = makeManagedProject(

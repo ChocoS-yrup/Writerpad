@@ -155,6 +155,7 @@ private struct ProjectBackupRestorePlan: Equatable {
 /// 작품 폴더와 SwiftData 메타데이터 사이의 다단계 작업을 직렬화하고 복구한다.
 actor LocalProjectManager: ProjectManaging, ServerProjectReceiving {
     nonisolated let contractLifecycleEpoch = SyncV2ContractEpoch()
+    nonisolated var syncLifecycleEpoch: SyncV2ContractEpoch? { contractLifecycleEpoch }
     private static let catalogFileName = ".writerpad-project-catalog.json"
     private static let journalPrefix = ".writerpad-project-transaction-"
     private static let journalSuffix = ".json"
