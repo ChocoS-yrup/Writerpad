@@ -3585,6 +3585,52 @@ extension SyncV2HandshakeTests {
         }
     }
 
+    func testNewSourcedSaveQuarantinesLegacyHandoffAndSurvivesReopen() async throws {
+        for blockQuarantine in [false, true] {
+            let f = try await productDocumentsFixture()
+            ContractPathGate.close(for: f.base.localID, in: f.base.defaults)
+            _ = try await f.save(0, "출처 없는 이전 저장")
+            let files = try FileManager.default.contentsOfDirectory(atPath: f.root.path)
+            let marker = f.root.appendingPathComponent(try XCTUnwrap(files.first { $0.hasPrefix(LocalDocumentStore.syncHandoffPrefix) }))
+            var json = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(contentsOf: marker)) as? [String: Any])
+            var batches = try XCTUnwrap(json["batches"] as? [[String: Any]])
+            batches[0].removeValue(forKey: "handoffOrigin")
+            json["batches"] = batches
+            try JSONSerialization.data(withJSONObject: json, options: [.sortedKeys]).write(to: marker)
+            let old = try JSONDecoder().decode(LocalMutationBatch.self,
+                from: JSONSerialization.data(withJSONObject: batches[0]))
+            let quarantine = f.root.appendingPathComponent(LocalDocumentStore.quarantinedHandoffPrefix
+                + old.batchID.uuidString.lowercased() + LocalDocumentStore.syncHandoffSuffix)
+            if blockQuarantine {
+                try FileManager.default.createDirectory(at: quarantine, withIntermediateDirectories: false)
+            }
+            let reopened = f.reopenedLocalStore()
+            ContractPathGate.setOpen(true, for: f.base.localID, in: f.base.defaults)
+            let saved = try await reopened.save(.init(projectID: f.base.localID, documentID: f.documents[0].id,
+                relativePath: f.documents[0].relativePath, text: "출처 확인된 새 저장", generation: 2, cursor: nil))
+            if blockQuarantine {
+                guard case .localSavedButNotQueued = saved.durableRecordResult else { return XCTFail("보존 실패인데 진행함") }
+                let remaining = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(contentsOf: marker)) as? [String: Any])
+                XCTAssertEqual((remaining["batches"] as? [Any])?.count, 2)
+                let queue = try await f.store.generalQueueStatus(localProjectID: f.base.localID)
+                XCTAssertEqual(queue.pendingCount, 0)
+                try FileManager.default.removeItem(at: quarantine)
+                _ = await f.reopenedLocalStore().retryPendingSyncHandoff(for: f.documents[0])
+            } else {
+                guard case .queued = saved.durableRecordResult else { return XCTFail("옛 기록이 새 저장을 막음: \(String(describing: saved.durableRecordResult))") }
+            }
+            XCTAssertEqual(try JSONDecoder().decode(LocalMutationBatch.self, from: Data(contentsOf: quarantine)), old)
+            XCTAssertFalse(FileManager.default.fileExists(atPath: marker.path))
+            let status = try await f.store.generalQueueStatus(localProjectID: f.base.localID)
+            XCTAssertEqual(status.pendingCount, 1)
+            _ = await f.reopenedLocalStore().retryPendingSyncHandoff(for: f.documents[0])
+            let after = try await f.store.generalQueueStatus(localProjectID: f.base.localID)
+            XCTAssertEqual(after.pendingCount, 1, "격리한 기록은 재시작해도 재송신하지 않음")
+            let text = try await reopened.loadText(for: f.documents[0])
+            XCTAssertEqual(text, "출처 확인된 새 저장")
+        }
+    }
+
     func testResumePublishesBaselineBeforePullReadyAndStillRejectsRevocationOnRelease() async throws {
         for revoke in [false, true] {
             let f = try await productDocumentsFixture()

@@ -190,6 +190,7 @@ final class AppEnvironment: ObservableObject {
             pathResolver: pathResolver
         )
         let syncMutationGate = SyncV2DocumentMutationGate()
+        let projectSaveGate = SyncV2DocumentMutationGate()
         let backupStore = LocalBackupStore(
             workspaceLocator: workspaceLocator,
             clock: clock
@@ -383,14 +384,16 @@ final class AppEnvironment: ObservableObject {
             snapshotClient: supabaseClientProvider.makeSnapshotClient(),
             bindingIsVisible: { id in (try? await projectManager.isReceiving(id)) == false },
             contractEpoch: contractBindingEpoch,
-            handshakeInvalidated: { Task { await handshakeService?.projectChanged() } }
+            handshakeInvalidated: { Task { await handshakeService?.projectChanged() } },
+            projectSaveGate: projectSaveGate
         )
         let localDocumentStore = LocalDocumentStore(
             workspaceLocator: workspaceLocator,
             metadataUpdater: repository,
             durableChangeRecorder: durableChangeRecorder,
             clock: clock,
-            syncMutationGate: syncMutationGate
+            syncMutationGate: syncMutationGate,
+            projectSaveGate: projectSaveGate
         )
         let snapshotPullService: SyncV2SnapshotPullService?
         if let snapshotStateStore,

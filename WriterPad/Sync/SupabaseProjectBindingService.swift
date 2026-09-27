@@ -360,6 +360,7 @@ actor SupabaseProjectBindingService: ProjectBindingServicing {
     nonisolated let contractEpoch: SyncV2ContractEpoch?
     private let handshakeInvalidated: @Sendable () -> Void
     private let contractDefaults: ContractDefaults
+    private let projectSaveGate: SyncV2DocumentMutationGate
     private let transport: (any EnsureProjectTransporting)?
     private let bindingStore: any ProjectBindingStoring
     private let projectRepository: any ProjectRepository
@@ -382,7 +383,8 @@ actor SupabaseProjectBindingService: ProjectBindingServicing {
         bindingIsVisible: @escaping @Sendable (ProjectID) async -> Bool = { _ in true },
         contractEpoch: SyncV2ContractEpoch = SyncV2ContractEpoch(),
         handshakeInvalidated: @escaping @Sendable () -> Void = {},
-        contractDefaults: ContractDefaults = .standard
+        contractDefaults: ContractDefaults = .standard,
+        projectSaveGate: SyncV2DocumentMutationGate = SyncV2DocumentMutationGate()
     ) {
         self.transport = transport
         self.bindingStore = bindingStore
@@ -394,6 +396,7 @@ actor SupabaseProjectBindingService: ProjectBindingServicing {
         self.contractEpoch = contractEpoch
         self.handshakeInvalidated = handshakeInvalidated
         self.contractDefaults = contractDefaults
+        self.projectSaveGate = projectSaveGate
     }
 
     func currentBinding(
@@ -541,7 +544,9 @@ actor SupabaseProjectBindingService: ProjectBindingServicing {
             name: name
         )
         do {
-            try await bindingStore.save(localOnly)
+            try await projectSaveGate.withCriticalSection(documentID: localProjectID.rawValue) {
+                try await self.bindingStore.save(localOnly)
+            }
             publish(localOnly, localProjectID: localProjectID)
             return .disconnected(localOnly)
         } catch {
@@ -674,12 +679,10 @@ actor SupabaseProjectBindingService: ProjectBindingServicing {
             ownerSubject: account.userID
         )
         do {
-            let previous = try await bindingStore.binding(for: localProjectID)
-            if previous.flatMap(LocalSyncHandoffOrigin.init) != LocalSyncHandoffOrigin(binding) {
-                ContractPathGate.close(for: localProjectID, in: contractDefaults.value)
+            let prepared = try await projectSaveGate.withCriticalSection(documentID: localProjectID.rawValue) {
+                try await self.persistBindingAndPrepareInitialSnapshot(binding)
             }
-            try await bindingStore.save(binding)
-            guard await prepareInitialSnapshotIfNeeded(for: binding) else {
+            guard prepared else {
                 return .failed(.initialSnapshotNotQueued)
             }
             publish(binding, localProjectID: localProjectID)
@@ -695,6 +698,25 @@ actor SupabaseProjectBindingService: ProjectBindingServicing {
     private func prepareInitialSnapshotIfNeeded(
         for binding: ProjectSyncBinding
     ) async -> Bool {
+        (try? await projectSaveGate.withCriticalSection(documentID: binding.localProjectID.rawValue) {
+            guard try await self.bindingStore.binding(for: binding.localProjectID) == binding else { return false }
+            return await self.prepareInitialSnapshotWhileLocked(for: binding)
+        }) ?? false
+    }
+
+    /// TXT 저장과 binding 확정/초기 snapshot을 같은 작품 gate로 직렬화한다.
+    /// 저장이 먼저면 초기 snapshot에 새 TXT가 포함되고, 연결이 먼저면 이후
+    /// 저장은 처음부터 확정된 출처를 잡는다. 네트워크 사전 검사는 gate 밖이다.
+    private func persistBindingAndPrepareInitialSnapshot(_ binding: ProjectSyncBinding) async throws -> Bool {
+        let previous = try await bindingStore.binding(for: binding.localProjectID)
+        if previous.flatMap(LocalSyncHandoffOrigin.init) != LocalSyncHandoffOrigin(binding) {
+            ContractPathGate.close(for: binding.localProjectID, in: contractDefaults.value)
+        }
+        try await bindingStore.save(binding)
+        return await prepareInitialSnapshotWhileLocked(for: binding)
+    }
+
+    private func prepareInitialSnapshotWhileLocked(for binding: ProjectSyncBinding) async -> Bool {
         guard ReceiveValidationPolicy.current.sendingAllowed else { return true }
         let batchKind: DurableLocalBatchKind
         switch binding.kind {
