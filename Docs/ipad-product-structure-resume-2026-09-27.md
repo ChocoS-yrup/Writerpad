@@ -228,3 +228,25 @@ PR 본문에 기록하며 이전 단계의 Release·CI 성공을 새 head 성공
   대체돼 중단했으며 성공 증거로 사용하지 않는다. 최종 소스는 새 DerivedData
   `/private/tmp/WriterPad-PR46-FinalRelease.ZNcLrE`에서 빌드하고
   `/private/tmp/writerpad-pr46-ordering-final-release.log`에 기록한다. 완료 결과·CI·재검토는 PR 본문에서 추적한다.
+
+### 전체 복구의 저장 배치 검증 통합
+
+`492f789` 최종 검토에서 [전체 복구 검증 우회](https://github.com/ChocoS-yrup/Writerpad/pull/46#discussion_r4115981810)가
+추가 확인됐다. 자동 인계는 검증하지만 기존 전체 복구의 `completeDurableHandoff`는 저장된 배치를
+바로 recorder에 전달했다. 기존 손상 종류/변경 내용 8종, 전체 snapshot 손상 4종, 생성/새 권의
+본문+hash 동시 손상 2종을 전체 복구에도 적용한 테스트 3개에서 **36 assertion failures,
+unexpected 0**을 재현했다 (`/private/tmp/writerpad-pr46-full-recovery-red.log`).
+
+이번 범위인 create/createVolume/relocate/reorder의 저장된 배치는 전체 복구에서도 같은 validator를
+통과해야 한다. 검사는 recorder 호출뿐 아니라 local-only 성공 처리보다 앞에 둔다. validator 자체도
+project/transaction ID와 journal·batch provenance 일치를 검사한다. 손상된 저장 요청은 현재 파일로
+재생성하거나 journal을 소비하지 않는다. 기존 명시적 휴지통/삭제 복구 동작의 범위는 확대하지 않는다.
+
+확장 회귀 로그는 `/private/tmp/writerpad-pr46-full-recovery-green.log`, Release 로그는
+`/private/tmp/writerpad-pr46-full-recovery-release.log`이며, 완료 결과는 아래와 PR 본문에서 추적한다.
+계약 0.2.0 검증 재통과, canonical digest 불변. 실제 서버/기기 변경 없음.
+
+- 선택 회귀 **591개 통과**, 실패·건너뜀 0, 컴파일 경고·오류 0, xcresult `runtimeWarnings: []`.
+  앞선 10개 class 구성에서 Handshake만 159→162개로 증가했다.
+- xcresult: `/private/tmp/WriterPad-RecoveryRun-Fix-DD/Logs/Test/Test-WriterPad-2026.09.28_00-57-45-+0900.xcresult`.
+- Release·최종 head CI·검토 결과는 PR 본문에 기록하여 검토 요청 이후 소스 head를 바꾸지 않는다.

@@ -3530,6 +3530,14 @@ extension SyncV2HandshakeTests {
     }
 
     func testStructureRetryRejectsBatchKindAndMutationShapeMismatch() async throws {
+        try await assertStructureRejectsBatchKindAndMutationShapeMismatch(fullRecovery: false)
+    }
+
+    func testFullRecoveryRejectsBatchKindAndMutationShapeMismatch() async throws {
+        try await assertStructureRejectsBatchKindAndMutationShapeMismatch(fullRecovery: true)
+    }
+
+    private func assertStructureRejectsBatchKindAndMutationShapeMismatch(fullRecovery: Bool) async throws {
         for mode in 0..<8 {
             let f = try await productDocumentsFixture(withVolume: true)
             let commands = structureCommands(f)
@@ -3566,8 +3574,15 @@ extension SyncV2HandshakeTests {
             let encoder = JSONEncoder(); encoder.dateEncodingStrategy = .iso8601
             let bytes = try encoder.encode(journal); try bytes.write(to: url)
             ContractPathGate.setOpen(true, for: f.base.localID, in: f.base.defaults)
-            let deferred = try await commands.retryPendingStructureSyncHandoffs(in: f.base.localID, authorize: {})
-            XCTAssertEqual(deferred, 1, "mode \(mode)")
+            if fullRecovery {
+                do {
+                    try await commands.recoverPendingTransactions(in: f.base.localID)
+                    XCTFail("Full recovery must preserve malformed batch, mode \(mode)")
+                } catch is BinderCommandError { }
+            } else {
+                let deferred = try await commands.retryPendingStructureSyncHandoffs(in: f.base.localID, authorize: {})
+                XCTAssertEqual(deferred, 1, "mode \(mode)")
+            }
             XCTAssertEqual(try? Data(contentsOf: url), bytes, "mode \(mode)")
             XCTAssertEqual(try Data(contentsOf: f.root.appendingPathComponent(renamed.relativePath.rawValue)), body)
             let queue = try await f.store.generalQueueStatus(localProjectID: f.base.localID)
@@ -3576,6 +3591,14 @@ extension SyncV2HandshakeTests {
     }
 
     func testStructureRetryRejectsCorruptionOutsideAffectedJournalNodes() async throws {
+        try await assertStructureRejectsCorruptionOutsideAffectedJournalNodes(fullRecovery: false)
+    }
+
+    func testFullRecoveryRejectsCorruptionOutsideAffectedJournalNodes() async throws {
+        try await assertStructureRejectsCorruptionOutsideAffectedJournalNodes(fullRecovery: true)
+    }
+
+    private func assertStructureRejectsCorruptionOutsideAffectedJournalNodes(fullRecovery: Bool) async throws {
         for mode in 0..<4 {
             let f = try await productDocumentsFixture(withVolume: true)
             let commands = structureCommands(f)
@@ -3604,8 +3627,15 @@ extension SyncV2HandshakeTests {
             let encoder = JSONEncoder(); encoder.dateEncodingStrategy = .iso8601
             let bytes = try encoder.encode(journal); try bytes.write(to: url)
             ContractPathGate.setOpen(true, for: f.base.localID, in: f.base.defaults)
-            let deferred = try await commands.retryPendingStructureSyncHandoffs(in: f.base.localID, authorize: {})
-            XCTAssertEqual(deferred, 1, "mode \(mode)")
+            if fullRecovery {
+                do {
+                    try await commands.recoverPendingTransactions(in: f.base.localID)
+                    XCTFail("Full recovery must preserve corrupted snapshot, mode \(mode)")
+                } catch is BinderCommandError { }
+            } else {
+                let deferred = try await commands.retryPendingStructureSyncHandoffs(in: f.base.localID, authorize: {})
+                XCTAssertEqual(deferred, 1, "mode \(mode)")
+            }
             XCTAssertEqual(try? Data(contentsOf: url), bytes, "mode \(mode)")
             let queue = try await f.store.generalQueueStatus(localProjectID: f.base.localID)
             XCTAssertEqual(queue.pendingCount + queue.retryCount + queue.attentionCount, 0, "mode \(mode)")
@@ -3617,6 +3647,14 @@ extension SyncV2HandshakeTests {
     }
 
     func testStructureCreatedBodyAndHashMustMatchJournalMetadata() async throws {
+        try await assertStructureCreatedBodyAndHashMustMatchJournalMetadata(fullRecovery: false)
+    }
+
+    func testFullRecoveryCreatedBodyAndHashMustMatchJournalMetadata() async throws {
+        try await assertStructureCreatedBodyAndHashMustMatchJournalMetadata(fullRecovery: true)
+    }
+
+    private func assertStructureCreatedBodyAndHashMustMatchJournalMetadata(fullRecovery: Bool) async throws {
         for volume in [false, true] {
             let f = try await productDocumentsFixture(withVolume: true)
             let commands = structureCommands(f)
@@ -3642,8 +3680,15 @@ extension SyncV2HandshakeTests {
             let encoder = JSONEncoder(); encoder.dateEncodingStrategy = .iso8601
             let bytes = try encoder.encode(journal); try bytes.write(to: url)
             ContractPathGate.setOpen(true, for: f.base.localID, in: f.base.defaults)
-            let deferred = try await commands.retryPendingStructureSyncHandoffs(in: f.base.localID, authorize: {})
-            XCTAssertEqual(deferred, 1)
+            if fullRecovery {
+                do {
+                    try await commands.recoverPendingTransactions(in: f.base.localID)
+                    XCTFail("Full recovery must preserve corrupted create body, volume=\(volume)")
+                } catch is BinderCommandError { }
+            } else {
+                let deferred = try await commands.retryPendingStructureSyncHandoffs(in: f.base.localID, authorize: {})
+                XCTAssertEqual(deferred, 1)
+            }
             XCTAssertEqual(try? Data(contentsOf: url), bytes)
             let queue = try await f.store.generalQueueStatus(localProjectID: f.base.localID)
             XCTAssertEqual(queue.pendingCount + queue.retryCount + queue.attentionCount, 0)

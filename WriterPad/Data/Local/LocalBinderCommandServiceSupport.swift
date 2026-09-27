@@ -580,7 +580,9 @@ extension LocalBinderCommandService {
         case .createVolume: expectedKind = .volumeCreation
         default: return false
         }
-        guard batch.kind == expectedKind, batch.contractStep == nil, batch.originBatchID == nil,
+        guard batch.projectID == journal.projectID, batch.localTransactionID == journal.transactionID,
+              batch.handoffOrigin == journal.handoffOrigin,
+              batch.kind == expectedKind, batch.contractStep == nil, batch.originBatchID == nil,
               journal.trashRecord == nil, let snapshot = batch.structureSnapshot,
               snapshot.sorted(by: { $0.id.rawValue.uuidString < $1.id.rawValue.uuidString })
                 == committedNodes.map(LocalStructureSnapshotNode.init).sorted(by: { $0.id.rawValue.uuidString < $1.id.rawValue.uuidString }),
@@ -638,6 +640,14 @@ extension LocalBinderCommandService {
         journalURL: URL,
         workspaceRoot: URL
     ) async throws -> Bool {
+        // Full recovery also consumes previously persisted batches. Validate them
+        // before recording or even treating a now-local-only handoff as complete.
+        // Do not rebuild a malformed saved request from current files.
+        if let saved = journal.durableBatch,
+           [.create, .createVolume, .relocate, .reorder].contains(journal.kind) {
+            let committed = try await metadataStore.binderDocuments(in: journal.projectID)
+            guard isReplayableStructureBatch(saved, for: journal, committedNodes: committed) else { return false }
+        }
         let requirement = await durableChangeRecorder.requirement(
             for: journal.projectID
         )
