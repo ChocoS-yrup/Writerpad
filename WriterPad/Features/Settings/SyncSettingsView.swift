@@ -73,6 +73,44 @@ struct SyncProjectRow: Identifiable, Equatable, Sendable {
     }
 }
 
+/// Last observed compatibility only, never permission to send or migrate.
+struct SyncPreparationReport: Equatable, Sendable {
+    let checkedAt: Date
+    let mode: SyncV2ProjectSyncMode?
+    let migrationEpoch: Int?
+    let message: String
+
+    init(handshake: SyncV2ValidatedHandshake, checkedAt: Date = Date()) {
+        self.checkedAt = checkedAt
+        mode = handshake.projectSyncMode
+        migrationEpoch = handshake.migrationEpoch
+        switch handshake.projectSyncMode {
+        case .legacy:
+            message = "형식 전환 필요 · LEGACY. 서버 연결과 일반 동기화 준비는 별개입니다. 소유자가 다른 기기의 호환성을 확인한 뒤 명시적으로 전환해야 합니다. 이 조회는 전환하지 않았습니다."
+        case .migrating:
+            message = "전환 진행 중 · MIGRATING. 전환을 시작한 기기에서 검증과 명시적 완료가 필요합니다. 자동 완료하거나 이전 형식으로 되돌리지 않았습니다."
+        case .idBased:
+            message = "서버 형식 확인됨 · ID_BASED. 일반 동기화를 활성화할 때 서버를 다시 확인합니다. 이 결과는 본문 송수신 완료나 활성화를 뜻하지 않습니다."
+        }
+    }
+
+    init(error: Error, checkedAt: Date = Date()) {
+        self.checkedAt = checkedAt; mode = nil; migrationEpoch = nil
+        switch error as? SyncV2HandshakeError {
+        case .networkUnavailable, .timedOut:
+            message = "연결 상태를 확인하지 못했습니다. 네트워크가 복구되면 준비 확인을 다시 눌러 주세요."
+        case .authenticationRequired, .identityUnknown:
+            message = "로그인 상태를 확인한 뒤 다시 조회해 주세요."
+        case .forbidden:
+            message = "이 계정으로 작품의 준비 상태를 조회할 권한이 없습니다."
+        case .contractUnavailable, .incompatible:
+            message = "서버가 이 앱의 동기화 계약을 지원하지 않습니다. 앱·서버 호환성 확인이 필요합니다."
+        default:
+            message = "서버 응답을 확인하지 못했습니다. 준비된 것으로 처리하지 않았으니 다시 조회해 주세요."
+        }
+    }
+}
+
 @MainActor
 final class SyncSettingsModel: ObservableObject {
     @Published private(set) var authenticationState: AuthenticationState =
@@ -97,6 +135,91 @@ final class SyncSettingsModel: ObservableObject {
     private let snapshotPuller: (any SyncV2SnapshotPulling)?
     private let defaults: UserDefaults
     private let generalRetryEpoch = SyncV2ContractEpoch()
+    private let preparationEpoch = SyncV2ContractEpoch()
+    @Published private(set) var checkingPreparationProjectIDs: Set<ProjectID> = []
+    @Published private var preparationReports: [ProjectID: SyncPreparationReport] = [:]
+    private var preparationTickets: [ProjectID: PreparationTicket] = [:]
+
+    private struct PreparationTicket {
+        let binding: ProjectSyncBinding?
+        let authentication: UInt64?
+        let bindings: UInt64?
+        let projects: UInt64?
+        let activity: UInt64?
+        let screen: UInt64
+    }
+
+    private func preparationIsCurrent(_ ticket: PreparationTicket, row: SyncProjectRow) -> Bool {
+        !Task.isCancelled && ticket.binding == row.binding &&
+        ticket.authentication == authenticationService.contractEpoch?.value &&
+        authenticationService.contractEpoch?.isAvailable == true &&
+        ticket.bindings == projectBindingService.contractEpoch?.value &&
+        projectBindingService.contractEpoch?.isAvailable == true &&
+        ticket.projects == projectLister.contractEpoch?.value && projectLister.contractEpoch?.isAvailable == true &&
+        ticket.activity == handshakeService?.activityEpoch.value && handshakeService?.activityEpoch.isAvailable == true &&
+        ticket.screen == preparationEpoch.value
+    }
+
+    func preparationReport(for row: SyncProjectRow) -> SyncPreparationReport? {
+        guard let ticket = preparationTickets[row.id], preparationIsCurrent(ticket, row: row) else { return nil }
+        return preparationReports[row.id]
+    }
+
+    /// Only a fresh read-only handshake. No initial-snapshot recovery, gate open,
+    /// dispatcher start, baseline adoption, or mode-transition RPC is permitted here.
+    @discardableResult
+    func checkSyncPreparation(for row: SyncProjectRow) -> Task<Void, Never> {
+        guard !isWorking, !openingContractPathProjectIDs.contains(row.id),
+              checkingPreparationProjectIDs.insert(row.id).inserted else { return Task {} }
+        preparationReports[row.id] = nil
+        let ticket = PreparationTicket(binding: row.binding,
+            authentication: authenticationService.contractEpoch?.value,
+            bindings: projectBindingService.contractEpoch?.value,
+            projects: projectLister.contractEpoch?.value,
+            activity: handshakeService?.activityEpoch.value, screen: preparationEpoch.value)
+        preparationTickets[row.id] = ticket
+        return Task {
+            defer { checkingPreparationProjectIDs.remove(row.id) }
+            guard let handshakeService else {
+                errorMessage = "서버 준비 상태를 조회할 수 없는 구성입니다."
+                return
+            }
+            let state = await authenticationService.currentState()
+            let binding = await projectBindingService.storedBindingForInspection(for: row.id)
+            guard preparationIsCurrent(ticket, row: row),
+                  case let .authenticated(account) = state,
+                  let binding, binding == row.binding, binding.localProjectID == row.id,
+                  binding.kind != .localOnly, binding.ownerSubject == account.userID,
+                  let serverID = binding.serverProjectID,
+                  (try? await projectLister.projects().contains { $0.id == row.id && $0.isActive }) == true,
+                  let context = SyncV2HandshakeContext.make(authenticationState: state,
+                    localProjectID: row.id, serverProjectID: serverID,
+                    authenticationEpoch: ticket.authentication ?? 0, bindingEpoch: ticket.bindings ?? 0)
+            else {
+                if preparationIsCurrent(ticket, row: row) {
+                    preparationReports[row.id] = SyncPreparationReport(error: SyncV2HandshakeError.identityUnknown)
+                }
+                return
+            }
+            do {
+                guard await handshakeService.canStartContractWrite(), preparationIsCurrent(ticket, row: row) else { return }
+                let handshake = try await handshakeService.inspectCompatibility(context: context)
+                let current = await projectBindingService.storedBindingForInspection(for: row.id)
+                guard current == binding, await handshakeService.canStartContractWrite(),
+                      preparationIsCurrent(ticket, row: row) else { return }
+                preparationReports[row.id] = SyncPreparationReport(handshake: handshake)
+            } catch {
+                guard preparationIsCurrent(ticket, row: row) else { return }
+                preparationReports[row.id] = SyncPreparationReport(error: error)
+            }
+        }
+    }
+
+    private func invalidatePreparationReports() {
+        preparationEpoch.advance()
+        preparationReports.removeAll()
+        preparationTickets.removeAll()
+    }
 
     init(
         projectManager: any ProjectManaging,
@@ -191,7 +314,7 @@ final class SyncSettingsModel: ObservableObject {
             gateReport = "\(row.project.name) 관문: 닫힘"
             return Task { await handshakeService?.gateClosed() }
         }
-        guard !isWorking, ReceiveValidationPolicy.current.sendingAllowed,
+        guard !isWorking, !checkingPreparationProjectIDs.contains(row.id), ReceiveValidationPolicy.current.sendingAllowed,
               openingContractPathProjectIDs.insert(row.id).inserted else { return Task {} }
         let revision = ContractPathGate.revision(for: row.project.id, in: defaults)
         let authEpoch = authenticationService.contractEpoch?.value ?? 0
@@ -256,6 +379,7 @@ final class SyncSettingsModel: ObservableObject {
 
     /// A late server response must not opt a project in after leaving the settings UI.
     func cancelPendingGateOpenings() {
+        invalidatePreparationReports()
         generalRetryEpoch.advance()
         guard !openingContractPathProjectIDs.isEmpty else { return }
         for id in openingContractPathProjectIDs {
@@ -535,6 +659,7 @@ final class SyncSettingsModel: ObservableObject {
     }
 
     func load() async {
+        invalidatePreparationReports()
         authenticationState = await authenticationService.currentState()
         await reloadProjects()
     }
@@ -544,6 +669,7 @@ final class SyncSettingsModel: ObservableObject {
         for await updatedState in updates {
             guard !Task.isCancelled else { return }
             authenticationState = updatedState
+            invalidatePreparationReports()
         }
     }
 
@@ -1630,20 +1756,38 @@ struct SyncSettingsView: View {
                         }
 
                         if row.isConnected {
+                            Button("동기화 준비 확인 · 전송 없음") {
+                                model.checkSyncPreparation(for: row)
+                            }
+                            .disabled(model.checkingPreparationProjectIDs.contains(row.id) ||
+                                model.openingContractPathProjectIDs.contains(row.id))
+                            .accessibilityIdentifier("writerpad.sync-preparation-" + row.id.rawValue.uuidString)
+                            if model.checkingPreparationProjectIDs.contains(row.id) {
+                                ProgressView("서버 준비 상태 조회 중…")
+                            }
+                            if let report = model.preparationReport(for: row) {
+                                Text(report.message).font(.footnote)
+                                if let epoch = report.migrationEpoch {
+                                    Text("전환 세대: \(epoch)").font(.caption).foregroundStyle(.secondary)
+                                }
+                                Text("마지막 확인: \(report.checkedAt.formatted(date: .abbreviated, time: .shortened))")
+                                    .font(.caption).foregroundStyle(.secondary)
+                            }
                             Toggle("이 작품의 일반 동기화", isOn: Binding(
                                 get: { model.isGateOpen(for: row) },
                                 set: { enabled in
                                     if enabled { enableProjectSyncTarget = row }
                                     else { model.setGateOpen(false, for: row) }
                                 }))
-                                .disabled(model.openingContractPathProjectIDs.contains(row.id))
+                                .disabled(model.openingContractPathProjectIDs.contains(row.id) ||
+                                    model.checkingPreparationProjectIDs.contains(row.id))
                                 .accessibilityIdentifier("writerpad.project-sync-" + row.id.rawValue.uuidString)
                             if model.openingContractPathProjectIDs.contains(row.id) {
                                 ProgressView("서버 호환성 확인 중…")
                             }
                             Text(model.isGateOpen(for: row)
                                 ? "일반 동기화 활성화됨 · 자동 송수신은 전체 동기화 설정을 따릅니다."
-                                : "서버 연결만 저장된 상태입니다. 일반 동기화를 활성화해야 새 계약 경로를 사용할 수 있습니다.")
+                                : "서버 연결과 일반 동기화 준비는 별개입니다. 먼저 준비 상태를 확인한 뒤 일반 동기화를 활성화하세요.")
                                 .font(.caption).foregroundStyle(.secondary)
                             if let status = model.generalQueueStatuses[row.id], status.pendingCount > 0 {
                                 Text(status.message).font(.caption).foregroundStyle(.secondary)

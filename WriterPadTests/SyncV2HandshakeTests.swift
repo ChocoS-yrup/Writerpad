@@ -789,7 +789,9 @@ extension SyncV2HandshakeTests {
         nonisolated let contractEpoch: SyncV2ContractEpoch? = SyncV2ContractEpoch()
         let bindings: [ProjectID: ProjectSyncBinding]
         init(_ bindings: [ProjectSyncBinding]) { self.bindings = Dictionary(uniqueKeysWithValues: bindings.map { ($0.localProjectID, $0) }) }
-        func currentBinding(for id: ProjectID) -> ProjectSyncBinding? { bindings[id] }
+        private(set) var currentBindingCalls = 0
+        func currentBinding(for id: ProjectID) -> ProjectSyncBinding? { currentBindingCalls += 1; return bindings[id] }
+        func storedBindingForInspection(for id: ProjectID) -> ProjectSyncBinding? { bindings[id] }
         func createServerProject(for id: ProjectID) -> ProjectBindingResult { .failed(.serverRejected) }
         func connectExistingProject(localProjectID: ProjectID, confirmation: ConfirmedServerProjectID) -> ProjectBindingResult { .failed(.serverRejected) }
         func connectWindowsProject(localProjectID: ProjectID, confirmation: ConfirmedServerProjectID) -> ProjectBindingResult { .failed(.serverRejected) }
@@ -2404,6 +2406,157 @@ extension SyncV2HandshakeTests {
             let count = await f.transport.count; XCTAssertEqual(count, 0)
             XCTAssertTrue(f.model.openingContractPathProjectIDs.isEmpty)
         }
+    }
+
+    @MainActor
+    func testPreparationInspectionDistinguishesModesWithoutEnablingOrRecovering() async throws {
+        for mode in [SyncV2ProjectSyncMode.legacy, .migrating, .idBased] {
+            let f = try await productGateFixture(), server = try XCTUnwrap(f.row.binding?.serverProjectID)
+            let calls = await f.bindings.currentBindingCalls
+            let authRevision = f.service.authorizationEpoch.value
+            let task = f.model.checkSyncPreparation(for: f.row)
+            await eventually { [transport = f.transport] in await transport.count == 1 }
+            await f.transport.finish(.success(supportedResponse(projectID: server, mode: mode, epoch: mode == .legacy ? 0 : 1)))
+            await task.value
+            let report = try XCTUnwrap(f.model.preparationReport(for: f.row))
+            XCTAssertEqual(report.mode, mode)
+            XCTAssertEqual(report.migrationEpoch, mode == .legacy ? 0 : 1)
+            XCTAssertFalse(report.message.isEmpty)
+            XCTAssertFalse(ContractPathGate.isOpen(for: f.row.id, in: f.defaults))
+            XCTAssertFalse(GlobalSyncPreference.isEnabled(in: f.defaults))
+            XCTAssertEqual(f.service.authorizationEpoch.value, authRevision)
+            let after = await f.bindings.currentBindingCalls
+            XCTAssertEqual(after, calls, "Inspection must not use recovering binding lookup")
+            XCTAssertTrue(f.model.checkingPreparationProjectIDs.isEmpty)
+        }
+    }
+
+    @MainActor
+    func testPreparationInspectionDeduplicatesAndAlwaysFetchesAgain() async throws {
+        let f = try await productGateFixture(), server = try XCTUnwrap(f.row.binding?.serverProjectID)
+        let first = f.model.checkSyncPreparation(for: f.row)
+        await f.model.checkSyncPreparation(for: f.row).value
+        await eventually { [transport = f.transport] in await transport.count == 1 }
+        await f.transport.finish(.success(supportedResponse(projectID: server, mode: .idBased, epoch: 1)))
+        await first.value
+        XCTAssertNotNil(f.model.preparationReport(for: f.row))
+        let second = f.model.checkSyncPreparation(for: f.row)
+        XCTAssertNil(f.model.preparationReport(for: f.row), "Old success must disappear during a new query")
+        await eventually { [transport = f.transport] in await transport.count == 2 }
+        await f.transport.finish(.failure(SyncV2HandshakeTransportError.networkUnavailable))
+        await second.value
+        let report = try XCTUnwrap(f.model.preparationReport(for: f.row))
+        XCTAssertNil(report.mode)
+        XCTAssertTrue(report.message.contains("네트워크"))
+    }
+
+    @MainActor
+    func testPreparationInspectionRejectsLifecycleChangesBeforePublishing() async throws {
+        for change in 0..<7 {
+            let f = try await productGateFixture(), server = try XCTUnwrap(f.row.binding?.serverProjectID)
+            let task = f.model.checkSyncPreparation(for: f.row)
+            await eventually { [transport = f.transport] in await transport.count == 1 }
+            switch change {
+            case 0: await f.auth.relogin()
+            case 1: f.bindings.contractEpoch?.advance()
+            case 2: f.environment.projectManager.syncLifecycleEpoch?.advance()
+            case 3: await f.service.updateSceneActivity(false)
+            case 4: f.model.cancelPendingGateOpenings()
+            case 5: await f.model.load()
+            default: task.cancel()
+            }
+            await f.transport.finish(.success(supportedResponse(projectID: server, mode: .idBased, epoch: 1)))
+            await task.value
+            XCTAssertNil(f.model.preparationReport(for: f.row), "change \(change)")
+            XCTAssertTrue(f.model.checkingPreparationProjectIDs.isEmpty)
+            XCTAssertFalse(ContractPathGate.isOpen(for: f.row.id, in: f.defaults))
+        }
+    }
+
+    @MainActor
+    func testPreparationInspectionRejectsInvalidIdentityBeforeNetwork() async throws {
+        for change in 0..<5 {
+            let f = try await productGateFixture(wrongOwner: change == 0)
+            var row = f.row
+            switch change {
+            case 1: row = SyncProjectRow(project: row.project, binding: nil)
+            case 2: _ = await f.auth.signOut()
+            case 3:
+                let confirmation = try await f.environment.projectManager.prepareDeletion(id: row.id)
+                try await f.environment.projectManager.confirmDeletion(confirmation)
+            case 4: await f.service.updateSceneActivity(false)
+            default: break
+            }
+            await f.model.checkSyncPreparation(for: row).value
+            let count = await f.transport.count
+            XCTAssertEqual(count, 0)
+            XCTAssertNil(f.model.preparationReport(for: row)?.mode)
+        }
+    }
+
+    @MainActor
+    func testPreparationInspectionRejectsWrongProjectAndIncompatibleResponses() async throws {
+        for responseKind in 0..<3 {
+            let f = try await productGateFixture(), server = try XCTUnwrap(f.row.binding?.serverProjectID)
+            let task = f.model.checkSyncPreparation(for: f.row)
+            await eventually { [transport = f.transport] in await transport.count == 1 }
+            let response = supportedResponse(projectID: responseKind == 0 ? UUID() : server,
+                mode: .idBased, epoch: responseKind == 1 ? 0 : 1,
+                serverDigest: responseKind == 2 ? String(repeating: "0", count: 64) : SyncV2Contract.canonicalSHA256)
+            await f.transport.finish(.success(response)); await task.value
+            XCTAssertNil(f.model.preparationReport(for: f.row)?.mode)
+            XCTAssertFalse(ContractPathGate.isOpen(for: f.row.id, in: f.defaults))
+        }
+    }
+
+    @MainActor
+    func testPreparationReportIsInvalidAfterContextChangeAndDoesNotAuthorizeGate() async throws {
+        for change in 0..<5 {
+            let f = try await productGateFixture(), server = try XCTUnwrap(f.row.binding?.serverProjectID)
+            let task = f.model.checkSyncPreparation(for: f.row)
+            await eventually { [transport = f.transport] in await transport.count == 1 }
+            await f.transport.finish(.success(supportedResponse(projectID: server, mode: .idBased, epoch: 1)))
+            await task.value
+            XCTAssertEqual(f.model.preparationReport(for: f.row)?.mode, .idBased)
+            switch change {
+            case 0: await f.auth.relogin()
+            case 1: f.bindings.contractEpoch?.advance()
+            case 2: f.environment.projectManager.syncLifecycleEpoch?.advance()
+            case 3: await f.service.updateSceneActivity(false)
+            default: f.model.cancelPendingGateOpenings()
+            }
+            XCTAssertNil(f.model.preparationReport(for: f.row))
+            XCTAssertFalse(ContractPathGate.isOpen(for: f.row.id, in: f.defaults))
+        }
+    }
+
+    @MainActor
+    func testPreparationSuccessCannotBypassFreshGateHandshake() async throws {
+        let f = try await productGateFixture(), server = try XCTUnwrap(f.row.binding?.serverProjectID)
+        let check = f.model.checkSyncPreparation(for: f.row)
+        await eventually { [transport = f.transport] in await transport.count == 1 }
+        await f.transport.finish(.success(supportedResponse(projectID: server, mode: .idBased, epoch: 1)))
+        await check.value
+        let open = f.model.setGateOpen(true, for: f.row)
+        await eventually { [transport = f.transport] in await transport.count == 2 }
+        await f.transport.finish(.success(supportedResponse(projectID: server)))
+        await open.value
+        XCTAssertFalse(ContractPathGate.isOpen(for: f.row.id, in: f.defaults))
+    }
+
+    func testCompatibilityInspectionDoesNotChangeExistingStandingAuthorization() async throws {
+        let ctx = context(serverProjectID: UUID())
+        let transport = StubTransport(results: [.success(supportedResponse(projectID: ctx.serverProjectID)),
+            .success(supportedResponse(projectID: ctx.serverProjectID, mode: .idBased, epoch: 1)),
+            .failure(SyncV2HandshakeTransportError.forbidden)])
+        let service = SyncV2HandshakeService(transport: transport)
+        let original = try await service.refresh(context: ctx)
+        let revision = service.authorizationEpoch.value
+        _ = try await service.inspectCompatibility(context: ctx)
+        await assertThrows(.forbidden) { _ = try await service.inspectCompatibility(context: ctx) }
+        let standing = await service.standingHandshake(for: ctx)
+        XCTAssertEqual(standing, original)
+        XCTAssertEqual(service.authorizationEpoch.value, revision)
     }
 
     @MainActor
