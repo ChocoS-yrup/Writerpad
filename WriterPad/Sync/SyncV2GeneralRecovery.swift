@@ -24,6 +24,7 @@ struct SyncV2GeneralRecoveryRow: Identifiable, Equatable, Sendable {
     }
 
     var statusText: String {
+        if errorCode == NormalEditorTestQueueRetirement.marker { return "미송신 테스트 취소 기록" }
         if errorCode == "EXPANDED_CONTRACT_PLAN" { return "단계별 요청의 보관 원본" }
         if errorCode == "ADOPT_SERVER_STRUCTURE" { return "서버 구조 선택 기록" }
         if requestStatus == "superseded" { return "선택 반영 전의 보관본" }
@@ -36,6 +37,7 @@ struct SyncV2GeneralRecoveryRow: Identifiable, Equatable, Sendable {
 
     var guidance: String {
         switch errorCode {
+        case NormalEditorTestQueueRetirement.marker: return "확인된 이전 테스트의 송신 대기를 명시적으로 취소했습니다. 서버 전송 없이 저장 당시 본문과 기록을 유지합니다."
         case "ADOPT_SERVER_STRUCTURE": return "서버 구조를 선택한 기록입니다. 이름·위치·순서는 일반 수신에서 반영되며 편집 중 변경은 보호됩니다."
         case "EXPANDED_CONTRACT_PLAN": return "여러 동기화 요청으로 나눈 작업의 원본입니다. 각 단계가 완료된 뒤에도 이 보관본을 유지합니다."
         case "SUPERSEDED_AFTER_CONFLICT": return "선택한 보관본으로 새 동기화 요청을 만들었습니다. 이 원본과 서버 비교 기록은 계속 보관됩니다."

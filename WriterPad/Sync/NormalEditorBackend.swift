@@ -224,21 +224,24 @@ actor LiveNormalEditorBackend: NormalEditorBackend {
               let count = Int(range.split(separator: "/").last ?? ""), count == rows.count, count < limit else { throw NormalEditorError.request }
         return rows
     }
-    func remote() async throws -> SyncV2RemoteDocumentSnapshot {
+    private func remoteStructure() async throws -> SyncV2PreparationSnapshot {
         _ = try grant()
         let filter = [URLQueryItem(name: "project_id", value: "eq." + NormalEditorPlan.server.uuidString.lowercased())]
-        let localStructure = try await store.normalEditorStructure()
         let folders = try await rows("folders", columns: "folder_id,project_id,parent_folder_id,name,revision,is_deleted", filters: filter)
         let orders = try await rows("tree_orders", columns: "tree_order_id,project_id,parent_folder_id,children,revision", filters: filter)
         let docs = try await rows("documents", columns: "document_id,project_id,relative_path,revision,parent_folder_id,name,structure_revision,is_deleted", filters: filter)
-        let remoteStructure = SyncV2PreparationSnapshot(folders: folders, documents: docs, treeOrders: orders)
-        func structure(_ snapshot: SyncV2PreparationSnapshot) -> SyncV2PreparationSnapshot {
-            .init(folders: snapshot.folders, documents: snapshot.documents.map { row in
-                guard var fields = row.objectValue, fields["document_id"] == .string(NormalEditorPlan.document.uuidString.lowercased()) else { return row }
-                fields["revision"] = .int(0); return .object(fields)
-            }, treeOrders: snapshot.treeOrders)
-        }
-        guard try structure(localStructure).fingerprint() == structure(remoteStructure).fingerprint() else { throw NormalEditorError.target }
+        return .init(folders: folders, documents: docs, treeOrders: orders)
+    }
+    func remote() async throws -> SyncV2RemoteDocumentSnapshot {
+        let localStructure = try await store.normalEditorStructure()
+        let remoteStructure = try await remoteStructure()
+        let comparison = try journal.state().structureReference?.comparison(local: localStructure) ?? localStructure
+        guard try NormalEditorStructureReference.comparable(comparison).fingerprint()
+            == NormalEditorStructureReference.comparable(remoteStructure).fingerprint() else { throw NormalEditorError.target }
+        return try await targetBody(manifest: remoteStructure)
+    }
+    private func targetBody(manifest: SyncV2PreparationSnapshot) async throws -> SyncV2RemoteDocumentSnapshot {
+        let filter = [URLQueryItem(name: "project_id", value: "eq." + NormalEditorPlan.server.uuidString.lowercased())]
         let target = try await rows("documents", columns: "document_id,relative_path,content,revision,parent_folder_id,name,structure_revision,is_deleted,deleted_at,updated_at", filters: filter + [.init(name: "document_id", value: "eq." + NormalEditorPlan.document.uuidString.lowercased())], limit: 2)
         guard target.count == 1 else { throw NormalEditorError.target }
         let decoder = JSONDecoder(); decoder.dateDecodingStrategy = .custom { decoder in
@@ -248,9 +251,69 @@ actor LiveNormalEditorBackend: NormalEditorBackend {
         }
         let result = try decoder.decode(SyncV2RemoteDocumentSnapshot.self, from: JSONEncoder().encode(target[0]))
         try NormalEditorPlan.validate(result)
-        guard let manifest = docs.first(where: { $0.objectValue?["document_id"] == .string(NormalEditorPlan.document.uuidString.lowercased()) }),
-              manifest.objectValue?["revision"] == .int(Int(result.revision)) else { throw NormalEditorError.baseline }
+        guard let row = manifest.documents.first(where: { $0.objectValue?["document_id"] == .string(NormalEditorPlan.document.uuidString.lowercased()) }),
+              row.objectValue?["revision"] == .int(Int(result.revision)) else { throw NormalEditorError.baseline }
         return result
+    }
+    func refreshStructureReference() async throws {
+        let authority = try grant(), state = journal.state()
+        guard NormalEditorStructureReference.canRefresh(state), let head = state.head,
+              let configuration = state.recoveryRuns?.last?.configuration,
+              let base = state.baseline else { throw NormalEditorError.dirty }
+        let source = state.saves[head].source
+        let local = try await store.normalEditorStructure()
+        let first = try await remoteStructure()
+        let remoteBody = try await targetBody(manifest: first)
+        guard remoteBody.revision == base.revision, Data(remoteBody.content.utf8) == Data(base.content.utf8) else { throw NormalEditorError.baseline }
+        let second = try await remoteStructure()
+        let latestLocal = try await store.normalEditorStructure()
+        guard try first.fingerprint() == second.fingerprint(),
+              try local.fingerprint() == latestLocal.fingerprint() else { throw NormalEditorError.target }
+        let reference = try NormalEditorStructureReference(local: local, remote: second)
+        if let previous = state.structureReference {
+            _ = try previous.comparison(local: local)
+            try NormalEditorStructureReference.validate(local: previous.snapshot, remote: second)
+        }
+        // Recheck the actual saved text, local content baseline and journal draft after awaits.
+        let latestBase = try await localBaseline(), latestText = try await localText()
+        try NormalEditorRecoveryInjection.preflight(journal: journal, baseline: latestBase,
+            localText: latestText, dirty: false, composing: false, draftFailed: false)
+        try authority.check()
+        try journal.update("structureComparisonReferenceRefreshed") { state in
+            try authority.check()
+            guard NormalEditorStructureReference.canRefresh(state), let head = state.head,
+                  state.saves[head].source == source, state.recoveryRuns?.last?.configuration == configuration,
+                  state.baseline?.revision == base.revision,
+                  state.baseline.map({ Data($0.content.utf8) }) == Data(base.content.utf8) else { throw NormalEditorError.dirty }
+            state.structureReference = reference
+        }
+    }
+    func reconcileDuplicateSaves() async throws {
+        let journal = self.journal, lifecycle = self.lifecycle, version = lifecycle.value
+        guard let resolution = NormalEditorDuplicateSaveResolution(journal.state()),
+              try NormalEditorRecoveryInjection.effectiveConfiguration(journal) == resolution.run.configuration else { throw NormalEditorError.queue }
+        let text = try await localText()
+        try await store.reconcileNormalEditorDuplicateSaves(resolution, journal: journal, localText: text) {
+            try Task.checkCancellation()
+            guard lifecycle.isAvailable, lifecycle.value == version else { throw NormalEditorError.locked }
+        }
+    }
+    func retireUnsentTestQueue() async throws {
+        let authority = try grant(), journal = self.journal, store = self.store
+        let before = journal.state()
+        guard NormalEditorTestQueueRetirement.canRetire(before), let head = before.head else { throw NormalEditorError.queue }
+        let source = before.saves[head].source, run = before.recoveryRuns?.last
+        try NormalEditorRecoveryInjection.preflight(journal: journal, baseline: try await localBaseline(),
+            localText: try await localText(), dirty: false, composing: false, draftFailed: false)
+        try await authority.mutate(sending: true) {
+            try await store.retireNormalEditorUnsentTests {
+                try authority.requireMutation(sending: true)
+                let current = journal.state()
+                guard NormalEditorTestQueueRetirement.canRetire(current), let head = current.head,
+                      current.saves[head].source == source, current.recoveryRuns?.last == run else { throw NormalEditorError.queue }
+            }
+        }
+        // SQLite keeps the durable cancellation audit. No cross-store success marker is required.
     }
     func freeze(_ source: LocalMutationBatch) async throws -> SyncV2ContractRequest {
         let authority = try grant()
@@ -258,11 +321,11 @@ actor LiveNormalEditorBackend: NormalEditorBackend {
         _ = try NormalEditorPlan.content(source)
         let store = self.store
         return try await authority.mutate(sending: true) {
-            let page = try await store.generalRecoveryPage(localProjectID: NormalEditorPlan.local, after: nil)
-            guard page.nextCursor == nil, page.rows.allSatisfy({ $0.batchID == source.batchID }) else { throw NormalEditorError.queue }
+            let active = try await store.normalEditorActiveQueueIDs()
+            guard active.count <= 1, active.allSatisfy({ $0 == source.batchID }) else { throw NormalEditorError.queue }
             let queue = try await store.uploadQueueSnapshot(localProjectID: NormalEditorPlan.local)
             guard queue.conflictCount == 0, queue.blockedCount == 0, queue.retryWaitingCount == 0,
-                  queue.pendingCount + queue.inflightCount <= (page.rows.isEmpty ? 0 : 1) else { throw NormalEditorError.queue }
+                  queue.pendingCount + queue.inflightCount <= (active.isEmpty ? 0 : 1) else { throw NormalEditorError.queue }
             _ = try await store.enqueueContractStructure(source, binding: binding, handshake: handshake, general: true,
                 authorize: { try authority.requireMutation(sending: true) })
             if let existing = try await store.normalEditorPending(batchID: source.batchID) { return existing.request }

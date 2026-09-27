@@ -8,11 +8,20 @@ protocol NormalEditorBackend: Sendable {
     func prepare() async throws
     func invalidate() async
     func remote() async throws -> SyncV2RemoteDocumentSnapshot
+    func refreshStructureReference() async throws
+    func retireUnsentTestQueue() async throws
+    func reconcileDuplicateSaves() async throws
     func freeze(_ source: LocalMutationBatch) async throws -> SyncV2ContractRequest
     func transmit(_ request: SyncV2ContractRequest, willStart: @escaping @Sendable () throws -> Void) async throws -> SyncV2JSON
     func receipt(_ request: SyncV2ContractRequest) async throws -> SyncV2JSON?
     func complete(_ request: SyncV2ContractRequest, response: SyncV2JSON) async throws
     func apply(_ receive: NormalEditorJournal.Receive, willApply: @escaping @Sendable () throws -> Void) async throws
+}
+
+extension NormalEditorBackend {
+    func refreshStructureReference() async throws { throw NormalEditorError.target }
+    func retireUnsentTestQueue() async throws { throw NormalEditorError.queue }
+    func reconcileDuplicateSaves() async throws { throw NormalEditorError.queue }
 }
 
 /// One explicit action per tap. No timer, network callback or restart invokes another action.
@@ -94,6 +103,54 @@ final class NormalEditorSession: ObservableObject {
         guard opened else { return }
         // Saving is deliberately independent of network busy/authentication.
         _ = await editor.saveNow()
+    }
+    func refreshStructureReference() async {
+        guard opened, foreground, prepared, !busy else { return }
+        await perform {
+            let version = self.epoch
+            guard NormalEditorStructureReference.canRefresh(self.journal.state()),
+                  !self.editor.hasUnsavedChanges, !self.editor.isComposing,
+                  self.editor.draftPersistenceError == nil else { throw NormalEditorError.dirty }
+            try await self.validateRecoveryRun()
+            guard self.foreground, self.epoch == version else { throw NormalEditorError.locked }
+            try await self.backend.refreshStructureReference()
+            guard self.foreground, self.epoch == version else { throw NormalEditorError.locked }
+            self.prepared = false
+            await self.backend.invalidate()
+            self.message = "구조 비교 기준 갱신 완료. 본문·저장 대기는 유지했습니다. 송수신 준비를 다시 확인하세요."
+        }
+    }
+    func reconcileDuplicateSaves() async {
+        // Local repair must be reachable when preparation itself is blocked by duplicate saves.
+        guard opened, foreground, !busy else { return }
+        await perform {
+            let version = self.epoch
+            guard NormalEditorDuplicateSaveResolution(self.journal.state()) != nil,
+                  !self.editor.hasUnsavedChanges, !self.editor.isComposing,
+                  self.editor.draftPersistenceError == nil else { throw NormalEditorError.dirty }
+            self.prepared = false
+            await self.backend.invalidate()
+            guard self.foreground, self.epoch == version else { throw NormalEditorError.locked }
+            try await self.backend.reconcileDuplicateSaves()
+            guard self.foreground, self.epoch == version else { throw NormalEditorError.locked }
+            self.message = "동일 본문 중복 대기 정리 완료. 본문·기록·기존 복구 시험은 유지했습니다. 송수신 준비를 다시 확인하세요."
+        }
+    }
+    func retireUnsentTestQueue() async {
+        guard opened, foreground, prepared, !busy else { return }
+        await perform {
+            let version = self.epoch
+            guard NormalEditorTestQueueRetirement.canRetire(self.journal.state()),
+                  !self.editor.hasUnsavedChanges, !self.editor.isComposing,
+                  self.editor.draftPersistenceError == nil else { throw NormalEditorError.dirty }
+            try await self.validateRecoveryRun()
+            guard self.foreground, self.epoch == version else { throw NormalEditorError.locked }
+            try await self.backend.retireUnsentTestQueue()
+            guard self.foreground, self.epoch == version else { throw NormalEditorError.locked }
+            self.prepared = false
+            await self.backend.invalidate()
+            self.message = "이전 테스트 송신 대기 2건 취소 완료. 본문·기록·현재 복구 시험은 유지했습니다. 송수신 준비를 다시 확인하세요."
+        }
     }
     func cancelPreparedRecoveryRun() async {
         guard opened, foreground, !busy else { return }
