@@ -130,9 +130,9 @@ actor LocalBinderCommandService: BinderCommanding {
 
     func recoverPendingTransactions(in projectID: ProjectID) async throws {
         let workspaceRoot = try await workspaceLocator.workspaceRoot(for: projectID)
-        try await syncMutationGate.withCriticalSection(
-            documentID: syncV2ProjectStructureMutationID(projectID), drainOnTimeout: true
-        ) { try await self.recoverPendingJournals(in: projectID, workspaceRoot: workspaceRoot) }
+        try await withStableJournalGates(in: projectID, root: workspaceRoot) {
+            try await self.recoverPendingJournals(in: projectID, workspaceRoot: workspaceRoot)
+        }
         guard recoverProjectAliases else { return }
         try await removeEmptyLegacySyncRootAliases(in: projectID, workspaceRoot: workspaceRoot)
         try await ensureCanonicalStoryPlotFolder(in: projectID, workspaceRoot: workspaceRoot)
@@ -207,15 +207,55 @@ actor LocalBinderCommandService: BinderCommanding {
         }
     }
 
+    private struct JournalGateSnapshot: Equatable, Sendable {
+        let url: URL
+        let bytes: Data
+    }
+
+    private func journalGateSnapshot(in root: URL) throws -> [JournalGateSnapshot] {
+        try structureJournalURLs(in: root).sorted { $0.path < $1.path }.map {
+            JournalGateSnapshot(url: $0, bytes: try Data(contentsOf: $0))
+        }
+    }
+
+    /// Discover under the structure gate, then reacquire the complete key set in
+    /// the same UUID order as normal execute. Never acquire a document gate while
+    /// retaining the discovery lock: execute may already hold that document key.
+    private func withStableJournalGates<Value: Sendable>(in projectID: ProjectID, root: URL,
+        operation: @escaping @Sendable () async throws -> Value) async throws -> Value {
+        let structureID = syncV2ProjectStructureMutationID(projectID)
+        let snapshot = try await syncMutationGate.withCriticalSection(documentID: structureID, drainOnTimeout: true) {
+            try await self.journalGateSnapshot(in: root)
+        }
+        let decoder = JSONDecoder(); decoder.dateDecodingStrategy = .iso8601
+        var keys = [structureID]
+        for entry in snapshot {
+            guard let journal = try? decoder.decode(BinderCommandJournal.self, from: entry.bytes),
+                  journal.projectID == projectID else { continue }
+            keys.append(contentsOf: (journal.oldNodes + journal.newNodes).filter { $0.kind == .text }.map { $0.id.rawValue })
+        }
+        return try await syncMutationGate.withCriticalSections(documentIDs: keys, drainOnTimeout: true) {
+            // Another command may have changed journals while the discovery lock
+            // was released. Never process a new journal with the old document keys.
+            let current = try await self.journalGateSnapshot(in: root)
+            // A competing recovery may have consumed entries. That is a safe
+            // subset of the locked keys; new or rewritten entries are not.
+            guard current.allSatisfy({ snapshot.contains($0) }) else {
+                throw BinderCommandError.recoveryRequired(root.path)
+            }
+            return try await operation()
+        }
+    }
+
     /// Transmission-only replay. Never rolls back files, reapplies metadata, builds
     /// a new batch, migrates aliases, or performs deferred trash deletion.
     func retryPendingStructureSyncHandoffs(in projectID: ProjectID,
         authorize: @escaping @Sendable () throws -> Void) async throws -> Int {
         try authorize()
         let root = try await workspaceLocator.workspaceRoot(for: projectID)
-        return try await syncMutationGate.withCriticalSection(
-            documentID: syncV2ProjectStructureMutationID(projectID), drainOnTimeout: true
-        ) { try await self.retryStructureHandoffInsideGate(in: projectID, root: root, authorize: authorize) }
+        return try await withStableJournalGates(in: projectID, root: root) {
+            try await self.retryStructureHandoffInsideGate(in: projectID, root: root, authorize: authorize)
+        }
     }
 
     private func retryStructureHandoffInsideGate(in projectID: ProjectID, root: URL,

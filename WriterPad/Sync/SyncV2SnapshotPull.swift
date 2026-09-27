@@ -146,6 +146,7 @@ actor SyncV2DocumentMutationGate {
         timeoutSleep: @escaping SyncV2GateTimeoutSleep = { duration in
             try await ContinuousClock().sleep(for: duration)
         },
+        drainOnTimeout: Bool = false,
         operation: @escaping @Sendable () async throws -> Value
     ) async throws -> Value {
         let identifiers = Array(Set(documentIDs)).sorted {
@@ -155,6 +156,7 @@ actor SyncV2DocumentMutationGate {
             identifiers[...],
             holdTimeout: holdTimeout,
             timeoutSleep: timeoutSleep,
+            drainOnTimeout: drainOnTimeout,
             operation: operation
         )
     }
@@ -163,6 +165,7 @@ actor SyncV2DocumentMutationGate {
         _ documentIDs: ArraySlice<UUID>,
         holdTimeout: Duration,
         timeoutSleep: @escaping SyncV2GateTimeoutSleep,
+        drainOnTimeout: Bool,
         operation: @escaping @Sendable () async throws -> Value
     ) async throws -> Value {
         guard let documentID = documentIDs.first else {
@@ -171,12 +174,14 @@ actor SyncV2DocumentMutationGate {
         return try await withCriticalSection(
             documentID: documentID,
             holdTimeout: holdTimeout,
-            timeoutSleep: timeoutSleep
+            timeoutSleep: timeoutSleep,
+            drainOnTimeout: drainOnTimeout
         ) {
             try await self.withCriticalSections(
                 documentIDs.dropFirst(),
                 holdTimeout: holdTimeout,
                 timeoutSleep: timeoutSleep,
+                drainOnTimeout: drainOnTimeout,
                 operation: operation
             )
         }

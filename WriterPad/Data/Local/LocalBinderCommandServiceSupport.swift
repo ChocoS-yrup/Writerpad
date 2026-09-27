@@ -615,6 +615,7 @@ extension LocalBinderCommandService {
             case let .documentSnapshot(id, documentID, path, content, hash, generation, isDeleted):
                 guard !isDeleted, generation == 0,
                       let node = texts.first(where: { $0.id == documentID }), node.relativePath == path,
+                      node.contentHash == hash,
                       hash == hasher.sha256(for: Data(content.utf8)), textIDs.insert(documentID).inserted
                 else { return false }
                 operationID = id

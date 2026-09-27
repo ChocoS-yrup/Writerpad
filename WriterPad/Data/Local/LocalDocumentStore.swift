@@ -389,6 +389,20 @@ actor LocalDocumentStore: LocalDocumentStoring {
         while let batch = pendingSyncHandoffs[documentID]?.first {
             do { try authorize?() }
             catch { return .localSavedButNotQueued(reason: "자동 재개 수명이 변경되어 저장 기록을 보류했습니다.") }
+            // A save can start before structure replay acquires document gates.
+            // Keep its TXT/marker, but do not enqueue newer bodies ahead of the
+            // older binder transaction. The project resumer drains structure first.
+            do {
+                let files = try fileManager.contentsOfDirectory(at: workspaceRoot, includingPropertiesForKeys: nil)
+                if files.contains(where: {
+                    $0.lastPathComponent.hasPrefix(LocalBinderCommandService.journalPrefix)
+                        && $0.lastPathComponent.hasSuffix(LocalBinderCommandService.journalSuffix)
+                }) {
+                    return .localSavedButNotQueued(reason: "먼저 완료해야 할 구조 변경 기록이 있어 본문 전송 기록을 보류했습니다.")
+                }
+            } catch {
+                return .localSavedButNotQueued(reason: "구조 변경 기록을 확인할 수 없어 본문 전송 기록을 보류했습니다.")
+            }
             if durableChangeRecorder.requiresHandoffOrigin && batch.handoffOrigin == nil {
                 let currentOrigin = await durableChangeRecorder.handoffOrigin(for: batch.projectID)
                 let hasSourcedSuccessor = currentOrigin != nil

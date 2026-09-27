@@ -190,3 +190,41 @@ Windows 의존성이나 계약·교차 플랫폼 입력 변경이 없으므로 W
 - xcresult: `/private/tmp/WriterPad-RecoveryRun-Fix-DD/Logs/Test/Test-WriterPad-2026.09.28_00-27-45-+0900.xcresult`.
 - 계약 0.2.0 검증 재통과, canonical digest 불변. Release 로그는
   `/private/tmp/writerpad-pr46-snapshot-release.log`이며 완료 결과는 PR 본문에서 추적한다.
+
+### 본문 저장과 구조 인계 순서·본문 근거 보강
+
+`1892310` 검토의 [영향 문서 잠금](https://github.com/ChocoS-yrup/Writerpad/pull/46#discussion_r4115926628)과
+[생성 본문 근거](https://github.com/ChocoS-yrup/Writerpad/pull/46#discussion_r4115926632)를 함께 수정한다.
+수정 전 집중 검사 2개에서 16 assertion failures, unexpected 0을 재현했다
+(`/private/tmp/writerpad-pr46-document-gates-red.log`). 자동/전체 복구의 recorder를 멈춘 동안 같은
+문서 저장이 먼저 진입하고, 후속 송신이 막히는 것을 실제 SQLite·합성 transport로 확인했다.
+본문과 그 hash를 함께 변경한 생성/새 권 batch도 큐에 들어갔다.
+
+- journal 복구는 구조 잠금 아래 journal bytes와 대상 문서 ID를 수집한 뒤 잠금을 해제하고,
+  일반 execute와 같은 UUID 정렬 순서로 **구조 키 + old/new text ID 전체**를 함께 획득한다.
+  구조 키를 잡은 채 더 작은 문서 키를 얻는 역순 획득을 하지 않는다.
+- 잠금을 다시 얻은 뒤 journal 집합·bytes를 재확인한다. 다른 재개가 소비한 항목은 허용하지만
+  새 journal이나 바뀐 내용은 기존 문서 키로 처리하지 않고 보류한다. 복수 키 경로에도
+  `drainOnTimeout`을 전달해, 실행 중 작업이 끝나기 전에 문서 잠금이 풀리지 않도록 한다.
+- 전송 본문의 계산 hash뿐 아니라 해당 `journal.newNodes`에 저장된 hash와도 일치를 요구한다.
+  새 본문과 hash가 함께 바뀐 기록은 보류한다. 새 요청을 재생성하거나 현재 TXT를 덮어쓰지 않는다.
+- 잠금 획득보다 먼저 시작한 본문 저장도 별도로 시험했다. 구조 journal이 남아 있으면 TXT와
+  본문 handoff는 저장하되 recorder 등록은 보류한다. 구조를 먼저 등록한 뒤 공통 재개가 본문을
+  이어 등록한다. journal 조회 실패도 보류하며, 손상 journal을 없애거나 성공으로 간주하지 않는다.
+  이 선행 저장 검사는 보강 전 5 assertion failures로 재현했다
+  (`/private/tmp/writerpad-pr46-earlier-save-red.log`).
+
+잠금/hash 보강의 중간 선택 회귀 567개가 통과했다. 선행 저장 보류까지 포함한 최종 회귀에는
+`LocalDocumentStoreTests`, `LocalDocumentStoreRecoveryTests`도 추가한다. 최종 결과는 아래와
+PR 본문에 기록하며 이전 단계의 Release·CI 성공을 새 head 성공으로 대체하지 않는다.
+
+- 최종 선택 회귀 **588개 통과**, 실패·건너뜀 0, 컴파일 경고·오류 0, xcresult `runtimeWarnings: []`.
+  AppEnvironment 116 / BinderCommand 45 / BinderFolderSync 6 / BinderRepository 16 /
+  DocumentStoreRecovery 3 / DocumentStore 17 / Settings 6 / GeneralSync 73 / Handshake 159 / SnapshotPull 147.
+- 로그: `/private/tmp/writerpad-pr46-ordering-final-tests.log`.
+- xcresult: `/private/tmp/WriterPad-RecoveryRun-Fix-DD/Logs/Test/Test-WriterPad-2026.09.28_00-44-05-+0900.xcresult`.
+- 계약 0.2.0 재통과, canonical digest 불변. 실제 서버/기기 작업 없음.
+- 중간 Release(`/private/tmp/writerpad-pr46-document-gates-release.log`)는 마지막 저장 경로 보완으로
+  대체돼 중단했으며 성공 증거로 사용하지 않는다. 최종 소스는 새 DerivedData
+  `/private/tmp/WriterPad-PR46-FinalRelease.ZNcLrE`에서 빌드하고
+  `/private/tmp/writerpad-pr46-ordering-final-release.log`에 기록한다. 완료 결과·CI·재검토는 PR 본문에서 추적한다.
