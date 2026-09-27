@@ -2,6 +2,15 @@ import Foundation
 import SwiftUI
 import UIKit
 
+enum SyncV2HandoffNotifications {
+    /// A hint to re-read local handoffs, not proof that the project is synced.
+    static let settingsRetryFinished = Notification.Name("writerpad.sync-v2.settings-handoff-retry-finished")
+
+    static func postSettingsRetryFinished(for projectID: ProjectID) {
+        NotificationCenter.default.post(name: settingsRetryFinished, object: projectID.rawValue)
+    }
+}
+
 enum GlobalSyncPreference {
     static let storageKey = "writerpad.sync-all-projects-enabled"
     static let contractEpoch = SyncV2ContractEpoch()
@@ -29,7 +38,7 @@ extension SyncProjectListing {
     var contractEpoch: SyncV2ContractEpoch? { nil }
 }
 
-private struct ProjectManagerSyncProjectLister: SyncProjectListing {
+struct ProjectManagerSyncProjectLister: SyncProjectListing {
     let projectManager: any ProjectManaging
     var contractEpoch: SyncV2ContractEpoch? { projectManager.syncLifecycleEpoch }
 
@@ -290,63 +299,21 @@ final class SyncSettingsModel: ObservableObject {
     /// Replay the selected project's existing records only; never save/rewrite manuscript text here.
     private func retryProjectHandoffs(for row: SyncProjectRow, repository: any DocumentRepository,
         store: any LocalDocumentStoring) async throws -> Int {
-        try ReceiveValidationPolicy.current.requireSending()
-        try GeneralSyncValidationScope.current.require(local: row.id)
-        guard let handshakeService, let authEpoch = authenticationService.contractEpoch,
-              let bindingEpoch = projectBindingService.contractEpoch, let localEpoch = projectLister.contractEpoch
-        else { throw SyncV2ContractStructureError.authenticationRequired }
-        let authRevision = authEpoch.value, bindingRevision = bindingEpoch.value, localRevision = localEpoch.value
-        let gateRevision = ContractPathGate.revision(for: row.id, in: defaults)
-        let globalRevision = GlobalSyncPreference.contractEpoch.value
-        let activityEpoch = handshakeService.activityEpoch, activityRevision = activityEpoch.value
+        guard let handshakeService, let contractStructureSender else {
+            throw SyncV2ContractStructureError.unavailable
+        }
+        guard let binding = row.binding else { throw SyncV2ContractStructureError.projectNotConnected }
         let retryEpoch = generalRetryEpoch, generation = retryEpoch.value
-        let sharedDefaults = ContractDefaults(value: defaults)
-        let authorize: @Sendable () throws -> Void = {
-            try Task.checkCancellation()
-            guard ReceiveValidationPolicy.current.sendingAllowed, generation == retryEpoch.value,
-                  GlobalSyncPreference.isEnabled(in: sharedDefaults.value), GlobalSyncPreference.contractEpoch.value == globalRevision,
-                  ContractPathGate.isOpen(for: row.id, in: sharedDefaults.value), ContractPathGate.revision(for: row.id, in: sharedDefaults.value) == gateRevision,
-                  authEpoch.isAvailable, authEpoch.value == authRevision,
-                  bindingEpoch.isAvailable, bindingEpoch.value == bindingRevision,
-                  localEpoch.isAvailable, localEpoch.value == localRevision,
-                  activityEpoch.isAvailable, activityEpoch.value == activityRevision
-            else { throw SyncV2ContractStructureError.gateClosed }
-        }
-        try authorize()
-        let state = await authenticationService.currentState()
-        guard case .authenticated(let account) = state,
-              let binding = await projectBindingService.currentBinding(for: row.id), binding == row.binding,
-              binding.localProjectID == row.id, binding.kind != .localOnly, binding.ownerSubject == account.userID,
-              let serverID = binding.serverProjectID,
-              try await projectLister.projects().contains(where: { $0.id == row.id && $0.isActive })
-        else { throw SyncV2ContractStructureError.projectNotConnected }
-        try authorize()
-        let context = SyncV2HandshakeContext(localProjectID: row.id, serverProjectID: serverID, accountID: account.userID,
-            authenticationEpoch: authRevision, bindingEpoch: bindingRevision)
-        let handshake = try await handshakeService.refresh(context: context)
-        try authorize()
-        guard handshake.projectSyncMode == .idBased else { throw SyncV2ContractStructureError.projectNotConnected }
-        guard let contractStructureSender else { throw SyncV2ContractStructureError.unavailable }
-        // An uncertain request may already be applied remotely. Let the existing
-        // sender recover its receipt even if file-handoff baseline comparison fails.
-        try await contractStructureSender.retryGeneralContract(localProjectID: row.id)
-        try authorize()
-        try await contractStructureSender.prepareGeneralHandoffResume(context: context, authorizeCaller: authorize)
-        try authorize()
-        let documents = try await repository.documents(in: row.id)
-        try authorize()
-        var deferredCount = 0
-        for document in documents.sorted(by: { $0.relativePath.rawValue < $1.relativePath.rawValue })
-            where document.projectID == row.id && document.kind == .text && document.deletionStatus == .active {
-            try authorize()
-            let result = await store.retryPendingSyncHandoff(for: document)
-            try authorize()
-            switch result {
-            case .localSavedButNotQueued, .serverSizeLimitExceeded: deferredCount += 1
-            case .queued, .notNeeded, .localOnly: break
+        let deferred = try await SyncV2ProjectHandoffResumer(projectLister: projectLister,
+            authenticationService: authenticationService, projectBindingService: projectBindingService,
+            handshakeService: handshakeService, sender: contractStructureSender,
+            repository: repository, store: store, defaults: ContractDefaults(value: defaults))
+            .resume(localProjectID: row.id, expectedBinding: binding) {
+                guard retryEpoch.value == generation else { throw CancellationError() }
             }
-        }
-        return deferredCount
+        guard retryEpoch.value == generation else { throw CancellationError() }
+        SyncV2HandoffNotifications.postSettingsRetryFinished(for: row.id)
+        return deferred
     }
 
 #if DEBUG

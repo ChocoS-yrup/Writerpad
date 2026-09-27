@@ -250,13 +250,33 @@ actor LocalDocumentStore: LocalDocumentStoring {
         }
     }
 
+    /// Read-only presence probe: malformed records still count as pending and
+    /// must be reported by replay, not silently treated as an empty workspace.
+    func hasPendingSyncHandoff(for document: DocumentNode) async throws -> Bool {
+        let root = try await workspaceLocator.workspaceRoot(for: document.projectID)
+        return pendingSyncHandoffs[document.id]?.isEmpty == false
+            || fileManager.fileExists(atPath: syncHandoffURL(for: document.id, workspaceRoot: root).path)
+    }
+
     func retryPendingSyncHandoff(
         for document: DocumentNode
     ) async -> DurableRecordResult {
+        await retryHandoff(for: document, authorize: nil)
+    }
+
+    func retryPendingSyncHandoff(for document: DocumentNode,
+        authorize: @escaping @Sendable () throws -> Void) async -> DurableRecordResult {
+        await retryHandoff(for: document, authorize: authorize)
+    }
+
+    private func retryHandoff(for document: DocumentNode,
+        authorize: (@Sendable () throws -> Void)?) async -> DurableRecordResult {
         do {
+            try authorize?()
             return try await projectSaveGate.withCriticalSection(documentID: document.projectID.rawValue, drainOnTimeout: true) {
                 try await self.syncMutationGate.withCriticalSection(documentID: document.id.rawValue, drainOnTimeout: true) {
-                    await self.performRetryPendingSyncHandoff(for: document)
+                    try authorize?()
+                    return await self.performRetryPendingSyncHandoff(for: document, authorize: authorize)
                 }
             }
         } catch {
@@ -264,7 +284,8 @@ actor LocalDocumentStore: LocalDocumentStoring {
         }
     }
 
-    private func performRetryPendingSyncHandoff(for document: DocumentNode) async -> DurableRecordResult {
+    private func performRetryPendingSyncHandoff(for document: DocumentNode,
+        authorize: (@Sendable () throws -> Void)?) async -> DurableRecordResult {
         let requirement = await durableChangeRecorder.requirement(
             for: document.projectID
         )
@@ -272,9 +293,11 @@ actor LocalDocumentStore: LocalDocumentStoring {
             return .localOnly
         }
         do {
+            try authorize?()
             let workspaceRoot = try await workspaceLocator.workspaceRoot(
                 for: document.projectID
             )
+            try authorize?()
             try loadPendingSyncHandoffsIfNeeded(
                 for: document.id,
                 workspaceRoot: workspaceRoot
@@ -287,7 +310,8 @@ actor LocalDocumentStore: LocalDocumentStoring {
             }
             return await flushPendingSyncHandoffs(
                 for: document.id,
-                workspaceRoot: workspaceRoot
+                workspaceRoot: workspaceRoot,
+                authorize: authorize
             )
         } catch {
             return .localSavedButNotQueued(
@@ -355,13 +379,16 @@ actor LocalDocumentStore: LocalDocumentStoring {
 
     private func flushPendingSyncHandoffs(
         for documentID: DocumentID,
-        workspaceRoot: URL
+        workspaceRoot: URL,
+        authorize: (@Sendable () throws -> Void)? = nil
     ) async -> DurableRecordResult {
         var queuedOperationIDs: [UUID] = []
         var didSkipNoOp = false
         var sizeLimitFailure: (byteCount: Int, limit: Int)?
 
         while let batch = pendingSyncHandoffs[documentID]?.first {
+            do { try authorize?() }
+            catch { return .localSavedButNotQueued(reason: "자동 재개 수명이 변경되어 저장 기록을 보류했습니다.") }
             if durableChangeRecorder.requiresHandoffOrigin && batch.handoffOrigin == nil {
                 let currentOrigin = await durableChangeRecorder.handoffOrigin(for: batch.projectID)
                 let hasSourcedSuccessor = currentOrigin != nil
@@ -371,6 +398,7 @@ actor LocalDocumentStore: LocalDocumentStoring {
                     }
                 if isFullDocumentSave(batch, documentID: documentID), hasSourcedSuccessor {
                     do {
+                        try authorize?()
                         try quarantineLegacyHandoff(batch, documentID: documentID, workspaceRoot: workspaceRoot)
                         continue
                     } catch {
@@ -379,7 +407,12 @@ actor LocalDocumentStore: LocalDocumentStoring {
                 }
                 return .localSavedButNotQueued(reason: "저장 당시 서버·계정 연결을 확인할 수 없어 이전 기록을 보류했습니다.")
             }
-            let result = await durableChangeRecorder.record(batch)
+            let result: DurableRecordResult
+            if let authorize {
+                result = await durableChangeRecorder.record(batch, authorize: authorize)
+            } else {
+                result = await durableChangeRecorder.record(batch)
+            }
             switch result {
             case .queued(let operationIDs):
                 queuedOperationIDs.append(contentsOf: operationIDs)

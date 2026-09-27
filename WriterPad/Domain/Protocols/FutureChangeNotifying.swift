@@ -215,6 +215,8 @@ protocol DurableLocalChangeRecording: Sendable {
         kind: DurableLocalBatchKind
     ) async throws -> Bool
     func record(_ batch: LocalMutationBatch) async -> DurableRecordResult
+    func record(_ batch: LocalMutationBatch,
+        authorize: @escaping @Sendable () throws -> Void) async -> DurableRecordResult
     func preservedResult(
         for projectID: ProjectID,
         documentID: DocumentID
@@ -222,6 +224,11 @@ protocol DurableLocalChangeRecording: Sendable {
 }
 
 extension DurableLocalChangeRecording {
+    func record(_ batch: LocalMutationBatch,
+        authorize: @escaping @Sendable () throws -> Void) async -> DurableRecordResult {
+        .localSavedButNotQueued(reason: "이 기록기는 수명 검증을 포함한 자동 재개를 지원하지 않습니다.")
+    }
+
     var requiresHandoffOrigin: Bool { false }
     func handoffOrigin(for projectID: ProjectID) async -> LocalSyncHandoffOrigin? { nil }
     func requirement(for projectID: ProjectID) async -> DurableRecordingRequirement {

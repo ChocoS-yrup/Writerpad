@@ -948,6 +948,8 @@ typealias SyncV2WorkspaceSleep =
     @Sendable (Duration) async throws -> Void
 typealias SyncV2WorkspaceDispatchRetry =
     @Sendable () async -> Void
+typealias SyncV2WorkspaceHandoffResume =
+    @Sendable (ProjectID, @escaping @Sendable () throws -> Void) async throws -> Int
 /// 서버가 거절해 세워 둔 폴더 변경을 읽는다. 화면이 pull 결과만 보고 상태를
 /// 정하므로, 이것이 없으면 나가는 쪽 굳음은 드러나지 않는다.
 typealias SyncV2WorkspaceStalledFolderReader =
@@ -994,6 +996,7 @@ private typealias SyncV2WorkspacePullRace =
 
 @MainActor
 final class SyncV2WorkspaceSyncModel: ObservableObject {
+    @Published private(set) var handoffResumeMessage: String?
     @Published private(set) var state = SyncV2WorkspaceState(
         connection: .unknown
     ) {
@@ -1013,6 +1016,13 @@ final class SyncV2WorkspaceSyncModel: ObservableObject {
     private let authenticationService: any AuthenticationServicing
     private let projectBindingService: any ProjectBindingServicing
     private let requestDispatchRetry: SyncV2WorkspaceDispatchRetry?
+    private let resumeProjectHandoffs: SyncV2WorkspaceHandoffResume?
+    private let handoffResumeEpoch = SyncV2ContractEpoch()
+    private var handoffResumeTask: Task<Void, Never>?
+    private var handoffResumePending = false
+    private var handoffPreferenceObservation: AnyCancellable?
+    private var handoffSettingsObservation: AnyCancellable?
+    private var handoffSettingsObservationID: UUID?
     private let readStalledFolderChanges:
         SyncV2WorkspaceStalledFolderReader?
     private let uploadPullCoordinator:
@@ -1097,6 +1107,7 @@ final class SyncV2WorkspaceSyncModel: ObservableObject {
         authenticationService: any AuthenticationServicing,
         projectBindingService: any ProjectBindingServicing,
         requestDispatchRetry: SyncV2WorkspaceDispatchRetry? = nil,
+        resumeProjectHandoffs: SyncV2WorkspaceHandoffResume? = nil,
         readStalledFolderChanges:
             SyncV2WorkspaceStalledFolderReader? = nil,
         uploadPullCoordinator:
@@ -1152,6 +1163,7 @@ final class SyncV2WorkspaceSyncModel: ObservableObject {
         self.authenticationService = authenticationService
         self.projectBindingService = projectBindingService
         self.requestDispatchRetry = requestDispatchRetry
+        self.resumeProjectHandoffs = resumeProjectHandoffs
         self.readStalledFolderChanges = readStalledFolderChanges
         self.uploadPullCoordinator = uploadPullCoordinator
         self.readUploadQueueSnapshot = readUploadQueueSnapshot
@@ -1189,6 +1201,35 @@ final class SyncV2WorkspaceSyncModel: ObservableObject {
             ([SyncV2RemoteDocumentSnapshot]) -> Void
     ) async {
         guard ReceiveValidationPolicy.current.sendingAllowed else { return }
+        // Observe both preference switches without introducing a file polling loop.
+        if handoffPreferenceObservation == nil {
+            handoffPreferenceObservation = NotificationCenter.default.publisher(
+                for: UserDefaults.didChangeNotification
+            ).sink { [weak self] _ in
+                Task { @MainActor [weak self] in
+                    self?.cancelHandoffResumeIfDisabled()
+                }
+            }
+        }
+        if handoffSettingsObservation == nil {
+            let observationID = UUID()
+            handoffSettingsObservationID = observationID
+            handoffSettingsObservation = NotificationCenter.default.publisher(
+                for: SyncV2HandoffNotifications.settingsRetryFinished
+            ).sink { [weak self] notification in
+                guard let projectID = notification.object as? UUID else { return }
+                Task { @MainActor [weak self] in
+                    guard let self, self.handoffSettingsObservationID == observationID,
+                          self.isActive, self.localProjectID.rawValue == projectID,
+                          self.handoffResumeMessage != nil || self.handoffResumeTask != nil
+                    else { return }
+                    // Supersede an older pass, but keep its warning until a
+                    // fresh authorized read confirms the remaining file state.
+                    self.cancelHandoffResume(clearMessage: false)
+                    await self.resumeHandoffsIfNeeded()
+                }
+            }
+        }
         if pendingDiagnosticsContext == nil {
             pendingDiagnosticsContext = SyncV2PullDiagnostics.current
         }
@@ -1222,6 +1263,7 @@ final class SyncV2WorkspaceSyncModel: ObservableObject {
             reason: active ? "scene-active" : "scene-inactive"
         )
         isActive = active
+        if !active { cancelHandoffResume() }
         if active {
             await startAuthenticationObservation()
             networkMonitor.start { [weak self] in
@@ -1281,11 +1323,16 @@ final class SyncV2WorkspaceSyncModel: ObservableObject {
     }
 
     func retry() async {
+        await resumeHandoffsIfNeeded()
         await requestDispatchRetry?()
         await pullNow(forceVisibleProgress: true)
     }
 
     func stop() async {
+        cancelHandoffResume()
+        handoffPreferenceObservation = nil
+        handoffSettingsObservation = nil
+        handoffSettingsObservationID = nil
         activationRequestID &+= 1
         await cancelInitialSubscriptionBoundary()
         await releaseCoordinatorPullPermit()
@@ -1341,8 +1388,73 @@ final class SyncV2WorkspaceSyncModel: ObservableObject {
         scheduleDebouncedPull()
     }
 
+    /// Event-driven, one project at a time within this workspace. Cancellation
+    /// revokes the caller epoch immediately, but retains the slot until the old
+    /// operation really finishes. A new foreground event may request one rerun.
+    private func resumeHandoffsIfNeeded() async {
+        guard !cancelHandoffResumeIfDisabled(), isActive, let resumeProjectHandoffs else { return }
+        if let handoffResumeTask {
+            // Repeated events in the same epoch share the existing pass. Only a
+            // new lifecycle after cancellation needs another pass once it drains.
+            if handoffResumeTask.isCancelled { handoffResumePending = true }
+            await handoffResumeTask.value
+            return
+        }
+        let epoch = handoffResumeEpoch, revision = epoch.value
+        let projectID = localProjectID
+        let globalRevision = GlobalSyncPreference.contractEpoch.value
+        let projectRevision = ContractPathGate.revision(for: projectID)
+        let task = Task { [weak self] in
+            let authorize: @Sendable () throws -> Void = {
+                try Task.checkCancellation()
+                guard epoch.value == revision,
+                      GlobalSyncPreference.isEnabled(),
+                      GlobalSyncPreference.contractEpoch.value == globalRevision,
+                      ContractPathGate.isOpen(for: projectID),
+                      ContractPathGate.revision(for: projectID) == projectRevision
+                else { throw CancellationError() }
+            }
+            do {
+                try authorize()
+                let deferred = try await resumeProjectHandoffs(projectID, authorize)
+                try authorize()
+                self?.handoffResumeMessage = deferred == 0 ? nil
+                    : "저장 기록 \(deferred)개는 연결 확인이 필요합니다. 설정에서 동기화 상태를 확인해 주세요."
+            } catch {
+                if (try? authorize()) != nil {
+                    self?.handoffResumeMessage = "저장 기록 자동 재개를 보류했습니다. 본문과 기록은 유지됩니다. 설정에서 재시도할 수 있습니다."
+                }
+            }
+            guard let self else { return }
+            self.handoffResumeTask = nil
+            if self.handoffResumePending {
+                self.handoffResumePending = false
+                await self.resumeHandoffsIfNeeded()
+            }
+        }
+        handoffResumeTask = task
+        await task.value
+    }
+
+    @discardableResult
+    private func cancelHandoffResumeIfDisabled() -> Bool {
+        guard !GlobalSyncPreference.isEnabled() || !ContractPathGate.isOpen(for: localProjectID)
+        else { return false }
+        cancelHandoffResume()
+        return true
+    }
+
+    private func cancelHandoffResume(clearMessage: Bool = true) {
+        handoffResumeEpoch.advance()
+        handoffResumeTask?.cancel()
+        handoffResumePending = false
+        if clearMessage { handoffResumeMessage = nil }
+    }
+
     func networkRecovered() async {
         guard ReceiveValidationPolicy.current.sendingAllowed else { return }
+        guard isActive else { return }
+        await resumeHandoffsIfNeeded()
         guard isActive else { return }
         activationRequestID &+= 1
         // NWPath가 반복해서 흔들려도 사용자에게 보이는 12초 제한을
@@ -1432,6 +1544,8 @@ final class SyncV2WorkspaceSyncModel: ObservableObject {
         // 기존 pending operation을 먼저 dispatch해야 첫 pull이 단순
         // waiting이 아니라 자동 rebase/conflict 결과를 관찰할 수 있다.
         let dispatchStartedAt = DispatchTime.now().uptimeNanoseconds
+        await resumeHandoffsIfNeeded()
+        guard isActive, activationRequestID == requestActivationID else { return }
         await requestDispatchRetry?()
         guard isActive,
               activationRequestID == requestActivationID
@@ -1527,6 +1641,7 @@ final class SyncV2WorkspaceSyncModel: ObservableObject {
         _ state: AuthenticationState
     ) async {
         guard isActive else { return }
+        cancelHandoffResume()
         switch state {
         case .authenticated:
             await activate()
@@ -1823,6 +1938,7 @@ final class SyncV2WorkspaceSyncModel: ObservableObject {
         _ binding: ProjectSyncBinding?
     ) async {
         guard isActive else { return }
+        cancelHandoffResume()
         guard let serverProjectID = binding?.serverProjectID else {
             self.serverProjectID = nil
             logTask("debounceTask", action: "cancel", reason: "bindingRemoved")
@@ -1855,7 +1971,10 @@ final class SyncV2WorkspaceSyncModel: ObservableObject {
             state = SyncV2WorkspaceState(lastResult: .localOnly)
             return
         }
-        guard self.serverProjectID != serverProjectID else { return }
+        guard self.serverProjectID != serverProjectID else {
+            await resumeHandoffsIfNeeded()
+            return
+        }
         self.serverProjectID = nil
         logTask("pullTask", action: "cancel", reason: "bindingChanged")
         pullTask.cancel()

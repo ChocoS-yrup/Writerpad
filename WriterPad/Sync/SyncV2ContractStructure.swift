@@ -1,6 +1,96 @@
 import Foundation
 import Supabase
 
+/// Shared by explicit settings retry and foreground workspace recovery. This
+/// replays saved records only; it does not enable opt-in or rewrite manuscript text.
+struct SyncV2ProjectHandoffResumer: Sendable {
+    let projectLister: any SyncProjectListing
+    let authenticationService: any AuthenticationServicing
+    let projectBindingService: any ProjectBindingServicing
+    let handshakeService: SyncV2HandshakeService
+    let sender: SyncV2ContractStructureSender
+    let repository: any DocumentRepository
+    let store: any LocalDocumentStoring
+    var defaults: ContractDefaults = .standard
+
+    func resume(localProjectID id: ProjectID, expectedBinding: ProjectSyncBinding? = nil, onlyIfPending: Bool = false,
+        authorizeCaller: @escaping @Sendable () throws -> Void) async throws -> Int {
+        try ReceiveValidationPolicy.current.requireSending()
+        try GeneralSyncValidationScope.current.require(local: id)
+        guard let authEpoch = authenticationService.contractEpoch,
+              let bindingEpoch = projectBindingService.contractEpoch, let localEpoch = projectLister.contractEpoch
+        else { throw SyncV2ContractStructureError.authenticationRequired }
+        let authRevision = authEpoch.value, bindingRevision = bindingEpoch.value, localRevision = localEpoch.value
+        let gateRevision = ContractPathGate.revision(for: id, in: defaults.value)
+        let globalRevision = GlobalSyncPreference.contractEpoch.value
+        let activityEpoch = handshakeService.activityEpoch, activityRevision = activityEpoch.value
+        let defaults = self.defaults
+        let authorize: @Sendable () throws -> Void = {
+            try Task.checkCancellation()
+            try authorizeCaller()
+            guard ReceiveValidationPolicy.current.sendingAllowed,
+                  GlobalSyncPreference.isEnabled(in: defaults.value), GlobalSyncPreference.contractEpoch.value == globalRevision,
+                  ContractPathGate.isOpen(for: id, in: defaults.value), ContractPathGate.revision(for: id, in: defaults.value) == gateRevision,
+                  authEpoch.isAvailable, authEpoch.value == authRevision,
+                  bindingEpoch.isAvailable, bindingEpoch.value == bindingRevision,
+                  localEpoch.isAvailable, localEpoch.value == localRevision,
+                  activityEpoch.isAvailable, activityEpoch.value == activityRevision
+            else { throw SyncV2ContractStructureError.gateClosed }
+        }
+        try authorize()
+        let state = await authenticationService.currentState()
+        guard case .authenticated(let account) = state,
+              let binding = await projectBindingService.currentBinding(for: id),
+              expectedBinding == nil || binding == expectedBinding,
+              binding.localProjectID == id, binding.kind != .localOnly, binding.ownerSubject == account.userID,
+              let serverID = binding.serverProjectID,
+              try await projectLister.projects().contains(where: { $0.id == id && $0.isActive })
+        else { throw SyncV2ContractStructureError.projectNotConnected }
+        try authorize()
+        if onlyIfPending {
+            let documents = try await repository.documents(in: id)
+            try authorize()
+            var hasPending = false
+            for document in documents where document.projectID == id && document.kind == .text && document.deletionStatus == .active {
+                hasPending = try await store.hasPendingSyncHandoff(for: document)
+                try authorize()
+                if hasPending { break }
+            }
+            guard hasPending else { return 0 }
+        }
+        let context = SyncV2HandshakeContext(localProjectID: id, serverProjectID: serverID, accountID: account.userID,
+            authenticationEpoch: authRevision, bindingEpoch: bindingRevision)
+        let handshake = try await handshakeService.refresh(context: context)
+        try authorize()
+        guard handshake.projectSyncMode == .idBased else { throw SyncV2ContractStructureError.projectNotConnected }
+        // Existing uncertain requests may need receipt recovery even when a
+        // separate file handoff cannot pass the server-baseline comparison.
+        try await sender.retryGeneralContract(localProjectID: id)
+        try authorize()
+        try await sender.prepareGeneralHandoffResume(context: context, authorizeCaller: authorize)
+        try authorize()
+        let documents = try await repository.documents(in: id)
+        try authorize()
+        var deferredCount = 0
+        for document in documents.sorted(by: { $0.relativePath.rawValue < $1.relativePath.rawValue })
+            where document.projectID == id && document.kind == .text && document.deletionStatus == .active {
+            try authorize()
+            let result: DurableRecordResult
+            if onlyIfPending {
+                result = await store.retryPendingSyncHandoff(for: document, authorize: authorize)
+            } else {
+                result = await store.retryPendingSyncHandoff(for: document)
+            }
+            try authorize()
+            switch result {
+            case .localSavedButNotQueued, .serverSizeLimitExceeded: deferredCount += 1
+            case .queued, .notNeeded, .localOnly: break
+            }
+        }
+        return deferredCount
+    }
+}
+
 /// UserDefaults의 읽기/쓰기는 스레드 안전하다. 송신 예약에만 전달하는 불변 참조다.
 struct ContractDefaults: @unchecked Sendable {
     let value: UserDefaults
@@ -269,9 +359,26 @@ actor SyncV2ContractPathRecorder: DurableLocalChangeRecording {
     }
 
     func record(_ batch: LocalMutationBatch) async -> DurableRecordResult {
+        await record(batch, allowsLegacyFallback: true, authorize: {})
+    }
+
+    func record(_ batch: LocalMutationBatch,
+        authorize authorizeCaller: @escaping @Sendable () throws -> Void) async -> DurableRecordResult {
+        await record(batch, allowsLegacyFallback: false, authorize: authorizeCaller)
+    }
+
+    private func record(_ batch: LocalMutationBatch, allowsLegacyFallback: Bool,
+        authorize authorizeCaller: @escaping @Sendable () throws -> Void) async -> DurableRecordResult {
+        do { try authorizeCaller() }
+        catch { return .localSavedButNotQueued(reason: "자동 재개 수명이 변경되어 기록을 보류했습니다.") }
         do { try GeneralSyncValidationScope.current.require(local: batch.projectID) }
         catch { return .localSavedButNotQueued(reason: "이 작품은 현재 동기화 검증 범위에 포함되지 않습니다.") }
         guard ContractPathGate.isOpen(for: batch.projectID, in: defaults.value) else {
+            // Automatic replay must never drop its caller authorization by
+            // entering the ordinary recorder, even with no contract history yet.
+            guard allowsLegacyFallback else {
+                return .localSavedButNotQueued(reason: "동기화 관문이 닫혀 자동 재개 기록을 보류했습니다.")
+            }
             return await store.record(batch)
         }
         guard let handshakeService else {
@@ -313,6 +420,9 @@ actor SyncV2ContractPathRecorder: DurableLocalChangeRecording {
                 reason: "이 작품에 서 있는 계약 핸드셰크가 없어 구조 쓰기를 보내지 않습니다."
             )
         }
+        guard allowsLegacyFallback || handshake.projectSyncMode == .idBased else {
+            return .localSavedButNotQueued(reason: "UUID 계약을 확인할 수 없어 자동 재개 기록을 보류했습니다.")
+        }
         // LEGACY의 일반 본문 저장은 이관하지 않는다. UUID 계약임이 확인된
         // 작품만 일반 계약 큐를 사용하고 기존 검토용 구조 경로는 유지한다.
         let touchesStructure = batch.mutations.contains {
@@ -332,6 +442,7 @@ actor SyncV2ContractPathRecorder: DurableLocalChangeRecording {
         let bindingEpoch = self.bindingEpoch
         let authorize: @Sendable () throws -> Void = {
             try Task.checkCancellation()
+            try authorizeCaller()
             try ContractPathGate.reserveStart(for: batch.projectID, in: defaults.value, revision: gateRevision) {
                 (authEpoch?.value ?? 0) == authRevision &&
                 (bindingEpoch?.value ?? 0) == bindingRevision &&

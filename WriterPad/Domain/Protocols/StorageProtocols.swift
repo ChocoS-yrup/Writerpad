@@ -58,9 +58,22 @@ protocol LocalDocumentStoring: Sendable {
     func retryPendingSyncHandoff(
         for document: DocumentNode
     ) async -> DurableRecordResult
+    func hasPendingSyncHandoff(for document: DocumentNode) async throws -> Bool
+    func retryPendingSyncHandoff(for document: DocumentNode,
+        authorize: @escaping @Sendable () throws -> Void) async -> DurableRecordResult
 }
 
 extension LocalDocumentStoring {
+    func retryPendingSyncHandoff(for document: DocumentNode,
+        authorize: @escaping @Sendable () throws -> Void) async -> DurableRecordResult {
+        .localSavedButNotQueued(reason: "이 저장소는 수명 검증을 포함한 자동 재개를 지원하지 않습니다.")
+    }
+
+    /// Unknown stores cannot claim that all file handoffs are absent.
+    func hasPendingSyncHandoff(for document: DocumentNode) async throws -> Bool {
+        throw CocoaError(.featureUnsupported)
+    }
+
     func saveCompared(_ request: DocumentSaveRequest,
         authorize: @escaping @Sendable () throws -> Void) async throws -> DocumentSaveReceipt {
         throw LocalDocumentStoreError.comparedContentChanged
