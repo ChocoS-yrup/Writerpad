@@ -3,6 +3,41 @@ import XCTest
 @testable import WriterPad
 
 final class SupabaseProjectBindingServiceTests: XCTestCase {
+    func testBindingCompletedAfterWatchdogIsPublishedForConnectAndDisconnect() async throws {
+        for disconnect in [true, false] {
+            let project = makeProject(id: UUID().uuidString, name: "느린 연결 저장")
+            let store = InMemoryProjectBindingStore()
+            let barrier = BindingSaveBarrier()
+            let delayed = DelayedBindingStore(store: store, barrier: barrier)
+            let f = makeFixture(projects: [project], store: store, serviceBindingStore: delayed)
+            let original = ProjectSyncBinding.connected(localProjectID: project.id, serverProjectID: UUID(),
+                kind: .existingServerProject, projectName: project.name, ownerSubject: f.userID)
+            try await store.save(original)
+            let updates = await f.service.bindingUpdates(for: project.id)
+            let probe = BindingUpdateProbe()
+            let observer = Task { for await binding in updates { await probe.record(binding) } }
+            defer { observer.cancel() }
+            let target = UUID()
+            let confirmation = try ConfirmedServerProjectID(expectedServerProjectID: target, userEnteredUUID: target.uuidString)
+            let change = Task {
+                if disconnect { return await f.service.disconnect(localProjectID: project.id) }
+                return await f.service.connectExistingProject(localProjectID: project.id, confirmation: confirmation)
+            }
+            await barrier.waitUntilEntered()
+            try await Task.sleep(for: .seconds(21))
+            let before = await probe.values
+            XCTAssertTrue(before.isEmpty, "미완료 저장을 공개하면 안 됨")
+            await barrier.release()
+            let result = await change.value
+            guard case .failed = result else { return XCTFail("watchdog 결과는 유지해야 함") }
+            for _ in 0..<100 { await Task.yield() }
+            let durable = await store.binding(for: project.id)
+            let published = await probe.values
+            XCTAssertEqual(published, [durable], "늦게 완료된 실제 연결 상태의 알림이 누락됨")
+            XCTAssertEqual(durable?.serverProjectID, disconnect ? nil : target)
+        }
+    }
+
     func testFirstConnectionAndSaveSerializeInBothOrders() async throws {
         for scenario in 0..<3 {
             let saveFirst = scenario == 0
@@ -18,6 +53,10 @@ final class SupabaseProjectBindingServiceTests: XCTestCase {
             let initial = ProjectInitialSyncRecorder(documentRepository: BindingRaceDocuments(document: workspace.document()),
                 workspaceLocator: FixedWorkspaceLocator(root: workspace.root), durableChangeRecorder: durable)
             let f = makeFixture(projects: [project], initialSyncRecorder: initial, store: store, projectSaveGate: gate)
+            let updates = await f.service.bindingUpdates(for: project.id)
+            let probe = BindingUpdateProbe()
+            let observer = Task { for await binding in updates { await probe.record(binding) } }
+            defer { observer.cancel() }
             let local = LocalDocumentStore(workspaceLocator: FixedWorkspaceLocator(root: workspace.root),
                 metadataUpdater: BindingSaveMetadata(barrier: saveFirst ? barrier : nil),
                 durableChangeRecorder: durable, projectSaveGate: gate)
@@ -55,6 +94,9 @@ final class SupabaseProjectBindingServiceTests: XCTestCase {
                 binding = value
             }
             let batches = await durable.batches
+            for _ in 0..<100 { await Task.yield() }
+            let published = await probe.values
+            XCTAssertEqual(published, [binding], "초기 enqueue가 늦게 완료돼도 준비된 연결을 공개해야 함")
             if saveFirst {
                 XCTAssertEqual(receipt.durableRecordResult, .localOnly)
                 XCTAssertEqual(batches.count, 1)
@@ -749,6 +791,7 @@ final class SupabaseProjectBindingServiceTests: XCTestCase {
         snapshotClientFails: Bool = false,
         contractDefaults: ContractDefaults = .standard,
         store: InMemoryProjectBindingStore = InMemoryProjectBindingStore(),
+        serviceBindingStore: (any ProjectBindingStoring)? = nil,
         projectSaveGate: SyncV2DocumentMutationGate = SyncV2DocumentMutationGate()
     ) -> BindingFixture {
         let transport = EnsureProjectTransportStub(result: transportResult)
@@ -759,7 +802,7 @@ final class SupabaseProjectBindingServiceTests: XCTestCase {
             ?? ProjectRepositoryStub(projects: projects)
         let service = SupabaseProjectBindingService(
             transport: transport,
-            bindingStore: store,
+            bindingStore: serviceBindingStore ?? store,
             projectRepository: projectRepository,
             authenticationService: auth,
             initialSyncRecorder: initialSyncRecorder,
@@ -787,6 +830,31 @@ final class SupabaseProjectBindingServiceTests: XCTestCase {
 }
 
 private struct BindingSnapshotClientStubError: Error {}
+
+private actor BindingUpdateProbe {
+    private(set) var values: [ProjectSyncBinding?] = []
+    func record(_ binding: ProjectSyncBinding?) { values.append(binding) }
+}
+
+private actor DelayedBindingStore: ProjectBindingStoring {
+    let store: InMemoryProjectBindingStore
+    let barrier: BindingSaveBarrier
+    init(store: InMemoryProjectBindingStore, barrier: BindingSaveBarrier) {
+        self.store = store; self.barrier = barrier
+    }
+    func availability() async -> ProjectBindingStoreAvailability { .available }
+    func binding(for localProjectID: ProjectID) async throws -> ProjectSyncBinding? {
+        await store.binding(for: localProjectID)
+    }
+    func binding(forServerProjectID serverProjectID: UUID) async throws -> ProjectSyncBinding? {
+        await store.binding(forServerProjectID: serverProjectID)
+    }
+    func allBindings() async throws -> [ProjectSyncBinding] { await store.allBindings() }
+    func save(_ binding: ProjectSyncBinding) async throws {
+        await barrier.suspend() // Deliberately ignores task cancellation, like a slow durable write.
+        try await store.save(binding)
+    }
+}
 
 private actor BindingSaveBarrier {
     private var entered = false

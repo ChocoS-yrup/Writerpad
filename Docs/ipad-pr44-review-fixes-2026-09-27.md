@@ -147,3 +147,38 @@ Supabase 변경사항과 공식 인증 문서를 확인했으며 기존 인증 t
 - Release 로그: `/private/tmp/writerpad-pr44-drain-fix-release-v1.log`.
   Release 완료 및 새 커밋 CI·재검토 요청은 PR 본문/댓글에 기록한다.
 - 계약 검증기와 `git diff --check` 재통과. 실제 서버·실기기 변경 없음.
+
+## 네 번째 검토: 늦게 완료된 연결 상태 발행
+
+검토 기준: `4766c0466a129d5905901ffcd3b87ccb6d72fe07`.
+검토 지적: https://github.com/ChocoS-yrup/Writerpad/pull/44#discussion_r4114620407
+
+작업 종료 대기만으로는 충분하지 않았다. 저장이 실제 성공했더라도 watchdog가
+먼저 만료되면 gate 호출이 timeout을 반환해 바깥쪽 `publish`가 실행되지 않았다.
+그 결과 bindingUpdates를 보는 workspace에 이전 연결이 남을 수 있었다.
+
+- 해제의 저장과 상태 발행을 하나의 gate 내부 작업으로 묶었다.
+- 연결도 binding 저장 및 초기 snapshot 준비가 실제 완료된 뒤 gate 내부에서 발행한다.
+  초기 기록이 준비되지 않은 연결을 공개하지 않는 기존 조건은 유지한다.
+- 다음 binding 작업에 gate를 넘기기 전에 알림을 발행하므로 알림 순서도 저장 순서를 따른다.
+- watchdog의 실패 반환과 실제 durable 상태를 구분한다. timeout 결과를 성공으로 바꾸지
+  않더라도 이미 성공한 저장의 알림은 누락하지 않는다. 중복 바깥쪽 알림은 제거했다.
+- 새 시험: 취소에 협조하지 않는 binding 저장을 연결/해제 각각 21초 지연한 뒤,
+  저장 전 알림 없음·timeout 결과 유지·완료 후 실제 연결과 동일한 알림 1건을 확인한다.
+- 기존 초기 enqueue 지연 시험에서도 준비된 binding의 알림 1건을 확인하도록 확장했다.
+- 새 시험의 첫 실행에서는 정상/지연 모두 구독 알림이 비어 있었다. 서비스의
+  `bindingUpdates` 선언에 `async`를 명시해 프로토콜의 비동기 기본 구현과 구별하고
+  실제 관찰자 등록 구현을 선택하도록 맞췄다. 변경 뒤 정상·지연 알림 검사가 모두 통과했다.
+
+인증·출처 검사, 공유 계약·서버·Windows 동작은 변경하지 않는다.
+Supabase 스킬에 따라 최신 변경사항과 공식 인증 문서를 확인하고 기존 인증 transport를 유지했다.
+최종 회귀 **568개 통과, 실패 0, 건너뜀 0**, `runtimeWarnings: []`.
+컴파일 경고·오류 0건. SupabaseProjectBindingService 26개, 나머지 클래스는
+직전 567개 결과와 같으며 SnapshotPull 140개도 통과했다.
+
+- 시험 로그: `/private/tmp/writerpad-pr44-publish-fix-tests-v2.log`.
+- xcresult: `/private/tmp/WriterPad-RecoveryRun-Fix-DD/Logs/Test/Test-WriterPad-2026.09.27_17-30-42-+0900.xcresult`.
+- Release 로그: `/private/tmp/writerpad-pr44-publish-fix-release-v2.log`.
+  추가 수정 전 Release 실행은 중단했으며 최종 결과는 v2 로그/PR 기록만 사용한다.
+- 계약 0.2.0 검증기와 `git diff --check` 재통과.
+- 새 head의 Release 완료·원격 CI·재검토 요청은 PR 본문/댓글에 기록한다.

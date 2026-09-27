@@ -418,7 +418,7 @@ actor SupabaseProjectBindingService: ProjectBindingServicing {
 
     func bindingUpdates(
         for localProjectID: ProjectID
-    ) -> AsyncStream<ProjectSyncBinding?> {
+    ) async -> AsyncStream<ProjectSyncBinding?> {
         let observerID = UUID()
         return AsyncStream(bufferingPolicy: .bufferingNewest(1)) {
             continuation in
@@ -545,9 +545,8 @@ actor SupabaseProjectBindingService: ProjectBindingServicing {
         )
         do {
             try await projectSaveGate.withCriticalSection(documentID: localProjectID.rawValue, drainOnTimeout: true) {
-                try await self.bindingStore.save(localOnly)
+                try await self.persistDisconnectedBinding(localOnly)
             }
-            publish(localOnly, localProjectID: localProjectID)
             return .disconnected(localOnly)
         } catch {
             return .failed(storeFailure(error))
@@ -685,11 +684,17 @@ actor SupabaseProjectBindingService: ProjectBindingServicing {
             guard prepared else {
                 return .failed(.initialSnapshotNotQueued)
             }
-            publish(binding, localProjectID: localProjectID)
             return .connected(binding)
         } catch {
             return .failed(storeFailure(error))
         }
+    }
+
+    /// Watchdog가 먼저 만료돼도 실제 완료된 저장은 관찰자에게 알려야 한다.
+    /// 다음 연결 작업에 gate를 넘기기 전에 알림도 순서대로 발행한다.
+    private func persistDisconnectedBinding(_ binding: ProjectSyncBinding) async throws {
+        try await bindingStore.save(binding)
+        publish(binding, localProjectID: binding.localProjectID)
     }
 
     /// Native identity 연결은 초기 batch가 durable queue에 들어가기 전까지 다른
@@ -713,7 +718,11 @@ actor SupabaseProjectBindingService: ProjectBindingServicing {
             ContractPathGate.close(for: binding.localProjectID, in: contractDefaults.value)
         }
         try await bindingStore.save(binding)
-        return await prepareInitialSnapshotWhileLocked(for: binding)
+        let prepared = await prepareInitialSnapshotWhileLocked(for: binding)
+        // 초기 기록까지 준비된 연결만 공개하되, watchdog의 반환 여부와
+        // 무관하게 실제 완료된 상태를 gate 안에서 순서대로 전달한다.
+        if prepared { publish(binding, localProjectID: binding.localProjectID) }
+        return prepared
     }
 
     private func prepareInitialSnapshotWhileLocked(for binding: ProjectSyncBinding) async -> Bool {
