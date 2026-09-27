@@ -3529,6 +3529,94 @@ extension SyncV2HandshakeTests {
         }
     }
 
+    func testStructureRetryRejectsBatchKindAndMutationShapeMismatch() async throws {
+        for mode in 0..<8 {
+            let f = try await productDocumentsFixture(withVolume: true)
+            let commands = structureCommands(f)
+            ContractPathGate.close(for: f.base.localID, in: f.base.defaults)
+            let renamed = try await commands.renameChapter(documentID: f.documents[0].id,
+                titleSuffix: " 손상 배치", projectID: f.base.localID)
+            let (url, _, original) = try structureJournal(f)
+            let batch = try XCTUnwrap(original.durableBatch)
+            var mutations = batch.mutations
+            let body = Data("기준 0".utf8)
+            switch mode {
+            case 2, 6:
+                mutations[0] = .documentSnapshot(operationID: UUID(),
+                    documentID: mode == 6 ? f.documents[1].id : f.documents[0].id,
+                    relativePath: renamed.relativePath, content: "기준 0",
+                    contentHash: SHA256ContentHasher().sha256(for: body), localSaveGeneration: 0, isDeleted: mode == 2)
+            case 3:
+                mutations.append(.folderSnapshot(operationID: UUID(), folderID: DocumentID(rawValue: f.folders[2].folderID),
+                    parentFolderID: DocumentID(rawValue: f.folders[1].folderID), name: "1권", isDeleted: true))
+            case 4: mutations.append(.trashPurge(operationID: UUID(), content: "{}", generation: UUID()))
+            case 5: mutations.append(.ensureProject(operationID: UUID(), name: "unexpected"))
+            default: break
+            }
+            let kind: DurableLocalBatchKind = mode == 0 ? .trashChange : (mode == 1 ? .volumeCreation : .structureChange)
+            var altered = LocalMutationBatch(batchID: batch.batchID, projectID: batch.projectID,
+                localTransactionID: batch.localTransactionID, kind: kind, mutations: mutations,
+                structureSnapshot: try await f.repository.documents(in: f.base.localID))
+            altered.handoffOrigin = batch.handoffOrigin
+            var journal = BinderCommandJournal(transactionID: original.transactionID, projectID: original.projectID,
+                kind: mode == 7 ? .reorder : original.kind, phase: original.phase, sourcePath: original.sourcePath,
+                destinationPath: original.destinationPath, createdKind: original.createdKind, oldNodes: original.oldNodes,
+                newNodes: original.newNodes, trashRecord: original.trashRecord, durableBatch: altered)
+            journal.handoffOrigin = original.handoffOrigin
+            let encoder = JSONEncoder(); encoder.dateEncodingStrategy = .iso8601
+            let bytes = try encoder.encode(journal); try bytes.write(to: url)
+            ContractPathGate.setOpen(true, for: f.base.localID, in: f.base.defaults)
+            let deferred = try await commands.retryPendingStructureSyncHandoffs(in: f.base.localID, authorize: {})
+            XCTAssertEqual(deferred, 1, "mode \(mode)")
+            XCTAssertEqual(try? Data(contentsOf: url), bytes, "mode \(mode)")
+            XCTAssertEqual(try Data(contentsOf: f.root.appendingPathComponent(renamed.relativePath.rawValue)), body)
+            let queue = try await f.store.generalQueueStatus(localProjectID: f.base.localID)
+            XCTAssertEqual(queue.pendingCount + queue.retryCount + queue.attentionCount, 0, "mode \(mode)")
+        }
+    }
+
+    private actor MissingStructureOriginRecorder: DurableLocalChangeRecording {
+        let recorder: SyncV2ContractPathRecorder
+        private(set) var calls = 0
+        init(_ recorder: SyncV2ContractPathRecorder) { self.recorder = recorder }
+        nonisolated var requiresHandoffOrigin: Bool { true }
+        func handoffOrigin(for id: ProjectID) async -> LocalSyncHandoffOrigin? { nil }
+        func requirement(for id: ProjectID) async -> DurableRecordingRequirement { await recorder.requirement(for: id) }
+        func hasRecordedInitialSnapshot(for id: ProjectID, kind: DurableLocalBatchKind) async throws -> Bool {
+            try await recorder.hasRecordedInitialSnapshot(for: id, kind: kind)
+        }
+        func record(_ batch: LocalMutationBatch) async -> DurableRecordResult {
+            calls += 1
+            return await recorder.record(batch)
+        }
+    }
+
+    func testStructureMissingCapturedOriginDefersOrdinaryAndFullRecoveryHandoff() async throws {
+        let f = try await productDocumentsFixture(withVolume: true)
+        // Capture is unavailable, but the later recording requirement sees a connected project.
+        let recorder = MissingStructureOriginRecorder(f.recorder)
+        let commands = structureCommands(f, recorder: recorder)
+        let renamed = try await commands.renameChapter(documentID: f.documents[0].id,
+            titleSuffix: " 출처 없음", projectID: f.base.localID)
+        let pending = try await commands.hasPendingStructureSyncHandoff(in: f.base.localID)
+        XCTAssertTrue(pending)
+        let calls = await recorder.calls; XCTAssertEqual(calls, 0)
+        let queue = try await f.store.generalQueueStatus(localProjectID: f.base.localID)
+        XCTAssertEqual(queue.pendingCount + queue.retryCount + queue.attentionCount, 0)
+        XCTAssertEqual(try Data(contentsOf: f.root.appendingPathComponent(renamed.relativePath.rawValue)), Data("기준 0".utf8))
+        guard pending else { return }
+        let (url, bytes, journal) = try structureJournal(f)
+        XCTAssertNil(journal.handoffOrigin)
+        let normal = structureCommands(f)
+        do { try await normal.recoverPendingTransactions(in: f.base.localID); XCTFail("Missing origin was retroactively assigned") }
+        catch let error as BinderCommandError {
+            guard case .recoveryRequired = error else { return XCTFail("Unexpected error: \(error)") }
+        }
+        XCTAssertEqual(try Data(contentsOf: url), bytes)
+        let after = try await f.store.generalQueueStatus(localProjectID: f.base.localID)
+        XCTAssertEqual(after.pendingCount + after.retryCount + after.attentionCount, 0)
+    }
+
     private func structureCommands(_ f: ProductDocumentsFixture,
         recorder: (any DurableLocalChangeRecording)? = nil) -> LocalBinderCommandService {
         LocalBinderCommandService(metadataStore: f.repository, workspaceStateRepository: f.repository,

@@ -232,6 +232,7 @@ actor LocalBinderCommandService: BinderCommanding {
               [.create, .createVolume, .relocate, .reorder].contains(journal.kind),
               let batch = journal.durableBatch, batch.projectID == projectID,
               batch.localTransactionID == journal.transactionID,
+              isReplayableStructureBatch(batch, for: journal),
               let origin = journal.handoffOrigin, batch.handoffOrigin == origin,
               origin == (await durableChangeRecorder.handoffOrigin(for: projectID))
         else { return 1 }
@@ -803,6 +804,7 @@ actor LocalBinderCommandService: BinderCommanding {
             throw BinderCommandError.missingDocument(DocumentID(rawValue: UUID()))
         }
         let roots = documents.filter { $0.parentID == trash.id }
+        let handoffOrigin = await durableChangeRecorder.handoffOrigin(for: projectID)
         let originalSubtrees = Dictionary(
             uniqueKeysWithValues: roots.map {
                 ($0.id, subtreeRooted(at: $0, in: documents))
@@ -826,7 +828,8 @@ actor LocalBinderCommandService: BinderCommanding {
         await recordEmptyTrashHandoff(
             projectID: projectID,
             deletedNodes: deletedNodes,
-            trashPath: trash.relativePath
+            trashPath: trash.relativePath,
+            handoffOrigin: handoffOrigin
         )
         return TrashDeletionResult(deletedDocumentIDs: deleted, failures: failures)
     }

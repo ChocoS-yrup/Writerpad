@@ -124,3 +124,40 @@ LocalBinderRepository 16, SyncSettingsModel 6, GeneralSync 73, Handshake 148, Sn
 다음 단계는 이 브랜치의 구현·검증 변경을 한 PR로 제출하고 최종 head에 한 번 검토를 요청하는 것이다.
 Windows 의존성이나 계약·교차 플랫폼 입력 변경이 없으므로 Windows 회신을 대기하지 않는다.
 여러 미완료 journal, 파괴적 구조 거래, 출처 없는 이전 journal의 자동 복구는 계속 제외한다.
+
+## PR #46 검토 보완 — 2026-09-28
+
+`6045b0f`를 [PR #46](https://github.com/ChocoS-yrup/Writerpad/pull/46)로 제출했다.
+첫 최종 head 검토에서 다음 P1 두 건이 제기됐고, 추가 재현 검사 2개가 기존 제품 코드에서
+실패했다(`/private/tmp/writerpad-pr46-review-red.log`, 21 assertion failures, unexpected 0).
+
+1. [배치와 journal 작업 불일치](https://github.com/ChocoS-yrup/Writerpad/pull/46#discussion_r4115831623):
+   바깥 journal 종류만 허용 목록에 있어도 내부 trashChange 배치나 삭제 mutation 등이 들어갈 수 있었다.
+   배치 종류, 복구용 override 부재, 프로젝트/노드 중복/활성 상태, 기록된 구조 snapshot과 새 노드,
+   문서 ID·경로·본문 hash·저장 세대, 폴더 ID·부모·이름·삭제 여부, operation ID 중복,
+   기대 문서·폴더 mutation 집합과 tree-order 한 개를 검증한다. purge/ensureProject는 거부한다.
+   현재 파일을 재작성하거나 새 요청 UUID를 만들지 않는다.
+2. [변경 시작 시 출처 없음](https://github.com/ChocoS-yrup/Writerpad/pull/46#discussion_r4115831625):
+   출처 조회는 nil인데 나중 requirement가 연결 상태인 경우, 일반 recorder가 당시 출처 없는 작업을
+   현재 연결에 등록할 수 있었다. 출처 필수 recorder에는 journal 출처와 batch 출처 일치를 요구하며,
+   출처가 없으면 batch 생성·등록·journal 제거 없이 보류한다. 전체 journal 복구에도 같은 방어가 적용된다.
+   localOnly requirement와 출처 비필수 recorder의 기존 동작은 유지한다.
+
+출처 검사 강화에 맞춰 기존 명시적 휴지통 비우기에도 삭제 시작 전에 얻은 출처를 별도의
+전체 비우기 요약 batch에 전달한다. 개별 삭제는 기존 거래 시작 시 출처 캡처를 사용한다.
+삭제 명령을 자동 재개 대상으로 확대한 것이 아니다.
+
+새 검사는 불일치/삭제/외부 문서 mutation 등 8종의 큐 미등록·journal 및 본문 보존,
+출처 nil→연결된 requirement 상황과 이후 전체 복구의 보류, 정상 휴지통 비우기 개별·요약 batch의
+출처 전달을 다룬다. 이전 생성·이름 변경·이동·하위 트리·순서·동시성·수명 검사는 그대로 유지한다.
+
+검토 보완의 최종 회귀는 아래에 기록하며, Release·최종 head CI·재검토 결과는 PR 본문에서 추적한다.
+검토 대상 head를 문서 갱신만으로 바꾸지 않는다. Supabase 스킬의 변경 목록·Swift 인증 문서를
+재확인했고 서버/계정 경계를 로컬에서 강화했다. 실제 기기·서버 변경은 없다.
+
+- 최종 선택 회귀 **564개 통과**, 실패·건너뜀 0, 컴파일 경고·오류 0, xcresult `runtimeWarnings: []`.
+  AppEnvironment 116 / BinderCommand 45 / BinderFolderSync 6 / BinderRepository 16 /
+  Settings 6 / GeneralSync 73 / Handshake 155 / SnapshotPull 147.
+- 로그: `/private/tmp/writerpad-pr46-review-green-v2.log`.
+- xcresult: `/private/tmp/WriterPad-RecoveryRun-Fix-DD/Logs/Test/Test-WriterPad-2026.09.28_00-15-05-+0900.xcresult`.
+- 계약 0.2.0 재검증 통과, canonical digest 불변.
