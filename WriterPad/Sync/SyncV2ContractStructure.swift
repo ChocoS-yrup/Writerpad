@@ -12,6 +12,7 @@ struct SyncV2ProjectHandoffResumer: Sendable {
     let repository: any DocumentRepository
     let store: any LocalDocumentStoring
     var defaults: ContractDefaults = .standard
+    var binderCommands: (any BinderCommanding)? = nil
 
     func resume(localProjectID id: ProjectID, expectedBinding: ProjectSyncBinding? = nil, onlyIfPending: Bool = false,
         authorizeCaller: @escaping @Sendable () throws -> Void) async throws -> Int {
@@ -50,8 +51,10 @@ struct SyncV2ProjectHandoffResumer: Sendable {
         if onlyIfPending {
             let documents = try await repository.documents(in: id)
             try authorize()
-            var hasPending = false
+            var hasPending = try await binderCommands?.hasPendingStructureSyncHandoff(in: id) ?? false
+            try authorize()
             for document in documents where document.projectID == id && document.kind == .text && document.deletionStatus == .active {
+                if hasPending { break }
                 hasPending = try await store.hasPendingSyncHandoff(for: document)
                 try authorize()
                 if hasPending { break }
@@ -69,6 +72,13 @@ struct SyncV2ProjectHandoffResumer: Sendable {
         try authorize()
         try await sender.prepareGeneralHandoffResume(context: context, authorizeCaller: authorize)
         try authorize()
+        if let binderCommands, try await binderCommands.hasPendingStructureSyncHandoff(in: id) {
+            try authorize()
+            let deferred = try await binderCommands.retryPendingStructureSyncHandoffs(in: id, authorize: authorize)
+            try authorize()
+            // Do not replay later document saves past unresolved structure work.
+            if deferred > 0 { return deferred }
+        }
         let documents = try await repository.documents(in: id)
         try authorize()
         var deferredCount = 0

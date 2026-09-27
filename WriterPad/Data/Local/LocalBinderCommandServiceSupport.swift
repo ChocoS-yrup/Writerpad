@@ -491,6 +491,7 @@ extension LocalBinderCommandService {
         workspaceRoot: URL
     ) async throws {
         var journal = originalJournal
+        journal.handoffOrigin = await durableChangeRecorder.handoffOrigin(for: journal.projectID)
         let journalURL = transactionJournalURL(
             journal.transactionID,
             workspaceRoot: workspaceRoot
@@ -569,27 +570,105 @@ extension LocalBinderCommandService {
         }
     }
 
+    /// Validate saved intent without rebuilding requests or consulting current files.
+    /// An allowlisted journal envelope alone does not make its payload safe to replay.
+    func isReplayableStructureBatch(_ batch: LocalMutationBatch, for journal: BinderCommandJournal,
+        committedNodes: [DocumentNode]) -> Bool {
+        let expectedKind: DurableLocalBatchKind
+        switch journal.kind {
+        case .create, .relocate, .reorder: expectedKind = .structureChange
+        case .createVolume: expectedKind = .volumeCreation
+        default: return false
+        }
+        guard batch.projectID == journal.projectID, batch.localTransactionID == journal.transactionID,
+              batch.handoffOrigin == journal.handoffOrigin,
+              batch.kind == expectedKind, batch.contractStep == nil, batch.originBatchID == nil,
+              journal.trashRecord == nil, let snapshot = batch.structureSnapshot,
+              snapshot.sorted(by: { $0.id.rawValue.uuidString < $1.id.rawValue.uuidString })
+                == committedNodes.map(LocalStructureSnapshotNode.init).sorted(by: { $0.id.rawValue.uuidString < $1.id.rawValue.uuidString }),
+              snapshot.allSatisfy({ $0.projectID == journal.projectID }),
+              Set(snapshot.map(\.id)).count == snapshot.count,
+              Set(journal.newNodes.map(\.id)).count == journal.newNodes.count,
+              Set(journal.oldNodes.map(\.id)).count == journal.oldNodes.count,
+              (journal.oldNodes + journal.newNodes).allSatisfy({
+                  $0.projectID == journal.projectID && LocalStructureSnapshotNode($0).isIncludedInTree
+              }),
+              journal.newNodes.allSatisfy({ snapshot.contains(LocalStructureSnapshotNode($0)) })
+        else { return false }
+        let old = Dictionary(uniqueKeysWithValues: journal.oldNodes.map { ($0.id, $0) })
+        switch journal.kind {
+        case .create, .createVolume:
+            guard old.isEmpty, !journal.newNodes.isEmpty else { return false }
+        case .relocate, .reorder:
+            guard Set(old.keys) == Set(journal.newNodes.map(\.id)) else { return false }
+        default: return false
+        }
+        let texts = journal.kind == .reorder ? [] : journal.newNodes.filter { $0.kind == .text }
+        let folders = journal.newNodes.filter { node in
+            guard node.kind == .folder, journal.kind != .reorder else { return false }
+            guard journal.kind == .relocate, let previous = old[node.id] else { return true }
+            return folderName(of: node) != folderName(of: previous) || node.parentID != previous.parentID
+        }
+        var textIDs: Set<DocumentID> = [], folderIDs: Set<DocumentID> = [], operations: Set<UUID> = []
+        var treeOrders = 0
+        for mutation in batch.mutations {
+            let operationID: UUID
+            switch mutation {
+            case let .documentSnapshot(id, documentID, path, content, hash, generation, isDeleted):
+                guard !isDeleted, generation == 0,
+                      let node = texts.first(where: { $0.id == documentID }), node.relativePath == path,
+                      node.contentHash == hash,
+                      hash == hasher.sha256(for: Data(content.utf8)), textIDs.insert(documentID).inserted
+                else { return false }
+                operationID = id
+            case let .folderSnapshot(id, folderID, parentID, name, isDeleted):
+                guard !isDeleted, let node = folders.first(where: { $0.id == folderID }),
+                      node.parentID == parentID, folderName(of: node) == name, folderIDs.insert(folderID).inserted
+                else { return false }
+                operationID = id
+            case let .treeOrder(id, _, _):
+                treeOrders += 1; operationID = id
+            case .trashPurge, .ensureProject: return false
+            }
+            guard operations.insert(operationID).inserted else { return false }
+        }
+        return treeOrders == 1 && textIDs == Set(texts.map(\.id)) && folderIDs == Set(folders.map(\.id))
+    }
+
     func completeDurableHandoff(
         journal: inout BinderCommandJournal,
         journalURL: URL,
         workspaceRoot: URL
     ) async throws -> Bool {
+        // Full recovery also consumes previously persisted batches. Validate them
+        // before recording or even treating a now-local-only handoff as complete.
+        // Do not rebuild a malformed saved request from current files.
+        if let saved = journal.durableBatch,
+           [.create, .createVolume, .relocate, .reorder].contains(journal.kind) {
+            let committed = try await metadataStore.binderDocuments(in: journal.projectID)
+            guard isReplayableStructureBatch(saved, for: journal, committedNodes: committed) else { return false }
+        }
         let requirement = await durableChangeRecorder.requirement(
             for: journal.projectID
         )
         guard requirement == .durableQueue else {
             return true
         }
+        // A later connection cannot supply provenance missing before the mutation.
+        // Keep local-only recorders compatible, but fail closed for connected recorders.
+        guard !durableChangeRecorder.requiresHandoffOrigin || journal.handoffOrigin != nil else { return false }
         if journal.durableBatch == nil {
             journal.durableBatch = try await durableBatch(
                 for: journal,
                 workspaceRoot: workspaceRoot
             )
+            journal.durableBatch?.handoffOrigin = journal.handoffOrigin
             try writeJournal(journal, to: journalURL)
         }
         guard let batch = journal.durableBatch else {
             return true
         }
+        guard !durableChangeRecorder.requiresHandoffOrigin || batch.handoffOrigin == journal.handoffOrigin else { return false }
         switch await durableChangeRecorder.record(batch) {
         case .queued, .notNeeded, .serverSizeLimitExceeded:
             return true
@@ -808,7 +887,8 @@ extension LocalBinderCommandService {
     func recordEmptyTrashHandoff(
         projectID: ProjectID,
         deletedNodes: [DocumentNode],
-        trashPath: RelativeDocumentPath
+        trashPath: RelativeDocumentPath,
+        handoffOrigin: LocalSyncHandoffOrigin?
     ) async {
         guard !deletedNodes.isEmpty,
               await durableChangeRecorder.requirement(for: projectID)
@@ -832,6 +912,7 @@ extension LocalBinderCommandService {
             newNodes: [],
             trashRecord: nil
         )
+        journal.handoffOrigin = handoffOrigin
         let journalURL = transactionJournalURL(
             transactionID,
             workspaceRoot: workspaceRoot
@@ -841,6 +922,7 @@ extension LocalBinderCommandService {
                 for: journal,
                 workspaceRoot: workspaceRoot
             )
+            journal.durableBatch?.handoffOrigin = handoffOrigin
             try writeJournal(journal, to: journalURL)
             if try await completeDurableHandoff(
                 journal: &journal,

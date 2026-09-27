@@ -143,7 +143,7 @@ struct ProjectWorkspaceView: View {
             projectLister: ProjectManagerSyncProjectLister(projectManager: projectManager),
             authenticationService: authenticationService, projectBindingService: projectBindingService,
             handshakeService: handshakeService, sender: contractStructureSender,
-            repository: documentRepository, store: documentStore)
+            repository: documentRepository, store: documentStore, binderCommands: binderCommands)
         return { id, authorize in
             try await resumer.resume(localProjectID: id, onlyIfPending: true, authorizeCaller: authorize)
         }

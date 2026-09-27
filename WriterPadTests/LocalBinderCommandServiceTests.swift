@@ -872,6 +872,27 @@ final class LocalBinderCommandServiceTests: XCTestCase {
         XCTAssertNil(deleted)
     }
 
+    func testEmptyTrashKeepsCapturedOriginInPerItemAndAggregateBatches() async throws {
+        let harness = try await makeHarness()
+        let notes = try await fixedRoot(.notes, harness: harness)
+        let created = try await harness.commands.create(kind: .text, named: "출처 있는 삭제",
+            in: notes.id, projectID: harness.project.id)
+        _ = try await harness.commands.moveToTrash(documentID: created.affectedDocumentID, projectID: harness.project.id)
+        let origin = try XCTUnwrap(LocalSyncHandoffOrigin(.connected(localProjectID: harness.project.id,
+            serverProjectID: UUID(), kind: .existingServerProject, projectName: "연결된 시험 작품", ownerSubject: UUID())))
+        let recorder = RecordingDurableChangeRecorder(requiresHandoffOrigin: true, origin: origin)
+        let commands = harness.makeCommands(faultPlan: nil, durableChangeRecorder: recorder)
+        let result = try await commands.emptyTrash(projectID: harness.project.id, confirmsPermanentDeletion: true)
+        XCTAssertEqual(result.deletedDocumentIDs, [created.affectedDocumentID])
+        XCTAssertTrue(result.failures.isEmpty)
+        let batches = await recorder.recordedBatches()
+        XCTAssertEqual(batches.count, 2)
+        XCTAssertTrue(batches.allSatisfy { $0.handoffOrigin == origin && $0.kind == .trashChange })
+        let remaining = try FileManager.default.contentsOfDirectory(atPath: harness.workspace.path)
+            .filter { $0.hasPrefix(LocalBinderCommandService.journalPrefix) }
+        XCTAssertTrue(remaining.isEmpty)
+    }
+
     func testGeneralChildrenCanReorderButManuscriptCannot() async throws {
         let harness = try await makeHarness()
         let notes = try await fixedRoot(.notes, harness: harness)
@@ -2091,10 +2112,17 @@ private actor RecordingFutureChangeNotifier: FutureChangeNotifying {
 private actor RecordingDurableChangeRecorder: DurableLocalChangeRecording {
     private let result: DurableRecordResult
     private var batches: [LocalMutationBatch] = []
+    nonisolated let requiresHandoffOrigin: Bool
+    private let origin: LocalSyncHandoffOrigin?
 
-    init(result: DurableRecordResult = .queued(operationIDs: [])) {
+    init(result: DurableRecordResult = .queued(operationIDs: []),
+        requiresHandoffOrigin: Bool = false, origin: LocalSyncHandoffOrigin? = nil) {
         self.result = result
+        self.requiresHandoffOrigin = requiresHandoffOrigin
+        self.origin = origin
     }
+
+    func handoffOrigin(for projectID: ProjectID) async -> LocalSyncHandoffOrigin? { origin }
 
     func requirement(
         for projectID: ProjectID

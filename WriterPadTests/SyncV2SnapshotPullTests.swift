@@ -5308,12 +5308,18 @@ final class SyncV2SnapshotPullTests: XCTestCase {
         await realtime.emitChange()
         await realtime.emitChange()
         await realtime.emitChange()
-        try await Task.sleep(for: .milliseconds(100))
+        // Wait for actual completion rather than assuming a 100 ms scheduler
+        // deadline while simulator tests and optimized builds share the host.
+        for _ in 0..<200 where await puller.count() < 2 {
+            try await Task.sleep(for: .milliseconds(10))
+        }
         pullCount = await puller.count()
         XCTAssertEqual(pullCount, 2)
 
         await realtime.emitSubscribed()
-        try await Task.sleep(for: .milliseconds(100))
+        for _ in 0..<200 where await puller.count() < 3 {
+            try await Task.sleep(for: .milliseconds(10))
+        }
         pullCount = await puller.count()
         XCTAssertEqual(pullCount, 3)
 
