@@ -287,7 +287,7 @@ declare
   v03 constant text := 'abbd234c7b65d422c2e43d468f4f724e069ede26a3d24be22eb8b35cce8ebf2c';
   profile constant text := '07e2e557921c17750f960d6b88b72dadb15d3aee45658d5260a3494607012b77';
   p uuid; f uuid; doc uuid; device uuid; control uuid; hash bytea;
-  c text; name text; expected text; message text; plan jsonb; request jsonb; r jsonb; h jsonb;
+  c text; v_name text; expected text; message text; plan jsonb; request jsonb; r jsonb; h jsonb;
   before_rows jsonb; before_doc jsonb; before_folders jsonb;
   windows_caps constant text[] := array['atomic_structure_commit','contract_allowlist_validation',
     'project_mode_migration_lock','folder_tombstones','id_tree_validation','legacy_epoch_zero_adapter',
@@ -307,19 +307,19 @@ begin
     perform set_config('writerpad.contract_sha256',v02,true);
     perform set_config('request.jwt.claim.sub',u::text,true);
     p:=gen_random_uuid(); f:=gen_random_uuid(); doc:=gen_random_uuid(); device:=gen_random_uuid();
-    name:='Straße.txt'; expected:=null;
+    v_name:='Straße.txt'; expected:=null;
     insert into public.projects(project_id,owner_id,name) values(p,u,'transition 0.3 '||c);
     insert into public.project_members(project_id,user_id,role) values(p,u,'owner');
     insert into public.folders(folder_id,project_id,parent_folder_id,name,revision,created_by,updated_by)
       values(f,p,null,'메인',1,u,u);
     set local role authenticated;
-    perform public.commit_document(doc,p,0,gen_random_uuid(),device,'메인/'||name,'preserved 0.3 body',false,null);
+    perform public.commit_document(doc,p,0,gen_random_uuid(),device,'메인/'||v_name,'preserved 0.3 body',false,null);
     reset role;
     if c='deleted' then update public.documents set is_deleted=true,deleted_at=now() where document_id=doc; end if;
-    if c='unassigned' then name:=chr(129768)||'.txt'; expected:='STORAGE_NAME_UNASSIGNED'; end if;
-    if c='excluded' then name:=chr(57344)||'.txt'; expected:='STORAGE_NAME_UNSUPPORTED_SCALAR'; end if;
-    if c='supplementary_adjacency' then name:=chr(65601)||chr(769)||'.txt'; expected:='STORAGE_NAME_INVALID'; end if;
-    if expected is not null then update public.documents set relative_path='메인/'||name where document_id=doc; end if;
+    if c='unassigned' then v_name:=chr(129768)||'.txt'; expected:='STORAGE_NAME_UNASSIGNED'; end if;
+    if c='excluded' then v_name:=chr(57344)||'.txt'; expected:='STORAGE_NAME_UNSUPPORTED_SCALAR'; end if;
+    if c='supplementary_adjacency' then v_name:=chr(65601)||chr(769)||'.txt'; expected:='STORAGE_NAME_INVALID'; end if;
+    if expected is not null then update public.documents set relative_path='메인/'||v_name where document_id=doc; end if;
     if c in ('disabled','revoked','future','unknown_target') then expected:='CONTRACT_NOT_ALLOWED'; end if;
     if c='active_02' then
       perform public.begin_project_sync_migration(p,device,v02); expected:='CONTRACT_NOT_ALLOWED';
