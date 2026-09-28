@@ -36,6 +36,7 @@ SECURITY_HARDENING_NAME = "20260921125202_harden_legacy_function_privileges.sql"
 MIGRATION_VALIDATION_NAME = "20260927164330_harden_project_sync_migration_validation.sql"
 FUNCTION_DEFAULTS_NAME = "20260927174805_correct_function_default_privileges.sql"
 TRANSITION_NAME = "20260927181453_product_sync_transition_initialization.sql"
+DOCUMENT_03_BOUNDARY_NAME = "20260928223412_allow_contract03_document_versions.sql"
 SOURCE_CATALOG_DIGEST = (
     "6c71ff36a90993dc327557b4a1a64c0dfb27b347134ed89e7f126dae76c6ff9a"
 )
@@ -93,7 +94,8 @@ def main() -> None:
         == [BASELINE_NAME, FOUNDATION_NAME, RPC_NAME, STORAGE_V2_NAME,
             CORRECTIVE_NAME, HANDSHAKE_NAME, RESTORE_HANDSHAKE_NAME,
             TRASH_PURGE_NAME, CONTROL_DOCUMENTS_NAME, SECURITY_HARDENING_NAME,
-            MIGRATION_VALIDATION_NAME, FUNCTION_DEFAULTS_NAME, TRANSITION_NAME],
+            MIGRATION_VALIDATION_NAME, FUNCTION_DEFAULTS_NAME, TRANSITION_NAME,
+            DOCUMENT_03_BOUNDARY_NAME],
         "the server chain must match the exact reviewed migration order",
     )
     for name, expected in IMMUTABLE_MIGRATION_DIGESTS.items():
@@ -268,7 +270,8 @@ def main() -> None:
     )
 
     for name in (TRASH_PURGE_NAME, CONTROL_DOCUMENTS_NAME, SECURITY_HARDENING_NAME,
-                 MIGRATION_VALIDATION_NAME, FUNCTION_DEFAULTS_NAME, TRANSITION_NAME):
+                 MIGRATION_VALIDATION_NAME, FUNCTION_DEFAULTS_NAME, TRANSITION_NAME,
+                 DOCUMENT_03_BOUNDARY_NAME):
         require(
             workflow.count(f"supabase/migrations/{name}") == 4,
             f"CI must apply and safely re-run the reviewed migration: {name}",
@@ -289,6 +292,19 @@ def main() -> None:
     require("update private.sync_contract_allowlist" not in transition.lower(),
             "transition migration must not activate or mutate allowlist entries")
     require("project_sync_transition.sql" in workflow, "transition SQL regression missing")
+    document_boundary = (MIGRATIONS / DOCUMENT_03_BOUNDARY_NAME).read_text(encoding="utf-8")
+    for marker in (
+        "private.enforce_document_write_boundary",
+        "batch.canonical_contract_sha256 = v_active_contract_sha256",
+        "batch.project_id = new.project_id",
+        CLIENT_DIGEST,
+        SERVER_DIGEST,
+        "operation.entity_kind = 'trash_purge'",
+        "message = 'PROTOCOL_TOO_OLD'",
+    ):
+        require(marker in document_boundary, f"0.3 document boundary missing: {marker}")
+    require("contract03_document_write_boundary.sql" in workflow,
+            "CI must execute the 0.3 document-write regression")
     require("alter default privileges for role postgres\n  revoke execute" in defaults,
             "PUBLIC EXECUTE must be revoked globally, not only per schema")
     require("pg_catalog.acldefault('f', 'postgres'::regrole)" in defaults,
