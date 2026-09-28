@@ -34,9 +34,9 @@ begin
       join paths p on f.parent_folder_id=p.id where f.project_id=p_project_id
   ) select coalesce(jsonb_agg(jsonb_build_object('id',id,'path',path) order by id),'[]') into v_paths from paths;
   if jsonb_array_length(v_paths) <> jsonb_array_length(v_folders) then raise exception 'FOLDER_CYCLE'; end if;
-  if exists(select 1 from jsonb_array_elements(v_paths) p group by p->>'path' having count(*)>1) then
-    raise exception 'PATH_CONFLICT';
-  end if;
+  -- Deleted folders may legitimately share a recorded path with a new folder.
+  -- Keep every historical ID, but require unique paths only where an uninitialized
+  -- document needs a parent lookup. Never infer its historical parent from liveness.
   for v_doc in select * from public.documents where project_id=p_project_id order by document_id loop
     if private.is_contract_migration_control_document(v_doc) then continue; end if;
     if split_part(v_doc.relative_path,'/',1)='__antigravity__' then raise exception 'INVALID_CONTROL_DOCUMENT'; end if;
@@ -63,7 +63,8 @@ begin
       v_parent_path := left(v_doc.relative_path,length(v_doc.relative_path)-length(v_name)-1);
       select count(*),min(p->>'id')::uuid into v_count,v_parent
         from jsonb_array_elements(v_paths) p where p->>'path'=v_parent_path;
-      if v_count<>1 then raise exception 'FOLDER_NOT_FOUND'; end if;
+      if v_count=0 then raise exception 'FOLDER_NOT_FOUND'; end if;
+      if v_count>1 then raise exception 'PATH_CONFLICT'; end if;
     end if;
     v_initial := v_initial || jsonb_build_array(jsonb_build_object(
       'id',v_doc.document_id,'name',v_name,'parent_folder_id',v_parent));

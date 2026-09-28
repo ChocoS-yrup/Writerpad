@@ -154,5 +154,127 @@ begin
   if has_function_privilege('anon','public.prepare_project_sync_transition(jsonb)','EXECUTE')
      or has_function_privilege('authenticated','private.project_transition_payload(uuid)','EXECUTE') then raise exception 'TRANSITION_ACL'; end if;
 end $cases$;
+
+-- A tombstoned folder does not reserve its path. A recorded parent ID is
+-- authoritative; an uninitialized document with multiple possible parents is not.
+do $folder_reuse$
+declare
+  u constant uuid := '97000000-0000-4000-8000-000000000001';
+  p uuid; root uuid; retired uuid; replacement uuid; leaf uuid; doc uuid; device uuid;
+  control uuid; hash bytea; c text; saved_error text; plan jsonb; request jsonb; r jsonb;
+  expected_parent uuid; identified boolean; ambiguous boolean; deleted boolean;
+  before_rows jsonb; before_doc jsonb; before_folders jsonb; before_projection jsonb;
+begin
+  foreach c in array array[
+    'empty_reuse', 'unreferenced_reuse', 'identified_live', 'identified_deleted',
+    'ambiguous_live', 'ambiguous_deleted', 'legacy_order_reuse', 'unique_descendant'
+  ] loop
+    p:=gen_random_uuid(); root:=gen_random_uuid(); retired:=gen_random_uuid();
+    replacement:=gen_random_uuid(); leaf:=gen_random_uuid(); doc:=gen_random_uuid(); device:=gen_random_uuid();
+    identified:=c in ('identified_live','identified_deleted');
+    ambiguous:=c in ('ambiguous_live','ambiguous_deleted');
+    deleted:=c in ('identified_deleted','ambiguous_deleted');
+    expected_parent:=case when deleted then retired when identified or ambiguous then replacement
+                          when c='unique_descendant' then leaf else root end;
+    perform set_config('request.jwt.claim.sub',u::text,true);
+    insert into public.projects(project_id,owner_id,name) values(p,u,'transition folder reuse '||c);
+    insert into public.project_members(project_id,user_id,role) values(p,u,'owner');
+    insert into public.folders(folder_id,project_id,parent_folder_id,name,revision,is_deleted,deleted_at,created_by,updated_by)
+      values(root,p,null,'메인',1,false,null,u,u),
+            (retired,p,root,'reused',4,true,now()-interval '1 day',u,u),
+            (replacement,p,root,'reused',1,false,null,u,u);
+    if c='unique_descendant' then
+      insert into public.folders(folder_id,project_id,parent_folder_id,name,revision,created_by,updated_by)
+        values(leaf,p,replacement,'leaf',1,u,u);
+    end if;
+    if c<>'empty_reuse' then
+      set local role authenticated;
+      perform public.commit_document(doc,p,0,gen_random_uuid(),device,
+        case when identified or ambiguous then '메인/reused/chapter.txt'
+             when c='unique_descendant' then '메인/reused/leaf/chapter.txt'
+             else '메인/chapter.txt' end,'unchanged body',false,null);
+      reset role;
+      if deleted then update public.documents set is_deleted=true,deleted_at=now() where document_id=doc; end if;
+      if identified then
+        update public.documents set name='chapter.txt',parent_folder_id=expected_parent,
+          structure_revision=3,storage_name_key=private.storage_name_v1('chapter.txt') where document_id=doc;
+      end if;
+    end if;
+    if c='legacy_order_reuse' then
+      hash:=extensions.digest(uuid_send(p)||convert_to('__antigravity__/tree-order.json','UTF8'),'sha1');
+      hash:=set_byte(hash,6,(get_byte(hash,6)&15)|80); hash:=set_byte(hash,8,(get_byte(hash,8)&63)|128);
+      control:=encode(substring(hash,1,16),'hex')::uuid;
+      set local role authenticated;
+      perform public.commit_document(control,p,0,gen_random_uuid(),device,'__antigravity__/tree-order.json',
+        '{"tree_order":{"<root>":["reused","chapter.txt"],"메인/reused":[]}}',false,null);
+      reset role;
+    end if;
+    before_rows:=pg_temp.transition_preserved(p);
+    select to_jsonb(d) into before_doc from public.documents d where document_id=doc;
+    select jsonb_agg(to_jsonb(f) order by folder_id),
+           jsonb_agg(to_jsonb(f)-'storage_name_key' order by folder_id)
+      into before_folders,before_projection from public.folders f where project_id=p;
+    begin
+      set local role authenticated;
+      plan:=public.get_project_sync_transition_plan(p);
+      reset role;
+      if ambiguous then raise exception using errcode='XX001',message='AMBIGUOUS_PARENT_ACCEPTED '||c; end if;
+    exception when sqlstate 'P0001' then
+      get stacked diagnostics saved_error=message_text;
+      reset role;
+      if not ambiguous or saved_error<>'PATH_CONFLICT' then
+        raise exception 'wrong folder reuse error %: %',c,saved_error;
+      end if;
+      if exists(select 1 from public.project_sync_settings where project_id=p)
+         or exists(select 1 from public.project_sync_migrations where project_id=p)
+         or exists(select 1 from public.sync_batches where project_id=p)
+         or exists(select 1 from public.tree_orders where project_id=p)
+         or pg_temp.transition_preserved(p) is distinct from before_rows
+         or (select to_jsonb(d) from public.documents d where document_id=doc) is distinct from before_doc
+         or (select jsonb_agg(to_jsonb(f) order by folder_id) from public.folders f where project_id=p)
+            is distinct from before_folders then raise exception 'AMBIGUOUS_PREFLIGHT_WROTE'; end if;
+      raise notice 'PASS folder reuse % (fail-closed)',c;
+      continue;
+    end;
+    if (identified or c='empty_reuse') and plan#>'{payload,documents}'<>'[]'::jsonb then
+      raise exception 'EXISTING_ID_REINITIALIZED %',c;
+    end if;
+    request:=pg_temp.transition_request(p,device,plan->'payload');
+    set local role authenticated;
+    r:=public.prepare_project_sync_transition(request);
+    reset role;
+    if r->>'applied' is distinct from 'true'
+       or pg_temp.transition_preserved(p) is distinct from before_rows
+       or (select jsonb_agg(to_jsonb(f) order by folder_id) from public.folders f where project_id=p)
+          is distinct from before_folders then raise exception 'REUSE_PREPARE_PRESERVATION %',c; end if;
+    if c<>'empty_reuse' and not exists(select 1 from public.documents where document_id=doc
+      and parent_folder_id=expected_parent and name='chapter.txt' and is_deleted=deleted
+      and structure_revision=case when identified then 3 else 1 end) then
+      raise exception 'REUSE_PARENT_OR_REVISION_CHANGED %',c;
+    end if;
+    if identified and (select to_jsonb(d) from public.documents d where document_id=doc) is distinct from before_doc then
+      raise exception 'IDENTIFIED_DOCUMENT_REWRITTEN %',c;
+    end if;
+    if c='legacy_order_reuse' and (
+      not exists(select 1 from public.tree_orders where project_id=p and parent_folder_id=root and children=array[replacement,doc])
+      or not exists(select 1 from public.tree_orders where project_id=p and parent_folder_id=replacement and children='{}'::uuid[])
+      or exists(select 1 from public.tree_orders where project_id=p and parent_folder_id=retired)
+    ) then raise exception 'REUSE_ORDER_LOST'; end if;
+    set local role authenticated;
+    r:=public.validate_project_sync_migration(p);
+    if r->>'valid' is distinct from 'true' then raise exception 'REUSE_INVALID %',c; end if;
+    r:=public.prepare_project_sync_transition(request);
+    if r->>'status' is distinct from 'replayed' then raise exception 'REUSE_REPLAY_FAILED %',c; end if;
+    r:=public.complete_project_sync_migration(p,device,1);
+    if r->>'status' is distinct from 'id_based' then raise exception 'REUSE_COMPLETE_FAILED %',c; end if;
+    r:=public.prepare_project_sync_transition(request);
+    if r->>'status' is distinct from 'replayed' then raise exception 'REUSE_COMPLETED_REPLAY_FAILED %',c; end if;
+    reset role;
+    if pg_temp.transition_preserved(p) is distinct from before_rows
+       or (select jsonb_agg(to_jsonb(f)-'storage_name_key' order by folder_id) from public.folders f where project_id=p)
+          is distinct from before_projection then raise exception 'REUSE_COMPLETE_PRESERVATION %',c; end if;
+    raise notice 'PASS folder reuse %',c;
+  end loop;
+end $folder_reuse$;
 rollback;
 \echo 'Product transition initialization regression passed'

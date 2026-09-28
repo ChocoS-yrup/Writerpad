@@ -59,6 +59,13 @@ payload의 baseline은 정렬된 폴더·문서 메타데이터, 본문 SHA, 기
 부분 metadata, 누락/모호한 부모, 순환, 이름 충돌 등은 거부한다.
 삭제 문서에도 구조를 부여하되 삭제 상태·본문·revision을 보존한다.
 
+삭제 폴더와 새 live 폴더가 같은 경로를 갖는 이력은 그 자체로 오류가 아니다.
+폴더 전체의 경로 중복을 일괄 거부하지 않는다. 이미 parent ID가 있는 문서는 해당 ID와
+기록된 경로의 일치만 확인하며 기존 구조 revision을 보존한다. 구조가 없는 문서의 부모를
+경로로 찾아야 할 때만 모든 live/tombstone 후보를 세어, 0개는 `FOLDER_NOT_FOUND`,
+2개 이상은 `PATH_CONFLICT`로 거부한다. live 후보 하나를 임의로 선택해 과거 부모를
+추측하지 않는다. legacy 정렬은 기존 규칙대로 살아 있는 폴더와 자식만 참조한다.
+
 기존 ID 정렬이 없을 때만 legacy tree-order 관리 문서의 정확한 이름을 UUID로 투영한다.
 `<root>`는 기존 클라이언트와 같은 `메인` 경로로 해석한다. 임의 이름 별칭이나 누락된
 폴더를 만들지 않는다. UUID-v5 정렬 ID도 immutable payload에 저장한다.
@@ -95,6 +102,10 @@ payload의 baseline은 정렬된 폴더·문서 메타데이터, 본문 SHA, 기
 SQL 회귀는 폐기형 `writerpad_stage7` CI DB에서만 실행하며 전체 transaction을 rollback한다.
 일반/빈/삭제 문서, legacy 정렬, stale baseline, 충돌, 누락 부모, 부분 metadata,
 다른 기기, editor 권한, 확장 해시 오류, 동일 요청 재시도/완료 후 재시도를 검사한다.
+폴더 경로 재사용 8경로도 검사한다: 빈 작품, 참조되지 않는 재사용 경로, ID가 확정된
+live/삭제 문서, 부모가 모호한 live/삭제 문서, legacy 정렬, 부모 경로가 유일한 하위 문서.
+성공 경로의 prepare·validate·complete·replay와 본문·버전·폴더 이력 보존, 모호한
+경로의 preflight 무변경 거부를 실제 authenticated RPC로 검증한다.
 잠금 경합 시험은 기존 validator와 새 조회/prepare 각각의 대기 중 권한 철회를 검사한다.
 Swift 회귀는 가짜 transport와 임시 journal을 사용한다. 실제 서버 전환 시험이 아니다.
 
