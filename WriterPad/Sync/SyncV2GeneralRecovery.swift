@@ -461,12 +461,12 @@ struct SyncV2GeneralRenameConflictReview: Sendable {
         func parentPath(_ path: String) -> String { (SyncV2ServerPath.canonical(path) as NSString).deletingLastPathComponent }
         guard parentPath(originalPath) == parentPath(remotePath), parentPath(originalPath) == parentPath(manuscript.relativePath),
               (remotePath as NSString).lastPathComponent == remoteName else { throw SyncV2GeneralConflictError.unsupported }
-        let nameKey = try SyncV2StorageName.normalize(name)
-        _ = try SyncV2StorageName.normalize(remoteName)
+        let nameKey = try context.contract.normalizeStorageName(name)
+        _ = try context.contract.normalizeStorageName(remoteName)
         for row in remoteBaseline.documents + remoteBaseline.folders {
             let fields = row.objectValue ?? [:]
             if fields["document_id"] == key || fields["is_deleted"] != .bool(false) || fields["parent_folder_id"] != original["parent_folder_id"] { continue }
-            guard let otherName = fields["name"]?.stringValue, try SyncV2StorageName.normalize(otherName) != nameKey else {
+            guard let otherName = fields["name"]?.stringValue, try context.contract.normalizeStorageName(otherName) != nameKey else {
                 throw SyncV2GeneralConflictError.unsupported
             }
         }
@@ -552,12 +552,12 @@ struct SyncV2GeneralRenameConflictReview: Sendable {
         var normalizedFolder = fields; normalizedFolder["name"] = original["name"]; normalizedFolder["revision"] = original["revision"]
         let normalized = remoteBaseline.folders.map { $0.objectValue?["folder_id"] == key ? .object(original) : $0 }
         guard normalizedFolder == original, local.records.count <= 50 else { throw SyncV2GeneralConflictError.unsupported }
-        let nameKey = try SyncV2StorageName.normalize(name)
-        _ = try SyncV2StorageName.normalize(remoteName)
+        let nameKey = try context.contract.normalizeStorageName(name)
+        _ = try context.contract.normalizeStorageName(remoteName)
         for row in remoteBaseline.folders + remoteBaseline.documents {
             let sibling = row.objectValue ?? [:]
             if sibling["folder_id"] == key || sibling["is_deleted"] != .bool(false) || sibling["parent_folder_id"] != fields["parent_folder_id"] { continue }
-            guard let siblingName = sibling["name"]?.stringValue, try SyncV2StorageName.normalize(siblingName) != nameKey else {
+            guard let siblingName = sibling["name"]?.stringValue, try context.contract.normalizeStorageName(siblingName) != nameKey else {
                 throw SyncV2GeneralConflictError.unsupported
             }
         }
@@ -579,7 +579,7 @@ struct SyncV2GeneralRenameConflictReview: Sendable {
                 throw SyncV2GeneralConflictError.unsupported
             }
             let component = id == folder.rawValue ? renamed : storedName
-            _ = try SyncV2StorageName.normalize(component)
+            _ = try context.contract.normalizeStorageName(component)
             if fields["parent_folder_id"] == .null { return component }
             guard let parent = fields["parent_folder_id"]?.stringValue.flatMap(UUID.init(uuidString:)) else { throw SyncV2GeneralConflictError.unsupported }
             return try folderPath(parent, renamed: renamed, visited: visited.union([id])) + "/" + component
@@ -622,7 +622,7 @@ struct SyncV2GeneralRenameConflictReview: Sendable {
                   let remoteRow = remoteBaseline.documents.firstIndex(where: { $0.objectValue?["document_id"] == documentKey }) else {
                 throw SyncV2GeneralConflictError.unsupported
             }
-            _ = try SyncV2StorageName.normalize(oldName)
+            _ = try context.contract.normalizeStorageName(oldName)
             comparedBytes += try remoteDocuments[index].canonicalJSON().utf8.count
             guard comparedBytes <= SyncV2GeneralRecoveryDetail.maximumRecordBytes else { throw SyncV2GeneralConflictError.unsupported }
             // 서버가 폴더만 바꾼 경우와 자식 경로까지 갱신한 경우를 모두 명시적으로 검증한다.
@@ -736,11 +736,13 @@ enum SyncV2GeneralContractStep: String, Codable, Sendable {
 
 /// 서버와 보관 구조를 UUID로 비교한다. 경로는 부모 사슬에서 검증하며 중간 이름 충돌도 피한다.
 struct SyncV2GeneralTree {
+    let contract: SyncV2ReleasedContract
     let folders: [UUID: [String: SyncV2JSON]]
     let documents: [UUID: [String: SyncV2JSON]]
     let orders: [UUID?: [String: SyncV2JSON]]
 
-    init(_ snapshot: SyncV2PreparationSnapshot) throws {
+    init(_ snapshot: SyncV2PreparationSnapshot, contract: SyncV2ReleasedContract = .v02) throws {
+        self.contract = contract
         func indexed(_ rows: [SyncV2JSON], key: String) throws -> [UUID: [String: SyncV2JSON]] {
             var result: [UUID: [String: SyncV2JSON]] = [:]
             for row in rows {
@@ -774,13 +776,13 @@ struct SyncV2GeneralTree {
         guard !visited.contains(id), let f = folders[id], f["is_deleted"] == .bool(false), let name = f["name"]?.stringValue else {
             throw SyncV2GeneralConflictError.unsupported
         }
-        _ = try SyncV2StorageName.normalize(name)
+        _ = try contract.normalizeStorageName(name)
         if let parent = try Self.parent(f) { return try folderPath(parent, visited: visited.union([id])) + "/" + name }
         return name
     }
     func documentPath(_ f: [String: SyncV2JSON]) throws -> String {
         guard let name = f["name"]?.stringValue else { throw SyncV2GeneralConflictError.unsupported }
-        _ = try SyncV2StorageName.normalize(name)
+        _ = try contract.normalizeStorageName(name)
         return try Self.parent(f).map { try folderPath($0) + "/" + name } ?? name
     }
     var activeDocumentIDs: Set<UUID> {
@@ -793,7 +795,7 @@ struct SyncV2GeneralTree {
             let parent = try Self.parent(f)
             if let parent { _ = try folderPath(parent) }
             guard let name = f["name"]?.stringValue else { throw SyncV2GeneralConflictError.unsupported }
-            let key = try SyncV2StorageName.normalize(name)
+            let key = try contract.normalizeStorageName(name)
             guard names[parent, default: []].insert(key).inserted else { throw SyncV2GeneralConflictError.unsupported }
         }
         for id in activeFolderIDs { _ = try folderPath(id) }
@@ -848,7 +850,7 @@ struct SyncV2GeneralStructureReview: Sendable {
 
     init(local: SyncV2GeneralConflictLocal, remoteBaseline: SyncV2PreparationSnapshot, remoteDocuments: [SyncV2JSON],
          context: SyncV2HandshakeContext, authorizationFingerprint: String) throws {
-        let detail = local.detail, old = try SyncV2GeneralTree(local.baseline), remote = try SyncV2GeneralTree(remoteBaseline)
+        let detail = local.detail, old = try SyncV2GeneralTree(local.baseline, contract: context.contract), remote = try SyncV2GeneralTree(remoteBaseline, contract: context.contract)
         guard detail.row.isQueueHead, detail.row.isStructureReviewCandidate,
               context.localProjectID == detail.localProjectID, context.serverProjectID == detail.serverProjectID,
               old.activeDocumentIDs == remote.activeDocumentIDs, old.activeFolderIDs == remote.activeFolderIDs,
@@ -974,7 +976,7 @@ extension SyncV2GeneralTree {
         }
         let snapshot = SyncV2PreparationSnapshot(folders: fs.keys.sorted { $0.uuidString < $1.uuidString }.map { .object(fs[$0]!) },
             documents: ds.keys.sorted { $0.uuidString < $1.uuidString }.map { .object(ds[$0]!) }, treeOrders: os)
-        let tree = try SyncV2GeneralTree(snapshot); try tree.validateNames()
+        let tree = try SyncV2GeneralTree(snapshot, contract: contract); try tree.validateNames()
         for node in nodes {
             let path = try node.kind == .folder ? tree.folderPath(node.id.rawValue) : tree.documentPath(ds[node.id.rawValue]!)
             guard SyncV2ServerPath.canonical(path) == SyncV2ServerPath.canonical(node.relativePath.rawValue) else { throw SyncV2GeneralConflictError.unsupported }

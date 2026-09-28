@@ -10522,6 +10522,17 @@ actor SyncV2Store:
         try transaction { try readGeneralConflictLocal(localProjectID: localProjectID, batchID: batchID) }
     }
 
+    private func requireGeneralContractProfile(batchID: UUID, contract: SyncV2ReleasedContract) throws {
+        try withStatement("SELECT contract_version,contract_sha256,protocol_version FROM sync_contract_local_batches WHERE batch_id=?;") { st in
+            try bind(batchID.uuidString.lowercased(), at: 1, to: st)
+            guard sqlite3_step(st) == SQLITE_ROW, columnText(st, at: 0) == contract.version,
+                  columnText(st, at: 1) == contract.sha256,
+                  Int(sqlite3_column_int64(st, 2)) == SyncV2Contract.syncProtocolVersion else {
+                throw SyncV2ContractStructureError.invalidStoredRequest
+            }
+        }
+    }
+
     private func readGeneralConflictLocal(localProjectID: ProjectID, batchID: UUID) throws -> SyncV2GeneralConflictLocal {
         let detail = try generalRecoveryDetail(localProjectID: localProjectID, batchID: batchID)
         guard detail.row.isStructureReviewCandidate else {
@@ -10574,6 +10585,7 @@ actor SyncV2Store:
             let localID = review.context.localProjectID
             let previousID = review.local.detail.row.batchID.uuidString.lowercased()
             let latest = try readGeneralConflictLocal(localProjectID: localID, batchID: review.local.detail.row.batchID)
+            try requireGeneralContractProfile(batchID: latest.detail.row.batchID, contract: review.context.contract)
             let checked = try SyncV2GeneralConflictReview(local: latest, remote: review.remote,
                 remoteBaseline: review.remoteBaseline, context: review.context, authorizationFingerprint: review.authorizationFingerprint)
             guard checked.fingerprint == review.fingerprint,
@@ -10595,7 +10607,7 @@ actor SyncV2Store:
                 intentKind: .update, baseRevision: review.remoteRevision,
                 parentFolderID: remote["parent_folder_id"]?.stringValue.flatMap(UUID.init(uuidString:)), name: name,
                 content: content, isDeleted: false, structureRevision: structureRevision,
-                operationID: newOperationID, batchID: newBatchID, clientBuildID: build)
+                operationID: newOperationID, batchID: newBatchID, clientBuildID: build, contract: try review.context.contract)
             let source = LocalMutationBatch(batchID: newBatchID, projectID: localID, localTransactionID: nil,
                 mutations: [.documentSnapshot(operationID: newOperationID, documentID: document, relativePath: path,
                     content: content, contentHash: hash, localSaveGeneration: generation, isDeleted: false)])
@@ -10660,6 +10672,7 @@ actor SyncV2Store:
             let localID = review.context.localProjectID
             let previousID = review.local.detail.row.batchID.uuidString.lowercased()
             let latest = try readGeneralConflictLocal(localProjectID: localID, batchID: review.local.detail.row.batchID)
+            try requireGeneralContractProfile(batchID: latest.detail.row.batchID, contract: review.context.contract)
             let checked = try SyncV2GeneralOrderConflictReview(local: latest, remoteBaseline: review.remoteBaseline,
                 context: review.context, authorizationFingerprint: review.authorizationFingerprint)
             guard checked.fingerprint == review.fingerprint,
@@ -10677,7 +10690,7 @@ actor SyncV2Store:
             }
             // 원본 구조 스냅샷으로 같은 요청이 만들어지는지 확인한 뒤 새 식별자를 부여한다.
             let rebuilt = try buildGeneralContract(latest.detail.source, serverID: review.context.serverProjectID,
-                mode: .idBased, epoch: epoch, writerID: writer, clientBuildID: build, includeUnchangedOrderID: review.treeOrderID)
+                mode: .idBased, epoch: epoch, writerID: writer, clientBuildID: build, contract: try review.context.contract, includeUnchangedOrderID: review.treeOrderID)
             guard rebuilt.json == original.json else { throw SyncV2GeneralConflictError.changed }
             let newBatchID = UUID(), newOperationID = UUID()
             let replacement = try SyncV2Contract.buildAtomicStructureRequest(projectID: review.context.serverProjectID,
@@ -10685,7 +10698,7 @@ actor SyncV2Store:
                 orderedIntents: [.init(entityKind: .treeOrder, entityID: review.treeOrderID, intentKind: .reorder,
                     baseRevision: review.remoteRevision, payload: review.payload,
                     operationID: syncV2UUIDv5(namespace: newOperationID, name: review.treeOrderID.uuidString.lowercased()))],
-                batchID: newBatchID, clientBuildID: build)
+                batchID: newBatchID, clientBuildID: build, contract: try review.context.contract)
             let source = LocalMutationBatch(replacing: latest.detail.source, batchID: newBatchID,
                 mutations: [.treeOrder(operationID: newOperationID, content: content, generation: generation)])
             let encoder = JSONEncoder(); encoder.outputFormatting = [.sortedKeys]
@@ -10749,6 +10762,7 @@ actor SyncV2Store:
             let localID = review.context.localProjectID
             let previousID = review.local.detail.row.batchID.uuidString.lowercased()
             let latest = try readGeneralConflictLocal(localProjectID: localID, batchID: review.local.detail.row.batchID)
+            try requireGeneralContractProfile(batchID: latest.detail.row.batchID, contract: review.context.contract)
             let checked = try SyncV2GeneralRenameConflictReview(local: latest, remote: review.remote, remoteBaseline: review.remoteBaseline,
                 context: review.context, authorizationFingerprint: review.authorizationFingerprint)
             guard checked.fingerprint == review.fingerprint,
@@ -10769,7 +10783,7 @@ actor SyncV2Store:
             }
             // 원본 구조 스냅샷으로 같은 요청이 만들어지는지 확인한 뒤 새 식별자를 부여한다.
             let rebuilt = try buildGeneralContract(latest.detail.source, serverID: review.context.serverProjectID,
-                mode: .idBased, epoch: epoch, writerID: writer, clientBuildID: build, includeUnchangedRenameID: review.entityID)
+                mode: .idBased, epoch: epoch, writerID: writer, clientBuildID: build, contract: try review.context.contract, includeUnchangedRenameID: review.entityID)
             guard rebuilt.json == original.json else { throw SyncV2GeneralConflictError.changed }
             let newBatchID = UUID(), newOperationID = UUID()
             var operations: [UUID: UUID] = [review.entityID: newOperationID]
@@ -10788,7 +10802,7 @@ actor SyncV2Store:
             }
             let replacement = try SyncV2Contract.buildAtomicStructureRequest(projectID: review.context.serverProjectID,
                 projectSyncMode: .idBased, migrationEpoch: epoch, writerDeviceID: writer, orderedIntents: intents,
-                batchID: newBatchID, clientBuildID: build)
+                batchID: newBatchID, clientBuildID: build, contract: try review.context.contract)
             let mutations: [DurableLocalMutation] = try latest.detail.source.mutations.map {
                 switch $0 {
                 case let .documentSnapshot(_, id, path, content, hash, generation, deleted):
@@ -10941,11 +10955,11 @@ actor SyncV2Store:
         }
     }
 
-    private func buildGeneralStructureRepair(_ source: LocalMutationBatch, serverID: UUID, epoch: Int, writer: UUID, build: String) throws -> SyncV2ContractRequest? {
+    private func buildGeneralStructureRepair(_ source: LocalMutationBatch, serverID: UUID, epoch: Int, writer: UUID, build: String, contract: SyncV2ReleasedContract) throws -> SyncV2ContractRequest? {
         guard let nodes = source.structureSnapshot else { throw SyncV2GeneralConflictError.unsupported }
         let baseline = try generalStoredBaseline(localProjectID: source.projectID, inTransaction: true)
-        let old = try SyncV2GeneralTree(baseline)
-        let target = try SyncV2GeneralTree(old.replacingStructure(with: nodes.filter(\.isIncludedInTree), projectID: serverID))
+        let old = try SyncV2GeneralTree(baseline, contract: contract)
+        let target = try SyncV2GeneralTree(old.replacingStructure(with: nodes.filter(\.isIncludedInTree), projectID: serverID), contract: contract)
         let folderIDs = old.activeFolderIDs.filter { id in
             old.folders[id]?["name"] != target.folders[id]?["name"] || old.folders[id]?["parent_folder_id"] != target.folders[id]?["parent_folder_id"]
         }.sorted { $0.uuidString < $1.uuidString }
@@ -10998,7 +11012,7 @@ actor SyncV2Store:
         }
         guard !intents.isEmpty else { return nil }
         return try SyncV2Contract.buildAtomicStructureRequest(projectID: serverID, projectSyncMode: .idBased, migrationEpoch: epoch,
-            writerDeviceID: writer, orderedIntents: intents, batchID: source.batchID, clientBuildID: build)
+            writerDeviceID: writer, orderedIntents: intents, batchID: source.batchID, clientBuildID: build, contract: contract)
     }
 
     func replaceGeneralStructureConflict(_ review: SyncV2GeneralStructureReview, adoptServer: Bool,
@@ -11007,6 +11021,7 @@ actor SyncV2Store:
         return try transaction {
             let localID = review.context.localProjectID, previous = review.local.detail.row.batchID
             let latest = try readGeneralConflictLocal(localProjectID: localID, batchID: previous)
+            try requireGeneralContractProfile(batchID: latest.detail.row.batchID, contract: review.context.contract)
             let checked = try SyncV2GeneralStructureReview(local: latest, remoteBaseline: review.remoteBaseline, remoteDocuments: review.remoteDocuments,
                 context: review.context, authorizationFingerprint: review.authorizationFingerprint)
             guard checked.fingerprint == review.fingerprint, let binding = try binding(for: localID),
@@ -11040,7 +11055,7 @@ actor SyncV2Store:
                 mutations.append(.treeOrder(operationID: UUID(), content: "{}", generation: 0))
                 var source = LocalMutationBatch(batchID: UUID(), projectID: localID, localTransactionID: nil, kind: .structureChange, mutations: mutations, structureSnapshot: nodes)
                 source.contractStep = .structure; source.originBatchID = previous
-                replacement = try buildGeneralStructureRepair(source, serverID: review.context.serverProjectID, epoch: identity.1, writer: identity.0, build: identity.2)
+                replacement = try buildGeneralStructureRepair(source, serverID: review.context.serverProjectID, epoch: identity.1, writer: identity.0, build: identity.2, contract: try review.context.contract)
                 let dispatch = try reserveGeneralDispatchSpace(localID: localID, head: previous)
                 if let replacement {
                     try persistContractRequest(replacement, localProjectID: localID, serverProjectID: review.context.serverProjectID)
@@ -11437,6 +11452,11 @@ actor SyncV2Store:
         guard binding.localProjectID == batch.projectID, let serverID = binding.serverProjectID,
               handshake.serverProjectID == serverID, handshake.projectSyncMode == .idBased,
               !batch.mutations.isEmpty else { throw SyncV2ContractStructureError.unsupportedLocalBatch }
+        let contract = try SyncV2ReleasedContract(sha256: handshake.contractSHA256)
+        guard handshake.contractVersion == contract.version else { throw SyncV2ContractError.contractDigestMismatch }
+        try SyncV2Contract.requireServerCompatibility(projectSyncMode: handshake.projectSyncMode,
+            migrationEpoch: handshake.migrationEpoch, serverProtocolVersion: handshake.serverProtocolVersion,
+            serverContractSHA256: handshake.contractSHA256, serverCapabilities: handshake.serverCapabilities, contract: contract)
         let ids = try batch.mutations.map { mutation -> UUID in
             switch mutation {
             case let .documentSnapshot(id, _, _, content, hash, _, _):
@@ -11473,8 +11493,8 @@ actor SyncV2Store:
                 }
                 try bind(handshake.migrationEpoch, at: 7, to: statement)
                 try bind(Self.timestamp(), at: 8, to: statement)
-                try bind(SyncV2Contract.version, at: 9, to: statement)
-                try bind(SyncV2Contract.canonicalSHA256, at: 10, to: statement)
+                try bind(contract.version, at: 9, to: statement)
+                try bind(contract.sha256, at: 10, to: statement)
                 try bind(SyncV2Contract.syncProtocolVersion, at: 11, to: statement)
                 try bind(SyncV2Contract.clientBuildID, at: 12, to: statement)
                 try stepDone(statement)
@@ -11637,9 +11657,9 @@ actor SyncV2Store:
         return true
     }
 
-    private func buildGeneralContractStep(_ batch: LocalMutationBatch, serverID: UUID, epoch: Int, writer: UUID, build: String) throws -> SyncV2ContractRequest? {
+    private func buildGeneralContractStep(_ batch: LocalMutationBatch, serverID: UUID, epoch: Int, writer: UUID, build: String, contract: SyncV2ReleasedContract) throws -> SyncV2ContractRequest? {
         guard let step = batch.contractStep, let nodes = batch.structureSnapshot else { throw SyncV2ContractStructureError.unsupportedLocalBatch }
-        if step == .structure { return try buildGeneralStructureRepair(batch, serverID: serverID, epoch: epoch, writer: writer, build: build) }
+        if step == .structure { return try buildGeneralStructureRepair(batch, serverID: serverID, epoch: epoch, writer: writer, build: build, contract: contract) }
         var intents: [SyncV2StructureIntent] = []
         switch step {
         case .create, .update, .delete, .restore:
@@ -11667,7 +11687,7 @@ actor SyncV2Store:
             return try SyncV2Contract.buildDocumentCommitRequest(projectID: serverID, projectSyncMode: .idBased, migrationEpoch: epoch,
                 writerDeviceID: writer, documentID: id.rawValue, intentKind: intent, baseRevision: base,
                 parentFolderID: parent, name: name, content: content, isDeleted: step == .delete, structureRevision: revision,
-                operationID: operation, batchID: batch.batchID, clientBuildID: build)
+                operationID: operation, batchID: batch.batchID, clientBuildID: build, contract: contract)
         case .folders:
             var pending = batch.mutations
             var available = Set<UUID>(), removed = Set<UUID>()
@@ -11692,7 +11712,7 @@ actor SyncV2Store:
                 guard progressed else { throw SyncV2ContractStructureError.unsupportedLocalBatch }
             }
         case .orders, .removeOrders:
-            let tree = try SyncV2GeneralTree(generalStoredBaseline(localProjectID: batch.projectID, inTransaction: true))
+            let tree = try SyncV2GeneralTree(generalStoredBaseline(localProjectID: batch.projectID, inTransaction: true), contract: contract)
             let live = nodes.filter(\.isIncludedInTree), liveIDs = Set(live.map { $0.id.rawValue.uuidString.lowercased() })
             let parents = Set(tree.orders.keys).union([nil]).union(live.filter { $0.kind == .folder }.map { Optional($0.id.rawValue) })
             for parent in parents.sorted(by: { ($0?.uuidString ?? "") < ($1?.uuidString ?? "") }) {
@@ -11729,7 +11749,7 @@ actor SyncV2Store:
         }
         if intents.isEmpty { return nil }
         return try SyncV2Contract.buildAtomicStructureRequest(projectID: serverID, projectSyncMode: .idBased, migrationEpoch: epoch,
-            writerDeviceID: writer, orderedIntents: intents, batchID: batch.batchID, clientBuildID: build)
+            writerDeviceID: writer, orderedIntents: intents, batchID: batch.batchID, clientBuildID: build, contract: contract)
     }
 
     private func materializeGeneralContract(localProjectID: ProjectID) throws {
@@ -11757,7 +11777,7 @@ actor SyncV2Store:
                 guard let serverID = UUID(uuidString: row.2), let writerID = UUID(uuidString: row.3),
                       let mode = SyncV2ProjectSyncMode(rawValue: row.4), mode == .idBased,
                       batch.projectID == localProjectID, batch.batchID.uuidString.lowercased() == row.0,
-                      row.7 == SyncV2Contract.version, row.8 == SyncV2Contract.canonicalSHA256,
+                      let contract = try? SyncV2ReleasedContract(sha256: row.8), row.7 == contract.version,
                       row.9 == SyncV2Contract.syncProtocolVersion
                 else { throw SyncV2ContractStructureError.invalidStoredRequest }
                 // 구형 큐와 새 큐를 서로 다른 base로 동시에 보내지 않는다.
@@ -11770,7 +11790,7 @@ actor SyncV2Store:
                 if try expandGeneralContractIfNeeded(batch) { advanced = true; return }
                 let request: SyncV2ContractRequest
                 if batch.contractStep != nil {
-                    guard let step = try buildGeneralContractStep(batch, serverID: serverID, epoch: row.5, writer: writerID, build: row.10) else {
+                    guard let step = try buildGeneralContractStep(batch, serverID: serverID, epoch: row.5, writer: writerID, build: row.10, contract: contract) else {
                         try withStatement("UPDATE sync_contract_local_batches SET status='completed',last_error_code='NO_CHANGE_REQUIRED' WHERE batch_id=?;") { st in
                             try bind(row.0, at: 1, to: st); try stepDone(st)
                         }
@@ -11778,7 +11798,7 @@ actor SyncV2Store:
                     }
                     request = step
                 } else {
-                    request = try buildGeneralContract(batch, serverID: serverID, mode: mode, epoch: row.5, writerID: writerID, clientBuildID: row.10)
+                    request = try buildGeneralContract(batch, serverID: serverID, mode: mode, epoch: row.5, writerID: writerID, clientBuildID: row.10, contract: contract)
                 }
                 try persistContractRequest(request, localProjectID: localProjectID, serverProjectID: serverID)
                 try withStatement("UPDATE sync_contract_local_batches SET status = 'materialized' WHERE batch_id = ?;") { statement in
@@ -11798,7 +11818,7 @@ actor SyncV2Store:
     }
 
     private func buildGeneralContract(_ batch: LocalMutationBatch, serverID: UUID, mode: SyncV2ProjectSyncMode,
-        epoch: Int, writerID: UUID, clientBuildID: String, includeUnchangedOrderID: UUID? = nil, includeUnchangedRenameID: UUID? = nil) throws -> SyncV2ContractRequest {
+        epoch: Int, writerID: UUID, clientBuildID: String, contract: SyncV2ReleasedContract, includeUnchangedOrderID: UUID? = nil, includeUnchangedRenameID: UUID? = nil) throws -> SyncV2ContractRequest {
         if batch.mutations.count == 1,
            case let .documentSnapshot(operationID, id, path, content, _, _, false) = batch.mutations[0] {
             guard let state = try documentState(documentID: id.rawValue), state.localProjectID == batch.projectID.rawValue,
@@ -11810,7 +11830,7 @@ actor SyncV2Store:
                 migrationEpoch: epoch, writerDeviceID: writerID, documentID: id.rawValue, intentKind: .update,
                 baseRevision: state.serverRevision, parentFolderID: metadata.parent, name: metadata.name,
                 content: content, isDeleted: false, structureRevision: metadata.revision,
-                operationID: operationID, batchID: batch.batchID, clientBuildID: clientBuildID)
+                operationID: operationID, batchID: batch.batchID, clientBuildID: clientBuildID, contract: contract)
         }
         guard let nodes = batch.structureSnapshot, nodes.allSatisfy({ $0.projectID == batch.projectID }),
               Set(nodes.map(\.id)).count == nodes.count else { throw SyncV2ContractStructureError.unsupportedLocalBatch }
@@ -11927,7 +11947,7 @@ actor SyncV2Store:
         }
         guard !intents.isEmpty else { throw SyncV2ContractStructureError.unsupportedLocalBatch }
         return try SyncV2Contract.buildAtomicStructureRequest(projectID: serverID, projectSyncMode: mode,
-            migrationEpoch: epoch, writerDeviceID: writerID, orderedIntents: intents, batchID: batch.batchID, clientBuildID: clientBuildID)
+            migrationEpoch: epoch, writerDeviceID: writerID, orderedIntents: intents, batchID: batch.batchID, clientBuildID: clientBuildID, contract: contract)
     }
 
     private func contractDocumentMetadata(_ id: UUID) throws -> (parent: UUID?, name: String, revision: Int) {

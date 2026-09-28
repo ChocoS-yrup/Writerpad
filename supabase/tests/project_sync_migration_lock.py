@@ -3,6 +3,7 @@
 
 import os
 import subprocess
+import sys
 import time
 
 
@@ -20,9 +21,21 @@ def main():
             or os.environ.get("PGDATABASE") != "writerpad_stage7"):
         raise SystemExit("This fixture is restricted to the disposable server-contract CI database")
 
-    project = "08000000-0000-4000-8000-000000000901"
-    owner = "98000000-0000-4000-8000-000000000901"
-    editor = "98000000-0000-4000-8000-000000000902"
+    preparation = "--transition-prepare" in sys.argv
+    contract03 = "--transition-03" in sys.argv
+    transition = "--transition" in sys.argv or preparation or contract03
+    suffix = "931" if contract03 else "921" if preparation else "911" if transition else "901"
+    project = f"08000000-0000-4000-8000-000000000{suffix}"
+    owner = f"98000000-0000-4000-8000-000000000{suffix}"
+    editor = f"98000000-0000-4000-8000-{int(suffix)+1:012d}"
+    caller = owner if transition else editor
+    rpc = "prepare_project_sync_transition" if preparation else "get_project_sync_transition_plan" if transition else "validate_project_sync_migration"
+    argument = f"'{{\"project_id\":\"{project}\"}}'::jsonb" if preparation else f"'{project}'"
+    if contract03:
+        rpc = "get_project_sync_transition_plan_for_contract"
+        argument += ",'abbd234c7b65d422c2e43d468f4f724e069ede26a3d24be22eb8b35cce8ebf2c'"
+    revoke = (f"update public.projects set owner_id='{editor}' where project_id='{project}';"
+              if transition else f"delete from public.project_members where project_id='{project}' and user_id='{editor}';")
     query(f"""
         insert into auth.users(id) values ('{owner}'), ('{editor}');
         insert into public.projects(project_id, owner_id, name)
@@ -42,7 +55,7 @@ def main():
             begin;
             set local statement_timeout = '10s';
             select pg_advisory_xact_lock(hashtextextended('project:{project}', 0));
-            delete from public.project_members where project_id = '{project}' and user_id = '{editor}';
+            {revoke}
             select 'LOCK_READY';
         """)
         blocker.stdin.flush()
@@ -53,9 +66,9 @@ def main():
         validator = subprocess.Popen(
             ["psql", "-XAtq", "-v", "ON_ERROR_STOP=1", "-c", f"""
                 set statement_timeout = '10s';
-                select set_config('request.jwt.claim.sub', '{editor}', false);
+                select set_config('request.jwt.claim.sub', '{caller}', false);
                 set role authenticated;
-                select public.validate_project_sync_migration('{project}');
+                select public.{rpc}({argument});
             """],
             env={**os.environ, "PGAPPNAME": "writerpad-migration-lock-regression"},
             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
@@ -78,7 +91,7 @@ def main():
             raise AssertionError(f"revoked editor was not rejected after lock wait: {output} {error}")
         if query(f"select count(*) from public.project_sync_settings where project_id = '{project}'") != "0":
             raise AssertionError("validator changed project mode")
-        print("project_sync_migration_lock_passed: serialized validation rechecks revoked membership")
+        print(f"project_sync_migration_lock_passed: {rpc} rechecks revoked authorization")
     finally:
         for process in (validator, blocker):
             if process is not None and process.poll() is None:

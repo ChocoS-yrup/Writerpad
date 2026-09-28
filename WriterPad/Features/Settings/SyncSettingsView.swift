@@ -194,7 +194,7 @@ final class SyncSettingsModel: ObservableObject {
                   (try? await projectLister.projects().contains { $0.id == row.id && $0.isActive }) == true,
                   let context = SyncV2HandshakeContext.make(authenticationState: state,
                     localProjectID: row.id, serverProjectID: serverID,
-                    authenticationEpoch: ticket.authentication ?? 0, bindingEpoch: ticket.bindings ?? 0)
+                    authenticationEpoch: ticket.authentication ?? 0, bindingEpoch: ticket.bindings ?? 0, defaults: defaults)
             else {
                 if preparationIsCurrent(ticket, row: row) {
                     preparationReports[row.id] = SyncPreparationReport(error: SyncV2HandshakeError.identityUnknown)
@@ -305,6 +305,20 @@ final class SyncSettingsModel: ObservableObject {
         openContractPathProjectIDs.contains(row.project.id)
     }
 
+    func selectedContract(for row: SyncProjectRow) -> SyncV2ReleasedContract? {
+        ContractPathGate.selectedContract(for: row.id, in: defaults)
+    }
+
+    func selectContract(_ contract: SyncV2ReleasedContract?, for row: SyncProjectRow) {
+        guard let contract, !isWorking, !isSyncAllEnabled,
+              !openingContractPathProjectIDs.contains(row.id), !checkingPreparationProjectIDs.contains(row.id) else { return }
+        ContractPathGate.selectContract(contract, for: row.id, in: defaults)
+        openContractPathProjectIDs.remove(row.id)
+        invalidatePreparationReports()
+        gateReport = "계약 \(contract.version) 선택 · 기존 대기열은 변경하지 않았습니다. 새 준비 확인이 필요합니다."
+        Task { await handshakeService?.gateClosed() }
+    }
+
     @discardableResult
     func setGateOpen(_ isOpen: Bool, for row: SyncProjectRow, requiresIDBased: Bool = true) -> Task<Void, Never> {
         // 닫힘은 await 전에 반영한다. 열기는 새 조회가 끝난 뒤에만 허용한다.
@@ -339,7 +353,7 @@ final class SyncSettingsModel: ObservableObject {
                   let serverID = binding.serverProjectID,
                   let context = SyncV2HandshakeContext.make(authenticationState: state,
                       localProjectID: row.project.id, serverProjectID: serverID,
-                      authenticationEpoch: authEpoch, bindingEpoch: bindingEpoch)
+                      authenticationEpoch: authEpoch, bindingEpoch: bindingEpoch, defaults: defaults)
             else { gateReport = "로그인과 작품 연결을 확인해 주세요."; return }
             do {
                 // 캐시가 있어도 명시적 열기는 서버를 새로 확인한다.
@@ -615,7 +629,7 @@ final class SyncSettingsModel: ObservableObject {
             localProjectID: localProjectID,
             serverProjectID: serverProjectID,
             authenticationEpoch: authenticationService.contractEpoch?.value ?? 0,
-            bindingEpoch: projectBindingService.contractEpoch?.value ?? 0
+            bindingEpoch: projectBindingService.contractEpoch?.value ?? 0, defaults: defaults
         ) else {
             handshakeReport = "로그인 상태가 아니라 누구로서 묻는지 확정할 수 없습니다."
             return
@@ -1236,6 +1250,7 @@ struct SyncSettingsView: View {
     @State private var disconnectTarget: SyncProjectRow?
     @State private var generalRecoveryTarget: SyncProjectRow?
     @State private var enableProjectSyncTarget: SyncProjectRow?
+    @State private var transitionTarget: SyncProjectRow?
 #if DEBUG
     @State private var handshakeProjectIDText = ""
 #endif
@@ -1362,6 +1377,11 @@ struct SyncSettingsView: View {
             if let reader = model.generalRecoveryReader {
                 GeneralSyncRecoveryView(projectID: row.id, projectName: row.project.name, reader: reader)
             }
+        }
+        .sheet(item: $transitionTarget) { row in
+            if let transport = environment.supabaseClientProvider.makeTransitionTransport() {
+                SyncProjectTransitionView(row: row, environment: environment, transport: transport)
+            } else { Text("서버 연결을 사용할 수 없습니다.") }
         }
         .sheet(item: $connectionRequest) { request in
             ExistingProjectConnectionView(
@@ -1756,6 +1776,23 @@ struct SyncSettingsView: View {
                         }
 
                         if row.isConnected {
+                            Picker("이 작품의 동기화 계약", selection: Binding(
+                                get: { model.selectedContract(for: row) },
+                                set: { model.selectContract($0, for: row) })) {
+                                if model.selectedContract(for: row) == nil {
+                                    Text("알 수 없는 계약 · 확인 필요").tag(Optional<SyncV2ReleasedContract>.none)
+                                }
+                                Text("0.2 · 기존 작품").tag(Optional(SyncV2ReleasedContract.v02))
+                                Text("0.3 · Windows storage-name-v2").tag(Optional(SyncV2ReleasedContract.v03))
+                            }
+                            .disabled(model.isWorking || model.isSyncAllEnabled || model.isGateOpen(for: row) ||
+                                model.openingContractPathProjectIDs.contains(row.id) || model.checkingPreparationProjectIDs.contains(row.id))
+                            Text("서버 작품과 같은 계약을 선택하세요. 선택은 전환·전송을 하지 않으며, 다른 계약의 대기 요청은 그대로 보존되어 전송이 차단됩니다.")
+                                .font(.caption).foregroundStyle(.secondary)
+                            Button("동기화 형식 전환·재개…") { transitionTarget = row }
+                                .disabled(model.isWorking || model.isSyncAllEnabled || model.isGateOpen(for: row))
+                            Text("형식 전환은 전체·작품별 일반 동기화를 끈 상태에서만 가능합니다.")
+                                .font(.caption).foregroundStyle(.secondary)
                             Button("동기화 준비 확인 · 전송 없음") {
                                 model.checkSyncPreparation(for: row)
                             }

@@ -62,6 +62,7 @@ struct SyncV2ProjectHandoffResumer: Sendable {
             guard hasPending else { return 0 }
         }
         let context = SyncV2HandshakeContext(localProjectID: id, serverProjectID: serverID, accountID: account.userID,
+            clientContractSHA256: ContractPathGate.selectedContract(for: id, in: defaults.value)?.sha256 ?? "",
             authenticationEpoch: authRevision, bindingEpoch: bindingRevision)
         let handshake = try await handshakeService.refresh(context: context)
         try authorize()
@@ -274,16 +275,25 @@ extension SyncV2ContractRequest {
                                  writerDeviceID: UUID) throws {
         let fields = json.objectValue
         let batch = fields?["batch"]?.objectValue
+        let contract = try context.contract
+        guard handshake.contractVersion == contract.version, handshake.contractSHA256 == contract.sha256,
+              handshake.serverProjectID == context.serverProjectID else {
+            throw SyncV2ContractStructureError.invalidStoredRequest
+        }
+        try SyncV2Contract.requireServerCompatibility(projectSyncMode: handshake.projectSyncMode,
+            migrationEpoch: handshake.migrationEpoch, serverProtocolVersion: handshake.serverProtocolVersion,
+            serverContractSHA256: handshake.contractSHA256, serverCapabilities: handshake.serverCapabilities, contract: contract)
         guard ["atomic_structure_commit_request", "document_commit_request"].contains(fields?["kind"]?.stringValue ?? ""),
               fields?["project_id"]?.stringValue == context.serverProjectID.uuidString.lowercased(),
               fields?["project_sync_mode"]?.stringValue == handshake.projectSyncMode.rawValue,
               fields?["migration_epoch"]?.intValue == handshake.migrationEpoch,
               batch?["writer_device_id"]?.stringValue == writerDeviceID.uuidString.lowercased(),
-              batch?["contract_version"]?.stringValue == SyncV2Contract.version,
+              batch?["contract_version"]?.stringValue == contract.version,
               batch?["canonical_contract_sha256"]?.stringValue == context.clientContractSHA256,
               batch?["sync_protocol_version"]?.intValue == SyncV2Contract.syncProtocolVersion,
               let capabilities = batch?["client_capabilities"]?.arrayValue,
-              Set(capabilities.compactMap(\.stringValue)) == Set(SyncV2Contract.clientCapabilities),
+              capabilities.count == contract.clientCapabilities.count,
+              Set(capabilities.compactMap(\.stringValue)) == Set(contract.clientCapabilities),
               try SyncV2JSON.array(orderedIntents).sha256Hex() == batchPayloadSHA256
         else { throw SyncV2ContractStructureError.invalidStoredRequest }
         for intent in orderedIntents {
@@ -419,7 +429,7 @@ actor SyncV2ContractPathRecorder: DurableLocalChangeRecording {
             localProjectID: batch.projectID,
             serverProjectID: serverProjectID,
             authenticationEpoch: authRevision,
-            bindingEpoch: bindingRevision
+            bindingEpoch: bindingRevision, defaults: defaults.value
         )
         guard await handshakeService.usesContractStructure(
             context: context,
@@ -562,6 +572,12 @@ extension LazySyncV2ProjectBindingStore: SyncV2ContractQueue {}
 /// 일반 자동 전송과 명시적 검토 전송이 공유하는 전송기다. 전송 직전에 관문과
 /// 핸드셰크를 다시 확인하고, 로컬에 먼저 저장된 불변 요청만 보낸다.
 actor SyncV2ContractStructureSender: SyncV2GeneralContractSending, SyncV2GeneralRecoveryReading, SyncV2GeneralConflictResolving, SyncV2GeneralStructureResolving {
+    /// Conversion may not strand queued legacy writes behind protocol-3 enforcement.
+    func transitionQueueAuthorization(localProjectID: ProjectID) async throws -> @Sendable () throws -> Void {
+        guard !sendingProjects.contains(localProjectID) else { throw SyncV2ContractStructureError.uploadPullGateBusy }
+        try await store.ensurePreparationQueueIsIdle(localProjectID: localProjectID, excluding: nil)
+        return try await store.preparationQueueAuthorization(localProjectID: localProjectID, excluding: nil)
+    }
     private let store: any SyncV2ContractQueue
     private let transport: any SyncV2AtomicStructureTransporting
     private let handshakeService: SyncV2HandshakeService
@@ -624,7 +640,7 @@ actor SyncV2ContractStructureSender: SyncV2GeneralContractSending, SyncV2General
               binding.serverProjectID == SyncV2EmptyVolumeReview.projectID,
               let context = SyncV2HandshakeContext.make(authenticationState: await authenticationService.currentState(),
                 localProjectID: localProjectID, serverProjectID: SyncV2EmptyVolumeReview.projectID,
-                authenticationEpoch: authRevision ?? 0, bindingEpoch: bindingRevision ?? 0),
+                authenticationEpoch: authRevision ?? 0, bindingEpoch: bindingRevision ?? 0, defaults: defaults.value),
               binding.ownerSubject == context.accountID, try await isLocalProjectActive(localProjectID),
               let deviceIdentityProvider, let structureAuthority,
               localProjectEpoch?.isAvailable == true, bindingEpoch?.isAvailable == true else {
@@ -951,7 +967,7 @@ actor SyncV2ContractStructureSender: SyncV2GeneralContractSending, SyncV2General
               await handshakeService.canStartContractWrite(), try await isLocalProjectActive(localProjectID),
               let binding = try await store.binding(for: localProjectID), let serverID = binding.serverProjectID,
               let context = SyncV2HandshakeContext.make(authenticationState: await authenticationService.currentState(),
-                localProjectID: localProjectID, serverProjectID: serverID, authenticationEpoch: authRevision, bindingEpoch: bindingRevision),
+                localProjectID: localProjectID, serverProjectID: serverID, authenticationEpoch: authRevision, bindingEpoch: bindingRevision, defaults: defaults.value),
               binding.ownerSubject == context.accountID else { throw SyncV2GeneralConflictError.unavailable }
         if await handshakeService.standingHandshake(for: context) == nil { _ = try await handshakeService.refresh(context: context) }
         guard let handshake = await handshakeService.standingHandshake(for: context), handshake.projectSyncMode == .idBased else {
@@ -979,7 +995,7 @@ actor SyncV2ContractStructureSender: SyncV2GeneralContractSending, SyncV2General
         let first = try await transport.fetchGeneralBaseline(projectID: serverID)
         var remote: SyncV2JSON?
         if includeAllContent {
-            let ids = try SyncV2GeneralTree(first).activeDocumentIDs.sorted { $0.uuidString < $1.uuidString }
+            let ids = try SyncV2GeneralTree(first, contract: context.contract).activeDocumentIDs.sorted { $0.uuidString < $1.uuidString }
             guard ids.count <= 500 else { throw SyncV2GeneralConflictError.unsupported }
             var bodies: [SyncV2JSON] = [], bytes = 0
             for id in ids {
@@ -1035,7 +1051,7 @@ actor SyncV2ContractStructureSender: SyncV2GeneralContractSending, SyncV2General
         guard let binding = try? await store.binding(for: projectID), let serverID = binding.serverProjectID,
               let context = SyncV2HandshakeContext.make(authenticationState: await authenticationService.currentState(),
                 localProjectID: projectID, serverProjectID: serverID,
-                authenticationEpoch: authenticationService.contractEpoch?.value ?? 0, bindingEpoch: bindingEpoch?.value ?? 0),
+                authenticationEpoch: authenticationService.contractEpoch?.value ?? 0, bindingEpoch: bindingEpoch?.value ?? 0, defaults: defaults.value),
               let handshake = await handshakeService.standingHandshake(for: context) else { return true }
         return handshake.projectSyncMode != .legacy
     }
@@ -1124,7 +1140,7 @@ actor SyncV2ContractStructureSender: SyncV2GeneralContractSending, SyncV2General
               binding.kind != .localOnly, binding.serverProjectID == context.serverProjectID, binding.ownerSubject == context.accountID,
               SyncV2HandshakeContext.make(authenticationState: await authenticationService.currentState(),
                 localProjectID: localID, serverProjectID: context.serverProjectID,
-                authenticationEpoch: authEpoch.value, bindingEpoch: bindingEpoch.value) == context,
+                authenticationEpoch: authEpoch.value, bindingEpoch: bindingEpoch.value, defaults: defaults.value) == context,
               try await isLocalProjectActive(localID), await handshakeService.canStartContractWrite(),
               let handshake = await handshakeService.standingHandshake(for: context), handshake.projectSyncMode == .idBased
         else { throw SyncV2ContractStructureError.projectNotConnected }
@@ -1277,7 +1293,7 @@ actor SyncV2ContractStructureSender: SyncV2GeneralContractSending, SyncV2General
             authenticationState: await authenticationService.currentState(),
             localProjectID: localProjectID,
             serverProjectID: serverProjectID,
-            authenticationEpoch: authRevision, bindingEpoch: bindingRevision
+            authenticationEpoch: authRevision, bindingEpoch: bindingRevision, defaults: defaults.value
         ) else { throw SyncV2ContractStructureError.authenticationRequired }
         if generalOnly, binding.ownerSubject == context.accountID,
            GlobalSyncPreference.isEnabled(in: defaults.value), await handshakeService.canStartContractWrite(),

@@ -64,12 +64,14 @@ jobs:
           psql -v ON_ERROR_STOP=1 -f supabase/migrations/20260921125202_harden_legacy_function_privileges.sql
           psql -v ON_ERROR_STOP=1 -f supabase/migrations/20260927164330_harden_project_sync_migration_validation.sql
           psql -v ON_ERROR_STOP=1 -f supabase/migrations/20260927174805_correct_function_default_privileges.sql
+          psql -v ON_ERROR_STOP=1 -f supabase/migrations/20260927181453_product_sync_transition_initialization.sql
           psql -v ON_ERROR_STOP=1 -f supabase/migrations/20260825000000_restore_deployed_sync_handshake.sql
           psql -v ON_ERROR_STOP=1 -f supabase/migrations/20260910053721_general_contract_trash_purge.sql
           psql -v ON_ERROR_STOP=1 -f supabase/migrations/20260910072310_contract_migration_control_documents.sql
           psql -v ON_ERROR_STOP=1 -f supabase/migrations/20260921125202_harden_legacy_function_privileges.sql
           psql -v ON_ERROR_STOP=1 -f supabase/migrations/20260927164330_harden_project_sync_migration_validation.sql
           psql -v ON_ERROR_STOP=1 -f supabase/migrations/20260927174805_correct_function_default_privileges.sql
+          psql -v ON_ERROR_STOP=1 -f supabase/migrations/20260927181453_product_sync_transition_initialization.sql
       - name: Run authenticated sync handshake conformance
         run: psql -v ON_ERROR_STOP=1 -f supabase/tests/authenticated_sync_handshake.sql
 
@@ -168,6 +170,7 @@ jobs:
           psql -v ON_ERROR_STOP=1 -f supabase/migrations/20260921125202_harden_legacy_function_privileges.sql
           psql -v ON_ERROR_STOP=1 -f supabase/migrations/20260927164330_harden_project_sync_migration_validation.sql
           psql -v ON_ERROR_STOP=1 -f supabase/migrations/20260927174805_correct_function_default_privileges.sql
+          psql -v ON_ERROR_STOP=1 -f supabase/migrations/20260927181453_product_sync_transition_initialization.sql
           psql -v ON_ERROR_STOP=1 -f supabase/migrations/20260811010000_sync_contract_0_1_0_foundation.sql
           psql -v ON_ERROR_STOP=1 -f supabase/migrations/20260811020000_sync_contract_0_1_0_rpcs.sql
           psql -v ON_ERROR_STOP=1 -f supabase/migrations/20260813063251_sync_contract_0_3_0_storage_name_v2.sql
@@ -179,6 +182,7 @@ jobs:
           psql -v ON_ERROR_STOP=1 -f supabase/migrations/20260921125202_harden_legacy_function_privileges.sql
           psql -v ON_ERROR_STOP=1 -f supabase/migrations/20260927164330_harden_project_sync_migration_validation.sql
           psql -v ON_ERROR_STOP=1 -f supabase/migrations/20260927174805_correct_function_default_privileges.sql
+          psql -v ON_ERROR_STOP=1 -f supabase/migrations/20260927181453_product_sync_transition_initialization.sql
       - name: Run effective function default privilege regression
         run: psql -v ON_ERROR_STOP=1 -f supabase/tests/function_default_privileges.sql
       - name: Prove function default regression rejects schema-only revoke
@@ -198,8 +202,14 @@ jobs:
           grep -Fq "NEW_FUNCTION_EXECUTE_EXPOSED" /tmp/function-defaults-before.log
       - name: Run migration validation and completion regression
         run: psql -v ON_ERROR_STOP=1 -f supabase/tests/project_sync_migration_validation.sql
+      - name: Run product transition initialization regression
+        run: psql -v ON_ERROR_STOP=1 -f supabase/tests/project_sync_transition.sql
       - name: Run migration lock and authorization race regression
-        run: python supabase/tests/project_sync_migration_lock.py
+        run: |
+          python supabase/tests/project_sync_migration_lock.py
+          python supabase/tests/project_sync_migration_lock.py --transition
+          python supabase/tests/project_sync_migration_lock.py --transition-prepare
+          python supabase/tests/project_sync_migration_lock.py --transition-03
       - name: Prove migration regression rejects the previous validator
         shell: bash
         run: |

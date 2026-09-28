@@ -66,6 +66,31 @@ enum SyncV2Contract {
     ]
 }
 
+/// Released profiles are additive. Historical defaults and queued pins never move.
+enum SyncV2ReleasedContract: Sendable, CaseIterable, Hashable {
+    case v02, v03
+    init(sha256: String) throws {
+        guard let value = Self.allCases.first(where: { $0.sha256 == sha256 }) else {
+            throw SyncV2ContractError.contractDigestMismatch
+        }
+        self = value
+    }
+    func normalizeStorageName(_ name: String) throws -> String {
+        try self == .v02 ? SyncV2StorageName.normalize(name) : SyncV2StorageNameV2.normalize(name)
+    }
+    var version: String { self == .v02 ? SyncV2Contract.version : "0.3.0" }
+    var sha256: String {
+        self == .v02 ? SyncV2Contract.canonicalSHA256
+            : "abbd234c7b65d422c2e43d468f4f724e069ede26a3d24be22eb8b35cce8ebf2c"
+    }
+    var clientCapabilities: [String] {
+        SyncV2Contract.clientCapabilities.map { self == .v03 && $0 == "storage_name_v1" ? "storage_name_v2" : $0 }
+    }
+    var serverCapabilities: Set<String> {
+        Set(SyncV2Contract.requiredServerCapabilities.map { self == .v03 && $0 == "storage_name_v1" ? "storage_name_v2" : $0 })
+    }
+}
+
 // MARK: - 오류
 
 /// 계약이 정한 안정된 오류 코드를 나른다.
@@ -302,6 +327,42 @@ extension SyncV2JSON {
 
 // MARK: - storage-name 정규화
 
+/// 0.3's bounded NFKC pipeline, separate from the historical v1 path.
+enum SyncV2StorageNameV2 {
+    static func normalize(_ value: String) throws -> String {
+        let scalars = value.unicodeScalars.map(\.value)
+        guard scalars.allSatisfy(SyncV2StorageNameTables.isAssigned) else {
+            throw SyncV2ContractError("STORAGE_NAME_UNASSIGNED")
+        }
+        guard !scalars.contains(where: { scalar in SyncV2StorageNameTables.excluded.contains { $0.contains(scalar) } }) else {
+            throw SyncV2ContractError("STORAGE_NAME_UNSUPPORTED_SCALAR")
+        }
+        for (previous, current) in zip(scalars, scalars.dropFirst()) where previous > 0xFFFF {
+            guard current != 0xFF9E, current != 0xFF9F, !SyncV2StorageNameTables.nonzeroCCC.contains(current) else {
+                throw SyncV2ContractError.storageNameInvalid
+            }
+        }
+        let normalized = SyncV2UnicodeCasefold.apply(value.precomposedStringWithCompatibilityMapping)
+            .precomposedStringWithCompatibilityMapping
+        guard !normalized.unicodeScalars.contains(where: { $0 == "/" || $0 == "\\" || $0.value <= 31 || $0.value == 127 }) else {
+            throw SyncV2ContractError.storageNameInvalid
+        }
+        guard normalized.unicodeScalars.allSatisfy({ SyncV2StorageNameTables.isAssigned($0.value) }) else {
+            throw SyncV2ContractError("STORAGE_NAME_UNASSIGNED")
+        }
+        // Scalar trimming, not grapheme trimming (a combining mark is significant).
+        var result = normalized.unicodeScalars
+        while let last = result.last, last == " " || last == "." { result.removeLast() }
+        let name = String(result)
+        guard !name.isEmpty else { throw SyncV2ContractError.storageNameInvalid }
+        let basename = String(name.split(separator: ".", maxSplits: 1, omittingEmptySubsequences: false)[0])
+        guard !SyncV2StorageName.reservedBasenames.contains(basename) else {
+            throw SyncV2ContractError.storageNameReserved
+        }
+        return name
+    }
+}
+
 /// 이름 충돌을 판정하는 정규화다.
 ///
 /// 아이패드는 자모가 분해된 이름을, Windows는 결합된 이름을 만들 수 있다. 두
@@ -332,7 +393,7 @@ extension SyncV2JSON {
 ///   측정 결과와 스칼라 목록은 저장소 뿌리의 `윈도우세션_회신*.md`와
 ///   `유니코드측정_*.json`에 있다.
 enum SyncV2StorageName {
-    private static let reservedBasenames: Set<String> = {
+    fileprivate static let reservedBasenames: Set<String> = {
         var names: Set<String> = ["con", "prn", "aux", "nul"]
         for index in 1...9 {
             names.insert("com\(index)")
@@ -460,7 +521,8 @@ extension SyncV2Contract {
         migrationEpoch: Int,
         serverProtocolVersion: Int,
         serverContractSHA256: String,
-        serverCapabilities: some Sequence<String>
+        serverCapabilities: some Sequence<String>,
+        contract: SyncV2ReleasedContract = .v02
     ) throws {
         guard isValidModeEpoch(projectSyncMode, migrationEpoch) else {
             throw SyncV2ContractError.staleMigrationEpoch
@@ -468,10 +530,10 @@ extension SyncV2Contract {
         guard serverProtocolVersion >= syncProtocolVersion else {
             throw SyncV2ContractError.protocolTooOld
         }
-        guard serverContractSHA256 == canonicalSHA256 else {
+        guard serverContractSHA256 == contract.sha256 else {
             throw SyncV2ContractError.contractDigestMismatch
         }
-        guard requiredServerCapabilities.isSubset(of: Set(serverCapabilities)) else {
+        guard contract.serverCapabilities.isSubset(of: Set(serverCapabilities)) else {
             throw SyncV2ContractError.capabilityMismatch
         }
     }
@@ -547,16 +609,17 @@ extension SyncV2Contract {
         batchID: UUID,
         writerDeviceID: UUID,
         clientBuildID: String,
-        batchPayloadSHA256: String
+        batchPayloadSHA256: String,
+        contract: SyncV2ReleasedContract = .v02
     ) -> SyncV2JSON {
         .object([
             "batch_id": .string(canonicalUUID(batchID)),
             "writer_device_id": .string(canonicalUUID(writerDeviceID)),
             "client_build_id": .string(clientBuildID),
             "sync_protocol_version": .int(syncProtocolVersion),
-            "contract_version": .string(version),
-            "canonical_contract_sha256": .string(canonicalSHA256),
-            "client_capabilities": .array(clientCapabilities.map { .string($0) }),
+            "contract_version": .string(contract.version),
+            "canonical_contract_sha256": .string(contract.sha256),
+            "client_capabilities": .array(contract.clientCapabilities.map { .string($0) }),
             "batch_payload_sha256": .string(batchPayloadSHA256),
         ])
     }
@@ -572,13 +635,23 @@ extension SyncV2Contract {
         writerDeviceID: UUID,
         orderedIntents: [SyncV2StructureIntent],
         batchID: UUID = UUID(),
-        clientBuildID: String = SyncV2Contract.clientBuildID
+        clientBuildID: String = SyncV2Contract.clientBuildID,
+        contract: SyncV2ReleasedContract = .v02
     ) throws -> SyncV2ContractRequest {
         guard isValidModeEpoch(projectSyncMode, migrationEpoch) else {
             throw SyncV2ContractError.invalidArgument
         }
         guard !orderedIntents.isEmpty else {
             throw SyncV2ContractError.invalidArgument
+        }
+        // The migration extension remains bounded independently of ordinary writes.
+        if contract == .v03 && projectSyncMode != .idBased {
+            guard projectSyncMode == .migrating, migrationEpoch == 1, orderedIntents.count == 1,
+                  orderedIntents[0].entityKind == .project, orderedIntents[0].intentKind == .migrate,
+                  orderedIntents[0].entityID == projectID, orderedIntents[0].baseRevision == 0,
+                  orderedIntents[0].payload.objectValue?["target_contract_sha256"] == .string(contract.sha256),
+                  orderedIntents[0].payload.objectValue?["name"] == nil
+            else { throw SyncV2ContractError("TRANSITION_UNSUPPORTED") }
         }
 
         var intents: [SyncV2JSON] = []
@@ -592,7 +665,7 @@ extension SyncV2Contract {
             // 이름이 실려 있으면 보내기 전에 규칙 위반을 걸러 낸다. 값 자체는
             // 원본을 그대로 보낸다. 정규화 결과는 충돌 판정에만 쓰인다.
             if let name = payloadFields["name"]?.stringValue {
-                _ = try SyncV2StorageName.normalize(name)
+                _ = try contract.normalizeStorageName(name)
             }
 
             var intent: [String: SyncV2JSON] = [
@@ -622,7 +695,8 @@ extension SyncV2Contract {
                 batchID: batchID,
                 writerDeviceID: writerDeviceID,
                 clientBuildID: clientBuildID,
-                batchPayloadSHA256: batchPayloadSHA256
+                batchPayloadSHA256: batchPayloadSHA256,
+                contract: contract
             ),
             "ordered_intents": .array(intents),
         ])
@@ -651,7 +725,8 @@ extension SyncV2Contract {
         operationID: UUID = UUID(),
         batchID: UUID = UUID(),
         supersedesOperationID: UUID? = nil,
-        clientBuildID: String = SyncV2Contract.clientBuildID
+        clientBuildID: String = SyncV2Contract.clientBuildID,
+        contract: SyncV2ReleasedContract = .v02
     ) throws -> SyncV2ContractRequest {
         guard isValidModeEpoch(projectSyncMode, migrationEpoch) else {
             throw SyncV2ContractError.invalidArgument
@@ -671,7 +746,7 @@ extension SyncV2Contract {
         {
             throw SyncV2ContractError.invalidArgument
         }
-        _ = try SyncV2StorageName.normalize(name)
+        _ = try contract.normalizeStorageName(name)
 
         let contentDigest = SHA256.hash(data: body)
             .map { String(format: "%02x", $0) }
@@ -712,7 +787,8 @@ extension SyncV2Contract {
                 batchID: batchID,
                 writerDeviceID: writerDeviceID,
                 clientBuildID: clientBuildID,
-                batchPayloadSHA256: batchPayloadSHA256
+                batchPayloadSHA256: batchPayloadSHA256,
+                contract: contract
             ),
             "ordered_intents": .array(intents),
         ])

@@ -1,5 +1,270 @@
 import Foundation
 import XCTest
+
+extension SyncV2ContractTests {
+    func testStorageNameV2ReleasedWindowsVectors() throws {
+        let fixture = #"""
+{
+  "$schema": "../storage-name-vectors.schema.json",
+  "contract_version": "0.3.0",
+  "algorithm_id": "storage-name-v2",
+  "baseline_unicode_version": "14.0.0",
+  "vectors": [
+    {
+      "vector_id": "SN-001",
+      "input": "Résumé",
+      "valid": true,
+      "normalized": "résumé",
+      "utf8_hex": "72c3a973756dc3a9"
+    },
+    {
+      "vector_id": "SN-002",
+      "input": "Résumé",
+      "valid": true,
+      "normalized": "résumé",
+      "utf8_hex": "72c3a973756dc3a9"
+    },
+    {
+      "vector_id": "SN-003",
+      "input": "FILE.TXT",
+      "valid": true,
+      "normalized": "file.txt",
+      "utf8_hex": "66696c652e747874"
+    },
+    {
+      "vector_id": "SN-004",
+      "input": "File. ",
+      "valid": true,
+      "normalized": "file",
+      "utf8_hex": "66696c65"
+    },
+    {
+      "vector_id": "SN-005",
+      "input": "폴더",
+      "valid": true,
+      "normalized": "폴더",
+      "utf8_hex": "ed8fb4eb8d94"
+    },
+    {
+      "vector_id": "SN-006",
+      "input": "İ",
+      "valid": true,
+      "normalized": "i̇",
+      "utf8_hex": "69cc87"
+    },
+    {
+      "vector_id": "SN-007",
+      "input": "Straße",
+      "valid": true,
+      "normalized": "strasse",
+      "utf8_hex": "73747261737365"
+    },
+    {
+      "vector_id": "SN-008",
+      "input": " leading",
+      "valid": true,
+      "normalized": " leading",
+      "utf8_hex": "206c656164696e67"
+    },
+    {
+      "vector_id": "SN-009",
+      "input": "A B",
+      "valid": true,
+      "normalized": "a b",
+      "utf8_hex": "612062"
+    },
+    {
+      "vector_id": "SN-010",
+      "input": "ＡＢＣ",
+      "valid": true,
+      "normalized": "abc",
+      "utf8_hex": "616263"
+    },
+    {
+      "vector_id": "SN-011",
+      "input": "CON.txt",
+      "valid": false,
+      "error_code": "STORAGE_NAME_RESERVED"
+    },
+    {
+      "vector_id": "SN-012",
+      "input": "folder/name",
+      "valid": false,
+      "error_code": "STORAGE_NAME_INVALID"
+    },
+    {
+      "vector_id": "SN-013",
+      "input": "folder\\name",
+      "valid": false,
+      "error_code": "STORAGE_NAME_INVALID"
+    },
+    {
+      "vector_id": "SN-014",
+      "input": ". ",
+      "valid": false,
+      "error_code": "STORAGE_NAME_INVALID"
+    },
+    {
+      "vector_id": "SN-015",
+      "input": "",
+      "valid": false,
+      "error_code": "STORAGE_NAME_INVALID"
+    },
+    {
+      "vector_id": "SN-016",
+      "input": "a／b",
+      "valid": false,
+      "error_code": "STORAGE_NAME_INVALID"
+    },
+    {
+      "vector_id": "SN-017",
+      "input": "℅",
+      "valid": false,
+      "error_code": "STORAGE_NAME_INVALID"
+    },
+    {
+      "vector_id": "SN-018",
+      "input": "﹨",
+      "valid": false,
+      "error_code": "STORAGE_NAME_INVALID"
+    },
+    {
+      "vector_id": "SN-019",
+      "input": "a\uE000b",
+      "valid": false,
+      "error_code": "STORAGE_NAME_UNSUPPORTED_SCALAR"
+    },
+    {
+      "vector_id": "SN-020",
+      "input": "\uDB40\uDC41",
+      "valid": false,
+      "error_code": "STORAGE_NAME_UNSUPPORTED_SCALAR"
+    },
+    {
+      "vector_id": "SN-021",
+      "input": "\uDB40\uDD00",
+      "valid": false,
+      "error_code": "STORAGE_NAME_UNSUPPORTED_SCALAR"
+    },
+    {
+      "vector_id": "SN-022",
+      "input": "\uD833\uDCD6",
+      "valid": false,
+      "error_code": "STORAGE_NAME_UNASSIGNED"
+    },
+    {
+      "vector_id": "SN-023",
+      "input": "\uD803\uDD50",
+      "valid": false,
+      "error_code": "STORAGE_NAME_UNASSIGNED"
+    },
+    {
+      "vector_id": "SN-024",
+      "input": "\uD80C\uDC46́",
+      "valid": false,
+      "error_code": "STORAGE_NAME_INVALID"
+    },
+    {
+      "vector_id": "SN-025",
+      "input": "\uD80C\uDC46ﾞ",
+      "valid": false,
+      "error_code": "STORAGE_NAME_INVALID"
+    },
+    {
+      "vector_id": "SN-026",
+      "input": "\uD80C\uDC46a",
+      "valid": true,
+      "normalized": "\uD80C\uDC46a",
+      "utf8_hex": "f093818661"
+    },
+    {
+      "vector_id": "SN-027",
+      "input": "🙂️",
+      "valid": true,
+      "normalized": "🙂️",
+      "utf8_hex": "f09f9982efb88f"
+    },
+    {
+      "vector_id": "SN-028",
+      "input": "ꭰ",
+      "valid": true,
+      "normalized": "Ꭰ",
+      "utf8_hex": "e18ea0"
+    },
+    {
+      "vector_id": "SN-029",
+      "input": "ᲀ",
+      "valid": true,
+      "normalized": "в",
+      "utf8_hex": "d0b2"
+    }
+  ]
+}
+"""#
+        let root = try JSONDecoder().decode(SyncV2JSON.self, from: Data(fixture.utf8))
+        let vectors = try XCTUnwrap(root.objectValue?["vectors"]?.arrayValue)
+        XCTAssertEqual(vectors.count, 29)
+        for vector in vectors {
+            let fields = try XCTUnwrap(vector.objectValue)
+            let input = try XCTUnwrap(fields["input"]?.stringValue)
+            let id = fields["vector_id"]?.stringValue ?? ""
+            do {
+                let normalized = try SyncV2StorageNameV2.normalize(input)
+                XCTAssertEqual(fields["valid"], .bool(true), id)
+                XCTAssertEqual(Data(normalized.utf8), Data((fields["normalized"]?.stringValue ?? "").utf8), id)
+                XCTAssertEqual(SyncV2StorageName.utf8Hex(normalized), fields["utf8_hex"]?.stringValue, id)
+            } catch let error as SyncV2ContractError {
+                XCTAssertEqual(fields["valid"], .bool(false), id)
+                XCTAssertEqual(error.code, fields["error_code"]?.stringValue, id)
+            }
+        }
+    }
+
+    func testStorageNameV2FrozenBoundariesAndErrorPrecedence() throws {
+        XCTAssertEqual(SyncV2StorageNameTables.assigned.count, 698)
+        XCTAssertEqual(SyncV2StorageNameTables.nonzeroCCC.count, 912)
+        // Assigned rejection precedes exclusions over the entire input.
+        XCTAssertThrowsError(try SyncV2StorageNameV2.normalize("\u{E000}\u{1CCD6}")) {
+            XCTAssertEqual(($0 as? SyncV2ContractError)?.code, "STORAGE_NAME_UNASSIGNED")
+        }
+        for scalar in SyncV2StorageName.divergentScalars.flatMap({ Array($0) }) {
+            XCTAssertThrowsError(try SyncV2StorageNameV2.normalize(String(Unicode.Scalar(scalar)!))) {
+                XCTAssertEqual(($0 as? SyncV2ContractError)?.code, "STORAGE_NAME_UNASSIGNED")
+            }
+        }
+        for scalar in [UInt32(0x301), 0xFF9E, 0xFF9F] {
+            XCTAssertThrowsError(try SyncV2StorageNameV2.normalize("\u{13046}" + String(Unicode.Scalar(scalar)!)))
+        }
+        XCTAssertNoThrow(try SyncV2StorageNameV2.normalize("\u{1F642}\u{FE0F}"))
+        XCTAssertEqual(try SyncV2StorageNameV2.normalize("A. "), "a")
+        XCTAssertThrowsError(try SyncV2StorageNameV2.normalize("℅"))
+        // Historical v1 behavior is deliberately not silently changed.
+        XCTAssertEqual(try SyncV2StorageName.normalize("℅"), "c/o")
+    }
+
+    func testExplicit03DocumentAndStructureMetadataAndNameValidation() throws {
+        let profile = SyncV2ReleasedContract.v03
+        let document = try SyncV2Contract.buildDocumentCommitRequest(projectID: projectID, projectSyncMode: .idBased,
+            migrationEpoch: 1, writerDeviceID: deviceID, documentID: documentID, intentKind: .create,
+            baseRevision: 0, parentFolderID: nil, name: "문서.txt", content: "본문", isDeleted: false,
+            structureRevision: 1, contract: profile)
+        let structure = try SyncV2Contract.buildAtomicStructureRequest(projectID: projectID, projectSyncMode: .idBased,
+            migrationEpoch: 1, writerDeviceID: deviceID,
+            orderedIntents: [.init(entityKind: .folder, entityID: folderID, intentKind: .create,
+                payload: .object(["name": .string("폴더")]))], contract: profile)
+        for request in [document, structure] {
+            let batch = try XCTUnwrap(request.json.objectValue?["batch"]?.objectValue)
+            XCTAssertEqual(batch["contract_version"], .string("0.3.0"))
+            XCTAssertEqual(batch["canonical_contract_sha256"], .string(profile.sha256))
+            XCTAssertEqual(batch["client_capabilities"], .array(profile.clientCapabilities.map(SyncV2JSON.string)))
+        }
+        XCTAssertThrowsError(try SyncV2Contract.buildDocumentCommitRequest(projectID: projectID, projectSyncMode: .idBased,
+            migrationEpoch: 1, writerDeviceID: deviceID, documentID: documentID, intentKind: .create,
+            baseRevision: 0, parentFolderID: nil, name: "℅", content: "", isDeleted: false,
+            structureRevision: 1, contract: profile))
+    }
+}
+
 @testable import WriterPad
 
 /// 계약 0.2.0을 Windows와 똑같이 계산하는지 확인한다.

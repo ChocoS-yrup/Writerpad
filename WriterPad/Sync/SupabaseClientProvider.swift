@@ -10,6 +10,7 @@ protocol SupabaseClientProviding: AnyObject {
     func makeSyncV2Client() -> SyncV2Client?
     func makeHandshakeTransport() -> (any SyncV2HandshakeTransporting)?
     func makeAtomicStructureTransport() -> (any SyncV2AtomicStructureTransporting)?
+    func makeTransitionTransport() -> (any SyncV2TransitionTransporting)?
     func makeSnapshotClient() -> SyncV2SnapshotClient?
     func makeRealtimeTrigger() -> (any SyncV2RealtimeTriggering)?
     func makeEditLeaseClient() -> EditLeaseClient?
@@ -19,6 +20,7 @@ extension SupabaseClientProviding {
     func makeServerCatalogTransport() -> (any ServerProjectCatalogTransporting)? { nil }
     func makeHandshakeTransport() -> (any SyncV2HandshakeTransporting)? { nil }
     func makeAtomicStructureTransport() -> (any SyncV2AtomicStructureTransporting)? { nil }
+    func makeTransitionTransport() -> (any SyncV2TransitionTransporting)? { nil }
     func makeSnapshotClient() -> SyncV2SnapshotClient? { nil }
     func makeRealtimeTrigger() -> (any SyncV2RealtimeTriggering)? { nil }
 }
@@ -165,10 +167,13 @@ final class SupabaseClientProvider: SupabaseClientProviding {
 
     func makeSnapshotClient() -> SyncV2SnapshotClient? {
         client.map {
-            SyncV2SnapshotClient(
-                transport: LiveSyncV2SnapshotTransport(client: $0, receiveClients: receiveClients)
-            )
+            SyncV2SnapshotClient(transport: LiveSyncV2SnapshotTransport(client: $0, receiveClients: receiveClients))
         }
+    }
+
+    func makeTransitionTransport() -> (any SyncV2TransitionTransporting)? {
+        guard case .configured(let configuration) = configurationState else { return nil }
+        return client.map { LiveSyncV2TransitionTransport(client: $0, configuration: configuration) }
     }
 
     func makeRealtimeTrigger() -> (any SyncV2RealtimeTriggering)? {
