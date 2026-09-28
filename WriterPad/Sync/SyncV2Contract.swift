@@ -66,6 +66,23 @@ enum SyncV2Contract {
     ]
 }
 
+/// Additive released pins. The ordinary sender keeps its existing 0.2 default;
+/// 0.3 is explicitly selected only by the bounded transition coordinator.
+enum SyncV2ReleasedContract: Sendable {
+    case v02, v03
+    var version: String { self == .v02 ? SyncV2Contract.version : "0.3.0" }
+    var sha256: String {
+        self == .v02 ? SyncV2Contract.canonicalSHA256
+            : "abbd234c7b65d422c2e43d468f4f724e069ede26a3d24be22eb8b35cce8ebf2c"
+    }
+    var clientCapabilities: [String] {
+        SyncV2Contract.clientCapabilities.map { self == .v03 && $0 == "storage_name_v1" ? "storage_name_v2" : $0 }
+    }
+    var serverCapabilities: Set<String> {
+        Set(SyncV2Contract.requiredServerCapabilities.map { self == .v03 && $0 == "storage_name_v1" ? "storage_name_v2" : $0 })
+    }
+}
+
 // MARK: - 오류
 
 /// 계약이 정한 안정된 오류 코드를 나른다.
@@ -460,7 +477,8 @@ extension SyncV2Contract {
         migrationEpoch: Int,
         serverProtocolVersion: Int,
         serverContractSHA256: String,
-        serverCapabilities: some Sequence<String>
+        serverCapabilities: some Sequence<String>,
+        contract: SyncV2ReleasedContract = .v02
     ) throws {
         guard isValidModeEpoch(projectSyncMode, migrationEpoch) else {
             throw SyncV2ContractError.staleMigrationEpoch
@@ -468,10 +486,10 @@ extension SyncV2Contract {
         guard serverProtocolVersion >= syncProtocolVersion else {
             throw SyncV2ContractError.protocolTooOld
         }
-        guard serverContractSHA256 == canonicalSHA256 else {
+        guard serverContractSHA256 == contract.sha256 else {
             throw SyncV2ContractError.contractDigestMismatch
         }
-        guard requiredServerCapabilities.isSubset(of: Set(serverCapabilities)) else {
+        guard contract.serverCapabilities.isSubset(of: Set(serverCapabilities)) else {
             throw SyncV2ContractError.capabilityMismatch
         }
     }
@@ -547,16 +565,17 @@ extension SyncV2Contract {
         batchID: UUID,
         writerDeviceID: UUID,
         clientBuildID: String,
-        batchPayloadSHA256: String
+        batchPayloadSHA256: String,
+        contract: SyncV2ReleasedContract = .v02
     ) -> SyncV2JSON {
         .object([
             "batch_id": .string(canonicalUUID(batchID)),
             "writer_device_id": .string(canonicalUUID(writerDeviceID)),
             "client_build_id": .string(clientBuildID),
             "sync_protocol_version": .int(syncProtocolVersion),
-            "contract_version": .string(version),
-            "canonical_contract_sha256": .string(canonicalSHA256),
-            "client_capabilities": .array(clientCapabilities.map { .string($0) }),
+            "contract_version": .string(contract.version),
+            "canonical_contract_sha256": .string(contract.sha256),
+            "client_capabilities": .array(contract.clientCapabilities.map { .string($0) }),
             "batch_payload_sha256": .string(batchPayloadSHA256),
         ])
     }
@@ -572,13 +591,24 @@ extension SyncV2Contract {
         writerDeviceID: UUID,
         orderedIntents: [SyncV2StructureIntent],
         batchID: UUID = UUID(),
-        clientBuildID: String = SyncV2Contract.clientBuildID
+        clientBuildID: String = SyncV2Contract.clientBuildID,
+        contract: SyncV2ReleasedContract = .v02
     ) throws -> SyncV2ContractRequest {
         guard isValidModeEpoch(projectSyncMode, migrationEpoch) else {
             throw SyncV2ContractError.invalidArgument
         }
         guard !orderedIntents.isEmpty else {
             throw SyncV2ContractError.invalidArgument
+        }
+        // This additive path does not claim that the ordinary 0.2 writer and
+        // its local name normalizer have been upgraded to 0.3.
+        if contract == .v03 {
+            guard projectSyncMode == .migrating, migrationEpoch == 1, orderedIntents.count == 1,
+                  orderedIntents[0].entityKind == .project, orderedIntents[0].intentKind == .migrate,
+                  orderedIntents[0].entityID == projectID, orderedIntents[0].baseRevision == 0,
+                  orderedIntents[0].payload.objectValue?["target_contract_sha256"] == .string(contract.sha256),
+                  orderedIntents[0].payload.objectValue?["name"] == nil
+            else { throw SyncV2ContractError("TRANSITION_UNSUPPORTED") }
         }
 
         var intents: [SyncV2JSON] = []
@@ -622,7 +652,8 @@ extension SyncV2Contract {
                 batchID: batchID,
                 writerDeviceID: writerDeviceID,
                 clientBuildID: clientBuildID,
-                batchPayloadSHA256: batchPayloadSHA256
+                batchPayloadSHA256: batchPayloadSHA256,
+                contract: contract
             ),
             "ordered_intents": .array(intents),
         ])

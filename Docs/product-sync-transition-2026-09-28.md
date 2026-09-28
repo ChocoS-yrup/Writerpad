@@ -18,7 +18,8 @@ iPad 시작·검증·완료·재개, 회귀시험 및 PR 준비를 승인했다.
 2. 전환 시작 및 구조 준비: 별도 확인 후 서버에서 원자적으로 수행한다.
 3. 전환 검증: 조회만 수행하며 완료하지 않는다.
 4. 전환 완료: 검증 성공 후 다시 명시적으로 확인해야 ID_BASED가 된다.
-5. 일반 동기화 활성화: 전환과 별개인 기존 opt-in을 사용한다.
+5. 일반 동기화는 별도다. 이번 화면의 0.3 전환 완료는 기존 iPad 0.2 일반 송신의
+   0.3 지원·활성화를 뜻하지 않는다. 기존 sender/gate는 다른 digest를 계속 거부한다.
 
 ## 공유 계약의 식별
 
@@ -30,7 +31,7 @@ iPad 시작·검증·완료·재개, 회귀시험 및 PR 준비를 승인했다.
 - 정확한 UTF-8/LF 파일 바이트 SHA-256:
   `5c5736ec9bda42f80b75dd8f863bb01b0bba8cef1ebe96675333db634b560c81`.
 - 이것은 base canonical contract digest를 대체하는 값이 아니다.
-- 현재 확장은 base 0.2.0만 지원한다. 0.3 활성 작품을 임의로 다시 pin하지 않는다.
+- v1 확장은 base 0.2.0만 지원하며 원본 바이트와 기존 요청 의미를 유지한다.
 - 서버 discovery의 확장 SHA와 앱의 pin이 다르면 시작하지 않는다.
 - 구서버에 새 RPC가 없는 경우도 지원하지 않는 것으로 처리한다.
 - 확장 해시는 immutable operation payload 안에 포함돼 요청 digest의 보호를 받는다.
@@ -39,6 +40,36 @@ iPad 시작·검증·완료·재개, 회귀시험 및 PR 준비를 승인했다.
 
 공통 성공/실패 의미가 추가되므로 Windows 읽기 전용 호환성 검토 대상이다.
 Windows CI의 스키마/벡터/해시 검사는 Windows 실앱 시험의 대체가 아니다.
+
+### Windows PR #11 대응: 추가 0.3 전환 확장
+
+Windows `WriterPad_main` PR #11 `95252c08df654563179d88a0afb1d3cea4793eb4`의
+`sync_contract.py`와 대조했다. Python 3.14.7 변경이나 Windows 코드는 수정하지 않는다.
+그 클라이언트의 계약은 0.3.0 / protocol 3 / SHA `abbd234c…`, storage-name-v2다.
+
+`sync-contract/migration-initialization-v2.json`을 **추가**한다. 기존 v1/0.2/0.3 pin을
+교체하지 않는다. 새 확장 SHA-256은
+`07e2e557921c17750f960d6b88b72dadb15d3aee45658d5260a3494607012b77`이다.
+
+- `get_project_sync_transition_plan_for_contract(project_id,target_contract_sha256)`가
+  소유권·잠금·allowlist의 enabled/revoked/valid_from 및 현재 작품 target을 검사한다.
+- 같은 잠금 아래 실제 `get_sync_handshake` 응답을 계획에 포함한다. iPad는 시작 전과
+  완료 후 모두 version, canonical/server digest, protocol, capability, 작품·mode·epoch를
+  검사한다. 없는 RPC, 비활성 계약, 잘못된 target은 0.2로 fallback하지 않고 거부한다.
+- preflight부터 선택한 target을 transaction-local `writerpad.contract_sha256`에 설정한다.
+  기존 storage_name_v1 호환 dispatcher가 0.3에서는 동결 storage_name_v2를 호출한다.
+  prepare와 기존 validator/complete까지 같은 digest를 사용한다. 과거 v2 migration은 불변이다.
+- v2 immutable payload는 `target_contract_sha256`도 포함하며 batch target과 일치해야 한다.
+  활성 0.2 작품을 0.3으로 repin하거나 0.3 작품을 0.2로 downgrade하지 않는다.
+- iPad 제품 전환 화면은 0.3 target을 명시한다. 서버가 보낸 초기화 payload를 재전송하며
+  이름 정규화는 인증된 서버에 맡긴다. 일반 0.2 request builder/handshake/sender 기본값은
+  유지하고, 추가 0.3 builder는 단일 project/migrate에만 제한한다.
+- **일반 iPad 편집 송수신의 storage-name-v2 구현 및 다기기 E2E는 별도 미완료 항목**이다.
+  이 제한을 감추기 위해 일반 게이트를 열거나 capability 검사를 완화하지 않는다.
+- 기존 0.2 journal을 0.3 요청으로 재작성하지 않는다. 불확실한 응답은 원본을 보존한다.
+
+배포·allowlist 활성화·실제 작품 전환은 이 구현에 포함하지 않는다. 테스트의 allowlist
+활성화는 폐기형 CI DB의 rollback transaction 내부에서만 수행한다.
 
 ## 서버
 

@@ -518,6 +518,11 @@ def main() -> None:
     if load_json(profile_path).get("base_contract_sha256") != canonical_digest:
         fail("migration initialization extension base contract mismatch")
     print(f"Validated additive migration initialization profile: {profile_digest}")
+    profile_v2 = CONTRACT_DIR / "migration-initialization-v2.json"
+    if hashlib.sha256(profile_v2.read_bytes()).hexdigest() != "07e2e557921c17750f960d6b88b72dadb15d3aee45658d5260a3494607012b77":
+        fail("0.3 migration initialization extension digest mismatch")
+    if load_json(profile_v2).get("base_contract_sha256") != "abbd234c7b65d422c2e43d468f4f724e069ede26a3d24be22eb8b35cce8ebf2c":
+        fail("0.3 migration initialization base contract mismatch")
 
     vector_ids: set[str] = set()
     vectors: list[dict[str, Any]] = []

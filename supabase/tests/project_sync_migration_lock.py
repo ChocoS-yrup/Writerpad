@@ -22,14 +22,18 @@ def main():
         raise SystemExit("This fixture is restricted to the disposable server-contract CI database")
 
     preparation = "--transition-prepare" in sys.argv
-    transition = "--transition" in sys.argv or preparation
-    suffix = "921" if preparation else "911" if transition else "901"
+    contract03 = "--transition-03" in sys.argv
+    transition = "--transition" in sys.argv or preparation or contract03
+    suffix = "931" if contract03 else "921" if preparation else "911" if transition else "901"
     project = f"08000000-0000-4000-8000-000000000{suffix}"
     owner = f"98000000-0000-4000-8000-000000000{suffix}"
     editor = f"98000000-0000-4000-8000-{int(suffix)+1:012d}"
     caller = owner if transition else editor
     rpc = "prepare_project_sync_transition" if preparation else "get_project_sync_transition_plan" if transition else "validate_project_sync_migration"
     argument = f"'{{\"project_id\":\"{project}\"}}'::jsonb" if preparation else f"'{project}'"
+    if contract03:
+        rpc = "get_project_sync_transition_plan_for_contract"
+        argument += ",'abbd234c7b65d422c2e43d468f4f724e069ede26a3d24be22eb8b35cce8ebf2c'"
     revoke = (f"update public.projects set owner_id='{editor}' where project_id='{project}';"
               if transition else f"delete from public.project_members where project_id='{project}' and user_id='{editor}';")
     query(f"""

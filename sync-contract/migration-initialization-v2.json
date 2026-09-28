@@ -1,0 +1,15 @@
+{
+  "profile": "migration-initialization-v2",
+  "base_contract_sha256": "abbd234c7b65d422c2e43d468f4f724e069ede26a3d24be22eb8b35cce8ebf2c",
+  "base_contract_version": "0.3.0",
+  "storage_name_algorithm": "storage-name-v2",
+  "scope": "Additive transition-only extension. Existing canonical 0.2/0.3 pins and migration-initialization-v1 bytes remain unchanged. No allowlist activation, project promotion or sending opt-in at deployment.",
+  "discovery": "get_project_sync_transition_plan_for_contract(project_id, target_contract_sha256) requires an enabled, non-revoked, currently valid exact target contract. Its handshake is the real get_sync_handshake result under the project lock. Clients validate version, both digests, protocol, capabilities, project, mode and epoch before using the plan, including after completion.",
+  "payload": "profile_sha256, target_contract_sha256, baseline_sha256, documents, orders. Target must match the immutable batch canonical_contract_sha256 and project active contract after begin. Baseline and document/order mapping follow migration-initialization-v1.",
+  "normalization": "Before every plan or preparation name check set the transaction-local writerpad.contract_sha256 to the validated target. The existing storage_name_v1 compatibility dispatcher then invokes frozen storage_name_v2 for 0.3. Validator and completion use the active project digest. No v1 fallback for a 0.3 target.",
+  "request": "Exactly one project/migrate intent, entity_id equals project_id, base_revision 0, MIGRATING epoch 1, complete discovery payload. Batch uses released 0.3.0 metadata, protocol 3 and storage_name_v2 client capability, never storage_name_v1.",
+  "authorization": "Owner before and after project advisory lock. Active migrations require the same target, starter account and device. Wrong-target active projects cannot be repinned or downgraded. Unknown, disabled, revoked or future targets fail closed before begin.",
+  "preservation": "Preserve document IDs, recorded paths, bodies, body revisions, versions and deletion history. Initialize only absent structure metadata. Resolve ambiguous historical parents fail-closed. Existing structure metadata and orders remain authoritative. Control documents remain unchanged.",
+  "recovery": "Persist immutable request before send. Replay the same batch, including after completion. Never rewrite a retained request to another contract/profile. Failure rolls back a newly begun migration; existing MIGRATING is not downgraded. Completion stays a separate explicit operation.",
+  "client_boundary": "The iPad transition coordinator delegates storage-name-v2 normalization to the authenticated server and verifies the negotiated profile and handshake. This does not enable the existing 0.2 ordinary sender or advertise that it has been upgraded. Ordinary multi-device 0.3 sending requires its own client-path validation."
+}

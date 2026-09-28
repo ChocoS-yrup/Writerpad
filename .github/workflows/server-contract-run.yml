@@ -209,6 +209,7 @@ jobs:
           python supabase/tests/project_sync_migration_lock.py
           python supabase/tests/project_sync_migration_lock.py --transition
           python supabase/tests/project_sync_migration_lock.py --transition-prepare
+          python supabase/tests/project_sync_migration_lock.py --transition-03
       - name: Prove migration regression rejects the previous validator
         shell: bash
         run: |

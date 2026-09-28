@@ -280,6 +280,14 @@ def main() -> None:
     require(profile_digest in transition, "transition extension digest not pinned in SQL")
     require(profile_digest in (ROOT / "WriterPad/Sync/SyncV2ProjectTransition.swift").read_text(),
             "transition extension digest not pinned in iPad")
+    profile_v2_digest = sha256(CONTRACT_DIR / "migration-initialization-v2.json")
+    require(profile_v2_digest in transition, "0.3 transition extension digest not pinned in SQL")
+    require(profile_v2_digest in (ROOT / "WriterPad/Sync/SyncV2ProjectTransition.swift").read_text(),
+            "0.3 transition extension digest not pinned in iPad")
+    require("set_config('writerpad.contract_sha256',p_target_contract_sha256,true)" in transition,
+            "transition preflight must bind normalization to the validated target")
+    require("update private.sync_contract_allowlist" not in transition.lower(),
+            "transition migration must not activate or mutate allowlist entries")
     require("project_sync_transition.sql" in workflow, "transition SQL regression missing")
     require("alter default privileges for role postgres\n  revoke execute" in defaults,
             "PUBLIC EXECUTE must be revoked globally, not only per schema")

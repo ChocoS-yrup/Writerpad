@@ -4,22 +4,38 @@ import Supabase
 enum SyncV2TransitionProfile {
     // SHA-256 of the exact UTF-8 extension file, not a replacement protocol pin.
     static let sha256 = "5c5736ec9bda42f80b75dd8f863bb01b0bba8cef1ebe96675333db634b560c81"
+    static let storageV2SHA256 = "07e2e557921c17750f960d6b88b72dadb15d3aee45658d5260a3494607012b77"
+    static func sha256(for contract: SyncV2ReleasedContract) -> String {
+        contract == .v02 ? sha256 : storageV2SHA256
+    }
 }
 
 struct SyncV2TransitionPlan: Equatable, Sendable {
     let mode: SyncV2ProjectSyncMode
     let epoch: Int
     let payload: SyncV2JSON
+    let handshake: SyncV2ValidatedHandshake?
 
-    init(_ json: SyncV2JSON, projectID: UUID, accountID: UUID, deviceID: UUID) throws {
+    init(_ json: SyncV2JSON, projectID: UUID, accountID: UUID, deviceID: UUID,
+         contract: SyncV2ReleasedContract = .v02) throws {
+        let profile = SyncV2TransitionProfile.sha256(for: contract)
         guard let fields = json.objectValue,
-              fields["profile_sha256"] == .string(SyncV2TransitionProfile.sha256),
+              fields["profile_sha256"] == .string(profile),
               fields["project_id"] == .string(projectID.uuidString.lowercased()),
               let modeValue = fields["mode"]?.stringValue,
               let mode = SyncV2ProjectSyncMode(rawValue: modeValue),
               let epoch = fields["epoch"]?.intValue,
               (mode == .legacy ? epoch == 0 : epoch == 1),
               let payload = fields["payload"] else { throw SyncV2ContractError("TRANSITION_UNSUPPORTED") }
+        if contract == .v03 || fields["handshake"] != nil {
+            guard fields["target_contract_sha256"] == .string(contract.sha256), let wire = fields["handshake"]
+            else { throw SyncV2ContractError("TRANSITION_UNSUPPORTED") }
+            let response = try JSONDecoder().decode(SyncV2HandshakeResponse.self, from: JSONEncoder().encode(wire))
+            let verified = try SyncV2Contract.readHandshakeCompatibility(response, contract: contract)
+            guard verified.serverProjectID == projectID, verified.projectSyncMode == mode, verified.migrationEpoch == epoch
+            else { throw SyncV2ContractError("TRANSITION_CONTEXT_CHANGED") }
+            self.handshake = verified
+        } else { self.handshake = nil }
         if mode == .migrating {
             guard fields["started_by_device_id"] == .string(deviceID.uuidString.lowercased()),
                   fields["started_by_user_id"] == .string(accountID.uuidString.lowercased())
@@ -27,12 +43,15 @@ struct SyncV2TransitionPlan: Equatable, Sendable {
         }
         if mode != .idBased {
             guard let p = payload.objectValue,
-                  p["profile_sha256"] == .string(SyncV2TransitionProfile.sha256),
+                  p["profile_sha256"] == .string(profile),
                   let baseline = p["baseline_sha256"]?.stringValue,
                   SyncV2Contract.isSHA256Hex(baseline),
                   let documents = p["documents"]?.arrayValue, documents.count <= 1000,
                   let orders = p["orders"]?.arrayValue, orders.count <= 1000
             else { throw SyncV2ContractError("TRANSITION_UNSUPPORTED") }
+            if contract == .v03 && p["target_contract_sha256"] != .string(contract.sha256) {
+                throw SyncV2ContractError("TRANSITION_UNSUPPORTED")
+            }
         }
         self.mode = mode; self.epoch = epoch; self.payload = payload
     }
@@ -48,7 +67,7 @@ struct LiveSyncV2TransitionTransport: SyncV2TransitionTransporting {
         http = SyncV2ContractHTTPClient(configuration: configuration, accessToken: { client.auth.currentSession?.accessToken })
     }
     func call(_ rpc: String, parameters: SyncV2JSON, authorize: @escaping @Sendable () throws -> Void) async throws -> SyncV2JSON {
-        guard ["get_project_sync_transition_plan", "prepare_project_sync_transition",
+        guard ["get_project_sync_transition_plan", "get_project_sync_transition_plan_for_contract", "prepare_project_sync_transition",
                "validate_project_sync_migration", "complete_project_sync_migration"].contains(rpc)
         else { throw SyncV2ContractError.invalidArgument }
         if rpc == "prepare_project_sync_transition" || rpc == "complete_project_sync_migration" {
@@ -123,14 +142,16 @@ final class SyncV2ProjectTransitionModel: ObservableObject {
     @Published private(set) var message = "전체 동기화와 이 작품의 일반 동기화를 끈 뒤 계획을 확인하세요. 조회만으로는 전환하지 않습니다."
     private let transport: any SyncV2TransitionTransporting
     private let journal: SyncV2TransitionJournal
+    let contract: SyncV2ReleasedContract
     private let authority: @MainActor (Bool) async throws -> SyncV2TransitionAuthority
     private let screen = SyncV2ContractEpoch()
     private var plannedIdentity: SyncV2TransitionIdentity?
     private var plannedCheck: (@Sendable () throws -> Void)?
 
     init(transport: any SyncV2TransitionTransporting, journal: SyncV2TransitionJournal,
+         contract: SyncV2ReleasedContract = .v02,
          authority: @escaping @MainActor (Bool) async throws -> SyncV2TransitionAuthority) {
-        self.transport = transport; self.journal = journal; self.authority = authority
+        self.transport = transport; self.journal = journal; self.authority = authority; self.contract = contract
     }
     func invalidate() {
         screen.advance(); plan = nil; validated = false; plannedIdentity = nil; plannedCheck = nil
@@ -151,19 +172,31 @@ final class SyncV2ProjectTransitionModel: ObservableObject {
         .object(["p_project_id": .string(identity.serverID.uuidString.lowercased())])
     }
     private func readPlan(_ auth: SyncV2TransitionAuthority) async throws {
-        let result = try await transport.call("get_project_sync_transition_plan", parameters: projectParameters(auth.identity), authorize: auth.check)
+        let rpc = contract == .v02 ? "get_project_sync_transition_plan" : "get_project_sync_transition_plan_for_contract"
+        let parameters: SyncV2JSON = contract == .v02 ? projectParameters(auth.identity) : .object([
+            "p_project_id": .string(auth.identity.serverID.uuidString.lowercased()),
+            "p_target_contract_sha256": .string(contract.sha256)])
+        let result = try await transport.call(rpc, parameters: parameters, authorize: auth.check)
         try auth.check()
         let value = try SyncV2TransitionPlan(result, projectID: auth.identity.serverID,
-            accountID: auth.identity.accountID, deviceID: auth.identity.deviceID)
+            accountID: auth.identity.accountID, deviceID: auth.identity.deviceID, contract: contract)
         let pending = try await journal.load(auth.identity)
         try auth.check()
+        if let pending {
+            guard pending.request.objectValue?["batch"]?.objectValue?["canonical_contract_sha256"] == .string(contract.sha256),
+                  pending.request.objectValue?["ordered_intents"]?.arrayValue?.first?.objectValue?["payload"]?.objectValue?["profile_sha256"]
+                    == .string(SyncV2TransitionProfile.sha256(for: contract))
+            else { throw SyncV2ContractError("TRANSITION_JOURNAL_MISMATCH") }
+        }
         plan = value; plannedIdentity = auth.identity; plannedCheck = auth.check; validated = false
         hasPendingRequest = pending != nil
         if value.mode == .idBased {
             try await journal.remove(auth.identity)
             try auth.check()
             hasPendingRequest = false
-            message = "ID_BASED 확인됨. 전환은 완료 상태이며 일반 동기화는 별도로 활성화하세요."
+            message = contract == .v03
+                ? "ID_BASED · 계약 0.3 / storage-name-v2 handshake 확인됨. 기존 iPad 일반 송신은 0.2이며 이 화면에서 활성화하지 않습니다."
+                : "ID_BASED 확인됨. 전환은 완료 상태이며 일반 동기화는 별도로 활성화하세요."
         } else {
             message = pending != nil ? "저장된 전환 요청이 있습니다. 같은 요청으로 결과를 확인·재시도할 수 있습니다."
                 : "\(value.mode.rawValue) · 구조 초기화 \(value.payload.objectValue?["documents"]?.arrayValue?.count ?? 0)개. 본문과 과거 버전은 변경하지 않습니다."
@@ -190,14 +223,30 @@ final class SyncV2ProjectTransitionModel: ObservableObject {
                 request = try SyncV2Contract.buildAtomicStructureRequest(projectID: auth.identity.serverID,
                     projectSyncMode: .migrating, migrationEpoch: 1, writerDeviceID: auth.identity.deviceID,
                     orderedIntents: [.init(entityKind: .project, entityID: auth.identity.serverID,
-                        intentKind: .migrate, payload: plan.payload)])
+                        intentKind: .migrate, payload: plan.payload)],
+                    clientBuildID: "writerpad-ipad-transition-contract-\(contract.version)", contract: contract)
                 try await journal.save(.init(identity: auth.identity, request: request.json))
             }
             // Revalidate the disk record, not only its filename, before transmission.
-            guard request.json.objectValue?["project_id"] == .string(auth.identity.serverID.uuidString.lowercased()),
-                  request.json.objectValue?["batch"]?.objectValue?["writer_device_id"] == .string(auth.identity.deviceID.uuidString.lowercased()),
+            let fields = request.json.objectValue
+            let batch = fields?["batch"]?.objectValue
+            let intent = request.orderedIntents.first?.objectValue
+            guard fields?["kind"] == .string("atomic_structure_commit_request"),
+                  fields?["project_id"] == .string(auth.identity.serverID.uuidString.lowercased()),
+                  fields?["project_sync_mode"] == .string("MIGRATING"), fields?["migration_epoch"] == .int(1),
+                  batch?["writer_device_id"] == .string(auth.identity.deviceID.uuidString.lowercased()),
+                  batch?["canonical_contract_sha256"] == .string(contract.sha256),
+                  batch?["contract_version"] == .string(contract.version), batch?["sync_protocol_version"] == .int(3),
+                  batch?["client_capabilities"] == .array(contract.clientCapabilities.map { .string($0) }),
                   request.orderedIntents.count == 1,
-                  request.orderedIntents[0].objectValue?["payload"]?.objectValue?["profile_sha256"] == .string(SyncV2TransitionProfile.sha256)
+                  intent?["entity_kind"] == .string("project"), intent?["intent_kind"] == .string("migrate"),
+                  intent?["entity_id"] == fields?["project_id"], intent?["base_revision"] == .int(0), intent?["sequence"] == .int(1),
+                  intent?["batch_id"] == batch?["batch_id"],
+                  UUID(uuidString: intent?["operation_id"]?.stringValue ?? "") != nil,
+                  try SyncV2JSON.array(request.orderedIntents).sha256Hex() == request.batchPayloadSHA256,
+                  try intent?["payload"]?.sha256Hex() == intent?["payload_sha256"]?.stringValue,
+                  intent?["payload"]?.objectValue?["profile_sha256"] == .string(SyncV2TransitionProfile.sha256(for: contract)),
+                  (contract == .v02 || intent?["payload"]?.objectValue?["target_contract_sha256"] == .string(contract.sha256))
             else { throw SyncV2ContractError("TRANSITION_JOURNAL_MISMATCH") }
             try auth.check()
             validated = false; hasPendingRequest = true

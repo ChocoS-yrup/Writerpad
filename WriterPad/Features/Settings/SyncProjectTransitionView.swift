@@ -15,7 +15,7 @@ struct SyncProjectTransitionView: View {
         let device = environment.deviceIdentityService
         let handshake = environment.handshakeService
         let sender = environment.contractStructureSender
-        _model = StateObject(wrappedValue: SyncV2ProjectTransitionModel(transport: transport, journal: .shared) { requiresIdleQueue in
+        _model = StateObject(wrappedValue: SyncV2ProjectTransitionModel(transport: transport, journal: .shared, contract: .v03) { requiresIdleQueue in
             guard !GlobalSyncPreference.isEnabled(), !ContractPathGate.isOpen(for: row.id),
                   !ReceiveValidationPolicy.current.enabled, !GeneralSyncValidationScope.current.restricted,
                   let authEpoch = auth.contractEpoch, let bindingEpoch = bindings.contractEpoch,
@@ -33,12 +33,8 @@ struct SyncProjectTransitionView: View {
                   (try await projects.projects()).contains(where: { $0.id == row.id && $0.isActive })
             else { throw SyncV2ContractError("TRANSITION_CONTEXT_CHANGED") }
             let deviceID = try await device.currentIdentifier().uuid
-            guard let context = SyncV2HandshakeContext.make(authenticationState: .authenticated(account),
-                localProjectID: row.id, serverProjectID: serverID,
-                authenticationEpoch: revisions[0], bindingEpoch: revisions[1]) else {
-                throw SyncV2ContractError("TRANSITION_CONTEXT_CHANGED")
-            }
-            _ = try await handshake.inspectCompatibility(context: context)
+            // The transition plan carries a fresh, target-bound 0.3 handshake
+            // under the server lock. Do not authorize it using the 0.2 sender.
             let queueCheck: @Sendable () throws -> Void
             if requiresIdleQueue {
                 queueCheck = try await sender.transitionQueueAuthorization(localProjectID: row.id)
@@ -59,6 +55,8 @@ struct SyncProjectTransitionView: View {
         NavigationStack {
             Form {
                 Section(name) {
+                    Text("전환 대상: 계약 0.3 · storage-name-v2. 서버 allowlist 승인이 없으면 진행하지 않습니다.")
+                        .font(.footnote)
                     Text(model.message)
                     Text("먼저 대기 중인 동기화를 마치고, 이 작품의 편집과 다른 기기의 동기화도 중지하세요. 서버 형식만 바꾸며 본문·과거 버전은 보존합니다. 일반 동기화를 자동으로 켜지 않습니다.")
                         .font(.footnote)

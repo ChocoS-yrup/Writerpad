@@ -242,7 +242,8 @@ extension SyncV2Contract {
     /// 여기서 본다. 모양 문제는 전부 `INVALID_ARGUMENT` 하나로 나가서, 부르는
     /// 쪽이 계약 오류와 해독 오류를 섞어 다루지 않아도 된다.
     static func readHandshakeCompatibility(
-        _ response: SyncV2HandshakeResponse
+        _ response: SyncV2HandshakeResponse,
+        contract: SyncV2ReleasedContract = .v02
     ) throws -> SyncV2ValidatedHandshake {
         guard response.migrationEpoch >= 0 else {
             throw SyncV2ContractError.invalidArgument
@@ -262,7 +263,7 @@ extension SyncV2Contract {
         else {
             throw SyncV2ContractError.invalidArgument
         }
-        guard contractVersion == version else {
+        guard contractVersion == contract.version else {
             throw SyncV2ContractError.contractDigestMismatch
         }
         guard
@@ -302,7 +303,8 @@ extension SyncV2Contract {
             migrationEpoch: response.migrationEpoch,
             serverProtocolVersion: serverProtocolVersion,
             serverContractSHA256: serverDigest,
-            serverCapabilities: response.serverCapabilities
+            serverCapabilities: response.serverCapabilities,
+            contract: contract
         )
 
         return SyncV2ValidatedHandshake(

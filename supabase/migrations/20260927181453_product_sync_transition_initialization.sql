@@ -1,15 +1,39 @@
 -- Explicitly negotiated initialization extension; no deployment-time data changes.
 begin;
 
-create or replace function private.project_transition_payload(p_project_id uuid)
+create or replace function private.project_transition_profile(p_target_contract_sha256 text)
+returns text language plpgsql immutable set search_path = '' as $$
+begin
+  case p_target_contract_sha256
+    when '416c1b99edb9bda694731dee4b25688d9d82d1f32610aa23ddfda571ec3c7670' then
+      return '5c5736ec9bda42f80b75dd8f863bb01b0bba8cef1ebe96675333db634b560c81';
+    when 'abbd234c7b65d422c2e43d468f4f724e069ede26a3d24be22eb8b35cce8ebf2c' then
+      return '07e2e557921c17750f960d6b88b72dadb15d3aee45658d5260a3494607012b77';
+    else raise exception 'CONTRACT_NOT_ALLOWED';
+  end case;
+end;
+$$;
+
+create or replace function private.project_transition_payload(p_project_id uuid,p_target_contract_sha256 text)
 returns jsonb language plpgsql security definer set search_path = '' as $$
 declare
   v_folders jsonb; v_documents jsonb; v_orders jsonb; v_paths jsonb;
   v_initial jsonb := '[]'; v_projected jsonb := '[]'; v_children jsonb;
   v_doc public.documents%rowtype; v_entry record; v_child record; v_parent uuid; v_id uuid;
   v_name text; v_parent_path text; v_count integer; v_control jsonb;
-  v_baseline text; v_hash bytea;
+  v_baseline text; v_hash bytea; v_profile text;
 begin
+  v_profile := private.project_transition_profile(p_target_contract_sha256);
+  if not exists(select 1 from private.sync_contract_allowlist
+    where canonical_contract_sha256=p_target_contract_sha256 and enabled and revoked_at is null
+      and valid_from<=transaction_timestamp()) then raise exception 'CONTRACT_NOT_ALLOWED'; end if;
+  if exists(select 1 from public.project_sync_settings where project_id=p_project_id
+    and project_sync_mode<>'LEGACY' and active_contract_sha256 is distinct from p_target_contract_sha256) then
+    raise exception 'CONTRACT_NOT_ALLOWED';
+  end if;
+  -- Preflight runs before begin/atomic validation, so it must select the exact
+  -- normalization contract itself. Never inherit another request's local setting.
+  perform set_config('writerpad.contract_sha256',p_target_contract_sha256,true);
   if (select count(*) from public.folders where project_id=p_project_id)>1000
      or (select count(*) from public.documents where project_id=p_project_id)>1000 then
     raise exception 'TRANSITION_SIZE_LIMIT';
@@ -111,30 +135,49 @@ begin
       end if;
     end loop;
   end if;
-  return jsonb_build_object('profile_sha256','5c5736ec9bda42f80b75dd8f863bb01b0bba8cef1ebe96675333db634b560c81',
-    'baseline_sha256',v_baseline,'documents',v_initial,'orders',v_projected);
+  return jsonb_build_object('profile_sha256',v_profile,
+    'baseline_sha256',v_baseline,'documents',v_initial,'orders',v_projected)
+    || case when p_target_contract_sha256='abbd234c7b65d422c2e43d468f4f724e069ede26a3d24be22eb8b35cce8ebf2c'
+       then jsonb_build_object('target_contract_sha256',p_target_contract_sha256) else '{}'::jsonb end;
 end;
 $$;
 
-create or replace function public.get_project_sync_transition_plan(p_project_id uuid)
+-- Keep the original 0.2 entry point and payload bytes for existing journals.
+create or replace function private.project_transition_payload(p_project_id uuid)
+returns jsonb language sql security definer set search_path = '' as $$
+  select private.project_transition_payload(p_project_id,'416c1b99edb9bda694731dee4b25688d9d82d1f32610aa23ddfda571ec3c7670');
+$$;
+
+create or replace function public.get_project_sync_transition_plan_for_contract(p_project_id uuid,p_target_contract_sha256 text)
 returns jsonb language plpgsql security definer set search_path = '' as $$
 declare v_settings public.project_sync_settings%rowtype; v_migration public.project_sync_migrations%rowtype;
+  v_profile text; v_handshake jsonb;
 begin
   if auth.uid() is null then raise exception 'AUTH_REQUIRED'; end if;
   if not private.has_project_role(p_project_id,auth.uid(),'owner') then raise exception 'FORBIDDEN'; end if;
   perform pg_advisory_xact_lock(hashtextextended('project:' || p_project_id::text,0));
   if not private.has_project_role(p_project_id,auth.uid(),'owner') then raise exception 'FORBIDDEN'; end if;
+  v_profile := private.project_transition_profile(p_target_contract_sha256);
+  v_handshake := public.get_sync_handshake(p_project_id,p_target_contract_sha256);
+  if (v_handshake->>'supported')::boolean is distinct from true then raise exception 'CONTRACT_NOT_ALLOWED'; end if;
   select * into v_settings from public.project_sync_settings where project_id=p_project_id;
   if v_settings.project_sync_mode in ('MIGRATING','ID_BASED') and v_settings.active_contract_sha256 is distinct from
-    '416c1b99edb9bda694731dee4b25688d9d82d1f32610aa23ddfda571ec3c7670' then raise exception 'CONTRACT_NOT_ALLOWED'; end if;
+    p_target_contract_sha256 then raise exception 'CONTRACT_NOT_ALLOWED'; end if;
   select * into v_migration from public.project_sync_migrations where project_id=p_project_id
     order by migration_epoch desc limit 1;
-  return jsonb_build_object('profile_sha256','5c5736ec9bda42f80b75dd8f863bb01b0bba8cef1ebe96675333db634b560c81',
+  return jsonb_build_object('profile_sha256',v_profile,
+    'target_contract_sha256',p_target_contract_sha256,'handshake',v_handshake,
     'project_id',p_project_id,'mode',coalesce(v_settings.project_sync_mode,'LEGACY'),
     'epoch',coalesce(v_settings.migration_epoch,0),'started_by_device_id',v_migration.started_by_device_id,
     'started_by_user_id',v_migration.started_by_user_id,
-    'payload',case when v_settings.project_sync_mode='ID_BASED' then null else private.project_transition_payload(p_project_id) end);
+    'payload',case when v_settings.project_sync_mode='ID_BASED' then null
+      else private.project_transition_payload(p_project_id,p_target_contract_sha256) end);
 end;
+$$;
+
+create or replace function public.get_project_sync_transition_plan(p_project_id uuid)
+returns jsonb language sql security definer set search_path = '' as $$
+  select public.get_project_sync_transition_plan_for_contract(p_project_id,'416c1b99edb9bda694731dee4b25688d9d82d1f32610aa23ddfda571ec3c7670');
 $$;
 
 -- Rename once, preserving the complete old dispatcher for every other intent.
@@ -146,7 +189,7 @@ end $$;
 
 create or replace function private.apply_structure_intent(p_project_id uuid,p_user_id uuid,p_intent jsonb)
 returns bigint language plpgsql security definer set search_path = '' as $$
-declare v_payload jsonb; v_entry jsonb; v_validation jsonb;
+declare v_payload jsonb; v_entry jsonb; v_validation jsonb; v_target text;
 begin
   if p_intent->>'entity_kind' is distinct from 'project' or p_intent->>'intent_kind' is distinct from 'migrate' then
     return private.apply_structure_intent_before_initialization(p_project_id,p_user_id,p_intent);
@@ -162,11 +205,13 @@ begin
        where b.batch_id=(p_intent->>'batch_id')::uuid and b.project_id=p_project_id
          and b.writer_user_id=p_user_id and m.started_by_user_id=p_user_id
          and b.writer_device_id=m.started_by_device_id and m.completed_at is null
-         and b.canonical_contract_sha256='416c1b99edb9bda694731dee4b25688d9d82d1f32610aa23ddfda571ec3c7670'
+         and b.canonical_contract_sha256 in ('416c1b99edb9bda694731dee4b25688d9d82d1f32610aa23ddfda571ec3c7670',
+           'abbd234c7b65d422c2e43d468f4f724e069ede26a3d24be22eb8b35cce8ebf2c')
          and s.active_contract_sha256=b.canonical_contract_sha256
          and s.project_sync_mode='MIGRATING' and s.migration_epoch=b.migration_epoch
          and b.project_sync_mode='MIGRATING') then raise exception 'MIGRATION_LOCKED'; end if;
-  v_payload := private.project_transition_payload(p_project_id);
+  select active_contract_sha256 into v_target from public.project_sync_settings where project_id=p_project_id;
+  v_payload := private.project_transition_payload(p_project_id,v_target);
   if p_intent->'payload' is distinct from v_payload then raise exception 'TRANSITION_BASELINE_CHANGED'; end if;
   for v_entry in select value from jsonb_array_elements(v_payload->'documents') loop
     update public.documents set name=v_entry->>'name',parent_folder_id=(v_entry->>'parent_folder_id')::uuid,
@@ -190,23 +235,25 @@ $$;
 create or replace function public.prepare_project_sync_transition(p_request jsonb)
 returns jsonb language plpgsql security definer set search_path = '' as $$
 declare v_project uuid := (p_request->>'project_id')::uuid; v_result jsonb; v_payload jsonb;
+  v_target text := p_request#>>'{batch,canonical_contract_sha256}'; v_profile text;
 begin
   if auth.uid() is null then raise exception 'AUTH_REQUIRED'; end if;
   if not private.has_project_role(v_project,auth.uid(),'owner') then raise exception 'FORBIDDEN'; end if;
   perform pg_advisory_xact_lock(hashtextextended('project:' || v_project::text,0));
   if not private.has_project_role(v_project,auth.uid(),'owner') then raise exception 'FORBIDDEN'; end if;
+  v_profile := private.project_transition_profile(v_target);
   if p_request->>'project_sync_mode' is distinct from 'MIGRATING'
-     or p_request#>>'{batch,canonical_contract_sha256}' is distinct from
-       '416c1b99edb9bda694731dee4b25688d9d82d1f32610aa23ddfda571ec3c7670'
      or (p_request->>'migration_epoch')::integer is distinct from 1
      or jsonb_array_length(p_request->'ordered_intents') is distinct from 1
      or p_request#>>'{ordered_intents,0,entity_kind}' is distinct from 'project'
      or p_request#>>'{ordered_intents,0,intent_kind}' is distinct from 'migrate'
-     or p_request#>>'{ordered_intents,0,payload,profile_sha256}' is distinct from
-       '5c5736ec9bda42f80b75dd8f863bb01b0bba8cef1ebe96675333db634b560c81' then raise exception 'INVALID_ARGUMENT'; end if;
+     or p_request#>>'{ordered_intents,0,payload,profile_sha256}' is distinct from v_profile
+     or (v_target='abbd234c7b65d422c2e43d468f4f724e069ede26a3d24be22eb8b35cce8ebf2c'
+       and p_request#>>'{ordered_intents,0,payload,target_contract_sha256}' is distinct from v_target)
+     then raise exception 'INVALID_ARGUMENT'; end if;
   -- Replay is checked by the existing immutable request digest, before any begin.
   if not exists(select 1 from public.sync_batches where batch_id=(p_request#>>'{batch,batch_id}')::uuid) then
-    v_payload := private.project_transition_payload(v_project);
+    v_payload := private.project_transition_payload(v_project,v_target);
     if p_request#>'{ordered_intents,0,payload}' is distinct from v_payload then raise exception 'TRANSITION_BASELINE_CHANGED'; end if;
     if not exists(select 1 from public.project_sync_settings where project_id=v_project and project_sync_mode<>'LEGACY') then
       perform public.begin_project_sync_migration(v_project,(p_request#>>'{batch,writer_device_id}')::uuid,
@@ -223,10 +270,14 @@ end;
 $$;
 
 revoke all on function private.project_transition_payload(uuid) from public,anon,authenticated;
+revoke all on function private.project_transition_payload(uuid,text) from public,anon,authenticated;
+revoke all on function private.project_transition_profile(text) from public,anon,authenticated;
 revoke all on function private.apply_structure_intent(uuid,uuid,jsonb) from public,anon,authenticated;
 revoke all on function private.apply_structure_intent_before_initialization(uuid,uuid,jsonb) from public,anon,authenticated;
 revoke all on function public.get_project_sync_transition_plan(uuid) from public,anon;
+revoke all on function public.get_project_sync_transition_plan_for_contract(uuid,text) from public,anon;
 revoke all on function public.prepare_project_sync_transition(jsonb) from public,anon;
 grant execute on function public.get_project_sync_transition_plan(uuid) to authenticated;
+grant execute on function public.get_project_sync_transition_plan_for_contract(uuid,text) to authenticated;
 grant execute on function public.prepare_project_sync_transition(jsonb) to authenticated;
 commit;
