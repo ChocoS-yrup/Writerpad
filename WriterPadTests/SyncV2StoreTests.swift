@@ -9528,6 +9528,82 @@ func makeGeneralCommitReceiptForTesting(_ pending: SyncV2PendingContractBatch, a
 }
 
 final class SyncV2GeneralSyncTests: XCTestCase {
+    func test03AllConflictReplacementKindsKeepOriginalProfile() async throws {
+        for kind in 0..<4 {
+            let f = try await fixture(contract: .v03)
+            let replacement: UUID
+            switch kind {
+            case 0: replacement = try await f.store.replaceGeneralConflict(conflictReview(f), authorize: {})
+            case 1: replacement = try await f.store.replaceGeneralOrderConflict(orderConflict(f), authorize: {})
+            case 2: replacement = try await f.store.replaceGeneralRenameConflict(renameConflict(f), authorize: {})
+            default: replacement = try await f.store.replaceGeneralStructureConflict(combinedStructureConflict(f), adoptServer: false, authorize: {})
+            }
+            let pending = try await f.store.claimNextGeneralContract(localProjectID: f.local)
+            XCTAssertEqual(pending.request.batchID, replacement)
+            XCTAssertEqual(pending.request.json.objectValue?["batch"]?.objectValue?["contract_version"], .string("0.3.0"))
+            XCTAssertEqual(pending.request.json.objectValue?["batch"]?.objectValue?["canonical_contract_sha256"], .string(f.handshake.contractSHA256))
+            await f.store.close()
+        }
+    }
+
+    func test03ConflictCannotReplaceImmutable02Source() async throws {
+        let f = try await fixture(), original = try await conflictReview(f)
+        let context = SyncV2HandshakeContext(localProjectID: f.local, serverProjectID: f.server,
+            accountID: f.binding.ownerSubject!, clientContractSHA256: SyncV2ReleasedContract.v03.sha256)
+        let changed = try SyncV2GeneralConflictReview(local: original.local, remote: original.remote,
+            remoteBaseline: original.remoteBaseline, context: context, authorizationFingerprint: "changed-profile")
+        do { _ = try await f.store.replaceGeneralConflict(changed, authorize: {}); XCTFail("profile relabel") } catch {}
+        let kept = try await f.store.generalRecoveryDetail(localProjectID: f.local, batchID: original.local.detail.row.batchID)
+        XCTAssertEqual(kept.requestJSON, original.local.detail.requestJSON)
+        XCTAssertNil(kept.resolutionJSON)
+        await f.store.close()
+    }
+
+    func test03CompoundCreationAndReceiptRecoveryPreserveExactProfileAcrossRestart() async throws {
+        let f = try await fixture(contract: .v03), source = try await compoundCreation(f)
+        try await enqueue(source, f)
+        try await enqueue(save(f, content: "0.3 후속 원고"), f)
+        let sent = try await finishGeneralPlan(f, restarting: true)
+        XCTAssertGreaterThan(sent.count, 3)
+        XCTAssertTrue(sent.contains { $0.request.json.objectValue?["kind"] == .string("document_commit_request") })
+        XCTAssertTrue(sent.contains { $0.request.json.objectValue?["kind"] == .string("atomic_structure_commit_request") })
+        for pending in sent {
+            let metadata = pending.request.json.objectValue?["batch"]?.objectValue
+            XCTAssertEqual(metadata?["contract_version"], .string("0.3.0"))
+            XCTAssertEqual(metadata?["canonical_contract_sha256"], .string(SyncV2ReleasedContract.v03.sha256))
+            XCTAssertEqual(metadata?["client_capabilities"], .array(SyncV2ReleasedContract.v03.clientCapabilities.map(SyncV2JSON.string)))
+        }
+    }
+
+    func testStored02QueueCannotBeRelabeledBy03Handshake() async throws {
+        let f = try await fixture(), source = save(f, content: "원본 0.2 저장")
+        try await enqueue(source, f)
+        let profile = SyncV2ReleasedContract.v03
+        let handshake = SyncV2ValidatedHandshake(serverProjectID: f.server, projectSyncMode: .idBased, migrationEpoch: 1,
+            contractVersion: profile.version, contractSHA256: profile.sha256, serverProtocolVersion: 3,
+            supportedProtocolVersions: [3], serverCapabilities: Array(profile.serverCapabilities))
+        _ = try await f.store.enqueueGeneralContract(source, binding: f.binding, handshake: handshake, writerDeviceID: f.device)
+        await f.store.close()
+        guard case .available(let reopened) = await SyncV2Store.open(at: f.url) else { return XCTFail("reopen") }
+        let pending = try await reopened.claimNextGeneralContract(localProjectID: f.local)
+        XCTAssertEqual(pending.request.json.objectValue?["batch"]?.objectValue?["canonical_contract_sha256"], .string(SyncV2Contract.canonicalSHA256))
+        XCTAssertThrowsError(try pending.request.validateForTransmission(context: .init(localProjectID: f.local,
+            serverProjectID: f.server, accountID: f.binding.ownerSubject!, clientContractSHA256: profile.sha256),
+            handshake: handshake, writerDeviceID: f.device))
+        await reopened.close()
+    }
+
+    func test03NameRejectionPreservesSourceWithoutMaterializedRequest() async throws {
+        let f = try await fixture(contract: .v03), source = renameSource(f, name: "℅")
+        try await enqueue(source, f)
+        do { _ = try await f.store.claimNextGeneralContract(localProjectID: f.local); XCTFail("invalid v2 name") } catch {}
+        let detail = try await f.store.generalRecoveryDetail(localProjectID: f.local, batchID: source.batchID)
+        XCTAssertNil(detail.requestJSON)
+        XCTAssertEqual(detail.row.sourceStatus, "blocked")
+        XCTAssertEqual(detail.source.batchID, source.batchID)
+        await f.store.close()
+    }
+
     private struct Fixture {
         let url: URL
         let store: SyncV2Store
@@ -9539,7 +9615,7 @@ final class SyncV2GeneralSyncTests: XCTestCase {
         var server: UUID { binding.serverProjectID! }
     }
 
-    private func fixture(metadata: Bool = true) async throws -> Fixture {
+    private func fixture(metadata: Bool = true, contract: SyncV2ReleasedContract = .v02) async throws -> Fixture {
         let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
         addTeardownBlock { try? FileManager.default.removeItem(at: root) }
@@ -9555,9 +9631,9 @@ final class SyncV2GeneralSyncTests: XCTestCase {
         let applied = try await store.applySnapshotBaseline(localProjectID: local, serverProjectID: server, snapshot: snapshot, expectedRevision: nil)
         XCTAssertTrue(applied)
         let handshake = SyncV2ValidatedHandshake(serverProjectID: server, projectSyncMode: .idBased, migrationEpoch: 1,
-            contractVersion: SyncV2Contract.version, contractSHA256: SyncV2Contract.canonicalSHA256,
+            contractVersion: contract.version, contractSHA256: contract.sha256,
             serverProtocolVersion: SyncV2Contract.syncProtocolVersion, supportedProtocolVersions: [SyncV2Contract.syncProtocolVersion],
-            serverCapabilities: Array(SyncV2Contract.requiredServerCapabilities).sorted())
+            serverCapabilities: Array(contract.serverCapabilities).sorted())
         return Fixture(url: url, store: store, binding: binding, handshake: handshake, device: device, document: document)
     }
 
@@ -9603,7 +9679,7 @@ final class SyncV2GeneralSyncTests: XCTestCase {
             documents: local.baseline.documents.map { $0.objectValue?["document_id"] == .string(f.document.uuidString.lowercased()) ? .object(remote) : $0 }, treeOrders: local.baseline.treeOrders)
         remote["content"] = .string("서버에서 바뀐 원고")
         return try .init(local: local, remote: .object(remote), remoteBaseline: remoteBaseline,
-            context: .init(localProjectID: f.local, serverProjectID: f.server, accountID: f.binding.ownerSubject!),
+            context: .init(localProjectID: f.local, serverProjectID: f.server, accountID: f.binding.ownerSubject!, clientContractSHA256: f.handshake.contractSHA256),
             authorizationFingerprint: "synthetic-review")
     }
 
@@ -9670,7 +9746,7 @@ final class SyncV2GeneralSyncTests: XCTestCase {
         let folders = local.baseline.folders.map { $0.objectValue?["folder_id"] == remote["folder_id"] ? .object(remote) : $0 }
         return try .init(local: local, remote: .object(remote), remoteBaseline: .init(folders: folders,
             documents: local.baseline.documents, treeOrders: local.baseline.treeOrders),
-            context: .init(localProjectID: f.local, serverProjectID: f.server, accountID: f.binding.ownerSubject!), authorizationFingerprint: "synthetic-folder-name")
+            context: .init(localProjectID: f.local, serverProjectID: f.server, accountID: f.binding.ownerSubject!, clientContractSHA256: f.handshake.contractSHA256), authorizationFingerprint: "synthetic-folder-name")
     }
 
     private func compoundCreation(_ f: Fixture) async throws -> LocalMutationBatch {
@@ -9875,7 +9951,7 @@ final class SyncV2GeneralSyncTests: XCTestCase {
         let local = try await f.store.generalConflictLocal(localProjectID: f.local, batchID: body.batchID)
         var remoteBody = local.baseline.documents[0].objectValue!; remoteBody["content"] = .string("처음")
         let review = try SyncV2GeneralStructureReview(local: local, remoteBaseline: local.baseline, remoteDocuments: [.object(remoteBody)],
-            context: .init(localProjectID: f.local, serverProjectID: f.server, accountID: f.binding.ownerSubject!), authorizationFingerprint: "path")
+            context: .init(localProjectID: f.local, serverProjectID: f.server, accountID: f.binding.ownerSubject!, clientContractSHA256: f.handshake.contractSHA256), authorizationFingerprint: "path")
         XCTAssertTrue(review.repairsHistoricalPath)
         _ = try await f.store.replaceGeneralStructureConflict(review, adoptServer: false, authorize: {})
         let sent = try await finishGeneralPlan(f)
@@ -9905,7 +9981,7 @@ final class SyncV2GeneralSyncTests: XCTestCase {
         let remoteBaseline = SyncV2PreparationSnapshot(folders: local.baseline.folders, documents: [.object(metadata)], treeOrders: local.baseline.treeOrders)
         var remoteBody = metadata; remoteBody["content"] = .string("처음")
         let review = try SyncV2GeneralStructureReview(local: local, remoteBaseline: remoteBaseline, remoteDocuments: [.object(remoteBody)],
-            context: .init(localProjectID: f.local, serverProjectID: f.server, accountID: f.binding.ownerSubject!), authorizationFingerprint: "path")
+            context: .init(localProjectID: f.local, serverProjectID: f.server, accountID: f.binding.ownerSubject!, clientContractSHA256: f.handshake.contractSHA256), authorizationFingerprint: "path")
         XCTAssertTrue(review.repairsHistoricalPath)
         _ = try await f.store.replaceGeneralStructureConflict(review, adoptServer: false, authorize: {})
         let sent = try await finishGeneralPlan(f)
@@ -10056,7 +10132,7 @@ final class SyncV2GeneralSyncTests: XCTestCase {
         remote["descendant_documents"] = .array(bodies)
         return try .init(local: local, remote: .object(remote), remoteBaseline: .init(folders: folders, documents: documents,
             treeOrders: local.baseline.treeOrders), context: .init(localProjectID: f.local, serverProjectID: f.server,
-                accountID: f.binding.ownerSubject!), authorizationFingerprint: "synthetic-populated-folder")
+                accountID: f.binding.ownerSubject!, clientContractSHA256: f.handshake.contractSHA256), authorizationFingerprint: "synthetic-populated-folder")
     }
 
     func testPopulatedFolderConflictPreservesEachOperationAndTailAcrossReceiptRecovery() async throws {
@@ -10303,7 +10379,7 @@ final class SyncV2GeneralSyncTests: XCTestCase {
         let baseline = SyncV2PreparationSnapshot(folders: local.baseline.folders, documents: [.object(remote)], treeOrders: local.baseline.treeOrders)
         remote["content"] = .string("처음")
         return try .init(local: local, remote: .object(remote), remoteBaseline: baseline,
-            context: .init(localProjectID: f.local, serverProjectID: f.server, accountID: f.binding.ownerSubject!), authorizationFingerprint: "synthetic-rename")
+            context: .init(localProjectID: f.local, serverProjectID: f.server, accountID: f.binding.ownerSubject!, clientContractSHA256: f.handshake.contractSHA256), authorizationFingerprint: "synthetic-rename")
     }
 
     func testRenameConflictPreservesBodyPathsArchiveAndTailAcrossReceiptRecovery() async throws {
@@ -10442,7 +10518,7 @@ final class SyncV2GeneralSyncTests: XCTestCase {
         var order = local.baseline.treeOrders[0].objectValue!
         order["revision"] = .int(6); order["children"] = .array([other, third, f.document].map { .string($0.uuidString.lowercased()) })
         return try .init(local: local, remoteBaseline: .init(folders: local.baseline.folders, documents: local.baseline.documents, treeOrders: [.object(order)]),
-            context: .init(localProjectID: f.local, serverProjectID: f.server, accountID: f.binding.ownerSubject!), authorizationFingerprint: "synthetic-order")
+            context: .init(localProjectID: f.local, serverProjectID: f.server, accountID: f.binding.ownerSubject!, clientContractSHA256: f.handshake.contractSHA256), authorizationFingerprint: "synthetic-order")
     }
 
     func testOrderConflictRebasesOnlyOrderPreservesArchiveTailAndRestartReceipt() async throws {

@@ -66,10 +66,18 @@ enum SyncV2Contract {
     ]
 }
 
-/// Additive released pins. The ordinary sender keeps its existing 0.2 default;
-/// 0.3 is explicitly selected only by the bounded transition coordinator.
-enum SyncV2ReleasedContract: Sendable {
+/// Released profiles are additive. Historical defaults and queued pins never move.
+enum SyncV2ReleasedContract: Sendable, CaseIterable, Hashable {
     case v02, v03
+    init(sha256: String) throws {
+        guard let value = Self.allCases.first(where: { $0.sha256 == sha256 }) else {
+            throw SyncV2ContractError.contractDigestMismatch
+        }
+        self = value
+    }
+    func normalizeStorageName(_ name: String) throws -> String {
+        try self == .v02 ? SyncV2StorageName.normalize(name) : SyncV2StorageNameV2.normalize(name)
+    }
     var version: String { self == .v02 ? SyncV2Contract.version : "0.3.0" }
     var sha256: String {
         self == .v02 ? SyncV2Contract.canonicalSHA256
@@ -319,6 +327,42 @@ extension SyncV2JSON {
 
 // MARK: - storage-name 정규화
 
+/// 0.3's bounded NFKC pipeline, separate from the historical v1 path.
+enum SyncV2StorageNameV2 {
+    static func normalize(_ value: String) throws -> String {
+        let scalars = value.unicodeScalars.map(\.value)
+        guard scalars.allSatisfy(SyncV2StorageNameTables.isAssigned) else {
+            throw SyncV2ContractError("STORAGE_NAME_UNASSIGNED")
+        }
+        guard !scalars.contains(where: { scalar in SyncV2StorageNameTables.excluded.contains { $0.contains(scalar) } }) else {
+            throw SyncV2ContractError("STORAGE_NAME_UNSUPPORTED_SCALAR")
+        }
+        for (previous, current) in zip(scalars, scalars.dropFirst()) where previous > 0xFFFF {
+            guard current != 0xFF9E, current != 0xFF9F, !SyncV2StorageNameTables.nonzeroCCC.contains(current) else {
+                throw SyncV2ContractError.storageNameInvalid
+            }
+        }
+        let normalized = SyncV2UnicodeCasefold.apply(value.precomposedStringWithCompatibilityMapping)
+            .precomposedStringWithCompatibilityMapping
+        guard !normalized.unicodeScalars.contains(where: { $0 == "/" || $0 == "\\" || $0.value <= 31 || $0.value == 127 }) else {
+            throw SyncV2ContractError.storageNameInvalid
+        }
+        guard normalized.unicodeScalars.allSatisfy({ SyncV2StorageNameTables.isAssigned($0.value) }) else {
+            throw SyncV2ContractError("STORAGE_NAME_UNASSIGNED")
+        }
+        // Scalar trimming, not grapheme trimming (a combining mark is significant).
+        var result = normalized.unicodeScalars
+        while let last = result.last, last == " " || last == "." { result.removeLast() }
+        let name = String(result)
+        guard !name.isEmpty else { throw SyncV2ContractError.storageNameInvalid }
+        let basename = String(name.split(separator: ".", maxSplits: 1, omittingEmptySubsequences: false)[0])
+        guard !SyncV2StorageName.reservedBasenames.contains(basename) else {
+            throw SyncV2ContractError.storageNameReserved
+        }
+        return name
+    }
+}
+
 /// 이름 충돌을 판정하는 정규화다.
 ///
 /// 아이패드는 자모가 분해된 이름을, Windows는 결합된 이름을 만들 수 있다. 두
@@ -349,7 +393,7 @@ extension SyncV2JSON {
 ///   측정 결과와 스칼라 목록은 저장소 뿌리의 `윈도우세션_회신*.md`와
 ///   `유니코드측정_*.json`에 있다.
 enum SyncV2StorageName {
-    private static let reservedBasenames: Set<String> = {
+    fileprivate static let reservedBasenames: Set<String> = {
         var names: Set<String> = ["con", "prn", "aux", "nul"]
         for index in 1...9 {
             names.insert("com\(index)")
@@ -600,9 +644,8 @@ extension SyncV2Contract {
         guard !orderedIntents.isEmpty else {
             throw SyncV2ContractError.invalidArgument
         }
-        // This additive path does not claim that the ordinary 0.2 writer and
-        // its local name normalizer have been upgraded to 0.3.
-        if contract == .v03 {
+        // The migration extension remains bounded independently of ordinary writes.
+        if contract == .v03 && projectSyncMode != .idBased {
             guard projectSyncMode == .migrating, migrationEpoch == 1, orderedIntents.count == 1,
                   orderedIntents[0].entityKind == .project, orderedIntents[0].intentKind == .migrate,
                   orderedIntents[0].entityID == projectID, orderedIntents[0].baseRevision == 0,
@@ -622,7 +665,7 @@ extension SyncV2Contract {
             // 이름이 실려 있으면 보내기 전에 규칙 위반을 걸러 낸다. 값 자체는
             // 원본을 그대로 보낸다. 정규화 결과는 충돌 판정에만 쓰인다.
             if let name = payloadFields["name"]?.stringValue {
-                _ = try SyncV2StorageName.normalize(name)
+                _ = try contract.normalizeStorageName(name)
             }
 
             var intent: [String: SyncV2JSON] = [
@@ -682,7 +725,8 @@ extension SyncV2Contract {
         operationID: UUID = UUID(),
         batchID: UUID = UUID(),
         supersedesOperationID: UUID? = nil,
-        clientBuildID: String = SyncV2Contract.clientBuildID
+        clientBuildID: String = SyncV2Contract.clientBuildID,
+        contract: SyncV2ReleasedContract = .v02
     ) throws -> SyncV2ContractRequest {
         guard isValidModeEpoch(projectSyncMode, migrationEpoch) else {
             throw SyncV2ContractError.invalidArgument
@@ -702,7 +746,7 @@ extension SyncV2Contract {
         {
             throw SyncV2ContractError.invalidArgument
         }
-        _ = try SyncV2StorageName.normalize(name)
+        _ = try contract.normalizeStorageName(name)
 
         let contentDigest = SHA256.hash(data: body)
             .map { String(format: "%02x", $0) }
@@ -743,7 +787,8 @@ extension SyncV2Contract {
                 batchID: batchID,
                 writerDeviceID: writerDeviceID,
                 clientBuildID: clientBuildID,
-                batchPayloadSHA256: batchPayloadSHA256
+                batchPayloadSHA256: batchPayloadSHA256,
+                contract: contract
             ),
             "ordered_intents": .array(intents),
         ])

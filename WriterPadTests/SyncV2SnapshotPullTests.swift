@@ -566,9 +566,10 @@ final class SyncV2SnapshotPullTests: XCTestCase {
     }
 
     func testContractBaselineAuthorityUsesEvaluatedPullAndRejectsFolderFailure() async throws {
+        for contract in SyncV2ReleasedContract.allCases {
         for failure in 0..<4 {
             let localID = ProjectID(rawValue: UUID()), serverID = UUID()
-            let context = SyncV2HandshakeContext(localProjectID: localID, serverProjectID: serverID, accountID: UUID())
+            let context = SyncV2HandshakeContext(localProjectID: localID, serverProjectID: serverID, accountID: UUID(), clientContractSHA256: contract.sha256)
             let authority = SyncV2ContractStructureAuthority()
             let old = authority.beginBaseline(context)
             authority.finishBaseline(context, token: old, allowed: true)
@@ -584,6 +585,10 @@ final class SyncV2SnapshotPullTests: XCTestCase {
             let report = try await service.pull(localProjectID: localID, serverProjectID: serverID)
             XCTAssertEqual(report.contractStructureBaselineReady, failure == 0 || failure == 3)
             XCTAssertEqual(authority.proof(context, requiresActiveServer: false) != nil, failure == 0 || failure == 3)
+            let other = SyncV2HandshakeContext(localProjectID: localID, serverProjectID: serverID, accountID: context.accountID,
+                clientContractSHA256: (contract == .v02 ? SyncV2ReleasedContract.v03 : .v02).sha256)
+            XCTAssertNil(authority.proof(other, requiresActiveServer: false))
+        }
         }
     }
 

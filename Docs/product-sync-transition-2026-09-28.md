@@ -18,8 +18,9 @@ iPad 시작·검증·완료·재개, 회귀시험 및 PR 준비를 승인했다.
 2. 전환 시작 및 구조 준비: 별도 확인 후 서버에서 원자적으로 수행한다.
 3. 전환 검증: 조회만 수행하며 완료하지 않는다.
 4. 전환 완료: 검증 성공 후 다시 명시적으로 확인해야 ID_BASED가 된다.
-5. 일반 동기화는 별도다. 이번 화면의 0.3 전환 완료는 기존 iPad 0.2 일반 송신의
-   0.3 지원·활성화를 뜻하지 않는다. 기존 sender/gate는 다른 digest를 계속 거부한다.
+5. 일반 동기화는 별도다. 전환 완료 뒤 작품 설정에서 서버와 같은 계약 0.3을 명시적으로
+   선택하고 준비 확인을 새로 수행한다. 계약 선택만으로 관문이나 전체 동기화를 켜지 않는다.
+   기존 0.2 대기열은 재작성하지 않으며, 선택한 계약과 다른 요청의 전송은 거부한다.
 
 ## 공유 계약의 식별
 
@@ -62,10 +63,14 @@ Windows `WriterPad_main` PR #11 `95252c08df654563179d88a0afb1d3cea4793eb4`의
 - v2 immutable payload는 `target_contract_sha256`도 포함하며 batch target과 일치해야 한다.
   활성 0.2 작품을 0.3으로 repin하거나 0.3 작품을 0.2로 downgrade하지 않는다.
 - iPad 제품 전환 화면은 0.3 target을 명시한다. 서버가 보낸 초기화 payload를 재전송하며
-  이름 정규화는 인증된 서버에 맡긴다. 일반 0.2 request builder/handshake/sender 기본값은
-  유지하고, 추가 0.3 builder는 단일 project/migrate에만 제한한다.
-- **일반 iPad 편집 송수신의 storage-name-v2 구현 및 다기기 E2E는 별도 미완료 항목**이다.
-  이 제한을 감추기 위해 일반 게이트를 열거나 capability 검사를 완화하지 않는다.
+  전환 payload의 이름 정규화는 인증된 서버에 맡긴다. 일반 0.2 builder 기본값은 유지한다.
+  추가 0.3 builder는 ID_BASED 일반 본문·구조 요청도 지원하며, MIGRATING 요청은 여전히
+  단일 project/migrate 확장으로 제한한다.
+- iPad 일반 경로에는 동결 baseline·CCC·casefold를 사용하는 별도 storage-name-v2를 추가했다.
+  작품별 선택 → exact-profile handshake → baseline context → durable queue → 송신·복구에
+  같은 계약을 전달한다. 기존 batch의 버전·해시·build ID는 그대로 유지한다.
+- **실제 Windows–iPad 다기기 E2E는 아직 수행하지 않았다.** 격리 시험 통과만으로 배포·allowlist
+  활성화·실기기 기능시험의 승인을 대신하지 않는다.
 - 기존 0.2 journal을 0.3 요청으로 재작성하지 않는다. 불확실한 응답은 원본을 보존한다.
 
 배포·allowlist 활성화·실제 작품 전환은 이 구현에 포함하지 않는다. 테스트의 allowlist

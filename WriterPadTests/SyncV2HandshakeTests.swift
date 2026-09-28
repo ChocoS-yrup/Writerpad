@@ -9,6 +9,75 @@ import Supabase
 /// 있게 된다.
 @MainActor
 final class SyncV2HandshakeTests: XCTestCase {
+    func testProduct03SelectionDoesNotWriteOrEnableAndOpensOnlyAfter03Handshake() async throws {
+        let f = try await productGateFixture(), profile = SyncV2ReleasedContract.v03
+        XCTAssertEqual(f.model.selectedContract(for: f.row), .v02)
+        f.model.selectContract(profile, for: f.row)
+        await Task.yield()
+        XCTAssertEqual(f.model.selectedContract(for: f.row), profile)
+        XCTAssertFalse(f.model.isGateOpen(for: f.row))
+        XCTAssertFalse(f.model.isSyncAllEnabled)
+        let before = await f.transport.count
+        XCTAssertEqual(before, 0)
+        let opening = f.model.setGateOpen(true, for: f.row)
+        let transport = f.transport
+        await eventually { await transport.count == 1 }
+        await f.transport.finish(.success(supportedResponse(projectID: f.row.binding!.serverProjectID!, mode: .idBased, epoch: 1,
+            contractVersion: profile.version, canonicalDigest: profile.sha256, serverDigest: profile.sha256,
+            capabilities: Array(profile.serverCapabilities))))
+        await opening.value
+        XCTAssertTrue(f.model.isGateOpen(for: f.row))
+        XCTAssertFalse(f.model.isSyncAllEnabled)
+        await f.model.setGateOpen(false, for: f.row).value
+    }
+
+    func testCorruptSelectedContractDoesNotFallBackTo02() {
+        let defaults = makeDefaults(), id = ProjectID(rawValue: UUID())
+        defaults.set(Data([1,2,3]), forKey: "writerpad.contract-profile." + id.rawValue.uuidString)
+        XCTAssertNil(ContractPathGate.selectedContract(for: id, in: defaults))
+    }
+
+    func test03SelectedProfileSendsBothOrdinaryRequestKinds() async throws {
+        for document in [true, false] {
+            let f = try await senderFixture(generalDocument: document, generalAtomic: !document, contract: .v03)
+            let report = try await f.sender.sendNext(localProjectID: f.localID, generalOnly: true)
+            XCTAssertEqual(report.batchID, f.request.batchID)
+            let sent = await f.transport.requests
+            XCTAssertEqual(sent, [f.request.json])
+            let authorized = await f.service.usesContractStructure(context: f.context, gateIsOpen: true)
+            XCTAssertTrue(authorized)
+        }
+    }
+
+    func test03ProfileSelectionClosesGateInvalidatesLateOpenAndRequiresExactHandshake() async throws {
+        let f = try await senderFixture(generalDocument: true)
+        let revision = ContractPathGate.revision(for: f.localID, in: f.defaults)
+        ContractPathGate.selectContract(.v03, for: f.localID, in: f.defaults)
+        XCTAssertFalse(ContractPathGate.isOpen(for: f.localID, in: f.defaults))
+        XCTAssertFalse(ContractPathGate.openAfterValidation(for: f.localID, in: f.defaults, revision: revision, validate: { true }))
+        let state = await f.auth.currentState()
+        let ctx = try XCTUnwrap(SyncV2HandshakeContext.make(authenticationState: state,
+            localProjectID: f.localID, serverProjectID: f.context.serverProjectID, defaults: f.defaults))
+        XCTAssertEqual(ctx.clientContractSHA256, SyncV2ReleasedContract.v03.sha256)
+        let fresh = await f.service.isFresh(for: ctx)
+        XCTAssertFalse(fresh)
+        await assertThrows(.incompatible(.contractDigestMismatch)) { _ = try await f.service.refresh(context: ctx) }
+        let sent = await f.transport.requests
+        XCTAssertTrue(sent.isEmpty)
+    }
+
+    func test03HandshakeRejectsOldCapabilityAndUnknownDigest() async throws {
+        let local = ProjectID(rawValue: UUID()), server = UUID(), profile = SyncV2ReleasedContract.v03
+        let transport = StubTransport(results: [.success(supportedResponse(projectID: server, mode: .idBased, epoch: 1,
+            contractVersion: profile.version, canonicalDigest: profile.sha256, serverDigest: profile.sha256))])
+        let service = SyncV2HandshakeService(transport: transport)
+        let context = SyncV2HandshakeContext(localProjectID: local, serverProjectID: server, accountID: UUID(), clientContractSHA256: profile.sha256)
+        await assertThrows(.incompatible(.capabilityMismatch)) { _ = try await service.refresh(context: context) }
+        let unknown = SyncV2HandshakeContext(localProjectID: local, serverProjectID: server, accountID: context.accountID, clientContractSHA256: String(repeating: "a", count: 64))
+        await assertThrows(.incompatible(.contractDigestMismatch)) { _ = try await service.refresh(context: unknown) }
+        let count = await transport.callCount
+        XCTAssertEqual(count, 1)
+    }
 
     // MARK: - 도구
 
@@ -1120,22 +1189,24 @@ extension SyncV2HandshakeTests {
         let request: SyncV2ContractRequest
     }
 
-    private func senderFixture(deviceMismatch: Bool = false, localIsActive: Bool = true, serverID: UUID? = nil, generalDocument: Bool = false, generalAtomic: Bool = false) async throws -> SenderFixture {
+    private func senderFixture(deviceMismatch: Bool = false, localIsActive: Bool = true, serverID: UUID? = nil, generalDocument: Bool = false, generalAtomic: Bool = false, contract: SyncV2ReleasedContract = .v02) async throws -> SenderFixture {
         let local = ProjectID(rawValue: UUID()), server = serverID ?? UUID(), account = UUID(), device = UUID()
         let defaults = makeDefaults(function: UUID().uuidString)
         GlobalSyncPreference.setEnabled(true, in: defaults)
+        ContractPathGate.selectContract(contract, for: local, in: defaults)
         ContractPathGate.setOpen(true, for: local, in: defaults)
         let auth = LifecycleAuth(account: account)
         let bindingEpoch = SyncV2ContractEpoch()
-        let handshake = SyncV2HandshakeService(transport: StubTransport(results: Array(repeating: .success(supportedResponse(projectID: server, mode: (generalDocument || generalAtomic) ? .idBased : .legacy, epoch: (generalDocument || generalAtomic) ? 1 : 0)), count: 8)))
-        _ = try await handshake.refresh(context: .init(localProjectID: local, serverProjectID: server, accountID: account))
+        let handshake = SyncV2HandshakeService(transport: StubTransport(results: Array(repeating: .success(supportedResponse(projectID: server, mode: (generalDocument || generalAtomic) ? .idBased : .legacy, epoch: (generalDocument || generalAtomic) ? 1 : 0,
+            contractVersion: contract.version, canonicalDigest: contract.sha256, serverDigest: contract.sha256, capabilities: Array(contract.serverCapabilities))), count: 8)))
+        _ = try await handshake.refresh(context: .init(localProjectID: local, serverProjectID: server, accountID: account, clientContractSHA256: contract.sha256))
         let request = generalDocument ? try SyncV2Contract.buildDocumentCommitRequest(projectID: server,
             projectSyncMode: .idBased, migrationEpoch: 1, writerDeviceID: device, documentID: UUID(),
             intentKind: .update, baseRevision: 2, parentFolderID: nil, name: "합성.txt", content: "합성 원고",
-            isDeleted: false, structureRevision: 3) : try SyncV2Contract.buildAtomicStructureRequest(projectID: server,
+            isDeleted: false, structureRevision: 3, contract: contract) : try SyncV2Contract.buildAtomicStructureRequest(projectID: server,
             projectSyncMode: generalAtomic ? .idBased : .legacy, migrationEpoch: generalAtomic ? 1 : 0, writerDeviceID: device,
             orderedIntents: [.init(entityKind: .folder, entityID: UUID(), intentKind: .create,
-                                  payload: .object(["name": .string("전송 시험")]))])
+                                  payload: .object(["name": .string("전송 시험")]))], contract: contract)
         let binding = ProjectSyncBinding.connected(localProjectID: local, serverProjectID: server,
             kind: .existingServerProject, projectName: "전송 시험", ownerSubject: account)
         let queue = ContractQueueStub(binding: binding, request: request)
@@ -1143,7 +1214,7 @@ extension SyncV2HandshakeTests {
         let actualDevice = deviceMismatch ? UUID() : device
         let coordinator = SyncV2ProjectUploadPullCoordinator()
         let authority = coordinator.contractStructureAuthority
-        let context = SyncV2HandshakeContext(localProjectID: local, serverProjectID: server, accountID: account)
+        let context = SyncV2HandshakeContext(localProjectID: local, serverProjectID: server, accountID: account, clientContractSHA256: contract.sha256)
         let token = authority.beginBaseline(context)
         authority.finishBaseline(context, token: token, allowed: true)
         let localEpoch = SyncV2ContractEpoch()

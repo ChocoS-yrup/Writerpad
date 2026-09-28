@@ -356,6 +356,10 @@ struct SyncV2HandshakeContext: Equatable, Sendable {
     let authenticationEpoch: UInt64
     let bindingEpoch: UInt64
 
+    var contract: SyncV2ReleasedContract {
+        get throws { try SyncV2ReleasedContract(sha256: clientContractSHA256) }
+    }
+
     init(
         localProjectID: ProjectID,
         serverProjectID: UUID,
@@ -381,15 +385,18 @@ struct SyncV2HandshakeContext: Equatable, Sendable {
         localProjectID: ProjectID,
         serverProjectID: UUID,
         authenticationEpoch: UInt64 = 0,
-        bindingEpoch: UInt64 = 0
+        bindingEpoch: UInt64 = 0,
+        defaults: UserDefaults = .standard
     ) -> SyncV2HandshakeContext? {
-        guard case let .authenticated(account) = authenticationState else {
+        guard case let .authenticated(account) = authenticationState,
+              let contract = ContractPathGate.selectedContract(for: localProjectID, in: defaults) else {
             return nil
         }
         return SyncV2HandshakeContext(
             localProjectID: localProjectID,
             serverProjectID: serverProjectID,
             accountID: account.userID,
+            clientContractSHA256: contract.sha256,
             authenticationEpoch: authenticationEpoch,
             bindingEpoch: bindingEpoch
         )
@@ -464,7 +471,7 @@ actor SyncV2HandshakeService {
             forget(reason: "identityUnknown")
             throw SyncV2HandshakeError.identityUnknown
         }
-        guard context.clientContractSHA256 == SyncV2Contract.canonicalSHA256 else {
+        guard let contract = try? context.contract else {
             forget(reason: "clientDigestMismatch")
             throw SyncV2HandshakeError.incompatible(.contractDigestMismatch)
         }
@@ -503,7 +510,7 @@ actor SyncV2HandshakeService {
                         throw SyncV2HandshakeError.invalidResponse
                     }
                     guard response.supported else { throw SyncV2HandshakeError.contractUnavailable }
-                    outcome = .success(try SyncV2Contract.readHandshakeCompatibility(response))
+                    outcome = .success(try SyncV2Contract.readHandshakeCompatibility(response, contract: contract))
                 } catch let error as SyncV2HandshakeError {
                     outcome = .failure(error)
                 } catch let error as SyncV2ContractError {
@@ -558,7 +565,7 @@ actor SyncV2HandshakeService {
     func standingHandshake(for context: SyncV2HandshakeContext?) -> SyncV2ValidatedHandshake? {
         guard let context, let reading, reading.generation == generation,
               reading.context == context,
-              context.clientContractSHA256 == SyncV2Contract.canonicalSHA256
+              (try? context.contract) != nil
         else { return nil }
         return reading.handshake
     }
@@ -754,6 +761,21 @@ enum ContractPathGate {
     private static let state = State()
     static let storageKeyPrefix = "writerpad.contract-path-enabled."
 
+    static func selectedContract(for id: ProjectID, in defaults: UserDefaults = .standard) -> SyncV2ReleasedContract? {
+        guard let stored = defaults.object(forKey: "writerpad.contract-profile." + id.rawValue.uuidString) else { return .v02 }
+        guard let hash = stored as? String else { return nil }
+        return try? SyncV2ReleasedContract(sha256: hash)
+    }
+
+    /// Explicit local selection never opens a gate, migrates a project, or rewrites a queue.
+    static func selectContract(_ contract: SyncV2ReleasedContract, for id: ProjectID, in defaults: UserDefaults = .standard) {
+        state.lock.withLock {
+            state.revisions[revisionKey(id, defaults), default: 0] &+= 1
+            defaults.removeObject(forKey: storageKey(for: id))
+            defaults.set(contract.sha256, forKey: "writerpad.contract-profile." + id.rawValue.uuidString)
+        }
+    }
+
     static func storageKey(for localProjectID: ProjectID) -> String {
         storageKeyPrefix + localProjectID.rawValue.uuidString
     }
@@ -833,7 +855,8 @@ extension SyncV2HandshakeService {
         gateIsOpen: Bool
     ) -> Bool {
         guard gateIsOpen else { return false }
-        guard let handshake = standingHandshake(for: context) else { return false }
+        guard let handshake = standingHandshake(for: context), let context,
+              let contract = try? context.contract else { return false }
         // 들고 있는 서버 상태를 쓸 때마다 다시 검사한다. 지금 이 설계에서는 답이
         // 메모리에 있고 잡은 뒤로 바뀌지 않아 여기서 걸릴 일이 없지만, 언젠가 답을
         // 어딘가에 남기게 되면 그때부터 이 검사가 유일한 방어가 된다.
@@ -843,7 +866,8 @@ extension SyncV2HandshakeService {
                 migrationEpoch: handshake.migrationEpoch,
                 serverProtocolVersion: handshake.serverProtocolVersion,
                 serverContractSHA256: handshake.contractSHA256,
-                serverCapabilities: handshake.serverCapabilities
+                serverCapabilities: handshake.serverCapabilities,
+                contract: contract
             )
         } catch {
             return false

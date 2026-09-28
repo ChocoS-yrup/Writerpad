@@ -195,7 +195,7 @@ final class SyncV2ProjectTransitionModel: ObservableObject {
             try auth.check()
             hasPendingRequest = false
             message = contract == .v03
-                ? "ID_BASED · 계약 0.3 / storage-name-v2 handshake 확인됨. 기존 iPad 일반 송신은 0.2이며 이 화면에서 활성화하지 않습니다."
+                ? "ID_BASED · 계약 0.3 / storage-name-v2 handshake 확인됨. 작품 설정에서 계약 0.3을 선택하고 일반 동기화 준비를 새로 확인하세요. 이 화면에서는 활성화하지 않습니다."
                 : "ID_BASED 확인됨. 전환은 완료 상태이며 일반 동기화는 별도로 활성화하세요."
         } else {
             message = pending != nil ? "저장된 전환 요청이 있습니다. 같은 요청으로 결과를 확인·재시도할 수 있습니다."

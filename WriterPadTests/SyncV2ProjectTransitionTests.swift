@@ -193,7 +193,8 @@ final class SyncV2ProjectTransitionTests: XCTestCase {
             "operation_attempt_history", "operation_state_events", "storage_name_v2", "document_commit_v1"].map { .string($0) }))
         let calls = await transport.calls
         XCTAssertFalse(calls.contains("get_project_sync_transition_plan"))
-        XCTAssertTrue(model.message.contains("기존 iPad 일반 송신은 0.2"))
+        XCTAssertTrue(model.message.contains("계약 0.3을 선택"))
+        XCTAssertTrue(model.message.contains("이 화면에서는 활성화하지 않습니다"))
     }
     func testContract03HandshakeDriftBlocksBeforeJournalOrPreparation() async throws {
         let cases: [[String: SyncV2JSON]] = [
@@ -297,10 +298,10 @@ final class SyncV2ProjectTransitionTests: XCTestCase {
         let entry = try await journal.load(identity)
         XCTAssertNotNil(entry)
     }
-    func testContract03DoesNotUpgradeOrdinaryWriterOrReplaceReleased02Pin() throws {
+    func testContract03WriterIsExplicitAndDoesNotReplaceReleased02Pin() throws {
         XCTAssertEqual(SyncV2Contract.version, "0.2.0")
         XCTAssertEqual(SyncV2Contract.canonicalSHA256, "416c1b99edb9bda694731dee4b25688d9d82d1f32610aa23ddfda571ec3c7670")
-        XCTAssertThrowsError(try SyncV2Contract.buildAtomicStructureRequest(projectID: identity.serverID,
+        XCTAssertNoThrow(try SyncV2Contract.buildAtomicStructureRequest(projectID: identity.serverID,
             projectSyncMode: .idBased, migrationEpoch: 1, writerDeviceID: identity.deviceID,
             orderedIntents: [.init(entityKind: .folder, entityID: UUID(), intentKind: .create,
                 payload: .object(["name": .string("folder")]))], contract: .v03))
